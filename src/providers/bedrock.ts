@@ -303,7 +303,7 @@ export class BedrockAdapter implements ProviderAdapter {
     options?: ProviderRequestOptions
   ): Promise<ProviderResponse> {
     const bedrockModelId = this.toBedrockModelId(request.model);
-    const bedrockRequest = this.buildRequest(request);
+    const bedrockRequest = this.buildRequest(request, bedrockModelId);
     const fullRequest = { modelId: bedrockModelId, ...bedrockRequest };
     options?.onRequest?.(fullRequest);
 
@@ -324,7 +324,7 @@ export class BedrockAdapter implements ProviderAdapter {
     options?: ProviderRequestOptions
   ): Promise<ProviderResponse> {
     const bedrockModelId = this.toBedrockModelId(request.model);
-    const bedrockRequest = this.buildRequest(request);
+    const bedrockRequest = this.buildRequest(request, bedrockModelId);
     const fullRequest = { modelId: bedrockModelId, ...bedrockRequest, stream: true };
     options?.onRequest?.(fullRequest);
 
@@ -338,7 +338,7 @@ export class BedrockAdapter implements ProviderAdapter {
     }
   }
 
-  private buildRequest(request: ProviderRequest): BedrockMessageRequest {
+  private buildRequest(request: ProviderRequest, bedrockModelId?: string): BedrockMessageRequest {
     // Strip provider-specific fields (e.g., sourceUrl for Gemini) from image blocks
     // before sending to Bedrock/Anthropic, which rejects extra inputs
     const sanitizedMessages = (request.messages as any[]).map((msg: any) => {
@@ -362,8 +362,17 @@ export class BedrockAdapter implements ProviderAdapter {
     };
 
     // Handle system prompt
+    // Claude 3 Sonnet (20240229) on Bedrock intermittently rejects the array content-block
+    // format for system prompts via APAC cross-region inference. Flatten to a plain string
+    // for this model to avoid the "system: Input should be a valid string" validation error.
     if (request.system) {
-      params.system = request.system as BedrockMessageRequest['system'];
+      const needsFlatten = bedrockModelId?.includes('claude-3-sonnet-20240229') ?? false;
+      if (needsFlatten && Array.isArray(request.system)) {
+        const blocks = request.system as Array<{ type: string; text: string }>;
+        params.system = blocks.map(b => b.text).join('\n\n');
+      } else {
+        params.system = request.system as BedrockMessageRequest['system'];
+      }
     }
 
     if (request.temperature !== undefined) {
