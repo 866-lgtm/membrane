@@ -1726,9 +1726,11 @@ export class Membrane {
     } = options;
     // Yielding paths default to unlimited (the caller — typically an agent
     // framework — drives the stream and is expected to budget its own work).
-    // Pass an explicit non-negative integer, or -1, to opt back into a cap.
+    // Omit `maxToolDepth` for unlimited; `-1` is an explicit "unlimited"
+    // sentinel for callers that need to write the value out; any other
+    // number is taken at face value as the cap.
     const maxToolDepth =
-      maxToolDepthOpt === undefined || maxToolDepthOpt < 0
+      maxToolDepthOpt === undefined || maxToolDepthOpt === -1
         ? Infinity
         : maxToolDepthOpt;
 
@@ -2181,9 +2183,11 @@ export class Membrane {
     } = options;
     // Yielding paths default to unlimited (the caller — typically an agent
     // framework — drives the stream and is expected to budget its own work).
-    // Pass an explicit non-negative integer, or -1, to opt back into a cap.
+    // Omit `maxToolDepth` for unlimited; `-1` is an explicit "unlimited"
+    // sentinel for callers that need to write the value out; any other
+    // number is taken at face value as the cap.
     const maxToolDepth =
-      maxToolDepthOpt === undefined || maxToolDepthOpt < 0
+      maxToolDepthOpt === undefined || maxToolDepthOpt === -1
         ? Infinity
         : maxToolDepthOpt;
 

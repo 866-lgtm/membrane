@@ -125,6 +125,28 @@ describe('streamYielding maxToolDepth', () => {
     expect(terminalEvent).toBe('complete');
   });
 
+  it('does NOT treat other negative values as unlimited (-1 is the only sentinel)', async () => {
+    // Pre-fix, `< 0` accepted -2, -99, etc. as unlimited. That silently
+    // masked computation errors (e.g. `userCap - N` going negative). Now
+    // anything other than -1 is taken at face value as the cap, which
+    // makes the failure loud — zero tool rounds, stream terminates.
+    const adapter = new MockAdapter({
+      streamChunkDelayMs: 0,
+      completeDelayMs: 0,
+      responseQueue: Array.from({ length: 5 }, (_, i) => scriptedToolCall(i + 1)),
+    });
+    const membrane = new Membrane(adapter);
+
+    const { toolRounds, terminalEvent } = await driveStream(
+      membrane,
+      makeRequest(),
+      { maxToolDepth: -2 },
+    );
+
+    expect(toolRounds).toBe(0);
+    expect(terminalEvent).toBe('complete');
+  });
+
   it('honors an explicit maxToolDepth=10 (the legacy cap)', async () => {
     const adapter = new MockAdapter({
       streamChunkDelayMs: 0,
