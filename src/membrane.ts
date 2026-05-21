@@ -1719,11 +1719,18 @@ export class Membrane {
   ): Promise<void> {
     const startTime = Date.now();
     const {
-      maxToolDepth = 10,
+      maxToolDepth: maxToolDepthOpt,
       emitTokens = true,
       emitBlocks = true,
       emitUsage = true,
     } = options;
+    // Yielding paths default to unlimited (the caller — typically an agent
+    // framework — drives the stream and is expected to budget its own work).
+    // Pass an explicit non-negative integer, or -1, to opt back into a cap.
+    const maxToolDepth =
+      maxToolDepthOpt === undefined || maxToolDepthOpt < 0
+        ? Infinity
+        : maxToolDepthOpt;
 
     // Initialize parser from formatter for format-specific tracking
     const formatter = this.formatter;
@@ -2168,10 +2175,17 @@ export class Membrane {
   ): Promise<void> {
     const startTime = Date.now();
     const {
-      maxToolDepth = 10,
+      maxToolDepth: maxToolDepthOpt,
       emitTokens = true,
       emitUsage = true,
     } = options;
+    // Yielding paths default to unlimited (the caller — typically an agent
+    // framework — drives the stream and is expected to budget its own work).
+    // Pass an explicit non-negative integer, or -1, to opt back into a cap.
+    const maxToolDepth =
+      maxToolDepthOpt === undefined || maxToolDepthOpt < 0
+        ? Infinity
+        : maxToolDepthOpt;
 
     let toolDepth = 0;
     let totalUsage: DetailedUsage = { inputTokens: 0, outputTokens: 0 };

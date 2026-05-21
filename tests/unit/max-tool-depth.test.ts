@@ -1,9 +1,14 @@
 /**
- * Confirms the hypothesis from the data-miner postmortem:
- * `streamYielding` defaults `maxToolDepth = 10`. With a scripted model
- * that wants to keep calling tools, the stream emits at most 11 tool
- * rounds (depths 0..10), then emits `complete` regardless of model
- * intent. Bumping `maxToolDepth` raises the cap.
+ * Coverage for `streamYielding`'s `maxToolDepth` option:
+ *   - by default the yielding paths are uncapped (the agent framework
+ *     budgets its own work);
+ *   - an explicit non-negative cap is honored;
+ *   - `-1` is accepted as an "unlimited" sentinel;
+ *   - the stream still terminates naturally when the model emits no tool.
+ *
+ * Background: the original data-miner postmortem traced a stalled agent
+ * to the prior default of 10 tool rounds. This test pins the new default
+ * and keeps the cap mechanic itself tested for callers that still want it.
  */
 
 import { describe, it, expect } from 'vitest';
@@ -77,25 +82,70 @@ async function driveStream(
   return { toolRounds, terminalEvent };
 }
 
-describe('streamYielding maxToolDepth cap', () => {
-  it('caps tool rounds at 11 with the default maxToolDepth=10', async () => {
+describe('streamYielding maxToolDepth', () => {
+  it('is uncapped by default — runs all scripted tool rounds', async () => {
+    const SCRIPTED = 25;
     const adapter = new MockAdapter({
       streamChunkDelayMs: 0,
       completeDelayMs: 0,
-      // Queue 15 scripted tool-calling responses — more than the cap.
-      // The mock will keep handing them out for as long as the loop asks.
-      responseQueue: Array.from({ length: 15 }, (_, i) => scriptedToolCall(i + 1)),
+      responseQueue: [
+        ...Array.from({ length: SCRIPTED }, (_, i) => scriptedToolCall(i + 1)),
+        // Final plain-text response so the stream terminates naturally
+        // once the scripted tool rounds are exhausted.
+        'done.',
+      ],
     });
     const membrane = new Membrane(adapter);
 
     const { toolRounds, terminalEvent } = await driveStream(membrane, makeRequest());
+
+    expect(toolRounds).toBe(SCRIPTED);
+    expect(terminalEvent).toBe('complete');
+  });
+
+  it('accepts -1 as an explicit "unlimited" sentinel', async () => {
+    const SCRIPTED = 25;
+    const adapter = new MockAdapter({
+      streamChunkDelayMs: 0,
+      completeDelayMs: 0,
+      responseQueue: [
+        ...Array.from({ length: SCRIPTED }, (_, i) => scriptedToolCall(i + 1)),
+        'done.',
+      ],
+    });
+    const membrane = new Membrane(adapter);
+
+    const { toolRounds, terminalEvent } = await driveStream(
+      membrane,
+      makeRequest(),
+      { maxToolDepth: -1 },
+    );
+
+    expect(toolRounds).toBe(SCRIPTED);
+    expect(terminalEvent).toBe('complete');
+  });
+
+  it('honors an explicit maxToolDepth=10 (the legacy cap)', async () => {
+    const adapter = new MockAdapter({
+      streamChunkDelayMs: 0,
+      completeDelayMs: 0,
+      // Queue 15 scripted tool-calling responses — more than the cap.
+      responseQueue: Array.from({ length: 15 }, (_, i) => scriptedToolCall(i + 1)),
+    });
+    const membrane = new Membrane(adapter);
+
+    const { toolRounds, terminalEvent } = await driveStream(
+      membrane,
+      makeRequest(),
+      { maxToolDepth: 10 },
+    );
 
     // 11 tool rounds happen (toolDepth iterates 0..10 inclusive)
     expect(toolRounds).toBe(11);
     expect(terminalEvent).toBe('complete');
   });
 
-  it('respects a higher maxToolDepth', async () => {
+  it('honors a higher explicit maxToolDepth', async () => {
     const adapter = new MockAdapter({
       streamChunkDelayMs: 0,
       completeDelayMs: 0,

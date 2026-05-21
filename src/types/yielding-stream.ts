@@ -176,7 +176,14 @@ export interface YieldingStreamOptions {
   /** Request ID for correlation/logging */
   requestId?: string;
 
-  /** Maximum tool execution depth (default: 10) */
+  /**
+   * Maximum tool execution depth. Default: unlimited.
+   *
+   * The yielding stream's caller (typically an agent framework) is expected
+   * to budget its own work, so we don't impose a per-stream cap by default.
+   * Pass a non-negative integer to enforce one; `-1` is accepted as an
+   * explicit "unlimited" sentinel.
+   */
   maxToolDepth?: number;
 
   /**
