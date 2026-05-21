@@ -130,7 +130,7 @@ describe('JSON.parse safety for tool arguments', () => {
       const adapterPath = path.join(process.cwd(), 'src/providers', file);
       const source = fs.readFileSync(adapterPath, 'utf-8');
 
-      expect(source).toContain("import { safeParseJson } from './utils.js'");
+      expect(source).toMatch(/import\s*\{[^}]*\bsafeParseJson\b[^}]*\}\s*from\s*['"]\.\/utils\.js['"]/);
       expect(source).toContain('input: safeParseJson(tc.function.arguments)');
       // Verify raw JSON.parse on tool arguments is gone
       expect(source).not.toContain("JSON.parse(tc.function.arguments || '{}')");
