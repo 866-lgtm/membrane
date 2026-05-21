@@ -15,6 +15,7 @@ import {
   MembraneError,
   rateLimitError,
   contextLengthError,
+  invalidRequestError,
   authError,
   serverError,
   abortError,
@@ -349,6 +350,17 @@ export class AnthropicAdapter implements ProviderAdapter {
 
       if (message.includes('context') || message.includes('too long')) {
         return contextLengthError(message, error, rawRequest);
+      }
+
+      // 400 invalid_request_error — malformed payload (e.g. orphan tool_use_id,
+      // unknown model, schema violation). Retrying with the same payload is
+      // guaranteed to produce the same 400, so classify these as non-retryable
+      // here. Previously these fell through to the generic `unknown` branch
+      // below, which left them with `retryable: false` but also with no
+      // structured type — making framework-level error policies unable to
+      // distinguish them from genuinely unknown errors.
+      if (status === 400) {
+        return invalidRequestError(message, error, rawRequest);
       }
 
       if (status >= 500) {
