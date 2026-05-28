@@ -153,6 +153,16 @@ export class AnthropicAdapter implements ProviderAdapter {
           } else if (event.delta.type === 'thinking_delta') {
             currentBlockContent += event.delta.thinking;
             callbacks.onChunk(event.delta.thinking);
+          } else if ((event.delta as { type: string }).type === 'signature_delta') {
+            // Accumulate the cryptographic signature that authenticates this
+            // thinking block. Without this, signatures never land on the
+            // streaming path and the next request — which carries the block
+            // back in history — fails Anthropic's signature validation.
+            const sig = (event.delta as { signature?: string }).signature;
+            const block = contentBlocks[currentBlockIndex];
+            if (block && block.type === 'thinking' && sig) {
+              block.signature = ((block.signature as string | undefined) ?? '') + sig;
+            }
           } else if ((event.delta as { type: string }).type === 'input_json_delta') {
             currentBlockInputJson += (event.delta as { partial_json: string }).partial_json;
           }
@@ -463,6 +473,7 @@ export function toAnthropicContent(blocks: ContentBlock[]): Anthropic.ContentBlo
         result.push({
           type: 'thinking',
           thinking: block.thinking,
+          ...(block.signature ? { signature: block.signature } : {}),
         } as any);
         break;
     }
