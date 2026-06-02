@@ -259,7 +259,11 @@ export class AnthropicAdapter implements ProviderAdapter {
 
   private buildRequest(request: ProviderRequest): Anthropic.MessageCreateParams {
     // Strip provider-specific fields (e.g., sourceUrl for Gemini) from image blocks
-    // before sending to Anthropic, which rejects extra inputs
+    // before sending to Anthropic, which rejects extra inputs.
+    // Also normalize nested tool_result content blocks: Membrane uses camelCase
+    // `mediaType`, Anthropic expects snake_case `media_type`. Without this,
+    // an image returned by a tool reaches the API as `{source: {mediaType: ...}}`
+    // and is silently rejected (the model sees the text label only).
     const sanitizedMessages = (request.messages as any[]).map((msg: any) => {
       if (!Array.isArray(msg.content)) return msg;
       return {
@@ -268,6 +272,12 @@ export class AnthropicAdapter implements ProviderAdapter {
           if (block.type === 'image' && block.sourceUrl !== undefined) {
             const { sourceUrl, ...rest } = block;
             return rest;
+          }
+          if (block.type === 'tool_result' && Array.isArray(block.content)) {
+            return {
+              ...block,
+              content: toAnthropicToolResultContent(block.content as ContentBlock[]),
+            };
           }
           return block;
         }),
@@ -407,6 +417,34 @@ export class AnthropicAdapter implements ProviderAdapter {
 // ============================================================================
 
 /**
+ * Convert Membrane tool-result content blocks to Anthropic's tool_result.content
+ * mixed array (text + image). This is what carries an image returned by a tool
+ * (e.g. an MCP fetch_attachment result) all the way to the model. Other block
+ * types are not valid inside tool_result.content per the Anthropic API and are
+ * dropped.
+ */
+function toAnthropicToolResultContent(
+  blocks: ContentBlock[],
+): Array<Anthropic.TextBlockParam | Anthropic.ImageBlockParam> {
+  const out: Array<Anthropic.TextBlockParam | Anthropic.ImageBlockParam> = [];
+  for (const block of blocks) {
+    if (block.type === 'text') {
+      out.push({ type: 'text', text: block.text });
+    } else if (block.type === 'image' && block.source.type === 'base64') {
+      out.push({
+        type: 'image',
+        source: {
+          type: 'base64',
+          media_type: block.source.mediaType as 'image/jpeg' | 'image/png' | 'image/gif' | 'image/webp',
+          data: block.source.data,
+        },
+      });
+    }
+  }
+  return out;
+}
+
+/**
  * Convert normalized content blocks to Anthropic format
  * Preserves cache_control for prompt caching
  */
@@ -464,7 +502,7 @@ export function toAnthropicContent(blocks: ContentBlock[]): Anthropic.ContentBlo
           tool_use_id: block.toolUseId,
           content: typeof block.content === 'string'
             ? block.content
-            : JSON.stringify(block.content),
+            : toAnthropicToolResultContent(block.content),
           is_error: block.isError,
         });
         break;
