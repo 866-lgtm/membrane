@@ -1085,10 +1085,14 @@ export class Membrane {
     const nativeThinkingType = request.config.thinking?.type ?? 'enabled';
     const thinking = request.config.thinking?.enabled
       ? (nativeThinkingType === 'adaptive'
-        ? { type: 'adaptive' as const }
+        ? {
+            type: 'adaptive' as const,
+            ...(request.config.thinking.display ? { display: request.config.thinking.display } : {}),
+          }
         : {
             type: 'enabled' as const,
             budget_tokens: request.config.thinking.budgetTokens ?? 5000,
+            ...(request.config.thinking.display ? { display: request.config.thinking.display } : {}),
           })
       : undefined;
 
@@ -1181,10 +1185,14 @@ export class Membrane {
     const thinkingType = config.thinking?.type ?? 'enabled';
     const thinking = config.thinking?.enabled
       ? (thinkingType === 'adaptive'
-        ? { type: 'adaptive' as const }
+        ? {
+            type: 'adaptive' as const,
+            ...(config.thinking.display ? { display: config.thinking.display } : {}),
+          }
         : {
             type: 'enabled' as const,
             budget_tokens: config.thinking!.budgetTokens ?? 5000,
+            ...(config.thinking.display ? { display: config.thinking.display } : {}),
           })
       : undefined;
     return {

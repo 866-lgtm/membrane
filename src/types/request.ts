@@ -40,6 +40,12 @@ export interface GenerationConfig {
     budgetTokens?: number;
     /** Thinking type for the API: 'enabled' (default, explicit budget) or 'adaptive' (model-managed) */
     type?: 'enabled' | 'adaptive';
+    /**
+     * Controls how thinking content is returned: 'summarized' (readable summary)
+     * or 'omitted' (empty thinking field, signature only). Models like Fable 5 /
+     * Opus 4.7+ default to 'omitted' — set 'summarized' to receive thinking text.
+     */
+    display?: 'summarized' | 'omitted';
   };
   
   /** Image generation config (Gemini) */
