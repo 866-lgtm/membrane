@@ -1,6 +1,6 @@
 {
   "name": "@animalabs/membrane",
-  "version": "0.5.61",
+  "version": "0.5.62",
   "description": "LLM middleware - a selective boundary that transforms what passes through",
   "repository": {
     "type": "git",

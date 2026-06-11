@@ -195,6 +195,19 @@ export class OpenAICompletionsAdapter implements ProviderAdapter {
       let accumulated = '';
       let finishReason = 'stop';
 
+      // Post-facto truncation of the adapter's own eotToken.
+      // The adapter serializes the prompt with this.eotToken and sends it as an
+      // API stop string, but some backends leak the stop string into streamed
+      // output. Since the bot-level formatter may use a different (or empty)
+      // turn-end token, downstream post-facto checks can't be relied on to
+      // catch it — the layer that introduced the token must truncate it.
+      // emittedLen tracks how much of `accumulated` has been emitted; a tail of
+      // eot.length-1 chars is held back in case the token is split across chunks.
+      const eot = this.eotToken;
+      let emittedLen = 0;
+      let eotFound = false;
+
+      streamLoop:
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
@@ -211,7 +224,28 @@ export class OpenAICompletionsAdapter implements ProviderAdapter {
 
             if (text) {
               accumulated += text;
-              callbacks.onChunk(text);
+              if (eot) {
+                const idx = accumulated.indexOf(eot);
+                if (idx !== -1) {
+                  // Truncate at the token, flush the un-emitted prefix, stop
+                  accumulated = accumulated.slice(0, idx);
+                  if (accumulated.length > emittedLen) {
+                    callbacks.onChunk(accumulated.slice(emittedLen));
+                  }
+                  emittedLen = accumulated.length;
+                  eotFound = true;
+                  finishReason = 'stop';
+                  break streamLoop;
+                }
+                // Emit all but a held-back tail that could be a partial token
+                const safeLen = Math.max(emittedLen, accumulated.length - (eot.length - 1));
+                if (safeLen > emittedLen) {
+                  callbacks.onChunk(accumulated.slice(emittedLen, safeLen));
+                  emittedLen = safeLen;
+                }
+              } else {
+                callbacks.onChunk(text);
+              }
             }
 
             if (parsed.choices?.[0]?.finish_reason) {
@@ -221,6 +255,14 @@ export class OpenAICompletionsAdapter implements ProviderAdapter {
             // Ignore parse errors in stream
           }
         }
+      }
+
+      // Flush any held-back tail if the token never completed
+      if (eot && !eotFound && accumulated.length > emittedLen) {
+        callbacks.onChunk(accumulated.slice(emittedLen));
+      }
+      if (eotFound) {
+        try { await reader.cancel(); } catch { /* stream already closed */ }
       }
 
       return this.buildStreamedResponse(accumulated, finishReason, request.model, completionsRequest);
@@ -424,7 +466,16 @@ export class OpenAICompletionsAdapter implements ProviderAdapter {
 
   private parseResponse(response: CompletionsResponse, requestedModel: string, rawRequest: unknown): ProviderResponse {
     const choice = response.choices[0];
-    const text = choice?.text ?? '';
+    let text = choice?.text ?? '';
+
+    // Post-facto truncation of the adapter's own eotToken — some backends
+    // leak the stop string into the output (see stream() for details)
+    if (this.eotToken) {
+      const idx = text.indexOf(this.eotToken);
+      if (idx !== -1) {
+        text = text.slice(0, idx);
+      }
+    }
 
     return {
       content: this.textToContent(text),
