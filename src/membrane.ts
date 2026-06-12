@@ -292,6 +292,12 @@ export class Membrane {
     // These can't be handled by the text-based XML parser, so we capture and append them
     const extraContentBlocks: ContentBlock[] = [];
 
+    // Native thinking blocks from the provider (with signatures). The parser
+    // derives signature-less thinking blocks from <thinking> text (via
+    // wrapThinkingTags); signatures from these are merged into those after
+    // parsing, and signature-only blocks are prepended.
+    const providerThinkingBlocks: ContentBlock[] = [];
+
     // Transform initial request using the formatter
     let { providerRequest, prefillResult } = this.transformRequest(request, formatter);
 
@@ -414,6 +420,18 @@ export class Membrane {
                 data: (block as any).data,
                 mimeType: (block as any).mimeType,
               } as ContentBlock);
+            } else if (block.type === 'thinking') {
+              // Native thinking block from the provider — carries the signature
+              // (encrypted full reasoning). Captured so consumers can persist and
+              // round-trip it for reasoning continuity. Includes signature-only
+              // blocks (display:'omitted' returns an empty thinking field).
+              providerThinkingBlocks.push({
+                type: 'thinking',
+                thinking: (block as any).thinking ?? '',
+                ...((block as any).signature ? { signature: (block as any).signature } : {}),
+              } as ContentBlock);
+            } else if (block.type === 'redacted_thinking') {
+              providerThinkingBlocks.push({ ...(block as any) } as ContentBlock);
             }
           }
         }
@@ -702,6 +720,33 @@ export class Membrane {
       // Append non-text content blocks (e.g., generated_image) that the XML parser can't handle
       if (extraContentBlocks.length > 0) {
         response.content.push(...extraContentBlocks);
+      }
+
+      // Merge provider thinking signatures into parser-derived thinking blocks
+      // (matched in stream order), and prepend any leftover provider blocks —
+      // signature-only thinking (display:'omitted') never appears in the text
+      // stream, so the parser produces no block for it. redacted_thinking
+      // blocks are always prepended verbatim.
+      if (providerThinkingBlocks.length > 0) {
+        const parsedThinking = response.content.filter(
+          (b) => b.type === 'thinking'
+        ) as Array<{ type: 'thinking'; thinking: string; signature?: string }>;
+
+        const providerThinking = providerThinkingBlocks.filter((b) => b.type === 'thinking');
+        const redacted = providerThinkingBlocks.filter((b) => b.type === 'redacted_thinking');
+
+        const matched = Math.min(providerThinking.length, parsedThinking.length);
+        for (let i = 0; i < matched; i++) {
+          const sig = (providerThinking[i] as { signature?: string }).signature;
+          if (sig) {
+            parsedThinking[i]!.signature = sig;
+          }
+        }
+
+        const leftover = providerThinking.slice(matched);
+        if (leftover.length > 0 || redacted.length > 0) {
+          response.content.unshift(...leftover, ...redacted);
+        }
       }
 
       return response;
@@ -1009,6 +1054,19 @@ export class Membrane {
             content: block.content,
             is_error: block.isError,
           });
+        } else if (block.type === 'thinking') {
+          // Round-trip thinking blocks verbatim including the signature — the
+          // API validates it and (on display:'omitted' models) decrypts it to
+          // reconstruct prior reasoning. Empty thinking + signature is valid.
+          content.push({
+            type: 'thinking',
+            thinking: (block as { thinking?: string }).thinking ?? '',
+            ...((block as { signature?: string }).signature
+              ? { signature: (block as { signature?: string }).signature }
+              : {}),
+          });
+        } else if (block.type === 'redacted_thinking') {
+          content.push({ ...(block as unknown as Record<string, unknown>) });
         } else if (block.type === 'image') {
           if (block.source.type === 'base64') {
             const imageBlock: Record<string, unknown> = {

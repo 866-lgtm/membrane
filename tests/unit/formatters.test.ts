@@ -592,6 +592,61 @@ describe('AnthropicXmlFormatter', () => {
 // ============================================================================
 
 describe('NativeFormatter', () => {
+  describe('thinking block round-trip', () => {
+    it('emits thinking blocks with signatures in assistant turns', () => {
+      const formatter = new NativeFormatter();
+      const messages: NormalizedMessage[] = [
+        textMessage('Alice', 'Hello'),
+        {
+          participant: 'Claude',
+          content: [
+            { type: 'thinking', thinking: 'prior reasoning', signature: 'sig_123' } as any,
+            { type: 'text', text: 'My answer' },
+          ],
+        },
+        textMessage('Alice', 'Next question'),
+      ];
+
+      const result = formatter.buildMessages(messages, {
+        participantMode: 'multiuser',
+        assistantParticipant: 'Claude',
+      });
+
+      const assistant = result.messages.find(m => m.role === 'assistant');
+      const content = assistant?.content as any[];
+      expect(content[0].type).toBe('thinking');
+      expect(content[0].thinking).toBe('prior reasoning');
+      expect(content[0].signature).toBe('sig_123');
+      expect(content[1].type).toBe('text');
+    });
+
+    it('emits signature-only thinking blocks (display omitted) verbatim', () => {
+      const formatter = new NativeFormatter();
+      const messages: NormalizedMessage[] = [
+        textMessage('Alice', 'Hello'),
+        {
+          participant: 'Claude',
+          content: [
+            { type: 'thinking', thinking: '', signature: 'sig_encrypted' } as any,
+            { type: 'text', text: 'My answer' },
+          ],
+        },
+        textMessage('Alice', 'Next'),
+      ];
+
+      const result = formatter.buildMessages(messages, {
+        participantMode: 'multiuser',
+        assistantParticipant: 'Claude',
+      });
+
+      const assistant = result.messages.find(m => m.role === 'assistant');
+      const content = assistant?.content as any[];
+      expect(content[0].type).toBe('thinking');
+      expect(content[0].thinking).toBe('');
+      expect(content[0].signature).toBe('sig_encrypted');
+    });
+  });
+
   describe('buildMessages', () => {
     it('builds simple user/assistant messages', () => {
       const formatter = new NativeFormatter();

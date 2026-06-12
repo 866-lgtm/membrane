@@ -385,10 +385,20 @@ export class NativeFormatter implements PrefillFormatter {
           is_error: block.isError,
         });
       } else if (block.type === 'thinking') {
+        // Round-trip thinking blocks verbatim, including the signature — the
+        // API validates it and (on display:'omitted' models) decrypts it to
+        // reconstruct the original reasoning. Signature-only blocks (empty
+        // thinking field) are valid and must be passed back unchanged.
         result.push({
           type: 'thinking',
           thinking: block.thinking,
+          ...((block as { signature?: string }).signature
+            ? { signature: (block as { signature?: string }).signature }
+            : {}),
         });
+      } else if (block.type === 'redacted_thinking') {
+        // Pass through verbatim (carries encrypted data field)
+        result.push({ ...(block as unknown as Record<string, unknown>) });
       } else if (block.type === 'document' || block.type === 'audio') {
         hasUnsupportedMedia = true;
       }
