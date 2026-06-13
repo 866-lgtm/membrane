@@ -1112,10 +1112,13 @@ export class Membrane {
     }
 
     // Build thinking config for native extended thinking (budget clamped to max_tokens)
-    const thinking = this.buildThinkingParam(request.config);
+    // Fable/Mythos models: thinking is always on and unconfigurable; sampling params are removed.
+    // Sending thinking config or temperature returns a 400 — omit both entirely.
+    const alwaysOnThinking = Membrane.isAlwaysThinkingModel(request.config.model);
+    const thinking = alwaysOnThinking ? undefined : this.buildThinkingParam(request.config);
 
     // Anthropic requires temperature=1 when extended thinking is enabled
-    const temperature = thinking ? 1 : request.config.temperature;
+    const temperature = alwaysOnThinking ? undefined : (thinking ? 1 : request.config.temperature);
 
     return {
       model: request.config.model,
@@ -1261,21 +1264,32 @@ export class Membrane {
    * Used by transformRequest, buildContinuationRequest, and buildContinuationRequestWithImages.
    */
   private getBaseProviderParams(config: NormalizedRequest['config']) {
+    // Fable/Mythos models: thinking always on (unconfigurable), sampling params removed — omit both.
+    const alwaysOnThinking = Membrane.isAlwaysThinkingModel(config.model);
     // Build thinking config for native extended thinking
-    const thinking = this.buildThinkingParam(config);
+    const thinking = alwaysOnThinking ? undefined : this.buildThinkingParam(config);
     // Anthropic requires temperature=1 when extended thinking is enabled
-    const temperature = thinking ? 1 : config.temperature;
+    const temperature = alwaysOnThinking ? undefined : (thinking ? 1 : config.temperature);
     return {
       model: config.model,
       maxTokens: config.maxTokens,
       temperature,
-      topP: config.topP,
-      topK: config.topK,
+      topP: alwaysOnThinking ? undefined : config.topP,
+      topK: alwaysOnThinking ? undefined : config.topK,
       presencePenalty: config.presencePenalty,
       frequencyPenalty: config.frequencyPenalty,
       repetitionPenalty: config.repetitionPenalty,
       thinking,
     };
+  }
+
+  /**
+   * Models with always-on, unconfigurable thinking (Claude Fable/Mythos family).
+   * These reject `thinking` config and sampling params (`temperature`, `top_p`, `top_k`)
+   * with a 400 — callers must omit them entirely.
+   */
+  private static isAlwaysThinkingModel(model: string | undefined): boolean {
+    return /\b(fable|mythos)\b/i.test(model ?? '');
   }
 
   /**
