@@ -155,12 +155,14 @@ describe('Temperature enforcement for thinking', () => {
   it('does not clamp adaptive thinking (no budget)', async () => {
     let capturedRequest: any;
     const adapter = new MockAdapter({ defaultResponse: 'Hello' });
-    // Native formatter — no assistant prefill, so the thinking param is kept
+    // Native formatter — no assistant prefill, so the thinking param is kept.
+    // Use a configurable-thinking model (not a fable/mythos always-on model,
+    // which omits the thinking param entirely — see isAlwaysThinkingModel).
     const membrane = new Membrane(adapter, { formatter: new NativeFormatter() });
 
     const request = makeRequest({
       config: {
-        model: 'claude-fable-5',
+        model: 'claude-sonnet-4-5-20250929',
         maxTokens: 1000,
         thinking: { enabled: true, type: 'adaptive' as const, display: 'summarized' as const },
       },
