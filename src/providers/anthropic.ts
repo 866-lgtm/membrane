@@ -432,6 +432,18 @@ export class AnthropicAdapter implements ProviderAdapter {
       if (message.toLowerCase().includes('overloaded')) {
         return serverError(message, 529, error, rawRequest);
       }
+
+      // Vercel AI Gateway wraps transient upstream outages (a fallback
+      // provider 503, routing churn on a sunsetting model) in non-5xx
+      // aggregate errors whose body carries gateway routing metadata. The
+      // SAME request frequently succeeds on retry once a live provider is
+      // picked, so classify these as retryable instead of terminal.
+      const gw = message.toLowerCase();
+      if (gw.includes("providermetadata") || gw.includes("fallbacksavailable") ||
+          gw.includes("modelattempts") || gw.includes("temporarily unavailable") ||
+          gw.includes("no_providers_available")) {
+        return serverError(message, status ?? 503, error, rawRequest);
+      }
     }
 
     if (error instanceof Error && error.name === 'AbortError') {
