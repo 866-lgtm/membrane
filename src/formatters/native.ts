@@ -182,6 +182,15 @@ export class NativeFormatter implements PrefillFormatter {
       ? { type: 'ephemeral', ...(cacheTtl ? { ttl: cacheTtl } : {}) }
       : undefined;
 
+    // The system block is cached only as a FALLBACK. When the context strategy
+    // marks any message breakpoint, that breakpoint already caches a prefix
+    // beginning at the front of the request — tools + system included — so a
+    // separate system breakpoint is redundant. Placing it anyway both wastes one
+    // of Anthropic's 4 cache_control slots and can push a 4-marker turn to 5,
+    // which the API hard-rejects. So we only cache the system block when the
+    // caller/strategy marked no breakpoints of its own.
+    let markedBreakpoints = 0;
+
     const providerMessages: ProviderMessage[] = [];
 
     // Add context prefix as first assistant message (for simulacrum seeding)
@@ -189,6 +198,7 @@ export class NativeFormatter implements PrefillFormatter {
       const prefixBlock: Record<string, unknown> = { type: 'text', text: contextPrefix };
       if (promptCaching && cacheControl) {
         prefixBlock.cache_control = cacheControl;
+        markedBreakpoints++;
       }
       providerMessages.push({
         role: 'assistant',
@@ -235,6 +245,7 @@ export class NativeFormatter implements PrefillFormatter {
         const prevContent = Array.isArray(prevMsg.content) ? prevMsg.content as Record<string, unknown>[] : [];
         if (prevContent.length > 0) {
           prevContent[prevContent.length - 1]!.cache_control = cacheControl;
+          markedBreakpoints++;
         }
       }
 
@@ -243,6 +254,7 @@ export class NativeFormatter implements PrefillFormatter {
       // cacheBreakpoint: cache up to and INCLUDING this message — tag last block
       if (message.cacheBreakpoint && cacheControl && content.length > 0) {
         (content[content.length - 1] as Record<string, unknown>).cache_control = cacheControl;
+        markedBreakpoints++;
       }
     }
 
@@ -258,21 +270,24 @@ export class NativeFormatter implements PrefillFormatter {
     // Merge consecutive same-role messages (API requires alternating)
     const mergedMessages = mergeConsecutiveRoles(normalized.messages);
 
-    // Build system content with optional cache control
+    // Build system content. Cache the system block only as a fallback — when no
+    // message breakpoint was marked (see note above; otherwise a message
+    // breakpoint already caches tools+system as part of its prefix).
+    const cacheSystem = cacheControl && markedBreakpoints === 0 ? cacheControl : undefined;
     let systemContent: unknown;
     if (typeof systemPrompt === 'string') {
-      if (cacheControl) {
+      if (cacheSystem) {
         // Must use array format for cache_control support
-        systemContent = [{ type: 'text', text: systemPrompt, cache_control: cacheControl }];
+        systemContent = [{ type: 'text', text: systemPrompt, cache_control: cacheSystem }];
       } else {
         systemContent = systemPrompt;
       }
     } else if (Array.isArray(systemPrompt)) {
-      if (cacheControl && systemPrompt.length > 0) {
+      if (cacheSystem && systemPrompt.length > 0) {
         // Add cache_control to the last system block
         systemContent = systemPrompt.map((block, idx) => {
           if (idx === systemPrompt.length - 1) {
-            return { ...block, cache_control: cacheControl };
+            return { ...block, cache_control: cacheSystem };
           }
           return block;
         });
