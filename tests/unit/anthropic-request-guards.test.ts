@@ -5,9 +5,9 @@
  * previously produced a non-retryable 400 that killed the whole turn:
  *
  * 1. Temperature stripping for models that reject sampling parameters
- *    (the known claude-haiku-4-5 case; Opus 4.7+/Sonnet 5/Fable 5 have the
- *    parameters removed from the API surface). Mirrors the OpenAI
- *    provider's `noTemperatureSupport` gate.
+ *    (Opus 4.7+/Sonnet 5/Fable 5/Mythos 5 have the parameters removed from
+ *    the API surface). Haiku 4.5 ACCEPTS temperature and must be forwarded.
+ *    Mirrors the OpenAI provider's `noTemperatureSupport` gate.
  *
  * 2. Root-level oneOf/anyOf/allOf in a tool's input schema (legal MCP,
  *    illegal for Anthropic tools) is flattened into a single object schema
@@ -54,7 +54,23 @@ const baseRequest = {
 // ---------------------------------------------------------------------------
 
 describe('AnthropicAdapter: sampling-parameter model gate', () => {
-  it('strips temperature for a model in the reject-list (claude-haiku-4-5)', async () => {
+  it('strips temperature for a model in the reject-list (claude-opus-4-8)', async () => {
+    const { adapter, captured } = captureAdapter();
+
+    await adapter.complete({
+      ...baseRequest,
+      model: 'claude-opus-4-8',
+      temperature: 0.7,
+    } as any);
+
+    expect(captured).toHaveLength(1);
+    expect(captured[0]).not.toHaveProperty('temperature');
+  });
+
+  it('FORWARDS temperature for claude-haiku-4-5 (it is NOT a reject-list model)', async () => {
+    // Regression guard: haiku-4-5 documentably supports `temperature`. It was
+    // briefly (and wrongly) in NO_TEMPERATURE_MODELS; stripping here silently
+    // discarded a valid parameter on the most common cheap model.
     const { adapter, captured } = captureAdapter();
 
     await adapter.complete({
@@ -63,8 +79,16 @@ describe('AnthropicAdapter: sampling-parameter model gate', () => {
       temperature: 0.7,
     } as any);
 
-    expect(captured).toHaveLength(1);
-    expect(captured[0]).not.toHaveProperty('temperature');
+    expect(captured[0].temperature).toBe(0.7);
+
+    // ...and its dated snapshots are forwarded too.
+    await adapter.complete({
+      ...baseRequest,
+      model: 'claude-haiku-4-5-20251001',
+      temperature: 0.4,
+    } as any);
+
+    expect(captured[1].temperature).toBe(0.4);
   });
 
   it('strips temperature for dated snapshots of reject-list models', async () => {
@@ -72,7 +96,7 @@ describe('AnthropicAdapter: sampling-parameter model gate', () => {
 
     await adapter.complete({
       ...baseRequest,
-      model: 'claude-haiku-4-5-20251001',
+      model: 'claude-opus-4-8-20251001',
       temperature: 0.7,
     } as any);
 
@@ -180,13 +204,34 @@ describe('AnthropicAdapter: sampling-parameter model gate', () => {
 
     await adapter.complete({
       ...baseRequest,
-      model: 'claude-haiku-4-5',
+      model: 'claude-opus-4-8',
       extra: { temperature: 0.7, top_p: 0.9, top_k: 40 },
     } as any);
 
     expect(captured[0]).not.toHaveProperty('temperature');
     expect(captured[0]).not.toHaveProperty('top_p');
     expect(captured[0]).not.toHaveProperty('top_k');
+  });
+
+  // `extra.thinking` reaches params via the same Object.assign, AFTER the
+  // sampling gate. Resolving `thinkingOn` from `extra` too means a caller
+  // passing `extra: { thinking, temperature }` still gets temperature stripped —
+  // otherwise it reproduces the non-retryable 400 (thinking + custom sampling).
+  it('strips temperature when thinking is enabled via `extra` (bypass closed)', async () => {
+    const { adapter, captured } = captureAdapter();
+
+    await adapter.complete({
+      ...baseRequest,
+      model: 'claude-sonnet-4-5', // accepts temperature normally
+      extra: {
+        thinking: { type: 'enabled', budget_tokens: 2048 },
+        temperature: 0.7,
+      },
+    } as any);
+
+    expect(captured[0]).not.toHaveProperty('temperature');
+    // The thinking config still ships (installed via the extra passthrough).
+    expect(captured[0].thinking).toEqual({ type: 'enabled', budget_tokens: 2048 });
   });
 
   it('drops temperature/top_k passed via `extra` under extended thinking', async () => {
@@ -358,6 +403,36 @@ describe('flattenRootSchemaUnion', () => {
     expect(result.additionalProperties).toBe(true);
     expect(result.description).toContain('Weird tool');
     expect(result.description).toContain('"type":"string"');
+  });
+
+  it('preserves $defs/definitions on the fallback path so serialized $refs resolve', () => {
+    // A `$ref`-only variant is not mergeable, so this takes the fallback path.
+    // The fallback used to discard everything in `rest` except properties, which
+    // orphaned the definitions the serialized $refs point at.
+    const schema = {
+      definitions: {
+        A: { type: 'object', properties: { a: { type: 'string' } } },
+      },
+      $defs: {
+        B: { type: 'object', properties: { b: { type: 'number' } } },
+      },
+      oneOf: [{ $ref: '#/definitions/A' }, { $ref: '#/$defs/B' }],
+    };
+
+    const result = flattenRootSchemaUnion(schema) as Record<string, any>;
+
+    expect(result).not.toHaveProperty('oneOf');
+    expect(result.type).toBe('object');
+    expect(result.additionalProperties).toBe(true);
+    // Definitions the $refs point at survive.
+    expect(result.definitions).toEqual({
+      A: { type: 'object', properties: { a: { type: 'string' } } },
+    });
+    expect(result.$defs).toEqual({
+      B: { type: 'object', properties: { b: { type: 'number' } } },
+    });
+    // ...and the description still advertises the raw variants.
+    expect(result.description).toContain('$ref');
   });
 
   it('passes non-object schemas through untouched', () => {

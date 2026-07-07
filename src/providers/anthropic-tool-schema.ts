@@ -176,7 +176,13 @@ export function flattenRootSchemaUnion(schema: unknown): unknown {
       ? `${rest.description}\n${note}`
       : note;
 
+  // Spread `rest` (already sans the combinator keys) so sibling definitions —
+  // `$defs`/`definitions` — survive. Without this, a variant serialized into
+  // the description as `{"$ref":"#/definitions/A"}` would point at a definition
+  // that no longer exists anywhere in the tool. The mergeable path preserves
+  // `restSansObjectKeys` for the same reason; the fallback extends the courtesy.
   return {
+    ...rest,
     type: 'object',
     properties: isPlainObject(rest.properties) ? rest.properties : {},
     additionalProperties: true,

@@ -32,15 +32,26 @@ import { flattenRootSchemaUnion } from './anthropic-tool-schema.js';
  * non-retryable, so a single stray `temperature` kills the whole turn.
  * Mirrors the `noTemperatureSupport` gate in the OpenAI provider.
  *
- *   - claude-haiku-4-5: observed 400 in production when temperature is sent
- *   - Fable 5 / Mythos 5 / Opus 4.7+ / Sonnet 5: sampling parameters are
- *     removed from the API surface entirely (documented 400)
+ * This is the always-on-thinking / reasoning-forward tier, which removes the
+ * sampling parameters from the API surface entirely (Sonnet 5 rejects only
+ * non-default values). Everything else — Haiku 4.5, Sonnet 4.6, Opus 4.6 and
+ * older — ACCEPTS `temperature`, so it must NOT be listed here.
  *
- * Prefix-matched, so dated snapshots (e.g. claude-haiku-4-5-20251001) are
+ *   - Opus 4.7 / Opus 4.8 / Sonnet 5 / Fable 5 / Mythos 5 / Mythos preview:
+ *     documented 400 on any sampling parameter.
+ *
+ * NB: claude-haiku-4-5 was previously listed here on the strength of a single
+ * "observed 400 in production when temperature is sent" anecdote. Haiku 4.5
+ * documentably supports `temperature`; the production 400 was almost certainly
+ * the `extra`-params bypass fixed in this same PR (a sampling param smuggled
+ * through `extra` and re-inserted after the gate — 400s on any model), not a
+ * capability of Haiku. Listing it silently discarded a valid parameter on the
+ * most common cheap model, so it has been removed.
+ *
+ * Prefix-matched, so dated snapshots (e.g. claude-opus-4-8-20251001) are
  * covered. Keep this list updated as models launch.
  */
 const NO_TEMPERATURE_MODELS = [
-  'claude-haiku-4-5',
   'claude-opus-4-7',
   'claude-opus-4-8',
   'claude-sonnet-5',
@@ -366,7 +377,15 @@ export class AnthropicAdapter implements ProviderAdapter {
     //     (only the defaults are accepted while thinking is on) — strip those
     //     too when a thinking config is present and not disabled.
     const stripSampling = noTemperatureSupport(request.model);
-    const thinkingConfig = (request as any).thinking as { type?: string } | undefined;
+    // Thinking can arrive top-level OR smuggled through `extra` — the same
+    // `Object.assign(params, rest)` below installs `extra.thinking` into the
+    // request AFTER this gate ran. Resolve from both sources so an enabled
+    // thinking config strips sampling params no matter where it came from;
+    // otherwise `extra: { thinking, temperature }` reproduces the exact 400
+    // this gate exists to prevent (same bug class as the extra-sampling bypass,
+    // one field over).
+    const extraThinking = (request.extra as { thinking?: { type?: string } } | undefined)?.thinking;
+    const thinkingConfig = request.thinking ?? extraThinking;
     const thinkingOn = thinkingConfig !== undefined && thinkingConfig.type !== 'disabled';
 
     if (request.temperature !== undefined && !stripSampling && !thinkingOn) {
@@ -409,8 +428,8 @@ export class AnthropicAdapter implements ProviderAdapter {
     }
 
     // Handle extended thinking
-    if ((request as any).thinking) {
-      (params as any).thinking = (request as any).thinking;
+    if (request.thinking) {
+      (params as any).thinking = request.thinking;
     }
 
     // Apply extra params, excluding internal membrane fields
