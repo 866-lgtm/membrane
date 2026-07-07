@@ -20,6 +20,41 @@ import {
   serverError,
   abortError,
 } from '../types/index.js';
+import { flattenRootSchemaUnion } from './anthropic-tool-schema.js';
+
+// ============================================================================
+// Model capability gates
+// ============================================================================
+
+/**
+ * Models that reject the sampling parameters (`temperature`, `top_p`,
+ * `top_k`) with a 400 invalid_request_error — which Membrane classifies as
+ * non-retryable, so a single stray `temperature` kills the whole turn.
+ * Mirrors the `noTemperatureSupport` gate in the OpenAI provider.
+ *
+ *   - claude-haiku-4-5: observed 400 in production when temperature is sent
+ *   - Fable 5 / Mythos 5 / Opus 4.7+ / Sonnet 5: sampling parameters are
+ *     removed from the API surface entirely (documented 400)
+ *
+ * Prefix-matched, so dated snapshots (e.g. claude-haiku-4-5-20251001) are
+ * covered. Keep this list updated as models launch.
+ */
+const NO_TEMPERATURE_MODELS = [
+  'claude-haiku-4-5',
+  'claude-opus-4-7',
+  'claude-opus-4-8',
+  'claude-sonnet-5',
+  'claude-fable-5',
+  'claude-mythos-5',
+  'claude-mythos-preview',
+];
+
+/**
+ * Check if a model doesn't support custom sampling parameters
+ */
+function noTemperatureSupport(model: string): boolean {
+  return NO_TEMPERATURE_MODELS.some(prefix => model.startsWith(prefix));
+}
 
 // ============================================================================
 // Adapter Configuration
@@ -323,17 +358,34 @@ export class AnthropicAdapter implements ProviderAdapter {
       }
     }
     
-    if (request.temperature !== undefined) {
+    // Sampling-parameter gates:
+    //   - Some models reject temperature/top_p/top_k outright with a 400
+    //     (see NO_TEMPERATURE_MODELS) — strip rather than let the whole
+    //     inference die on a non-retryable invalid_request_error.
+    //   - Extended thinking rejects custom temperature/top_k on every model
+    //     (only the defaults are accepted while thinking is on) — strip those
+    //     too when a thinking config is present and not disabled.
+    const stripSampling = noTemperatureSupport(request.model);
+    const thinkingConfig = (request as any).thinking as { type?: string } | undefined;
+    const thinkingOn = thinkingConfig !== undefined && thinkingConfig.type !== 'disabled';
+
+    if (request.temperature !== undefined && !stripSampling && !thinkingOn) {
       params.temperature = request.temperature;
     }
 
     // Anthropic API rejects requests with both temperature and top_p set.
     // When both are provided, prefer temperature (more commonly tuned) and drop top_p.
-    if (request.topP !== undefined && request.temperature === undefined) {
+    // With thinking on, top_p is only accepted in [0.95, 1] — strip values below.
+    if (
+      request.topP !== undefined &&
+      params.temperature === undefined &&
+      !stripSampling &&
+      (!thinkingOn || request.topP >= 0.95)
+    ) {
       params.top_p = request.topP;
     }
 
-    if (request.topK !== undefined) {
+    if (request.topK !== undefined && !stripSampling && !thinkingOn) {
       params.top_k = request.topK;
     }
 
@@ -342,7 +394,18 @@ export class AnthropicAdapter implements ProviderAdapter {
     }
     
     if (request.tools && request.tools.length > 0) {
-      params.tools = request.tools as Anthropic.Tool[];
+      // MCP allows a root-level oneOf/anyOf/allOf in a tool's input schema,
+      // but the Anthropic API rejects it ("input_schema does not support
+      // oneOf, allOf, or anyOf at the top level") — one bad tool 400s the
+      // entire inference. Flatten such roots into a single object schema
+      // before shipping (see anthropic-tool-schema.ts).
+      params.tools = (request.tools as Anthropic.Tool[]).map(tool => {
+        const inputSchema = (tool as { input_schema?: unknown }).input_schema;
+        const flattened = flattenRootSchemaUnion(inputSchema);
+        return flattened === inputSchema
+          ? tool
+          : ({ ...tool, input_schema: flattened } as Anthropic.Tool);
+      });
     }
 
     // Handle extended thinking
