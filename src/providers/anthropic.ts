@@ -2,7 +2,7 @@
  * Anthropic provider adapter
  */
 
-import Anthropic from '@anthropic-ai/sdk';
+import Anthropic, { type ClientOptions } from '@anthropic-ai/sdk';
 import type {
   ProviderAdapter,
   ProviderRequest,
@@ -73,10 +73,20 @@ function noTemperatureSupport(model: string): boolean {
 
 export interface AnthropicAdapterConfig {
   /** API key (defaults to ANTHROPIC_API_KEY env var) */
-  apiKey?: string;
+  apiKey?: string | null;
+
+  /**
+   * OAuth/Bearer token (defaults to ANTHROPIC_AUTH_TOKEN env var when the SDK
+   * is allowed to resolve environment auth). If explicitly provided, API-key
+   * auth is disabled so requests do not send both auth schemes.
+   */
+  authToken?: string | null;
   
   /** Base URL override */
   baseURL?: string;
+
+  /** Default headers to include with Anthropic requests */
+  defaultHeaders?: ClientOptions['defaultHeaders'];
   
   /** Default max tokens */
   defaultMaxTokens?: number;
@@ -92,10 +102,19 @@ export class AnthropicAdapter implements ProviderAdapter {
   private defaultMaxTokens: number;
 
   constructor(config: AnthropicAdapterConfig = {}) {
-    this.client = new Anthropic({
-      apiKey: config.apiKey,
+    const clientOptions: ClientOptions = {
       baseURL: config.baseURL,
-    });
+      defaultHeaders: config.defaultHeaders,
+    };
+
+    if (config.authToken !== undefined) {
+      clientOptions.authToken = config.authToken;
+      clientOptions.apiKey = null;
+    } else {
+      clientOptions.apiKey = config.apiKey;
+    }
+
+    this.client = new Anthropic(clientOptions);
     this.defaultMaxTokens = config.defaultMaxTokens ?? 4096;
   }
 
