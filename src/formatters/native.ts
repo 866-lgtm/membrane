@@ -30,6 +30,18 @@ import type {
 } from './types.js';
 import { normalizeToolPairs, mergeConsecutiveRoles } from './normalize-tool-pairs.js';
 
+/** Index of the last content block that can carry cache_control. Anthropic
+ *  rejects cache_control on thinking / redacted_thinking blocks, so a cache
+ *  breakpoint must attach to the last NON-thinking block. Returns -1 when the
+ *  message has only thinking blocks (the breakpoint is then skipped). */
+function lastCacheableBlockIndex(blocks: Array<Record<string, unknown>>): number {
+  for (let k = blocks.length - 1; k >= 0; k--) {
+    const t = blocks[k]?.type as string | undefined;
+    if (t !== 'thinking' && t !== 'redacted_thinking') return k;
+  }
+  return -1;
+}
+
 // ============================================================================
 // Configuration
 // ============================================================================
@@ -243,8 +255,9 @@ export class NativeFormatter implements PrefillFormatter {
       if (hasCacheMarker && hasCacheMarker(message, i) && cacheControl && providerMessages.length > 0) {
         const prevMsg = providerMessages[providerMessages.length - 1]!;
         const prevContent = Array.isArray(prevMsg.content) ? prevMsg.content as Record<string, unknown>[] : [];
-        if (prevContent.length > 0) {
-          prevContent[prevContent.length - 1]!.cache_control = cacheControl;
+        const prevIdx = lastCacheableBlockIndex(prevContent);
+        if (prevIdx >= 0) {
+          prevContent[prevIdx]!.cache_control = cacheControl;
           markedBreakpoints++;
         }
       }
@@ -253,8 +266,11 @@ export class NativeFormatter implements PrefillFormatter {
 
       // cacheBreakpoint: cache up to and INCLUDING this message — tag last block
       if (message.cacheBreakpoint && cacheControl && content.length > 0) {
-        (content[content.length - 1] as Record<string, unknown>).cache_control = cacheControl;
-        markedBreakpoints++;
+        const bpIdx = lastCacheableBlockIndex(content as Record<string, unknown>[]);
+        if (bpIdx >= 0) {
+          (content[bpIdx] as Record<string, unknown>).cache_control = cacheControl;
+          markedBreakpoints++;
+        }
       }
     }
 
