@@ -27,16 +27,70 @@ export function isAcceptedImageMediaType(mediaType: string | null | undefined): 
  *  and JSON overhead; override via MEMBRANE_MAX_REQUEST_BYTES. */
 export const DEFAULT_MAX_REQUEST_BYTES = 28 * 1024 * 1024;
 
+/** The effective request byte cap. */
+export function requestByteCap(capBytes?: number): number {
+  return capBytes ?? (Number(process.env.MEMBRANE_MAX_REQUEST_BYTES) || DEFAULT_MAX_REQUEST_BYTES);
+}
+
+/** Serialized byte size of the messages array (JSON length ≈ wire size). */
+export function serializedMessageBytes(messages: Array<{ content?: unknown }>): number {
+  return JSON.stringify(messages).length;
+}
+
+/**
+ * FAIL LOUDLY when the serialized messages exceed the byte cap (2026-07-12).
+ * Silent content mutation at the transport layer is a diagnosis trap: every
+ * layer above believes it sent a different context than the wire carried.
+ * Callers that can genuinely tolerate losing old images must OWN that policy
+ * by setting `shedOversizeImages` on the request — everything else fails
+ * here, before the API round-trip, with the full breakdown.
+ */
+export function assertWithinByteBudget(
+  messages: Array<{ content?: unknown }>,
+  capBytes: number | undefined,
+  site: string,
+): void {
+  const cap = requestByteCap(capBytes);
+  const size = serializedMessageBytes(messages);
+  if (size <= cap) return;
+  let images = 0;
+  let imageBytes = 0;
+  const walk = (content: unknown[]): void => {
+    for (const b of content) {
+      if (!b || typeof b !== 'object') continue;
+      const typed = b as { type?: string; content?: unknown };
+      if (typed.type === 'image') {
+        images++;
+        imageBytes += JSON.stringify(b).length;
+      } else if (typed.type === 'tool_result' && Array.isArray(typed.content)) {
+        walk(typed.content);
+      }
+    }
+  };
+  for (const m of messages) if (Array.isArray(m.content)) walk(m.content);
+  throw new Error(
+    `[membrane] request exceeds the byte cap at ${site}: ${Math.round(size / 1e6)}MB > ` +
+      `cap ${Math.round(cap / 1e6)}MB (${images} inline image(s), ~${Math.round(imageBytes / 1e6)}MB of them). ` +
+      `Refusing to silently drop content. Either the compile must respect the byte wall ` +
+      `(context-manager maxLiveImageBytes), or the caller must explicitly own image loss ` +
+      `by setting shedOversizeImages on the request.`,
+  );
+}
+
 /** Shed inline images, OLDEST first, until the serialized messages fit the
  *  byte cap. Mutates content arrays in place, replacing shed image blocks
  *  (including ones nested in tool_result content) with loud agent-facing
- *  placeholders. Returns the number of images shed. */
+ *  placeholders. Returns the number of images shed.
+ *
+ *  ONLY runs for callers that explicitly opted in (`shedOversizeImages`) —
+ *  and even then it reports at error grade: an exercised opt-in is a signal
+ *  the upstream byte wall is misconfigured. */
 export function shedImagesToFitByteBudget(
   messages: Array<{ content?: unknown }>,
   capBytes?: number,
+  site = 'unknown-site',
 ): number {
-  const cap =
-    capBytes ?? (Number(process.env.MEMBRANE_MAX_REQUEST_BYTES) || DEFAULT_MAX_REQUEST_BYTES);
+  const cap = requestByteCap(capBytes);
   let size = JSON.stringify(messages).length;
   if (size <= cap) return 0;
 
@@ -71,9 +125,10 @@ export function shedImagesToFitByteBudget(
   for (const msg of messages) {
     if (Array.isArray(msg.content) && shedInArray(msg.content)) break;
   }
-  console.warn(
-    `[membrane] shed ${shed} inline image(s) to fit the request byte cap ` +
-      `(${Math.round(size / 1e6)}MB / cap ${Math.round(cap / 1e6)}MB)`,
+  console.error(
+    `[membrane-oversize] shed ${shed} inline image(s) at ${site} to fit the request byte cap ` +
+      `(${Math.round(size / 1e6)}MB / cap ${Math.round(cap / 1e6)}MB). This opt-in firing means ` +
+      `the upstream compile exceeded the byte wall — check maxLiveImageBytes / image policy.`,
   );
   return shed;
 }

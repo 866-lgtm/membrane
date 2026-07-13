@@ -112,6 +112,14 @@ export type ToolMode =
 // ============================================================================
 
 export interface NormalizedRequest {
+  /**
+   * Explicitly own the loss of old inline images when the serialized request
+   * exceeds the API byte cap: oldest images are replaced with loud
+   * placeholders (error-logged). Without this flag an oversize request FAILS
+   * LOUDLY before the API call (2026-07-12 — no silent transport-layer
+   * mutation). Intended for summarizer/compression callers.
+   */
+  shedOversizeImages?: boolean;
   /** Conversation messages */
   messages: NormalizedMessage[];
   

@@ -58,7 +58,7 @@ import { calculateCost } from './utils/cost.js';
 import {
   isAcceptedImageMediaType,
   strippedImagePlaceholder,
-  shedImagesToFitByteBudget,
+  shedImagesToFitByteBudget, assertWithinByteBudget,
 } from './utils/image-media.js';
 import { getDefaultPricing } from './registry/default-pricing.js';
 
@@ -1144,11 +1144,13 @@ export class Membrane {
     // Anthropic requires temperature=1 when extended thinking is enabled
     const temperature = alwaysOnThinking ? undefined : (thinking ? 1 : request.config.temperature);
 
-    // Byte-budget safety net: token budgets are blind to base64 bulk, so an
-    // image-heavy window can pass the context budget yet exceed the API's
-    // total request size (413 request_too_large — Mythos 2026-07-12, 47
-    // images / 34MB). Shed oldest inline images until the request fits.
-    shedImagesToFitByteBudget(mergedMessages);
+    // Byte-wall policy point (see transformRequest): loud failure unless the
+    // caller explicitly owns image loss.
+    if (request.shedOversizeImages) {
+      shedImagesToFitByteBudget(mergedMessages, undefined, 'buildNativeToolRequest');
+    } else {
+      assertWithinByteBudget(mergedMessages, undefined, 'buildNativeToolRequest');
+    }
 
     return {
       model: request.config.model,
@@ -1386,6 +1388,17 @@ export class Membrane {
       contextPrefix: request.contextPrefix,
       prefillUserMessage: request.prefillUserMessage,
     });
+
+    // Byte-wall policy point (2026-07-12): transformRequest serves BOTH
+    // complete() and the streaming path through EVERY adapter. Oversize
+    // requests FAIL LOUDLY here, before the API round-trip, unless the
+    // caller explicitly owns image loss via `shedOversizeImages` (and the
+    // shed itself reports at error grade). No silent transport mutation.
+    if (request.shedOversizeImages) {
+      shedImagesToFitByteBudget(buildResult.messages, undefined, 'transformRequest');
+    } else {
+      assertWithinByteBudget(buildResult.messages, undefined, 'transformRequest');
+    }
 
     const providerRequest = {
       ...this.getBaseProviderParams(request.config),
