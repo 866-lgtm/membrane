@@ -236,7 +236,7 @@ export class Membrane {
     // Auto mode: choose based on formatter
     // NativeFormatter → native tools via API
     // AnthropicXmlFormatter (default) → XML tools in prefill
-    if (this.formatter.name === 'native') {
+    if (this.formatter.name === 'native' || this.formatter.name === 'openai-responses') {
       return 'native';
     }
 
@@ -986,6 +986,14 @@ export class Membrane {
     request: NormalizedRequest,
     messages: typeof request.messages
   ): any {
+    // Provider-native formatters own their complete input-item shape. The
+    // legacy implementation below is intentionally Anthropic-specific; using
+    // it for Responses would normalize away item IDs, encrypted reasoning,
+    // assistant phases, and compaction items.
+    if (this.formatter.name === 'openai-responses') {
+      return this.transformRequest({ ...request, messages }, this.formatter).providerRequest;
+    }
+
     // Convert messages to provider format
     const providerMessages: any[] = [];
     
@@ -1174,20 +1182,25 @@ export class Membrane {
       const blocks: ContentBlock[] = [];
       for (const item of content) {
         if (item.type === 'text') {
-          blocks.push({ type: 'text', text: item.text });
+          blocks.push({
+            type: 'text', text: item.text,
+            ...(item.rawItem ? { rawItem: item.rawItem } : {}),
+          } as ContentBlock);
         } else if (item.type === 'tool_use') {
           blocks.push({
             type: 'tool_use',
             id: item.id,
             name: unsanitizeToolName(item.name),
             input: item.input,
-          });
+            ...(item.rawItem ? { rawItem: item.rawItem } : {}),
+          } as ContentBlock);
         } else if (item.type === 'thinking') {
           blocks.push({
             type: 'thinking',
             thinking: item.thinking ?? '',
             ...(item.signature ? { signature: item.signature } : {}),
-          });
+            ...(item.rawItem ? { rawItem: item.rawItem } : {}),
+          } as ContentBlock);
         } else if (item.type === 'redacted_thinking') {
           // Pass through verbatim — carries the encrypted `data` payload
           blocks.push({ ...item } as ContentBlock);
@@ -1197,6 +1210,12 @@ export class Membrane {
             data: item.data,
             mimeType: item.mimeType,
           });
+        } else if (item.rawItem) {
+          // Opaque Responses items such as encrypted compaction or custom
+          // tool records have no normalized ContentBlock equivalent. Retain a
+          // zero-width carrier so Chronicle and the Responses formatter can
+          // replay the raw item without surfacing synthetic prompt text.
+          blocks.push({ type: 'text', text: '', rawItem: item.rawItem } as ContentBlock);
         }
       }
       return blocks;

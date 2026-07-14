@@ -60,3 +60,14 @@ export {
   OpenAIResponsesAdapter,
   type OpenAIResponsesAdapterConfig,
 } from './openai-responses.js';
+
+export {
+  OpenAIResponsesAPIAdapter,
+  type OpenAIResponsesAPIAdapterConfig,
+  type OpenAIResponsesAPIContentBlock,
+  type OpenAIResponsesAPIProviderResponse,
+  type OpenAIResponsesAPIRequest,
+  type OpenAIResponsesAPIResponse,
+  type OpenAIResponsesInputItem,
+  type OpenAIResponsesOutputItem,
+} from './openai-responses-api.js';

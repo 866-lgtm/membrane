@@ -16,6 +16,10 @@ export type {
 
 export { AnthropicXmlFormatter, type AnthropicXmlFormatterConfig } from './anthropic-xml.js';
 export { NativeFormatter, type NativeFormatterConfig } from './native.js';
+export {
+  OpenAIResponsesFormatter,
+  OPENAI_RESPONSES_ITEMS_METADATA_KEY,
+} from './openai-responses.js';
 export { CompletionsFormatter, type CompletionsFormatterConfig } from './completions.js';
 
 export {
