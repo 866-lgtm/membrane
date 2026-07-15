@@ -115,6 +115,15 @@ export interface OpenAIResponsesAdapterConfig {
    * When false, always uses /v1/images/generations (text-only).
    */
   allowImageEditing?: boolean;
+
+  /**
+   * Whether to surface the API's `revised_prompt` as a text content block
+   * before the generated image (default true). Some gateways echo the
+   * submitted prompt back in `revised_prompt`; for chat-surface image bots
+   * that text gets posted as a message and pollutes the channel (and other
+   * bots' contexts), so set false to emit images only.
+   */
+  includeRevisedPrompt?: boolean;
 }
 
 // ============================================================================
@@ -127,12 +136,14 @@ export class OpenAIResponsesAdapter implements ProviderAdapter {
   private baseURL: string;
   private organization?: string;
   private allowImageEditing: boolean;
+  private includeRevisedPrompt: boolean;
 
   constructor(config: OpenAIResponsesAdapterConfig = {}) {
     this.apiKey = config.apiKey ?? process.env.OPENAI_API_KEY ?? '';
     this.baseURL = (config.baseURL ?? 'https://api.openai.com/v1').replace(/\/$/, '');
     this.organization = config.organization;
     this.allowImageEditing = config.allowImageEditing ?? true;
+    this.includeRevisedPrompt = config.includeRevisedPrompt ?? true;
 
     if (!this.apiKey) {
       throw new Error('OpenAI API key not provided');
@@ -384,7 +395,7 @@ export class OpenAIResponsesAdapter implements ProviderAdapter {
     }
 
     return {
-      content: this.buildContentBlocks(revisedPrompt, images),
+      content: this.buildContentBlocks(this.includeRevisedPrompt ? revisedPrompt : undefined, images),
       stopReason: 'end_turn',
       stopSequence: undefined,
       usage: {
