@@ -409,8 +409,23 @@ export class OpenAICompatibleAdapter implements ProviderAdapter {
           }
         }
 
-        // If we have tool results, return them (possibly multiple)
+        // If we have tool results, emit them first (the API requires
+        // role:"tool" immediately after the assistant tool_calls turn), then
+        // re-emit any text/image blocks that shared the normalized message as
+        // a follow-up user message. Returning ONLY the tool results here
+        // silently dropped sibling text blocks — e.g. the context-manager's
+        // trailing summarize instruction rides in the same user message as
+        // the last tool_result, so the summarizer model never saw it and
+        // answered the conversation's stale tail instead of compressing.
         if (toolResults.length > 0) {
+          const siblingImages = contentParts.some(p => p.type === 'image_url');
+          const siblingText = contentParts.filter(p => p.type === 'text').map(p => p.text!).join('\n');
+          if (siblingImages) {
+            return [...toolResults, { role: 'user', content: contentParts } as OpenAIMessage];
+          }
+          if (siblingText) {
+            return [...toolResults, { role: 'user', content: siblingText } as OpenAIMessage];
+          }
           return toolResults;
         }
 
