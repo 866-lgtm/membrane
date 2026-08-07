@@ -522,6 +522,18 @@ export class OpenAIAdapter implements ProviderAdapter {
         if (toolResults.length > 0) {
           const followParts = [...hoistedImages, ...contentParts];
           const followHasImages = followParts.some(p => p.type === 'image_url');
+          // Some gateways (observed live: LiteRouter with gpt-5.1) silently
+          // drop image parts from a user message that carries no text part —
+          // the model then answers "no image" or re-calls the tool. Always
+          // lead with a text part when images are present.
+          if (followHasImages && !followParts.some(p => p.type === 'text')) {
+            followParts.unshift({
+              type: 'text',
+              text: hoistedImages.length === 1
+                ? '[image from the preceding tool result:]'
+                : `[${hoistedImages.length} images from the preceding tool results:]`,
+            });
+          }
           const followText = followHasImages
             ? '' // unused: array form carries the parts
             : followParts.filter(p => p.type === 'text').map(p => p.text!).join('\n');

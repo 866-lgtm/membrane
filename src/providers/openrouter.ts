@@ -567,6 +567,21 @@ export class OpenRouterAdapter implements ProviderAdapter {
             if (interloperText) {
               followBlocks.push({ type: 'text', text: interloperText });
             }
+            // Some gateways (observed live: LiteRouter with gpt-5.1) silently
+            // drop image parts from a user message that carries no text part —
+            // the model then answers "no image" or re-calls the tool. Always
+            // lead with a text part when images are present.
+            if (
+              followBlocks.some((b) => b.type === 'image_url') &&
+              !followBlocks.some((b) => b.type === 'text')
+            ) {
+              followBlocks.unshift({
+                type: 'text',
+                text: hoistedImages.length === 1
+                  ? '[image from the preceding tool result:]'
+                  : `[${hoistedImages.length} images from the preceding tool results:]`,
+              });
+            }
             return [
               ...toolResults,
               { role: 'user' as const, content: followBlocks },

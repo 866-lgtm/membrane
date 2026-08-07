@@ -410,6 +410,9 @@ describe('ChatCompletions-shaped convertMessages: images inside tool_results', (
       expect(Array.isArray(parts)).toBe(true);
       const imagePart = parts.find((p: any) => p.type === 'image_url');
       expect(imagePart.image_url.url).toBe(`data:image/png;base64,${pngData}`);
+      // Never image-only: some gateways (LiteRouter) silently drop image
+      // parts from a user message without a text part.
+      expect(parts.some((p: any) => p.type === 'text')).toBe(true);
     });
 
     it(`${name}: accepts snake_case media_type`, () => {
