@@ -186,6 +186,41 @@ function noStopSupport(model: string): boolean {
 // OpenAI Adapter
 // ============================================================================
 
+/**
+ * Split a tool_result's content into the string body for the role:'tool'
+ * message plus any image blocks hoisted as image_url parts. Chat Completions
+ * tool messages are text-only — serializing an image block inline sends the
+ * raw base64 as literal text — so images must ride in a user message that
+ * follows the tool results. Mirrors openai-compatible.ts / openrouter.ts.
+ */
+function splitToolResultContent(content: unknown): { text: string; imageParts: OpenAIContentPart[] } {
+  if (typeof content === 'string') return { text: content, imageParts: [] };
+  if (!Array.isArray(content)) return { text: JSON.stringify(content), imageParts: [] };
+
+  const imageParts: OpenAIContentPart[] = [];
+  const rest: any[] = [];
+  for (const block of content as any[]) {
+    if (block?.type === 'image' && block.source?.type === 'base64' && block.source.data) {
+      const mediaType = block.source.media_type ?? block.source.mediaType ?? 'image/png';
+      imageParts.push({
+        type: 'image_url',
+        image_url: { url: `data:${mediaType};base64,${block.source.data}` },
+      });
+    } else if (block?.type === 'image' && block.source?.type === 'url') {
+      imageParts.push({ type: 'image_url', image_url: { url: block.source.url } });
+    } else {
+      rest.push(block);
+    }
+  }
+  if (imageParts.length === 0) return { text: JSON.stringify(content), imageParts };
+
+  const note = `[${imageParts.length === 1 ? 'image' : `${imageParts.length} images`} from this tool result attached in the following user message]`;
+  const restText = rest.length === 0
+    ? ''
+    : rest.every(b => b?.type === 'text') ? rest.map(b => b.text).join('\n') : JSON.stringify(rest);
+  return { text: restText ? `${restText}\n${note}` : note, imageParts };
+}
+
 export class OpenAIAdapter implements ProviderAdapter {
   readonly name = 'openai';
   private apiKey: string;
@@ -435,6 +470,7 @@ export class OpenAIAdapter implements ProviderAdapter {
         const contentParts: OpenAIContentPart[] = [];
         const toolCalls: OpenAIToolCall[] = [];
         const toolResults: OpenAIMessage[] = [];
+        const hoistedImages: OpenAIContentPart[] = [];
 
         for (const block of msg.content) {
           if (block.type === 'text') {
@@ -463,33 +499,38 @@ export class OpenAIAdapter implements ProviderAdapter {
               },
             });
           } else if (block.type === 'tool_result') {
-            // Collect ALL tool results - each becomes a separate message
+            // Collect ALL tool results - each becomes a separate message.
+            // Images inside a result are hoisted into the following user
+            // message (role:'tool' content is text-only in this API).
+            const { text, imageParts } = splitToolResultContent(block.content);
             toolResults.push({
               role: 'tool' as const,
               tool_call_id: block.tool_use_id || block.toolUseId,
-              content: typeof block.content === 'string' ? block.content : JSON.stringify(block.content),
+              content: text,
             });
+            hoistedImages.push(...imageParts);
           }
         }
 
         // If we have tool results, emit them (possibly multiple) as
-        // role:'tool' messages. Any OTHER content sharing the envelope
-        // (e.g. a mid-turn user message injected alongside tool_results —
-        // mergeConsecutiveRoles folds the separately-pushed injected user
-        // message INTO the tool_result envelope) is emitted as a FOLLOWING
-        // user message rather than dropped — this used to silently swallow
-        // such text. Same fix in openrouter.ts / openai-compatible.ts.
+        // role:'tool' messages. Images hoisted out of the results, plus any
+        // OTHER content sharing the envelope (e.g. a mid-turn user message
+        // injected alongside tool_results — mergeConsecutiveRoles folds the
+        // separately-pushed injected user message INTO the tool_result
+        // envelope), are emitted as a FOLLOWING user message rather than
+        // dropped. Same fix in openrouter.ts / openai-compatible.ts.
         if (toolResults.length > 0) {
-          const hasImagesInterloper = contentParts.some(p => p.type === 'image_url');
-          const interloperText = hasImagesInterloper
+          const followParts = [...hoistedImages, ...contentParts];
+          const followHasImages = followParts.some(p => p.type === 'image_url');
+          const followText = followHasImages
             ? '' // unused: array form carries the parts
-            : contentParts.filter(p => p.type === 'text').map(p => p.text!).join('\n');
-          if (hasImagesInterloper || interloperText) {
+            : followParts.filter(p => p.type === 'text').map(p => p.text!).join('\n');
+          if (followHasImages || followText) {
             return [
               ...toolResults,
               {
                 role: 'user' as const,
-                content: hasImagesInterloper ? contentParts : interloperText,
+                content: followHasImages ? followParts : followText,
               },
             ];
           }

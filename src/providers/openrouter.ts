@@ -144,6 +144,41 @@ export interface OpenRouterAdapterConfig {
 // OpenRouter Adapter
 // ============================================================================
 
+/**
+ * Split a tool_result's content into the string body for the role:'tool'
+ * message plus any image blocks hoisted as image_url parts. Chat Completions
+ * tool messages are text-only — serializing an image block inline sends the
+ * raw base64 as literal text — so images must ride in a user message that
+ * follows the tool results. Mirrors openai.ts / openai-compatible.ts.
+ */
+function splitToolResultContent(content: unknown): { text: string; imageParts: OpenRouterContentBlock[] } {
+  if (typeof content === 'string') return { text: content, imageParts: [] };
+  if (!Array.isArray(content)) return { text: JSON.stringify(content), imageParts: [] };
+
+  const imageParts: OpenRouterContentBlock[] = [];
+  const rest: any[] = [];
+  for (const block of content as any[]) {
+    if (block?.type === 'image' && block.source?.type === 'base64' && block.source.data) {
+      const mediaType = block.source.media_type ?? block.source.mediaType ?? 'image/png';
+      imageParts.push({
+        type: 'image_url',
+        image_url: { url: `data:${mediaType};base64,${block.source.data}` },
+      });
+    } else if (block?.type === 'image' && block.source?.type === 'url') {
+      imageParts.push({ type: 'image_url', image_url: { url: block.source.url } });
+    } else {
+      rest.push(block);
+    }
+  }
+  if (imageParts.length === 0) return { text: JSON.stringify(content), imageParts };
+
+  const note = `[${imageParts.length === 1 ? 'image' : `${imageParts.length} images`} from this tool result attached in the following user message]`;
+  const restText = rest.length === 0
+    ? ''
+    : rest.every(b => b?.type === 'text') ? rest.map(b => b.text).join('\n') : JSON.stringify(rest);
+  return { text: restText ? `${restText}\n${note}` : note, imageParts };
+}
+
 export class OpenRouterAdapter implements ProviderAdapter {
   readonly name = 'openrouter';
   private apiKey: string;
@@ -426,6 +461,7 @@ export class OpenRouterAdapter implements ProviderAdapter {
         const contentBlocks: OpenRouterContentBlock[] = [];
         const textParts: string[] = [];
         const toolResults: OpenRouterMessage[] = [];
+        const hoistedImages: OpenRouterContentBlock[] = [];
         let hasImages = false;
         let hasAudio = false;
 
@@ -505,26 +541,35 @@ export class OpenRouterAdapter implements ProviderAdapter {
               },
             });
           } else if (block.type === 'tool_result') {
-            // Collect ALL tool results - each becomes a separate message
+            // Collect ALL tool results - each becomes a separate message.
+            // Images inside a result are hoisted into the following user
+            // message (role:'tool' content is text-only in this API).
+            const { text, imageParts } = splitToolResultContent(block.content);
             toolResults.push({
               role: 'tool' as const,
               tool_call_id: block.tool_use_id || block.toolUseId,
-              content: typeof block.content === 'string' ? block.content : JSON.stringify(block.content),
+              content: text,
             });
+            hoistedImages.push(...imageParts);
           }
         }
 
         // If we have tool results, emit them (possibly multiple) as
-        // role:'tool' messages — plus a FOLLOWING user message for any other
-        // content sharing the envelope (e.g. a mid-turn injected user message
-        // that mergeConsecutiveRoles folded into the tool_result envelope),
+        // role:'tool' messages — plus a FOLLOWING user message for images
+        // hoisted out of the results and any other content sharing the
+        // envelope (e.g. a mid-turn injected user message that
+        // mergeConsecutiveRoles folded into the tool_result envelope),
         // instead of silently dropping it. Mirrors openai.ts / openai-compatible.ts.
         if (toolResults.length > 0) {
           const interloperText = textParts.join('\n');
-          if (contentBlocks.length > 0) {
+          if (hoistedImages.length > 0 || contentBlocks.length > 0) {
+            const followBlocks = [...hoistedImages, ...contentBlocks];
+            if (interloperText) {
+              followBlocks.push({ type: 'text', text: interloperText });
+            }
             return [
               ...toolResults,
-              { role: 'user' as const, content: contentBlocks },
+              { role: 'user' as const, content: followBlocks },
             ];
           }
           if (interloperText) {

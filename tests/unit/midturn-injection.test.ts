@@ -364,3 +364,100 @@ describe('ChatCompletions-shaped convertMessages: tool_result envelope interlope
     });
   }
 });
+
+describe('ChatCompletions-shaped convertMessages: images inside tool_results', () => {
+  // role:'tool' content is text-only in the Chat Completions API. Image
+  // blocks in a tool_result used to be JSON.stringify'd wholesale — the
+  // model received the raw base64 as literal text. They must instead be
+  // hoisted into a following user message as image_url data-URI parts.
+  const pngData = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg==';
+
+  const imageEnvelope = (extraBlocks: any[] = []) => ({
+    role: 'user',
+    content: [
+      {
+        type: 'tool_result',
+        tool_use_id: 'tu_1',
+        content: [
+          { type: 'text', text: 'snapshot taken' },
+          { type: 'image', source: { type: 'base64', data: pngData, mediaType: 'image/png' } },
+        ],
+      },
+      ...extraBlocks,
+    ],
+  });
+
+  const converters: Array<[string, (messages: any[]) => any[]]> = [
+    ['OpenAIAdapter', (m) => (new OpenAIAdapter({ apiKey: 'test' }) as any).convertMessages(m)],
+    ['OpenRouterAdapter', (m) => (new OpenRouterAdapter({ apiKey: 'test' }) as any).convertMessages(m)],
+    ['OpenAICompatibleAdapter', (m) =>
+      (new OpenAICompatibleAdapter({ apiKey: 'test', baseURL: 'http://localhost' }) as any).convertMessages(m)],
+  ];
+
+  for (const [name, convert] of converters) {
+    it(`${name}: hoists tool_result images into a following user message`, () => {
+      const out = convert([imageEnvelope()]);
+      expect(out.length).toBe(2);
+      expect(out[0].role).toBe('tool');
+      expect(out[0].tool_call_id).toBe('tu_1');
+      // Tool message keeps the text and a pointer note — never raw base64
+      expect(out[0].content).toContain('snapshot taken');
+      expect(out[0].content).toContain('following user message');
+      expect(out[0].content).not.toContain(pngData);
+      // Image rides in the following user message as a data-URI part
+      expect(out[1].role).toBe('user');
+      const parts = out[1].content;
+      expect(Array.isArray(parts)).toBe(true);
+      const imagePart = parts.find((p: any) => p.type === 'image_url');
+      expect(imagePart.image_url.url).toBe(`data:image/png;base64,${pngData}`);
+    });
+
+    it(`${name}: accepts snake_case media_type`, () => {
+      const out = convert([
+        {
+          role: 'user',
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'tu_1',
+              content: [
+                { type: 'image', source: { type: 'base64', data: pngData, media_type: 'image/jpeg' } },
+              ],
+            },
+          ],
+        },
+      ]);
+      const imagePart = out[1].content.find((p: any) => p.type === 'image_url');
+      expect(imagePart.image_url.url.startsWith('data:image/jpeg;base64,')).toBe(true);
+    });
+
+    it(`${name}: hoisted image and envelope interloper text share one user message`, () => {
+      const out = convert([imageEnvelope([{ type: 'text', text: 'Antra: look left!' }])]);
+      expect(out.length).toBe(2);
+      expect(out[0].role).toBe('tool');
+      expect(out[1].role).toBe('user');
+      const parts = out[1].content;
+      expect(parts.some((p: any) => p.type === 'image_url')).toBe(true);
+      expect(JSON.stringify(parts)).toContain('look left!');
+    });
+
+    it(`${name}: string and image-free array contents keep old serialization`, () => {
+      const out = convert([
+        {
+          role: 'user',
+          content: [
+            { type: 'tool_result', tool_use_id: 'tu_1', content: 'plain ok' },
+            {
+              type: 'tool_result',
+              tool_use_id: 'tu_2',
+              content: [{ type: 'text', text: 'structured ok' }],
+            },
+          ],
+        },
+      ]);
+      expect(out.length).toBe(2);
+      expect(out[0].content).toBe('plain ok');
+      expect(out[1].content).toBe(JSON.stringify([{ type: 'text', text: 'structured ok' }]));
+    });
+  }
+});

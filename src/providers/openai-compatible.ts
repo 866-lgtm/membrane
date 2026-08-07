@@ -127,6 +127,41 @@ export interface OpenAICompatibleAdapterConfig {
 // OpenAI-Compatible Adapter
 // ============================================================================
 
+/**
+ * Split a tool_result's content into the string body for the role:'tool'
+ * message plus any image blocks hoisted as image_url parts. Chat Completions
+ * tool messages are text-only — serializing an image block inline sends the
+ * raw base64 as literal text — so images must ride in a user message that
+ * follows the tool results. Mirrors openai.ts / openrouter.ts.
+ */
+function splitToolResultContent(content: unknown): { text: string; imageParts: OpenAIContentPart[] } {
+  if (typeof content === 'string') return { text: content, imageParts: [] };
+  if (!Array.isArray(content)) return { text: JSON.stringify(content), imageParts: [] };
+
+  const imageParts: OpenAIContentPart[] = [];
+  const rest: any[] = [];
+  for (const block of content as any[]) {
+    if (block?.type === 'image' && block.source?.type === 'base64' && block.source.data) {
+      const mediaType = block.source.media_type ?? block.source.mediaType ?? 'image/png';
+      imageParts.push({
+        type: 'image_url',
+        image_url: { url: `data:${mediaType};base64,${block.source.data}` },
+      });
+    } else if (block?.type === 'image' && block.source?.type === 'url') {
+      imageParts.push({ type: 'image_url', image_url: { url: block.source.url } });
+    } else {
+      rest.push(block);
+    }
+  }
+  if (imageParts.length === 0) return { text: JSON.stringify(content), imageParts };
+
+  const note = `[${imageParts.length === 1 ? 'image' : `${imageParts.length} images`} from this tool result attached in the following user message]`;
+  const restText = rest.length === 0
+    ? ''
+    : rest.every(b => b?.type === 'text') ? rest.map(b => b.text).join('\n') : JSON.stringify(rest);
+  return { text: restText ? `${restText}\n${note}` : note, imageParts };
+}
+
 export class OpenAICompatibleAdapter implements ProviderAdapter {
   readonly name: string;
   private baseURL: string;
@@ -364,6 +399,7 @@ export class OpenAICompatibleAdapter implements ProviderAdapter {
         const contentParts: OpenAIContentPart[] = [];
         const toolCalls: OpenAIToolCall[] = [];
         const toolResults: OpenAIMessage[] = [];
+        const hoistedImages: OpenAIContentPart[] = [];
         let reasoningText = '';
 
         for (const block of msg.content) {
@@ -400,31 +436,37 @@ export class OpenAICompatibleAdapter implements ProviderAdapter {
               },
             });
           } else if (block.type === 'tool_result') {
-            // Collect ALL tool results - each becomes a separate message
+            // Collect ALL tool results - each becomes a separate message.
+            // Images inside a result are hoisted into the following user
+            // message (role:'tool' content is text-only in this API).
+            const { text, imageParts } = splitToolResultContent(block.content);
             toolResults.push({
               role: 'tool' as const,
               tool_call_id: block.tool_use_id || block.toolUseId,
-              content: typeof block.content === 'string' ? block.content : JSON.stringify(block.content),
+              content: text,
             });
+            hoistedImages.push(...imageParts);
           }
         }
 
         // If we have tool results, emit them (possibly multiple) as
-        // role:'tool' messages — plus a FOLLOWING user message for any other
-        // content sharing the envelope (e.g. a mid-turn injected user message
-        // that mergeConsecutiveRoles folded into the tool_result envelope),
+        // role:'tool' messages — plus a FOLLOWING user message for images
+        // hoisted out of the results and any other content sharing the
+        // envelope (e.g. a mid-turn injected user message that
+        // mergeConsecutiveRoles folded into the tool_result envelope),
         // instead of silently dropping it. Mirrors openai.ts / openrouter.ts.
         if (toolResults.length > 0) {
-          const hasImagesInterloper = contentParts.some(p => p.type === 'image_url');
-          const interloperText = hasImagesInterloper
+          const followParts = [...hoistedImages, ...contentParts];
+          const followHasImages = followParts.some(p => p.type === 'image_url');
+          const followText = followHasImages
             ? ''
-            : contentParts.filter(p => p.type === 'text').map(p => p.text!).join('\n');
-          if (hasImagesInterloper || interloperText) {
+            : followParts.filter(p => p.type === 'text').map(p => p.text!).join('\n');
+          if (followHasImages || followText) {
             return [
               ...toolResults,
               {
                 role: 'user' as const,
-                content: hasImagesInterloper ? contentParts : interloperText,
+                content: followHasImages ? followParts : followText,
               },
             ];
           }
