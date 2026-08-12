@@ -377,12 +377,32 @@ export class OpenAICompatibleAdapter implements ProviderAdapter {
       params.tools = this.convertTools(request.tools as any[]);
     }
     
-    // Apply extra params (filter out internal membrane fields)
+    // Apply extra params (filter out internal membrane fields + control flags)
     if (request.extra) {
-      const { normalizedMessages, prompt, ...rest } = request.extra as Record<string, unknown>;
+      const { normalizedMessages, prompt, force_think_first, ...rest } =
+        request.extra as Record<string, unknown>;
       Object.assign(params, rest);
+
+      // Round-0 think forcing. `force_think_first` is a control flag (set from
+      // the recipe via framework-agent-config), NOT an API param — it is
+      // stripped above and never forwarded. When set, force a `think` call on
+      // the FIRST round of a turn only: in OpenAI chat format a fresh turn ends
+      // with a user message, whereas every resumed tool round ends with
+      // tool-result messages — so `role: 'tool'` at the tail means "not round 0"
+      // and we leave tool_choice at the provider default (auto). We emit the
+      // NAMED form; LiteRouter/gpt-5.1 silently ignores generic "required"
+      // (probed 2026-08-12). No-op if no `think` tool is present, or if the
+      // caller already set tool_choice explicitly.
+      if (force_think_first && !('tool_choice' in rest) && Array.isArray(params.tools)) {
+        const last = messages[messages.length - 1] as OpenAIMessage | undefined;
+        const isFirstRound = !!last && last.role !== 'tool' && last.role !== 'assistant';
+        const hasThink = params.tools.some((t: any) => t?.function?.name === 'think');
+        if (isFirstRound && hasThink) {
+          params.tool_choice = { type: 'function', function: { name: 'think' } };
+        }
+      }
     }
-    
+
     return params;
   }
 
