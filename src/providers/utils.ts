@@ -292,6 +292,28 @@ export function deadlineTimeoutError(error: unknown, rawRequest?: unknown): Time
 }
 
 /**
+ * The longest delay a platform timer holds. Node and browsers run a timer
+ * whose delay is longer, Infinity included, after 1 ms.
+ */
+const MAX_TIMER_DELAY_MS = 2_147_483_647;
+
+/**
+ * `setTimeout` for any delay: one past the platform's limit (about 24.8
+ * days) is armed in steps no longer than it, so it fires on time, and
+ * Infinity never fires. Returns its cancel.
+ */
+function setLongTimeout(fire: () => void, delayMs: number): () => void {
+  let timer: ReturnType<typeof setTimeout>;
+  const arm = (left: number): void => {
+    timer = left > MAX_TIMER_DELAY_MS
+      ? setTimeout(() => arm(left - MAX_TIMER_DELAY_MS), MAX_TIMER_DELAY_MS)
+      : setTimeout(fire, left);
+  };
+  arm(delayMs);
+  return () => clearTimeout(timer);
+}
+
+/**
  * Create a combined AbortSignal that fires on either the caller's signal
  * or a timeout (whichever comes first).
  *
@@ -310,10 +332,10 @@ export function createCombinedSignal(
   if (signal && !timeoutMs) return { signal };
 
   const controller = new AbortController();
-  let timeoutId: ReturnType<typeof setTimeout> | undefined;
+  let cancelTimeout: (() => void) | undefined;
 
   if (timeoutMs) {
-    timeoutId = setTimeout(() => controller.abort(deadlineAbortReason()), timeoutMs);
+    cancelTimeout = setLongTimeout(() => controller.abort(deadlineAbortReason()), timeoutMs);
   }
 
   const onAbort = () => controller.abort(signal!.reason);
@@ -328,7 +350,7 @@ export function createCombinedSignal(
   return {
     signal: controller.signal,
     cleanup: () => {
-      if (timeoutId) clearTimeout(timeoutId);
+      cancelTimeout?.();
       if (signal) signal.removeEventListener('abort', onAbort);
     },
   };
@@ -358,21 +380,21 @@ export function createProgressDeadline(
 
   const controller = new AbortController();
   let last = Date.now();
-  let timer: ReturnType<typeof setTimeout> | undefined;
+  let cancelTimer: (() => void) | undefined;
   const check = (): void => {
     const quiet = Date.now() - last;
     if (quiet >= timeoutMs) {
-      timer = undefined;
+      cancelTimer = undefined;
       controller.abort(deadlineAbortReason(`No stream progress within ${timeoutMs}ms`));
     } else {
-      timer = setTimeout(check, timeoutMs - quiet);
+      cancelTimer = setLongTimeout(check, timeoutMs - quiet);
     }
   };
-  timer = setTimeout(check, timeoutMs);
+  cancelTimer = setLongTimeout(check, timeoutMs);
 
   const onAbort = (): void => {
-    if (timer) clearTimeout(timer);
-    timer = undefined;
+    cancelTimer?.();
+    cancelTimer = undefined;
     controller.abort(signal!.reason);
   };
   if (signal) {
@@ -384,8 +406,8 @@ export function createProgressDeadline(
     signal: controller.signal,
     renew: () => { last = Date.now(); },
     cleanup: () => {
-      if (timer) clearTimeout(timer);
-      timer = undefined;
+      cancelTimer?.();
+      cancelTimer = undefined;
       signal?.removeEventListener('abort', onAbort);
     },
   };

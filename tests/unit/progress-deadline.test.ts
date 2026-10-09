@@ -25,7 +25,7 @@ import { BedrockAdapter } from '../../src/providers/bedrock.js';
 import { MockAdapter } from '../../src/providers/mock.js';
 import { rawSseResponse } from '../helpers/sse-fixtures.js';
 import { chunkFrame, streamBody } from '../helpers/bedrock-event-stream.js';
-import { createProgressDeadline, isDeadlineAbort, deadlineTimeoutError } from '../../src/providers/utils.js';
+import { createCombinedSignal, createProgressDeadline, isDeadlineAbort, deadlineTimeoutError } from '../../src/providers/utils.js';
 import { TimeoutAbortError, isAbortedResponse } from '../../src/types/index.js';
 import type { NormalizedRequest, StreamEvent } from '../../src/types/index.js';
 import type { ProviderRequest, ProviderRequestOptions, ProviderResponse } from '../../src/types/provider.js';
@@ -197,6 +197,55 @@ describe('createProgressDeadline', () => {
     expect(off.signal).toBe(caller.signal);
     expect(off.renew).toBeUndefined();
     off.cleanup();
+  });
+});
+
+// Node runs a timer whose delay is over 2³¹−1 ms, Infinity included, after 1 ms.
+describe('deadlines past the platform timer limit', () => {
+  const PAST_LIMIT_MS = 3_000_000_000;
+
+  it('a progress deadline of Infinity never expires, and does not re-arm every millisecond', async () => {
+    const armed = vi.spyOn(globalThis, 'setTimeout');
+    const deadline = createProgressDeadline(undefined, Infinity);
+    await new Promise((r) => setTimeout(r, 20));
+    expect(deadline.signal!.aborted).toBe(false);
+    expect(armed.mock.calls.length).toBeLessThan(5);
+    deadline.cleanup();
+  });
+
+  it('a progress deadline past the limit expires on time', () => {
+    vi.useFakeTimers();
+    const armed = vi.spyOn(globalThis, 'setTimeout');
+    const deadline = createProgressDeadline(undefined, PAST_LIMIT_MS);
+    // A deadline re-armed every millisecond would make the long advance below spin for hours.
+    vi.advanceTimersByTime(10);
+    expect(armed).toHaveBeenCalledTimes(1);
+    vi.advanceTimersByTime(PAST_LIMIT_MS - 11);
+    expect(deadline.signal!.aborted).toBe(false);
+    vi.advanceTimersByTime(1);
+    expect(deadline.signal!.aborted).toBe(true);
+    expect(deadlineTimeoutError(deadline.signal!.reason).message).toBe(`No stream progress within ${PAST_LIMIT_MS}ms`);
+    deadline.cleanup();
+  });
+
+  it('createCombinedSignal never aborts on a timeout of Infinity', async () => {
+    const combined = createCombinedSignal(undefined, Infinity);
+    await new Promise((r) => setTimeout(r, 20));
+    expect(combined.signal!.aborted).toBe(false);
+    combined.cleanup!();
+  });
+
+  it('createCombinedSignal aborts a timeout past the limit on time, not at the limit', () => {
+    vi.useFakeTimers();
+    const combined = createCombinedSignal(undefined, PAST_LIMIT_MS);
+    vi.advanceTimersByTime(2 ** 31);
+    expect(combined.signal!.aborted).toBe(false);
+    vi.advanceTimersByTime(PAST_LIMIT_MS - 2 ** 31 - 1);
+    expect(combined.signal!.aborted).toBe(false);
+    vi.advanceTimersByTime(1);
+    expect(combined.signal!.aborted).toBe(true);
+    expect(isDeadlineAbort(combined.signal!.reason)).toBe(true);
+    combined.cleanup!();
   });
 });
 
