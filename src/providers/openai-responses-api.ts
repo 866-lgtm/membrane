@@ -282,6 +282,8 @@ export class OpenAIResponsesAPIAdapter implements ProviderAdapter {
         } catch {
           return;
         }
+        // A parsed provider event is progress (comments never reach here).
+        options?.onProgress?.();
         events.push(event);
 
         if (event.type === 'response.output_text.delta') {

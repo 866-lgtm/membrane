@@ -287,7 +287,7 @@ export class GeminiAdapter implements ProviderAdapter {
 
         for (const line of lines) {
           if (!line.startsWith('data: ')) continue;
-          this.consumeStreamFrame(line.slice(6).trim(), streamState, callbacks, geminiRequest);
+          this.consumeStreamFrame(line.slice(6).trim(), streamState, callbacks, geminiRequest, options?.onProgress);
         }
       }
 
@@ -298,7 +298,8 @@ export class GeminiAdapter implements ProviderAdapter {
           trailing.startsWith('data: ') ? trailing.slice(6).trim() : trailing,
           streamState,
           callbacks,
-          geminiRequest
+          geminiRequest,
+          options?.onProgress,
         );
       }
 
@@ -339,7 +340,8 @@ export class GeminiAdapter implements ProviderAdapter {
     frameData: string,
     streamState: GeminiStreamState,
     callbacks: StreamCallbacks,
-    rawRequest: unknown
+    rawRequest: unknown,
+    onProgress?: () => void,
   ): void {
     if (!frameData || frameData === '[DONE]') return;
 
@@ -350,6 +352,8 @@ export class GeminiAdapter implements ProviderAdapter {
       // A frame that isn't valid JSON carries nothing to accumulate
       return;
     }
+    // A parsed provider event is progress.
+    onProgress?.();
 
     throwOnStreamErrorFrame(parsed, 'Gemini', rawRequest);
     if (parsed.modelVersion) streamState.lastModelVersion = parsed.modelVersion;

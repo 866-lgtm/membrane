@@ -253,8 +253,8 @@ export function textOnlyToolResultContent(content: unknown): string {
  */
 const DEADLINE_ABORT = Symbol.for('membrane.deadlineAbort');
 
-function deadlineAbortReason(): DOMException {
-  const reason = new DOMException('Request timed out', 'AbortError');
+function deadlineAbortReason(message = 'Request timed out'): DOMException {
+  const reason = new DOMException(message, 'AbortError');
   Object.defineProperty(reason, DEADLINE_ABORT, { value: true, enumerable: false });
   return reason;
 }
@@ -282,7 +282,13 @@ export function isDeadlineAbort(error: unknown): boolean {
  * caller-signal > timeout > error ladder could read it.
  */
 export function deadlineTimeoutError(error: unknown, rawRequest?: unknown): TimeoutAbortError {
-  return new TimeoutAbortError('Request timed out', error, rawRequest);
+  // The marked reason names its deadline (see createProgressDeadline).
+  const message = isDeadlineAbort(error) ? (error as { message?: unknown }).message : undefined;
+  return new TimeoutAbortError(
+    typeof message === 'string' && message ? message : 'Request timed out',
+    error,
+    rawRequest,
+  );
 }
 
 /**
@@ -324,6 +330,63 @@ export function createCombinedSignal(
     cleanup: () => {
       if (timeoutId) clearTimeout(timeoutId);
       if (signal) signal.removeEventListener('abort', onAbort);
+    },
+  };
+}
+
+/**
+ * A deadline that stream progress renews, for one provider call: it aborts
+ * when `timeoutMs` passes with no call to `renew`, combined with the caller's
+ * signal. Membrane core owns it (`progressTimeoutMs`); adapters renew it
+ * through `ProviderRequestOptions.onProgress` once per parsed provider event.
+ *
+ * Expiry aborts with the same mark as `createCombinedSignal`'s deadline, so
+ * every adapter's existing `isDeadlineAbort` → `deadlineTimeoutError` path
+ * turns it into a TimeoutAbortError: a timeout by type, an abort by
+ * provenance. Its message names this deadline.
+ *
+ * `renew` only records the time, so calling it per event costs nothing; the
+ * one timer re-arms itself for whatever is left when it fires early. Without
+ * `timeoutMs` the caller's signal passes through and there is no `renew`.
+ * `cleanup` MUST run in a `finally`.
+ */
+export function createProgressDeadline(
+  signal: AbortSignal | undefined,
+  timeoutMs: number | undefined,
+): { signal?: AbortSignal; renew?: () => void; cleanup: () => void } {
+  if (!timeoutMs || timeoutMs <= 0) return { signal, cleanup: () => {} };
+
+  const controller = new AbortController();
+  let last = Date.now();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const check = (): void => {
+    const quiet = Date.now() - last;
+    if (quiet >= timeoutMs) {
+      timer = undefined;
+      controller.abort(deadlineAbortReason(`No stream progress within ${timeoutMs}ms`));
+    } else {
+      timer = setTimeout(check, timeoutMs - quiet);
+    }
+  };
+  timer = setTimeout(check, timeoutMs);
+
+  const onAbort = (): void => {
+    if (timer) clearTimeout(timer);
+    timer = undefined;
+    controller.abort(signal!.reason);
+  };
+  if (signal) {
+    if (signal.aborted) onAbort();
+    else signal.addEventListener('abort', onAbort, { once: true });
+  }
+
+  return {
+    signal: controller.signal,
+    renew: () => { last = Date.now(); },
+    cleanup: () => {
+      if (timer) clearTimeout(timer);
+      timer = undefined;
+      signal?.removeEventListener('abort', onAbort);
     },
   };
 }

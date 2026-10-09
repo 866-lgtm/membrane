@@ -252,6 +252,17 @@ export interface YieldingStreamOptions {
   /** Abort if no SSE event arrives within this many ms (default: 120000) */
   idleTimeoutMs?: number;
 
+  /**
+   * Progress deadline, per provider call (default: off). Every parsed
+   * provider event renews it (an SDK event, an SSE data frame); keepalives,
+   * SSE comments and raw bytes don't, so a connection that stays up while the
+   * model sends nothing still ends. On expiry the stream ends with an
+   * `aborted` event whose reason is `'timeout'`, carrying what arrived. It
+   * bounds the wait for the first event too. Time between provider calls,
+   * such as waiting for `provideToolResults()`, never counts.
+   */
+  progressTimeoutMs?: number;
+
   /** Request ID for correlation/logging */
   requestId?: string;
 

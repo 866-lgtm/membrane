@@ -203,6 +203,17 @@ export interface StreamOptions {
    */
   idleTimeoutMs?: number;
 
+  /**
+   * Progress deadline, per provider call (default: off). Every parsed
+   * provider event renews it (an SDK event, an SSE data frame); keepalives,
+   * SSE comments and raw bytes don't, so a connection that stays up while the
+   * model sends nothing still ends. On expiry the call aborts as a
+   * `TimeoutAbortError` (type `timeout`, aborted reason `'timeout'`). It
+   * bounds the wait for the first event too. Time between provider calls,
+   * such as tool execution, never counts. Parity with YieldingStreamOptions.
+   */
+  progressTimeoutMs?: number;
+
   /** Request ID for correlation */
   requestId?: string;
   
@@ -285,6 +296,14 @@ export interface CompleteOptions {
 
   /** Request timeout */
   timeoutMs?: number;
+
+  /**
+   * Progress deadline, per provider call (default: off); see
+   * StreamOptions.progressTimeoutMs. A non-streaming call reports no progress
+   * until its response arrives, so here it bounds the whole call, and on
+   * expiry `complete()` throws a `TimeoutAbortError`.
+   */
+  progressTimeoutMs?: number;
 
   /** Request ID for correlation */
   requestId?: string;

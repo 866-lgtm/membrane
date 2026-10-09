@@ -250,6 +250,8 @@ export class OpenAICompatibleAdapter implements ProviderAdapter {
         } catch {
           return; // Ignore parse errors (partial/keep-alive lines)
         }
+        // A parsed provider event is progress (comments never reach here).
+        options?.onProgress?.();
 
         throwOnStreamErrorFrame(parsed, this.name, openAIRequest);
 
