@@ -16,7 +16,15 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { Membrane } from '../../src/membrane.js';
 import { AnthropicAdapter } from '../../src/providers/anthropic.js';
 import { OpenAICompatibleAdapter } from '../../src/providers/openai-compatible.js';
+import { OpenAIAdapter } from '../../src/providers/openai.js';
+import { GeminiAdapter } from '../../src/providers/gemini.js';
+import { OpenAICompletionsAdapter } from '../../src/providers/openai-completions.js';
+import { OpenRouterAdapter } from '../../src/providers/openrouter.js';
+import { OpenAIResponsesAPIAdapter } from '../../src/providers/openai-responses-api.js';
+import { BedrockAdapter } from '../../src/providers/bedrock.js';
 import { MockAdapter } from '../../src/providers/mock.js';
+import { rawSseResponse } from '../helpers/sse-fixtures.js';
+import { chunkFrame, streamBody } from '../helpers/bedrock-event-stream.js';
 import { createProgressDeadline, isDeadlineAbort, deadlineTimeoutError } from '../../src/providers/utils.js';
 import { TimeoutAbortError, isAbortedResponse } from '../../src/types/index.js';
 import type { NormalizedRequest, StreamEvent } from '../../src/types/index.js';
@@ -31,6 +39,8 @@ const REQUEST: NormalizedRequest = {
   messages: [{ participant: 'User', content: [{ type: 'text', text: 'zz hello' }] }],
   config: { model: 'claude-sonnet-4-6', maxTokens: 100 },
 };
+/** The prefill (XML tool) path; plain requests default to the native path. */
+const XML_REQUEST: NormalizedRequest = { ...REQUEST, toolMode: 'xml' };
 const NATIVE_REQUEST: NormalizedRequest = {
   ...REQUEST,
   toolMode: 'native',
@@ -205,10 +215,12 @@ describe('Membrane core: one renewable deadline per provider call', () => {
 
   it('gives the adapter onProgress and a deadline signal only when progressTimeoutMs is set', async () => {
     const on = new RecordingAdapter();
-    await new Membrane(on).stream(REQUEST, { progressTimeoutMs: 60_000 });
+    await new Membrane(on).stream(XML_REQUEST, { progressTimeoutMs: 60_000 });
+    await new Membrane(on).stream(NATIVE_REQUEST, { progressTimeoutMs: 60_000 });
     await new Membrane(on).complete(REQUEST, { progressTimeoutMs: 60_000 });
-    for await (const _ of new Membrane(on).streamYielding(REQUEST, { progressTimeoutMs: 60_000 })) { /* drain */ }
-    expect(on.seen).toHaveLength(3);
+    for await (const _ of new Membrane(on).streamYielding(XML_REQUEST, { progressTimeoutMs: 60_000 })) { /* drain */ }
+    for await (const _ of new Membrane(on).streamYielding(NATIVE_REQUEST, { progressTimeoutMs: 60_000 })) { /* drain */ }
+    expect(on.seen).toHaveLength(5);
     for (const options of on.seen) {
       expect(typeof options?.onProgress).toBe('function');
       expect(options?.signal).toBeInstanceOf(AbortSignal);
@@ -219,6 +231,19 @@ describe('Membrane core: one renewable deadline per provider call', () => {
     await new Membrane(off).stream(REQUEST, { signal: caller.signal });
     expect(off.seen[0]?.onProgress).toBeUndefined();
     expect(off.seen[0]?.signal).toBe(caller.signal);
+  });
+
+  it('keeps a mock stream alive while its chunks come faster than the deadline', async () => {
+    const steady = new MockAdapter({ defaultResponse: 'zz one two three four', streamChunkSize: 3, streamChunkDelayMs: PROGRESS_MS / 3 });
+    const result = await new Membrane(steady).stream(REQUEST, { progressTimeoutMs: PROGRESS_MS });
+    expect(isAbortedResponse(result)).toBe(false);
+  });
+
+  it('ends a mock stream whose chunks come slower than the deadline, as a timeout', async () => {
+    const slow = new MockAdapter({ defaultResponse: 'zz one two three', streamChunkSize: 4, streamChunkDelayMs: 4 * PROGRESS_MS });
+    const result = await new Membrane(slow).stream(REQUEST, { progressTimeoutMs: PROGRESS_MS });
+    expect(isAbortedResponse(result)).toBe(true);
+    expect((result as { reason: string }).reason).toBe('timeout');
   });
 });
 
@@ -283,6 +308,67 @@ describe('Anthropic: the deadline follows SDK events, not keepalives', () => {
       .then(() => undefined, (e: unknown) => e);
     expect(error).toBeInstanceOf(TimeoutAbortError);
     expect((error as TimeoutAbortError).message).toBe(`No stream progress within ${PROGRESS_MS}ms`);
+  });
+});
+
+describe('every streaming adapter reports progress once per parsed event', () => {
+  // The end-to-end cases above drive two adapters through Membrane. The call
+  // lives in each adapter's own parser, so the family fact is pinned here:
+  // three events that parse count; comments, keepalives and data that doesn't
+  // parse don't. Each body then ends without a terminal event, which is fine:
+  // only the count matters.
+  const sseBody = [
+    ': comment\n\n',
+    'data: {"zz":1}\n\n',
+    ': keepalive\n\n',
+    'data: {"zz":2}\n\n',
+    'data: not json\n\n',
+    'data: {"zz":3}\n\n',
+  ];
+  const adapters: Array<[string, () => { stream: (...args: never[]) => Promise<unknown> }]> = [
+    ['openai', () => new OpenAIAdapter({ apiKey: 'zz-not-a-key' })],
+    ['gemini', () => new GeminiAdapter({ apiKey: 'zz-not-a-key' })],
+    ['openai-completions', () => new OpenAICompletionsAdapter({ baseURL: 'http://zz-host.invalid/v1', apiKey: 'zz-not-a-key' })],
+    ['openai-compatible', () => new OpenAICompatibleAdapter({ baseURL: 'http://zz-host.invalid/v1', apiKey: 'zz-not-a-key' })],
+    ['openrouter', () => new OpenRouterAdapter({ apiKey: 'zz-not-a-key' })],
+    ['openai-responses-api', () => new OpenAIResponsesAPIAdapter({ apiKey: 'zz-not-a-key' })],
+  ] as never;
+
+  for (const [name, build] of adapters) {
+    it(`${name}: three data frames, three reports`, async () => {
+      stubFetch(() => rawSseResponse(sseBody));
+      let progress = 0;
+      const adapter = build() as unknown as {
+        stream: (request: unknown, callbacks: unknown, options: ProviderRequestOptions) => Promise<unknown>;
+      };
+      await adapter
+        .stream(
+          { model: 'zz-model', messages: [{ role: 'user', content: 'zz hello' }], maxTokens: 16 },
+          { onChunk: () => {} },
+          { onProgress: () => { progress++; } },
+        )
+        .catch(() => undefined);
+      expect(progress).toBe(3);
+    });
+  }
+
+  it('bedrock: decoded events count, pings do not', async () => {
+    stubFetch(() => new Response(streamBody([
+      chunkFrame({ type: 'message_start', message: { usage: { input_tokens: 3 } } }),
+      chunkFrame({ type: 'ping' }),
+      chunkFrame({ type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } }),
+      chunkFrame({ type: 'ping' }),
+      chunkFrame({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'zz' } }),
+    ]), { status: 200 }));
+    let progress = 0;
+    await new BedrockAdapter({ accessKeyId: 'zz-not-a-key-id', secretAccessKey: 'zz-not-a-secret', region: 'zz-region-1' })
+      .stream(
+        { model: 'anthropic.claude-sonnet-4-6', messages: [{ role: 'user', content: 'zz hello' }], maxTokens: 16 } as never,
+        { onChunk: () => {} },
+        { onProgress: () => { progress++; } },
+      )
+      .catch(() => undefined);
+    expect(progress).toBe(3);
   });
 });
 
