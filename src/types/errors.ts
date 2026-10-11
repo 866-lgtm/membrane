@@ -625,13 +625,15 @@ export function errorFromProviderStatus(params: {
     `${params.provider} API error ${status ?? code ?? 'failure'}: ${detail}${
       fields.param ? ` (param: ${fields.param})` : ''
     }`;
-  // With a status, the patterns read the provider's own error message: the
-  // body's message first, then the caller's, and a router's upstream message
-  // beside it (its generic "Provider returned error" classifies by the
-  // upstream provider's own text). Never a rendered body: a body with no
-  // message field can echo the request, and a prompt that says "context
-  // window" or "credit balance is too low" must not type the error.
-  const ownText = firstString(fields.message, params.message);
+  // With a status, the patterns read the provider's own error message, and a
+  // router's upstream message beside it (its generic "Provider returned
+  // error" classifies by the upstream provider's own text). The caller's
+  // message is read only when there is no body: with one, the caller's is a
+  // rendering of it (the Anthropic SDK's "400 {...}", the stream path's
+  // description). Never a rendered body: a body with no message field can
+  // echo the request, and a prompt that says "context window" or "credit
+  // balance is too low" must not type the error.
+  const ownText = fields.message ?? (params.body === undefined ? params.message : undefined);
   const evidence = [ownText, fields.upstreamMessage].filter((text): text is string => !!text).join('\n');
 
   const classification =

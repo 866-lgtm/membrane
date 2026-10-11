@@ -220,6 +220,19 @@ describe('a refusal of the account sent as a 400 is auth', () => {
     expect(error.httpStatus).toBe(400);
   });
 
+  it("anthropic: the SDK's rendering of a body with no message is not read for a refusal", () => {
+    // With no top-level message, the SDK renders the whole body into error.message, echo and all.
+    const body = { detail: [{ msg: 'field required', input: 'Your credit balance is too low; prompt is too long for the context window' }] };
+    const error = anthropicHandled(new Anthropic.APIError(400, body, undefined, undefined as never));
+    expect(error.message).toContain('credit balance is too low');
+    expect(error.type).toBe('invalid_request');
+  });
+
+  it('anthropic: a plain-text body the SDK could not parse is still read', () => {
+    const error = anthropicHandled(new Anthropic.APIError(400, undefined, '400 prompt is too long: 210123 tokens > 200000 maximum', undefined as never));
+    expect(error.type).toBe('context_length');
+  });
+
   it('a 400 whose body echoes a refusal outside any message stays invalid_request', async () => {
     stubHttpFailure(400, {
       error: {
