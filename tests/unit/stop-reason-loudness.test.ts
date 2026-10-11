@@ -35,9 +35,9 @@ class FixedStopReasonAdapter extends MockAdapter {
   }
 }
 
-/** The console.warn calls that name this stop reason. */
+/** The console.warn calls that name this stop reason (printed as a JSON string). */
 function warningsNaming(warn: ReturnType<typeof vi.spyOn>, reason: string): number {
-  return warn.mock.calls.filter(args => String(args[0]).includes(`'${reason}'`)).length;
+  return warn.mock.calls.filter(args => String(args[0]).includes(JSON.stringify(reason))).length;
 }
 
 async function streamed(membrane: Membrane, request: NormalizedRequest): Promise<NormalizedResponse> {
@@ -86,6 +86,17 @@ describe('membrane stop-reason mapping is loud', () => {
     expect(warningsNaming(warn, 'zz_repeated_reason')).toBe(1);
     await new Membrane(new FixedStopReasonAdapter('zz_other_reason')).complete(zzRequest);
     expect(warningsNaming(warn, 'zz_other_reason')).toBe(1);
+  });
+
+  it('prints a server-chosen token as a JSON string, cut to a token\'s length', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const forged = 'zz_reason\n[membrane] forged line ' + 'x'.repeat(300);
+    const response = await new Membrane(new FixedStopReasonAdapter(forged)).complete(zzRequest);
+    expect(response.details.stop.providerReason).toBe(forged);
+    const lines = warn.mock.calls.map(args => String(args[0])).filter(line => line.includes('zz_reason'));
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).not.toContain('\n');
+    expect(lines[0]).toContain(JSON.stringify(forged.slice(0, 128) + '…'));
   });
 
   it('carries pause_turn through on stream() too', async () => {

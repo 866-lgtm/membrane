@@ -300,8 +300,15 @@ function isBuildRefusal(error: unknown): error is MembraneError {
   return error instanceof MembraneNotReadyError || error instanceof MembraneNormalizerError;
 }
 
-/** Stop reasons membrane has already logged as unmapped (see mapStopReason). */
+/**
+ * Stop reasons membrane has already logged as unmapped (see mapStopReason).
+ * A server can send a fresh token on every response (one carrying an id, say),
+ * so the set stops growing at MAX_LOGGED_STOP_REASONS.
+ */
 const warnedStopReasons = new Set<string>();
+const MAX_LOGGED_STOP_REASONS = 64;
+/** Longest stop-reason token printed whole; real tokens are short. */
+const MAX_LOGGED_STOP_REASON_CHARS = 128;
 
 export class Membrane {
   private adapter: ProviderAdapter;
@@ -2983,13 +2990,26 @@ export class Membrane {
         // token per process (a compatible server may send its own token on
         // every response). Provider enums grow, and the last time this
         // default swallowed a member it hid safety refusals in production.
-        if (!warnedStopReasons.has(adapterReason)) {
+        if (!warnedStopReasons.has(adapterReason) && warnedStopReasons.size < MAX_LOGGED_STOP_REASONS) {
           warnedStopReasons.add(adapterReason);
+          // The token is the server's own text: printed as a JSON string, so
+          // a newline can't forge a log line, and cut to a token's length.
+          const shown = JSON.stringify(
+            adapterReason.length > MAX_LOGGED_STOP_REASON_CHARS
+              ? `${adapterReason.slice(0, MAX_LOGGED_STOP_REASON_CHARS)}…`
+              : adapterReason
+          );
           console.warn(
-            `[membrane] Unmapped adapter stop reason '${adapterReason}' normalized to end_turn ` +
+            `[membrane] Unmapped adapter stop reason ${shown} normalized to end_turn ` +
               '(details.stop.providerReason is present when the adapter supplies the raw provider token; ' +
               'logged once per reason)'
           );
+          if (warnedStopReasons.size === MAX_LOGGED_STOP_REASONS) {
+            console.warn(
+              `[membrane] ${MAX_LOGGED_STOP_REASONS} distinct unmapped stop reasons logged; further ones are not ` +
+                '(details.stop.providerReason still carries each)'
+            );
+          }
         }
         return 'end_turn';
     }
