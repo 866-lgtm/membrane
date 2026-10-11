@@ -312,12 +312,14 @@ interface ProviderErrorFields {
   retryAfterMs?: number;
   /** google.rpc.ErrorInfo `reason` from `details[]`, e.g. `API_KEY_INVALID`. */
   reason?: string;
-  /** A google.rpc.QuotaFailure in `details[]` names a quota no retry can outlast. */
+  /** A google.rpc.QuotaFailure in `details[]` names a quota no retry within a call or a backoff can outlast. */
   terminalQuota?: boolean;
   /**
    * The upstream provider's own message, when a router wraps it: OpenRouter
    * puts the provider's raw error body in `error.metadata.raw` beside a
-   * generic "Provider returned error". Read for classification only.
+   * generic "Provider returned error". Read for classification only, and
+   * only as that body's own message: a body with none, rendered, could echo
+   * the request.
    */
   upstreamMessage?: string;
 }
@@ -376,10 +378,12 @@ const NON_RETRYABLE_RATE_LIMIT_CODES = new Set([
  * status only over the provider's own error message (see
  * errorFromProviderStatus). A bare "too long" is not among them: a provider
  * says that of a field, such as a string past its maximum length, which no
- * shorter history fixes.
+ * shorter history fixes. The prompt or input said to be too long, with or
+ * without "is" (Bedrock's "Input is too long for requested model."), is.
+ * The status-less path reads the same forms (classifyMessage).
  */
 const CONTEXT_LENGTH_PATTERN =
-  /context[ _-]?(?:length|limit|window)|maximum context|too many tokens|token limit|(?:prompt|input) is too long|exceeds? the maximum number of (?:input )?tokens|input token count/i;
+  /context[ _-]?(?:length|limit|window)|maximum context|too many tokens|token limit|(?:prompt|input)(?: is)? too long|exceeds? the maximum number of (?:input )?tokens|input token count/i;
 
 const RATE_LIMIT_PATTERN = /\b429\b|rate[ _-]?limit|too many requests/i;
 
@@ -403,10 +407,14 @@ const AUTH_CODES = new Set(['invalid_api_key', 'authentication_error', 'unauthen
  * and "You have reached your specified API usage limits. You will regain
  * access on <date>". Like a 402 they are `auth`: no retry and no change to
  * the request succeeds until the account changes. They are read inside a
- * router's wrapper too: whoever's account it is, `auth` never sheds history,
- * whereas a router's quota (see quotaFailureIsTerminal) is better retried.
- * Like the context-length forms, they are read only over the provider's own
- * error message, never over a body that might echo the request.
+ * router's wrapper too. There the account may be the router's own, which
+ * another route might serve, but membrane can't tell, and the type is what
+ * matters: as `invalid_request` the refusal reaches agent-framework's
+ * poison-history breaker, which sheds history over it, and `auth` never does.
+ * A router's quota is another matter: retryability is all that rides on it,
+ * so it stays retryable (see quotaFailureIsTerminal). Like the context-length
+ * forms, these are read only over the provider's own error message, never
+ * over a body that might echo the request, with or without a status.
  */
 const ACCOUNT_REFUSAL_PATTERN = /credit balance is too low|reached your specified API usage limits/i;
 
@@ -486,10 +494,21 @@ export function extractProviderErrorFields(body: unknown): ProviderErrorFields {
 
   if (typeof body !== 'object') return { message: String(body) };
 
+  // A body wrapped in an array, as `[{"error": {...}}]`: its first entry is
+  // the error.
+  if (Array.isArray(body)) {
+    const first = body.find((entry) => entry !== null && typeof entry === 'object');
+    return first === undefined ? {} : extractProviderErrorFields(first);
+  }
+
   const root = body as Record<string, unknown>;
   const nested = root.error;
   const errorNode =
     nested !== null && typeof nested === 'object' ? (nested as Record<string, unknown>) : root;
+  // The provider's own message in the other shapes it comes in: a string
+  // `error` (`{"error": "..."}`), or the first of an `errors` list.
+  const listed = Array.isArray(errorNode.errors) ? errorNode.errors : Array.isArray(root.errors) ? root.errors : undefined;
+  const firstListed = listed?.find((entry) => entry !== null && typeof entry === 'object') as Record<string, unknown> | undefined;
 
   const metadata = errorNode.metadata;
   const upstreamRaw =
@@ -499,9 +518,12 @@ export function extractProviderErrorFields(body: unknown): ProviderErrorFields {
     : undefined;
 
   return {
-    message: firstString(errorNode.message, errorNode.Message, root.message, root.Message, errorNode.detail),
+    message: firstString(errorNode.message, errorNode.Message, root.message, root.Message, errorNode.detail,
+      typeof nested === 'string' ? nested : undefined, firstListed?.message),
     // A numeric code can be an HTTP-shaped status or a provider-local number.
     // Prefer a symbolic classification token; the original scalar stays in rawError.
+    // A router's wrapper gives its own code, not the upstream provider's: the
+    // upstream's stays in rawError, inside the raw body it came in.
     code: firstString(...[errorNode.code, errorNode.status, errorNode.type, root.__type, root.code]
       .filter(value => typeof value === 'string' && !/^\d+$/.test(value.trim())))
       ?? firstString(errorNode.code, errorNode.status, errorNode.type, root.__type, root.code),
@@ -512,25 +534,32 @@ export function extractProviderErrorFields(body: unknown): ProviderErrorFields {
     // OpenRouter a Google quota may be the router's shared one, which another
     // route can still serve.
     terminalQuota: quotaFailureIsTerminal(errorNode.details ?? root.details),
-    upstreamMessage: upstream?.message ?? (typeof upstreamRaw === 'string' ? upstreamRaw : undefined),
+    upstreamMessage: upstream?.message,
   };
 }
 
 /**
- * Whether a google.rpc.QuotaFailure in `details[]` names a quota no retry can
- * outlast: one with no allocation at all (`quotaValue` "0"; proto3 JSON
- * renders the int64 as a string), or a daily window (a `quotaId` naming
- * PerDay or Daily, which is how gemini-cli's own classifier reads it). A
- * per-minute quota stays retryable.
+ * Whether a google.rpc.QuotaFailure in `details[]` names a quota that no
+ * retry within the call, and no caller's backoff, can outlast: one with no
+ * allocation at all (`quotaValue` 0; proto3 JSON renders the int64 as the
+ * string "0", and a parser takes the number too), or a daily window (a
+ * `quotaId` naming PerDay or Daily, which is how gemini-cli's own classifier
+ * reads it), which resets only once the day is out. Such a 429 isn't
+ * retryable; the body's RetryInfo delay is still reported, for a caller that
+ * schedules work that late. Any one such violation decides. A per-minute
+ * quota with an allocation stays retryable. Only details entries that are a
+ * QuotaFailure by their `@type`, or carry none, are read.
  */
 function quotaFailureIsTerminal(details: unknown): boolean {
   if (!Array.isArray(details)) return false;
   return details.some((detail) => {
-    const violations = detail && typeof detail === 'object' ? (detail as Record<string, unknown>).violations : undefined;
+    if (!detail || typeof detail !== 'object') return false;
+    const { '@type': type, violations } = detail as Record<string, unknown>;
+    if (typeof type === 'string' && !type.endsWith('google.rpc.QuotaFailure')) return false;
     return Array.isArray(violations) && violations.some((violation) => {
       if (!violation || typeof violation !== 'object') return false;
       const { quotaValue, quotaId } = violation as Record<string, unknown>;
-      return quotaValue === '0' || (typeof quotaId === 'string' && /PerDay|Daily/.test(quotaId));
+      return quotaValue === '0' || quotaValue === 0 || (typeof quotaId === 'string' && /PerDay|Daily/.test(quotaId));
     });
   });
 }
@@ -636,15 +665,20 @@ export function errorFromProviderStatus(params: {
   const ownText = fields.message ?? (params.body === undefined ? params.message : undefined);
   const evidence = [ownText, fields.upstreamMessage].filter((text): text is string => !!text).join('\n');
 
+  // Without a status the transport patterns read the whole message, but the
+  // echo-sensitive ones (an account refusal, a context overflow) read the
+  // same evidence as with one, so the same body types the same way.
   const classification =
     status !== undefined
       ? { ...classifyByStatus(status, code, evidence, fields.reason, fields.terminalQuota), httpStatus: status }
-      : classifyMessage(fields.upstreamMessage ? `${message}\n${fields.upstreamMessage}` : message);
+      : classifyMessage(fields.upstreamMessage ? `${message}\n${fields.upstreamMessage}` : message, evidence);
   // A wait read from prose is believed only for an error that asks to be
   // retried: a stated wait is a hold for anyone who honours it, and a 400
-  // whose text happens to say "retry after" asks for none.
+  // whose text happens to say "retry after", or a 429 no retry can outlast,
+  // asks for none. A body's own RetryInfo or header is reported either way.
   const retryAfterMs = params.retryAfterMs ?? fields.retryAfterMs
-    ?? (classification.type === 'rate_limit' || classification.type === 'server' ? retryAfterFromProse(detail) : undefined);
+    ?? (classification.retryable && (classification.type === 'rate_limit' || classification.type === 'server')
+      ? retryAfterFromProse(detail) : undefined);
 
   return new MembraneError({
     type: classification.type,
@@ -776,8 +810,12 @@ export function isOverloadedError(info: ErrorInfo): boolean {
  * provider context_length. Status digits are word-boundary anchored, and the
  * server-status arm is tested BEFORE context-length so a transient 5xx whose
  * body mentions "context" stays retryable.
+ *
+ * `ownText` is the provider's own message, for the patterns a request's echo
+ * could otherwise trip (an account refusal, a context overflow), as with a
+ * status; it is the message itself when the caller has nothing more precise.
  */
-function classifyMessage(rawMessage: string): {
+function classifyMessage(rawMessage: string, ownText: string = rawMessage): {
   type: MembraneErrorType;
   retryable: boolean;
   httpStatus?: number;
@@ -786,6 +824,10 @@ function classifyMessage(rawMessage: string): {
 
   if (RATE_LIMIT_PATTERN.test(message)) {
     return { type: 'rate_limit', retryable: true, httpStatus: 429 };
+  }
+
+  if (ACCOUNT_REFUSAL_PATTERN.test(ownText)) {
+    return { type: 'auth', retryable: false };
   }
 
   if (/\b401\b|\bapi key\b|unauthorized|authentication|authorization/.test(message)) {
@@ -804,7 +846,7 @@ function classifyMessage(rawMessage: string): {
     return { type: 'server', retryable: true };
   }
 
-  if (CONTEXT_LENGTH_PATTERN.test(message)) {
+  if (CONTEXT_LENGTH_PATTERN.test(ownText)) {
     return { type: 'context_length', retryable: false };
   }
 

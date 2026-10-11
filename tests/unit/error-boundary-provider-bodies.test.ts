@@ -267,6 +267,9 @@ describe('a refusal of the account sent as a 400 is auth', () => {
     expect(error.type).toBe('auth');
     expect(error.retryable).toBe(false);
     expect(error.httpStatus).toBe(400);
+    // The code is the router's own, and OpenRouter's is a number: the
+    // upstream's invalid_request_error stays in rawError (sw-mb107 I6).
+    expect(error.providerErrorCode).toBeUndefined();
   });
 });
 
@@ -411,5 +414,154 @@ describe('transport failures without a status are typed', () => {
     const slow = Object.assign(new Error('connect'), { code: 'UND_ERR_CONNECT_TIMEOUT' });
     expect(classifyError(slow)).toMatchObject({ type: 'timeout', retryable: true });
     expect(classifyError(Object.assign(new Error('zz-internal'), { code: 'ERR_ZZ' })).type).toBe('unknown');
+  });
+});
+
+describe("sw-mb107's review: every shape of a provider's own message, and nothing else, types the error", () => {
+  /** A Gemini 429 with the QuotaFailure violations and details given. */
+  const gemini429 = (details: unknown, message = 'You exceeded your current quota, please check your plan and billing details.') => ({
+    error: { code: 429, message, status: 'RESOURCE_EXHAUSTED', details },
+  });
+  const quotaFailure = (...violations: Array<Record<string, unknown>>) => ({
+    '@type': 'type.googleapis.com/google.rpc.QuotaFailure',
+    violations: violations.map((v) => ({ quotaMetric: 'generativelanguage.googleapis.com/generate_content_free_tier_requests', ...v })),
+  });
+
+  async function streamFailure(adapter: { stream(request: ProviderRequest, callbacks: never): Promise<unknown> }, frame: unknown): Promise<MembraneError> {
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(frame)}\n\n`));
+        controller.close();
+      },
+    });
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(body, { status: 200, headers: { 'content-type': 'text/event-stream' } })));
+    try {
+      await adapter.stream(request, { onChunk: () => {} } as never);
+    } catch (error) {
+      expect(error).toBeInstanceOf(MembraneError);
+      return error as MembraneError;
+    }
+    throw new Error('expected the stream to reject');
+  }
+
+  // I1: the provider's message in a string `error`, an array wrapper, or an `errors` list.
+  it('a string-valued error is the provider\'s message', async () => {
+    stubHttpFailure(400, { error: 'prompt is too long: 210000 tokens > 200000 maximum' });
+    expect((await failure(new OpenAIAdapter({ apiKey: 'zz-key-openai' }))).type).toBe('context_length');
+  });
+
+  it('a body wrapped in an array is read from its first entry', async () => {
+    stubHttpFailure(400, [{ error: { code: 400, message: 'The input token count (1048577) exceeds the maximum number of tokens allowed (1048576).', status: 'INVALID_ARGUMENT' } }]);
+    const error = await failure(new GeminiAdapter({ apiKey: 'zz-key-gemini' }));
+    expect(error.type).toBe('context_length');
+    expect(error.providerErrorCode).toBe('INVALID_ARGUMENT');
+  });
+
+  it("the first of an errors list is the provider's message", async () => {
+    stubHttpFailure(400, { errors: [{ message: 'Input is too long for requested model.' }] });
+    expect((await failure(new OpenAIAdapter({ apiKey: 'zz-key-openai' }))).type).toBe('context_length');
+  });
+
+  // I2: a router's upstream body is read only as its own message.
+  it("openrouter: an upstream body with no message of its own isn't read, though it echoes a refusal or an overflow", async () => {
+    for (const echo of ['Your credit balance is too low to access the Anthropic API', 'my prompt is too long for the context window']) {
+      stubHttpFailure(400, {
+        error: {
+          code: 400,
+          message: 'Provider returned error',
+          metadata: { provider_name: 'Anthropic', raw: JSON.stringify({ type: 'error', error: { type: 'invalid_request_error', input: echo } }) },
+        },
+      });
+      const error = await failure(new OpenRouterAdapter({ apiKey: 'zz-key-openrouter' }));
+      expect(error.type, echo).toBe('invalid_request');
+    }
+  });
+
+  // I3, I7, I15, I16, I18: what the quota rule reads.
+  it('gemini: a quota whose id names a Daily window is not retryable', async () => {
+    stubHttpFailure(429, gemini429([quotaFailure({ quotaId: 'GenerateContentDailyRequestsPerProject-FreeTier', quotaValue: '50' })]));
+    expect((await failure(new GeminiAdapter({ apiKey: 'zz-key-gemini' }))).retryable).toBe(false);
+  });
+
+  it('gemini: any one terminal violation decides, in any QuotaFailure of the details', async () => {
+    const minute = { quotaId: 'GenerateRequestsPerMinutePerProjectPerModel-FreeTier', quotaValue: '15' };
+    const day = { quotaId: 'GenerateRequestsPerDayPerProjectPerModel-FreeTier', quotaValue: '50' };
+    stubHttpFailure(429, gemini429([quotaFailure(minute, day)]));
+    expect((await failure(new GeminiAdapter({ apiKey: 'zz-key-gemini' }))).retryable, 'second violation').toBe(false);
+    stubHttpFailure(429, gemini429([quotaFailure(minute), quotaFailure(day)]));
+    expect((await failure(new GeminiAdapter({ apiKey: 'zz-key-gemini' }))).retryable, 'second QuotaFailure').toBe(false);
+    stubHttpFailure(429, gemini429([quotaFailure(minute), quotaFailure({ ...minute, quotaValue: '30' })]));
+    expect((await failure(new GeminiAdapter({ apiKey: 'zz-key-gemini' }))).retryable, 'per-minute only').toBe(true);
+  });
+
+  it('gemini: a zero allocation written as a number is not retryable either', async () => {
+    stubHttpFailure(429, gemini429([quotaFailure({ quotaId: 'GenerateRequestsPerMinutePerProjectPerModel-FreeTier', quotaValue: 0 })]));
+    expect((await failure(new GeminiAdapter({ apiKey: 'zz-key-gemini' }))).retryable).toBe(false);
+  });
+
+  it('gemini: details that are not a list, or entries of another type, leave the 429 retryable', async () => {
+    stubHttpFailure(429, gemini429({ violations: [{ quotaValue: '0' }] }));
+    const notAList = await failure(new GeminiAdapter({ apiKey: 'zz-key-gemini' }));
+    expect(notAList.type).toBe('rate_limit');
+    expect(notAList.retryable).toBe(true);
+    // Still read field by field: a throw while reading a parsed body would fall
+    // back to the raw text, losing the code.
+    expect(notAList.providerErrorCode).toBe('RESOURCE_EXHAUSTED');
+    stubHttpFailure(429, gemini429([{ '@type': 'type.googleapis.com/google.rpc.PreconditionFailure', violations: [{ quotaValue: '0', quotaId: 'PerDay' }] }]));
+    expect((await failure(new GeminiAdapter({ apiKey: 'zz-key-gemini' }))).retryable).toBe(true);
+  });
+
+  // I8: the stream error frame passes its body to the same rules.
+  it('gemini: an SSE error frame with a zero allocation is not retryable', async () => {
+    const frame = gemini429([quotaFailure({ quotaId: 'GenerateRequestsPerMinutePerProjectPerModel-FreeTier', quotaValue: '0' })]);
+    const error = await streamFailure(new GeminiAdapter({ apiKey: 'zz-key-gemini' }), frame);
+    expect(error.type).toBe('rate_limit');
+    expect(error.retryable).toBe(false);
+  });
+
+  it("a 400 error frame with no message isn't read for a refusal, though its rendering echoes one", async () => {
+    const frame = { error: { code: 400, status: 'INVALID_ARGUMENT', details: [{ request: 'Your credit balance is too low to access the Anthropic API, it said' }] } };
+    const error = await streamFailure(new GeminiAdapter({ apiKey: 'zz-key-gemini' }), frame);
+    expect(error.type).toBe('invalid_request');
+    expect(error.httpStatus).toBe(400);
+  });
+
+  // I9, I11: the overflow forms that stay, on both paths.
+  it('"input is too long", and the forms without "is", are a context overflow with a status and without one', async () => {
+    for (const message of ['Input is too long for requested model.', 'input too long for this model', 'Prompt too long: 210000 tokens']) {
+      stubHttpFailure(400, { error: { message } });
+      expect((await failure(new OpenAIAdapter({ apiKey: 'zz-key-openai' }))).type, message).toBe('context_length');
+      expect(classifyError(new Error(message)).type, `${message} (no status)`).toBe('context_length');
+    }
+    expect(classifyError(new Error("Invalid 'input': string too long. Expected a string with maximum length 10")).type).not.toBe('context_length');
+  });
+
+  // I12, I20: without a status, the echo-sensitive forms read the provider's own message too.
+  it('without a status, a refusal in the provider\'s own message is auth, as with one', () => {
+    expect(classifyError(new Error('Your credit balance is too low to access the Anthropic API.'))).toMatchObject({ type: 'auth', retryable: false });
+  });
+
+  it("without a status, a frame with no message of its own isn't read for an overflow or a refusal", async () => {
+    for (const echo of ['my prompt is too long for the context window', 'Your credit balance is too low to access the Anthropic API']) {
+      const error = await streamFailure(new GeminiAdapter({ apiKey: 'zz-key-gemini' }), { error: { details: [{ request: echo }] } });
+      expect(error.httpStatus, echo).toBeUndefined();
+      expect(error.type, echo).not.toBe('context_length');
+      expect(error.type, echo).not.toBe('auth');
+    }
+  });
+
+  // I14: a 429 no retry can outlast states no wait in prose.
+  it("a 429 that isn't retryable takes no wait from its prose, though its own RetryInfo is still reported", async () => {
+    const zero = quotaFailure({ quotaId: 'GenerateRequestsPerMinutePerProjectPerModel-FreeTier', quotaValue: '0' });
+    stubHttpFailure(429, gemini429([zero], 'Quota exceeded. Please retry after 30 seconds.'));
+    const prose = await failure(new GeminiAdapter({ apiKey: 'zz-key-gemini' }));
+    expect(prose.retryable).toBe(false);
+    expect(prose.retryAfterMs).toBeUndefined();
+    stubHttpFailure(429, gemini429([zero, { '@type': 'type.googleapis.com/google.rpc.RetryInfo', retryDelay: '34s' }]));
+    expect((await failure(new GeminiAdapter({ apiKey: 'zz-key-gemini' }))).retryAfterMs).toBe(34_000);
+    stubHttpFailure(429, { error: { code: 'insufficient_quota', message: 'You exceeded your current quota. Please retry after 20 seconds.' } });
+    const billing = await failure(new OpenAIAdapter({ apiKey: 'zz-key-openai' }));
+    expect(billing.retryable).toBe(false);
+    expect(billing.retryAfterMs).toBeUndefined();
   });
 });
