@@ -457,13 +457,10 @@ export class Membrane {
         return response;
 
       } catch (error) {
-        // A refused build never reached the provider, and its own type is
-        // the answer. Rethrow it as it is instead of wrapping it as a
-        // transport error.
-        if (isBuildRefusal(error)) throw error;
         // The caller's signal fired: a cancellation, whatever the in-flight
         // error is named (AbortSignal.timeout() rejects with a TimeoutError),
-        // and never retried. The error stays on it as evidence.
+        // a refused build included, and never retried. The error stays on it
+        // as evidence. stream()'s paths judge the signal first too.
         if (options.signal?.aborted) {
           if (isTypedAbortError(error)) throw this.attachRawRequest(error, rawRequest);
           throw new MembraneError({
@@ -474,6 +471,10 @@ export class Membrane {
             rawRequest,
           });
         }
+        // A refused build never reached the provider, and its own type is
+        // the answer. Rethrow it as it is instead of wrapping it as a
+        // transport error.
+        if (isBuildRefusal(error)) throw error;
         const classifiedError = this.attachRawRequest(error, rawRequest);
         const errorInfo = classifyError(classifiedError);
 
@@ -566,7 +567,26 @@ export class Membrane {
           'with complete() per round).'
         );
       }
-      const response = await this.complete(request, options);
+      let response: NormalizedResponse;
+      try {
+        response = await this.complete(request, options);
+      } catch (error) {
+        // A cancellation is an AbortedResponse on every stream() path, this
+        // one included: the caller's signal (complete() then rejects with an
+        // abort MembraneError) or an adapter's own deadline. Nothing was
+        // streamed, so nothing partial is reported.
+        if (this.isCancellation(error, options.signal)) {
+          return this.buildAbortedResponse(
+            '',
+            { inputTokens: 0, outputTokens: 0 },
+            [],
+            [],
+            this.abortReason(error, options.signal),
+            []
+          );
+        }
+        throw error;
+      }
       // Synthesize onChunk callbacks so callers that depend on them still work
       if (options.onChunk && 'content' in response) {
         for (let i = 0; i < response.content.length; i++) {
@@ -3103,11 +3123,17 @@ export class Membrane {
         reject(signal.reason ?? new DOMException('The operation was aborted.', 'AbortError'));
         return;
       }
-      const timer = setTimeout(resolve, ms);
-      signal?.addEventListener('abort', () => {
+      const onAbort = () => {
         clearTimeout(timer);
-        reject(signal.reason ?? new DOMException('The operation was aborted.', 'AbortError'));
-      }, { once: true });
+        reject(signal?.reason ?? new DOMException('The operation was aborted.', 'AbortError'));
+      };
+      // The listener goes when the timer fires: a long-lived caller signal
+      // would otherwise keep one per retry sleep until it aborts.
+      const timer = setTimeout(() => {
+        signal?.removeEventListener('abort', onAbort);
+        resolve();
+      }, ms);
+      signal?.addEventListener('abort', onAbort, { once: true });
     });
   }
 
@@ -3375,22 +3401,10 @@ export class Membrane {
     try {
       // Tool execution loop
       while (toolDepth <= maxToolDepth) {
-        // Check for cancellation
-        if (stream.isCancelled) {
-          const fullAccumulated = parser.getAccumulated();
-          const newContent = fullAccumulated.slice(initialPrefillLength);
-          stream.emit({
-            type: 'aborted',
-            reason: 'user',
-            partialContent: xmlToolProtocol
-              ? parseAccumulatedIntoBlocks(newContent, { tools: request.tools, ...(initialBlockType ? { startInsideBlock: initialBlockType } : {}) }).blocks
-              : streamedThinking.content(newContent, (value, context) => formatter.parseContentBlocks(value, request.tools, context)),
-            rawAssistantText: newContent,
-            toolCalls: executedToolCalls,
-            toolResults: executedToolResults,
-          });
-          return;
-        }
+        // A cancelled stream stops here. cancel() is the only way to cancel
+        // it, and it has already emitted the terminal aborted event, so
+        // reporting again would deliver a second one.
+        if (stream.isCancelled) return;
 
         // Track if we manually detected a stop sequence
         let detectedStopSequence: string | null = null;
@@ -3962,18 +3976,10 @@ export class Membrane {
     try {
       // Tool execution loop
       while (toolDepth <= maxToolDepth) {
-        // Check for cancellation
-        if (stream.isCancelled) {
-          stream.emit({
-            type: 'aborted',
-            reason: 'user',
-            partialContent: [...allContentBlocks, ...(roundReceived?.() ?? [])],
-            rawAssistantText: allTextAccumulated,
-            toolCalls: executedToolCalls,
-            toolResults: executedToolResults,
-          });
-          return;
-        }
+        // A cancelled stream stops here. cancel() is the only way to cancel
+        // it, and it has already emitted the terminal aborted event, so
+        // reporting again would deliver a second one.
+        if (stream.isCancelled) return;
 
         // Build provider request with native tools
         const providerRequest = this.buildNativeToolRequest(request, messages, toolDepth > 0, activeFormatter);
