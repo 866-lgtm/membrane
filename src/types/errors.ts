@@ -506,9 +506,12 @@ export function extractProviderErrorFields(body: unknown): ProviderErrorFields {
   const errorNode =
     nested !== null && typeof nested === 'object' ? (nested as Record<string, unknown>) : root;
   // The provider's own message in the other shapes it comes in: a string
-  // `error` (`{"error": "..."}`), or the first of an `errors` list.
-  const listed = Array.isArray(errorNode.errors) ? errorNode.errors : Array.isArray(root.errors) ? root.errors : undefined;
-  const firstListed = listed?.find((entry) => entry !== null && typeof entry === 'object') as Record<string, unknown> | undefined;
+  // `error` (`{"error": "..."}`), or the first of a top-level `errors` list.
+  // (Google's older format also lists `errors` inside its error object, but
+  // always beside that object's own `message`, which is read first.)
+  const firstListed = Array.isArray(root.errors)
+    ? root.errors.find((entry) => entry !== null && typeof entry === 'object') as Record<string, unknown> | undefined
+    : undefined;
 
   const metadata = errorNode.metadata;
   const upstreamRaw =
