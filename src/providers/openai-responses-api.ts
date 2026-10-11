@@ -12,6 +12,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { normalizeResponsesInput } from './responses-input.js';
 import { fetchWithCredentials, type CredentialResolver } from './credentials.js';
+import { assertMessagePrefillSupported } from './request-capabilities.js';
 
 import type {
   ContentBlock,
@@ -229,6 +230,9 @@ export class OpenAIResponsesAPIAdapter implements ProviderAdapter {
   ): Promise<OpenAIResponsesAPIProviderResponse> {
     if (this.subscription) return this.stream(request, { onChunk: () => {} }, options);
     const responsesRequest = this.buildRequest(request);
+    // A gateway's Responses endpoint can serve a Claude model, which refuses
+    // an input ending in an assistant turn: refuse it here, typed, before HTTP.
+    assertMessagePrefillSupported(responsesRequest.model, responsesRequest.input, options, this.name, responsesRequest);
     options?.onRequest?.(responsesRequest);
 
     const { signal, cleanup } = createCombinedSignal(options?.signal, options?.timeoutMs);
@@ -253,6 +257,7 @@ export class OpenAIResponsesAPIAdapter implements ProviderAdapter {
   ): Promise<OpenAIResponsesAPIProviderResponse> {
     const responsesRequest = this.buildRequest(request);
     responsesRequest.stream = true;
+    assertMessagePrefillSupported(responsesRequest.model, responsesRequest.input, options, this.name, responsesRequest);
     options?.onRequest?.(responsesRequest);
 
     const { signal, cleanup } = createCombinedSignal(options?.signal, options?.timeoutMs);

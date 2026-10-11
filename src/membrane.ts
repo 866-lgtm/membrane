@@ -6,7 +6,7 @@
 
 import { restoreToolName } from './utils/tool-names.js';
 import { StreamedThinking } from './utils/streamed-thinking.js';
-import { LocalStopSequences, membraneBlockType } from './utils/local-stop-sequences.js';
+import { LocalStopSequences, firstStop, membraneBlockType } from './utils/local-stop-sequences.js';
 
 import type {
   NormalizedRequest,
@@ -85,6 +85,7 @@ import { AnthropicXmlFormatter } from './formatters/anthropic-xml.js';
 import {
   normalizeToolPairs,
   mergeConsecutiveRoles,
+  MembraneNormalizerError,
   PREFIX_REWRITING_NORMALIZE_EVENT_KINDS,
 } from './formatters/normalize-tool-pairs.js';
 import { YieldingStreamImpl } from './yielding-stream.js';
@@ -288,6 +289,17 @@ class NativeBlockTracker {
   }
 }
 
+/**
+ * An error raised while building a request: the formatter reported it not
+ * ready, or the tool-pair normalizer refused the history. Nothing reached the
+ * provider, the refusal is deterministic, and its own type tells the caller
+ * what to do, so Membrane passes it through instead of classifying and
+ * wrapping it like a transport error.
+ */
+function isBuildRefusal(error: unknown): error is MembraneError {
+  return error instanceof MembraneNotReadyError || error instanceof MembraneNormalizerError;
+}
+
 export class Membrane {
   private adapter: ProviderAdapter;
   private registry?: ModelRegistry;
@@ -442,9 +454,10 @@ export class Membrane {
         return response;
 
       } catch (error) {
-        // A not-ready build never reached the provider. Preserve its public
-        // wait-and-rebuild subtype instead of wrapping it as a transport error.
-        if (error instanceof MembraneNotReadyError) throw error;
+        // A refused build never reached the provider, and its own type is
+        // the answer. Rethrow it as it is instead of wrapping it as a
+        // transport error.
+        if (isBuildRefusal(error)) throw error;
         // The caller's signal fired: a cancellation, whatever the in-flight
         // error is named (AbortSignal.timeout() rejects with a TimeoutError),
         // and never retried. The error stays on it as evidence.
@@ -946,27 +959,27 @@ export class Membrane {
               const accumulated = parser.getAccumulated();
               const newContent = accumulated.slice(checkFromIndex);
 
-              for (const stopSeq of prefillResult.stopSequences) {
-                const idx = newContent.indexOf(stopSeq);
-                if (idx !== -1) {
-                  // Found stop sequence - mark it and truncate
-                  const absoluteIdx = checkFromIndex + idx;
-                  detectedStopSequence = stopSeq;
-                  truncatedAccumulated = accumulated.slice(0, absoluteIdx);
+              // The stop that ends first, where a provider applying the
+              // request's stops would end, whatever order they're listed in.
+              const found = firstStop(newContent, prefillResult.stopSequences);
+              if (found) {
+                // Found stop sequence - mark it and truncate
+                const absoluteIdx = checkFromIndex + found.at;
+                detectedStopSequence = found.stop;
+                truncatedAccumulated = accumulated.slice(0, absoluteIdx);
 
-                  // Emit only the portion up to stop sequence with metadata
-                  const alreadyEmitted = accumulated.length - chunk.length;
-                  if (absoluteIdx > alreadyEmitted) {
-                    const truncatedChunk = accumulated.slice(alreadyEmitted, absoluteIdx);
-                    const meta: ChunkMeta = {
-                      type: parser.getCurrentBlockType(),
-                      visible: parser.getCurrentBlockType() === 'text',
-                      blockIndex: 0, // Approximate
-                    };
-                    onChunk?.(truncatedChunk, meta);
-                  }
-                  return;
+                // Emit only the portion up to stop sequence with metadata
+                const alreadyEmitted = accumulated.length - chunk.length;
+                if (absoluteIdx > alreadyEmitted) {
+                  const truncatedChunk = accumulated.slice(alreadyEmitted, absoluteIdx);
+                  const meta: ChunkMeta = {
+                    type: parser.getCurrentBlockType(),
+                    visible: parser.getCurrentBlockType() === 'text',
+                    blockIndex: 0, // Approximate
+                  };
+                  onChunk?.(truncatedChunk, meta);
                 }
+                return;
               }
 
               // Emit in correct interleaved order using emissions array
@@ -1478,12 +1491,17 @@ export class Membrane {
           providerRequest,
           {
             onChunk: (chunk) => {
-              textAccumulated += chunk;
-              allTextAccumulated += chunk;
               tracker.onChunk(chunk);
+              const visible = tracker.currentType === 'text';
+              // The text accumulators hold visible text only: a provider's
+              // thinking deltas arrive here too, and they stay typed.
+              if (visible) {
+                textAccumulated += chunk;
+                allTextAccumulated += chunk;
+              }
               const meta: ChunkMeta = {
                 type: tracker.currentType,
-                visible: tracker.currentType === 'text',
+                visible,
                 blockIndex: tracker.blockIndex,
               };
               onChunk?.(chunk, meta);
@@ -1776,10 +1794,13 @@ export class Membrane {
     // would orphan the previous round's cache entry behind an unmarked
     // boundary.
     //
-    // Skipped when the normalizer synthesized a [pending] tool_result:
-    // those bytes are rewritten when the real result lands, and caching
-    // past them poisons the prefix — the same rationale as the
-    // normalizer's phase 5.5 cache suppression.
+    // Skipped after any repair that rewrites prefix bytes (the kinds in
+    // PREFIX_REWRITING_NORMALIZE_EVENT_KINDS: a synthesized [pending]
+    // result, a textified orphan or duplicate result): those bytes are
+    // rewritten when the real pairing lands, so caching at or past one
+    // poisons the prefix. A repair that only moves blocks (a hoist, a
+    // relocation, results-first) is a fixed function of the history, so the
+    // prefix it leaves is as stable as the history.
     // ------------------------------------------------------------------
     const floatingEnabled =
       request.floatingCacheMarker ?? this.config.defaultFloatingCacheMarker ?? true;
@@ -2187,6 +2208,9 @@ export class Membrane {
     const buildResult = activeFormatter.buildMessages(messages, {
       onNormalize: event => {
         if (PREFIX_REWRITING_NORMALIZE_EVENT_KINDS.has(event.kind)) prefixRewritten = true;
+        // The caller's view of every repair, textifications included: without
+        // it a result turned into text would reach the model unannounced.
+        this.config.hooks?.onNormalize?.(event);
       },
       deferCacheBudgetCheck: true,
       participantMode: 'multiuser',
@@ -2209,9 +2233,11 @@ export class Membrane {
 
     // Honor readiness at the shared formatter-build boundary used by
     // complete(), stream(), and streamYielding(), including native loops.
-    // NativeFormatter derives it from pendingToolCallIds supplied by a custom
-    // build. Ordinary loops await tool results before rebuilding; a custom
-    // build declaring an in-flight gap must wait and rebuild before sending.
+    // Membrane passes no in-flight set (pendingToolCallIds), so the built-in
+    // formatters always report ready here; a formatter that reports not
+    // ready (a custom one, or a subclass that passes its own in-flight set)
+    // is refused, and its caller waits for those results and rebuilds.
+    // Ordinary loops await tool results before rebuilding.
     if (buildResult.ready === false) {
       throw new MembraneNotReadyError(activeFormatter.name);
     }
@@ -3052,8 +3078,11 @@ export class Membrane {
   }
 
   private attachRawRequest(error: unknown, rawRequest: unknown): MembraneError {
-    // Native streaming can refuse a shared formatter build before sending.
-    if (error instanceof MembraneNotReadyError) return error;
+    // A build refusal (the formatter reported not ready, or the normalizer
+    // refused the history; native streaming builds through the shared
+    // formatter build every round) carries no request of its own: pass it
+    // through as it is.
+    if (isBuildRefusal(error)) return error;
     if (error instanceof MembraneError) return withRawRequest(error, rawRequest);
     const errorInfo = classifyError(error);
     errorInfo.rawRequest = rawRequest;
@@ -3346,7 +3375,7 @@ export class Membrane {
             type: 'aborted',
             reason: 'user',
             partialContent: xmlToolProtocol
-              ? parseAccumulatedIntoBlocks(newContent, { tools: request.tools }).blocks
+              ? parseAccumulatedIntoBlocks(newContent, { tools: request.tools, ...(initialBlockType ? { startInsideBlock: initialBlockType } : {}) }).blocks
               : streamedThinking.content(newContent, (value, context) => formatter.parseContentBlocks(value, request.tools, context)),
             rawAssistantText: newContent,
             toolCalls: executedToolCalls,
@@ -3407,26 +3436,25 @@ export class Membrane {
               const accumulated = parser.getAccumulated();
               const newContent = accumulated.slice(checkFromIndex);
 
-              for (const stopSeq of prefillResult.stopSequences) {
-                const idx = newContent.indexOf(stopSeq);
-                if (idx !== -1) {
-                  const absoluteIdx = checkFromIndex + idx;
-                  detectedStopSequence = stopSeq;
-                  truncatedAccumulated = accumulated.slice(0, absoluteIdx);
+              // The stop that ends first (see streamWithXmlTools).
+              const found = firstStop(newContent, prefillResult.stopSequences);
+              if (found) {
+                const absoluteIdx = checkFromIndex + found.at;
+                detectedStopSequence = found.stop;
+                truncatedAccumulated = accumulated.slice(0, absoluteIdx);
 
-                  // Emit only the portion up to stop sequence
-                  const alreadyEmitted = accumulated.length - chunk.length;
-                  if (emitTokens && absoluteIdx > alreadyEmitted) {
-                    const truncatedChunk = accumulated.slice(alreadyEmitted, absoluteIdx);
-                    const meta: ChunkMeta = {
-                      type: parser.getCurrentBlockType(),
-                      visible: parser.getCurrentBlockType() === 'text',
-                      blockIndex: 0,
-                    };
-                    stream.emit({ type: 'tokens', content: truncatedChunk, meta });
-                  }
-                  return;
+                // Emit only the portion up to stop sequence
+                const alreadyEmitted = accumulated.length - chunk.length;
+                if (emitTokens && absoluteIdx > alreadyEmitted) {
+                  const truncatedChunk = accumulated.slice(alreadyEmitted, absoluteIdx);
+                  const meta: ChunkMeta = {
+                    type: parser.getCurrentBlockType(),
+                    visible: parser.getCurrentBlockType() === 'text',
+                    blockIndex: 0,
+                  };
+                  stream.emit({ type: 'tokens', content: truncatedChunk, meta });
                 }
+                return;
               }
 
               // Emit in correct interleaved order
@@ -3853,7 +3881,7 @@ export class Membrane {
           type: 'aborted',
           reason: this.abortReason(error, stream.signal),
           partialContent: xmlToolProtocol
-              ? parseAccumulatedIntoBlocks(newContent, { tools: request.tools }).blocks
+              ? parseAccumulatedIntoBlocks(newContent, { tools: request.tools, ...(initialBlockType ? { startInsideBlock: initialBlockType } : {}) }).blocks
               : streamedThinking.content(newContent, (value, context) => formatter.parseContentBlocks(value, request.tools, context)),
           rawAssistantText: newContent,
           toolCalls: executedToolCalls,
@@ -3961,14 +3989,18 @@ export class Membrane {
             onChunk: (chunk) => {
               if (stream.isCancelled) return;
 
-              textAccumulated += chunk;
-              allTextAccumulated += chunk;
               tracker.onChunk(chunk);
+              const visible = tracker.currentType === 'text';
+              // Visible text only, as in streamWithNativeTools.
+              if (visible) {
+                textAccumulated += chunk;
+                allTextAccumulated += chunk;
+              }
 
               if (emitTokens) {
                 const meta: ChunkMeta = {
                   type: tracker.currentType,
-                  visible: tracker.currentType === 'text',
+                  visible,
                   blockIndex: tracker.blockIndex,
                 };
                 stream.emit({ type: 'tokens', content: chunk, meta });
