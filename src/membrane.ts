@@ -76,6 +76,7 @@ import { AnthropicXmlFormatter } from './formatters/anthropic-xml.js';
 import {
   normalizeToolPairs,
   mergeConsecutiveRoles,
+  MembraneNormalizerError,
   PREFIX_REWRITING_NORMALIZE_EVENT_KINDS,
 } from './formatters/normalize-tool-pairs.js';
 import { YieldingStreamImpl } from './yielding-stream.js';
@@ -188,6 +189,17 @@ class NativeBlockTracker {
     }
     this.emit?.({ event: 'block_complete', index, block: mb });
   }
+}
+
+/**
+ * An error raised while building a request: the formatter reported it not
+ * ready, or the tool-pair normalizer refused the history. Nothing reached the
+ * provider, the refusal is deterministic, and its own type tells the caller
+ * what to do, so Membrane passes it through instead of classifying and
+ * wrapping it like a transport error.
+ */
+function isBuildRefusal(error: unknown): error is MembraneError {
+  return error instanceof MembraneNotReadyError || error instanceof MembraneNormalizerError;
 }
 
 export class Membrane {
@@ -336,9 +348,10 @@ export class Membrane {
         return response;
 
       } catch (error) {
-        // A not-ready build never reached the provider. Preserve its public
-        // wait-and-rebuild subtype instead of wrapping it as a transport error.
-        if (error instanceof MembraneNotReadyError) throw error;
+        // A refused build never reached the provider, and its own type is
+        // the answer. Rethrow it as it is instead of wrapping it as a
+        // transport error.
+        if (isBuildRefusal(error)) throw error;
         const errorInfo = classifyError(error);
         errorInfo.rawRequest = rawRequest;
 
@@ -1717,9 +1730,11 @@ export class Membrane {
     // Every repair that REWRITES prefix bytes stands the float down, not just
     // the synthetic [pending] result: a textified orphan tool_result is
     // rewritten the same way when its real pairing arrives, so caching at or
-    // past one poisons the prefix identically. The kinds live in one exported
-    // set so a normalizer that grows a new prefix-rewriting repair cannot
-    // silently escape this guard.
+    // past one poisons the prefix identically. A repair that only moves
+    // blocks (a hoist, a relocation, results-first) is a fixed function of
+    // the history, so the prefix it leaves is as stable as the history. The
+    // kinds live in one exported set so a normalizer that grows a new
+    // prefix-rewriting repair cannot silently escape this guard.
     let prefixRewritten = false;
     const normalized = normalizeToolPairs(providerMessages, {
       onEvent: (e) => {
@@ -2238,9 +2253,11 @@ export class Membrane {
     });
 
     // Honor readiness whenever this path invokes a formatter: complete(),
-    // XML streaming/yielding, and Responses-native builds. NativeFormatter
-    // derives it from pendingToolCallIds supplied by a custom build; the
-    // caller must wait for those results and rebuild before sending.
+    // XML streaming/yielding, and Responses-native builds. Membrane passes
+    // no in-flight set (pendingToolCallIds), so the built-in formatters
+    // always report ready here; a formatter that reports not-ready (a
+    // custom one, or a subclass that passes its own in-flight set) is
+    // refused, and its caller waits for those results and rebuilds.
     // Anthropic-native tool streaming uses buildNativeToolRequest's own
     // normalizer after tool results have arrived, rather than this formatter
     // build. It intentionally supplies no in-flight set.
@@ -2985,8 +3002,10 @@ export class Membrane {
   }
 
   private attachRawRequest(error: unknown, rawRequest: unknown): Error {
-    // Responses-native streaming also builds through transformRequest.
-    if (error instanceof MembraneNotReadyError) return error;
+    // A build refusal (the native loop normalizes every round, and
+    // Responses-native streaming builds through transformRequest) carries
+    // no request of its own: pass it through as it is.
+    if (isBuildRefusal(error)) return error;
     const errorInfo = classifyError(error);
     errorInfo.rawRequest = rawRequest;
     return new MembraneError(errorInfo);
