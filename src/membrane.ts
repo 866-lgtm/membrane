@@ -3058,8 +3058,10 @@ export class Membrane {
    * The server's own `retry-after` outranks our backoff when it is longer:
    * retrying inside a window the provider has already told us to wait out
    * burns the whole attempt budget on guaranteed failures. maxRetryDelayMs
-   * still caps the wait, so a hostile or absurd retry-after cannot park a
-   * turn indefinitely.
+   * still caps Membrane's own sleep, so a hostile or absurd retry-after
+   * cannot park the call. The error a caller receives carries the provider's
+   * stated wait as stated (retryAfterMs): pacing across calls is the
+   * caller's.
    */
   private calculateRetryDelay(attempt: number, overloaded = false, errorInfo?: ErrorInfo): number {
     const { retryDelayMs, backoffMultiplier, maxRetryDelayMs } = overloaded

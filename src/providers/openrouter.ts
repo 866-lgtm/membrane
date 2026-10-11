@@ -21,7 +21,6 @@ import {
   abortError,
   classifyError,
   errorFromHttpResponse,
-  errorFromProviderStatus,
   isTypedAbortError,
   withRawRequest,
 } from '../types/index.js';

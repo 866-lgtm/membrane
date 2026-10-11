@@ -27,7 +27,6 @@ import {
   abortError,
   classifyError,
   errorFromHttpResponse,
-  errorFromProviderStatus,
   isTypedAbortError,
   networkError,
   withRawRequest,
