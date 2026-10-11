@@ -671,8 +671,13 @@ export class OpenAIResponsesAPIAdapter implements ProviderAdapter {
     )) return 'refusal';
 
     const reason = response.incomplete_details?.reason;
-    if (response.status === 'incomplete' && reason?.includes('max_output_tokens')) {
-      return 'max_tokens';
+    if (response.status === 'incomplete' && reason) {
+      if (reason.includes('max_output_tokens')) return 'max_tokens';
+      // A filtered response is a refusal, as on the sibling OpenAI adapters.
+      if (reason === 'content_filter') return 'refusal';
+      // Any other incomplete reason travels as the provider's own token, so
+      // membrane discloses and logs it instead of reading a clean end_turn.
+      return reason;
     }
     return 'end_turn';
   }

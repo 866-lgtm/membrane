@@ -300,6 +300,9 @@ function isBuildRefusal(error: unknown): error is MembraneError {
   return error instanceof MembraneNotReadyError || error instanceof MembraneNormalizerError;
 }
 
+/** Stop reasons membrane has already logged as unmapped (see mapStopReason). */
+const warnedStopReasons = new Set<string>();
+
 export class Membrane {
   private adapter: ProviderAdapter;
   private registry?: ModelRegistry;
@@ -2934,8 +2937,8 @@ export class Membrane {
     return estimatedCost ? { ...discarded, estimatedCost } : discarded;
   }
 
-  private mapStopReason(providerReason: string): StopReason {
-    switch (providerReason) {
+  private mapStopReason(adapterReason: string): StopReason {
+    switch (adapterReason) {
       case 'end_turn':
         return 'end_turn';
       case 'max_tokens':
@@ -2956,13 +2959,18 @@ export class Membrane {
       default:
         // Unknown reasons still normalize to end_turn — callers switch on a
         // closed union — but never silently: the raw token is disclosed as
-        // details.stop.providerReason and the mapping is logged. Provider
-        // enums grow, and the last time this default swallowed a member it
-        // hid safety refusals in production.
-        console.warn(
-          `[membrane] Unmapped adapter stop reason '${providerReason}' normalized to end_turn ` +
-            '(details.stop.providerReason is present when the adapter supplies the raw provider token)'
-        );
+        // details.stop.providerReason and the mapping is logged, once per
+        // token per process (a compatible server may send its own token on
+        // every response). Provider enums grow, and the last time this
+        // default swallowed a member it hid safety refusals in production.
+        if (!warnedStopReasons.has(adapterReason)) {
+          warnedStopReasons.add(adapterReason);
+          console.warn(
+            `[membrane] Unmapped adapter stop reason '${adapterReason}' normalized to end_turn ` +
+              '(details.stop.providerReason is present when the adapter supplies the raw provider token; ' +
+              'logged once per reason)'
+          );
+        }
         return 'end_turn';
     }
   }
