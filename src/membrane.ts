@@ -6,7 +6,7 @@
 
 import { restoreToolName } from './utils/tool-names.js';
 import { StreamedThinking } from './utils/streamed-thinking.js';
-import { LocalStopSequences, membraneBlockType } from './utils/local-stop-sequences.js';
+import { LocalStopSequences, firstStop, membraneBlockType } from './utils/local-stop-sequences.js';
 
 import type {
   NormalizedRequest,
@@ -918,27 +918,27 @@ export class Membrane {
               const accumulated = parser.getAccumulated();
               const newContent = accumulated.slice(checkFromIndex);
 
-              for (const stopSeq of prefillResult.stopSequences) {
-                const idx = newContent.indexOf(stopSeq);
-                if (idx !== -1) {
-                  // Found stop sequence - mark it and truncate
-                  const absoluteIdx = checkFromIndex + idx;
-                  detectedStopSequence = stopSeq;
-                  truncatedAccumulated = accumulated.slice(0, absoluteIdx);
+              // The stop that ends first, where a provider applying the
+              // request's stops would end, whatever order they're listed in.
+              const found = firstStop(newContent, prefillResult.stopSequences);
+              if (found) {
+                // Found stop sequence - mark it and truncate
+                const absoluteIdx = checkFromIndex + found.at;
+                detectedStopSequence = found.stop;
+                truncatedAccumulated = accumulated.slice(0, absoluteIdx);
 
-                  // Emit only the portion up to stop sequence with metadata
-                  const alreadyEmitted = accumulated.length - chunk.length;
-                  if (absoluteIdx > alreadyEmitted) {
-                    const truncatedChunk = accumulated.slice(alreadyEmitted, absoluteIdx);
-                    const meta: ChunkMeta = {
-                      type: parser.getCurrentBlockType(),
-                      visible: parser.getCurrentBlockType() === 'text',
-                      blockIndex: 0, // Approximate
-                    };
-                    onChunk?.(truncatedChunk, meta);
-                  }
-                  return;
+                // Emit only the portion up to stop sequence with metadata
+                const alreadyEmitted = accumulated.length - chunk.length;
+                if (absoluteIdx > alreadyEmitted) {
+                  const truncatedChunk = accumulated.slice(alreadyEmitted, absoluteIdx);
+                  const meta: ChunkMeta = {
+                    type: parser.getCurrentBlockType(),
+                    visible: parser.getCurrentBlockType() === 'text',
+                    blockIndex: 0, // Approximate
+                  };
+                  onChunk?.(truncatedChunk, meta);
                 }
+                return;
               }
 
               // Emit in correct interleaved order using emissions array
@@ -1447,12 +1447,17 @@ export class Membrane {
           providerRequest,
           {
             onChunk: (chunk) => {
-              textAccumulated += chunk;
-              allTextAccumulated += chunk;
               tracker.onChunk(chunk);
+              const visible = tracker.currentType === 'text';
+              // The text accumulators hold visible text only: a provider's
+              // thinking deltas arrive here too, and they stay typed.
+              if (visible) {
+                textAccumulated += chunk;
+                allTextAccumulated += chunk;
+              }
               const meta: ChunkMeta = {
                 type: tracker.currentType,
-                visible: tracker.currentType === 'text',
+                visible,
                 blockIndex: tracker.blockIndex,
               };
               onChunk?.(chunk, meta);
@@ -2159,6 +2164,9 @@ export class Membrane {
     const buildResult = activeFormatter.buildMessages(messages, {
       onNormalize: event => {
         if (PREFIX_REWRITING_NORMALIZE_EVENT_KINDS.has(event.kind)) prefixRewritten = true;
+        // The caller's view of every repair, textifications included: without
+        // it a result turned into text would reach the model unannounced.
+        this.config.hooks?.onNormalize?.(event);
       },
       deferCacheBudgetCheck: true,
       participantMode: 'multiuser',
@@ -3252,7 +3260,7 @@ export class Membrane {
             type: 'aborted',
             reason: 'user',
             partialContent: xmlToolProtocol
-              ? parseAccumulatedIntoBlocks(newContent, { tools: request.tools }).blocks
+              ? parseAccumulatedIntoBlocks(newContent, { tools: request.tools, ...(initialBlockType ? { startInsideBlock: initialBlockType } : {}) }).blocks
               : streamedThinking.content(newContent, (value, context) => formatter.parseContentBlocks(value, request.tools, context)),
             rawAssistantText: newContent,
             toolCalls: executedToolCalls,
@@ -3313,26 +3321,25 @@ export class Membrane {
               const accumulated = parser.getAccumulated();
               const newContent = accumulated.slice(checkFromIndex);
 
-              for (const stopSeq of prefillResult.stopSequences) {
-                const idx = newContent.indexOf(stopSeq);
-                if (idx !== -1) {
-                  const absoluteIdx = checkFromIndex + idx;
-                  detectedStopSequence = stopSeq;
-                  truncatedAccumulated = accumulated.slice(0, absoluteIdx);
+              // The stop that ends first (see streamWithXmlTools).
+              const found = firstStop(newContent, prefillResult.stopSequences);
+              if (found) {
+                const absoluteIdx = checkFromIndex + found.at;
+                detectedStopSequence = found.stop;
+                truncatedAccumulated = accumulated.slice(0, absoluteIdx);
 
-                  // Emit only the portion up to stop sequence
-                  const alreadyEmitted = accumulated.length - chunk.length;
-                  if (emitTokens && absoluteIdx > alreadyEmitted) {
-                    const truncatedChunk = accumulated.slice(alreadyEmitted, absoluteIdx);
-                    const meta: ChunkMeta = {
-                      type: parser.getCurrentBlockType(),
-                      visible: parser.getCurrentBlockType() === 'text',
-                      blockIndex: 0,
-                    };
-                    stream.emit({ type: 'tokens', content: truncatedChunk, meta });
-                  }
-                  return;
+                // Emit only the portion up to stop sequence
+                const alreadyEmitted = accumulated.length - chunk.length;
+                if (emitTokens && absoluteIdx > alreadyEmitted) {
+                  const truncatedChunk = accumulated.slice(alreadyEmitted, absoluteIdx);
+                  const meta: ChunkMeta = {
+                    type: parser.getCurrentBlockType(),
+                    visible: parser.getCurrentBlockType() === 'text',
+                    blockIndex: 0,
+                  };
+                  stream.emit({ type: 'tokens', content: truncatedChunk, meta });
                 }
+                return;
               }
 
               // Emit in correct interleaved order
@@ -3752,7 +3759,7 @@ export class Membrane {
           type: 'aborted',
           reason: this.abortReason(error, stream.signal),
           partialContent: xmlToolProtocol
-              ? parseAccumulatedIntoBlocks(newContent, { tools: request.tools }).blocks
+              ? parseAccumulatedIntoBlocks(newContent, { tools: request.tools, ...(initialBlockType ? { startInsideBlock: initialBlockType } : {}) }).blocks
               : streamedThinking.content(newContent, (value, context) => formatter.parseContentBlocks(value, request.tools, context)),
           rawAssistantText: newContent,
           toolCalls: executedToolCalls,
@@ -3859,14 +3866,18 @@ export class Membrane {
             onChunk: (chunk) => {
               if (stream.isCancelled) return;
 
-              textAccumulated += chunk;
-              allTextAccumulated += chunk;
               tracker.onChunk(chunk);
+              const visible = tracker.currentType === 'text';
+              // Visible text only, as in streamWithNativeTools.
+              if (visible) {
+                textAccumulated += chunk;
+                allTextAccumulated += chunk;
+              }
 
               if (emitTokens) {
                 const meta: ChunkMeta = {
                   type: tracker.currentType,
-                  visible: tracker.currentType === 'text',
+                  visible,
                   blockIndex: tracker.blockIndex,
                 };
                 stream.emit({ type: 'tokens', content: chunk, meta });

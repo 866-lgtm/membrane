@@ -159,7 +159,14 @@ Custom response parsers receive `parseContentBlocks(content, tools?, context?)`.
 Implement `PrefillFormatter` and declare both carrier flags as booleans. Missing declarations in JavaScript produce an explicit diagnostic; absence does not silently select XML. `usesPrefill` describes parser seeding, not an exemption from a transport's prefill restriction.
 
 ```typescript
-import type { PrefillFormatter, BuildOptions, BuildResult, ContentParseContext, ToolDefinition } from '@animalabs/membrane';
+import type {
+	BuildOptions, BuildResult, ContentBlock, ContentParseContext, NormalizedMessage,
+	PrefillFormatter, StreamParser, ToolCall, ToolDefinition, ToolResult,
+} from '@animalabs/membrane';
+
+// Your representation's request encoding and incremental parser.
+declare function encode(messages: NormalizedMessage[], options: BuildOptions): BuildResult;
+declare function createParser(): StreamParser;
 
 class CustomFormatter implements PrefillFormatter {
 	readonly name = 'custom';
@@ -167,22 +174,22 @@ class CustomFormatter implements PrefillFormatter {
 	readonly supportsNativeTools = false;
 	readonly supportsXmlTools = true;
 
-	buildMessages(messages, options: BuildOptions): BuildResult {
+	buildMessages(messages: NormalizedMessage[], options: BuildOptions): BuildResult {
 		// Encode the selected carrier, preserving caller fields and ownership.
-		return { messages: [...], assistantPrefill: '...', stopSequences: [...] };
+		return encode(messages, options);
 	}
 
-	createStreamParser() {
-		// Return a parser for this representation.
+	createStreamParser(): StreamParser {
+		return createParser();
 	}
 
-	parseToolCalls(content) { return []; }
-	hasToolUse(content) { return false; }
-	parseContentBlocks(content: string, _tools?: ToolDefinition[], context?: ContentParseContext) {
+	parseToolCalls(_content: string, _tools?: ToolDefinition[]): ToolCall[] { return []; }
+	hasToolUse(_content: string): boolean { return false; }
+	parseContentBlocks(content: string, _tools?: ToolDefinition[], _context?: ContentParseContext): ContentBlock[] {
 		// Literal passthrough preserves span semantics. Prefix-sensitive parsing uses context.
 		return [{ type: 'text', text: content }];
 	}
-	formatToolResults(results) { return JSON.stringify(results); }
+	formatToolResults(results: ToolResult[]): string { return JSON.stringify(results); }
 }
 ```
 

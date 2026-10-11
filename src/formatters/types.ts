@@ -332,7 +332,13 @@ export interface PrefillFormatter {
   /** Formatter name for identification */
   readonly name: string;
 
-  /** Whether this formatter uses prefill (vs native pass-through) */
+  /**
+   * Whether this formatter builds prefill transcripts (vs native pass-through):
+   * a fact about the formatter, not about one build. AnthropicXmlFormatter
+   * says true and still builds a native conversation in native mode; whether
+   * a given build ends in a prefill is its `BuildResult.assistantPrefill`.
+   * Membrane doesn't read this flag.
+   */
   readonly usesPrefill: boolean;
 
   /**
