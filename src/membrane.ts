@@ -81,6 +81,7 @@ import { AnthropicXmlFormatter } from './formatters/anthropic-xml.js';
 import {
   normalizeToolPairs,
   mergeConsecutiveRoles,
+  MembraneNormalizerError,
   PREFIX_REWRITING_NORMALIZE_EVENT_KINDS,
 } from './formatters/normalize-tool-pairs.js';
 import { YieldingStreamImpl } from './yielding-stream.js';
@@ -284,6 +285,17 @@ class NativeBlockTracker {
   }
 }
 
+/**
+ * An error raised while building a request: the formatter reported it not
+ * ready, or the tool-pair normalizer refused the history. Nothing reached the
+ * provider, the refusal is deterministic, and its own type tells the caller
+ * what to do, so Membrane passes it through instead of classifying and
+ * wrapping it like a transport error.
+ */
+function isBuildRefusal(error: unknown): error is MembraneError {
+  return error instanceof MembraneNotReadyError || error instanceof MembraneNormalizerError;
+}
+
 export class Membrane {
   private adapter: ProviderAdapter;
   private registry?: ModelRegistry;
@@ -438,9 +450,10 @@ export class Membrane {
         return response;
 
       } catch (error) {
-        // A not-ready build never reached the provider. Preserve its public
-        // wait-and-rebuild subtype instead of wrapping it as a transport error.
-        if (error instanceof MembraneNotReadyError) throw error;
+        // A refused build never reached the provider, and its own type is
+        // the answer. Rethrow it as it is instead of wrapping it as a
+        // transport error.
+        if (isBuildRefusal(error)) throw error;
         const errorInfo = classifyError(error);
         errorInfo.rawRequest = rawRequest;
 
@@ -1753,10 +1766,13 @@ export class Membrane {
     // would orphan the previous round's cache entry behind an unmarked
     // boundary.
     //
-    // Skipped when the normalizer synthesized a [pending] tool_result:
-    // those bytes are rewritten when the real result lands, and caching
-    // past them poisons the prefix — the same rationale as the
-    // normalizer's phase 5.5 cache suppression.
+    // Skipped after any repair that rewrites prefix bytes (the kinds in
+    // PREFIX_REWRITING_NORMALIZE_EVENT_KINDS: a synthesized [pending]
+    // result, a textified orphan or duplicate result): those bytes are
+    // rewritten when the real pairing lands, so caching at or past one
+    // poisons the prefix. A repair that only moves blocks (a hoist, a
+    // relocation, results-first) is a fixed function of the history, so the
+    // prefix it leaves is as stable as the history.
     // ------------------------------------------------------------------
     const floatingEnabled =
       request.floatingCacheMarker ?? this.config.defaultFloatingCacheMarker ?? true;
@@ -2189,9 +2205,11 @@ export class Membrane {
 
     // Honor readiness at the shared formatter-build boundary used by
     // complete(), stream(), and streamYielding(), including native loops.
-    // NativeFormatter derives it from pendingToolCallIds supplied by a custom
-    // build. Ordinary loops await tool results before rebuilding; a custom
-    // build declaring an in-flight gap must wait and rebuild before sending.
+    // Membrane passes no in-flight set (pendingToolCallIds), so the built-in
+    // formatters always report ready here; a formatter that reports not
+    // ready (a custom one, or a subclass that passes its own in-flight set)
+    // is refused, and its caller waits for those results and rebuilds.
+    // Ordinary loops await tool results before rebuilding.
     if (buildResult.ready === false) {
       throw new MembraneNotReadyError(activeFormatter.name);
     }
@@ -2975,8 +2993,11 @@ export class Membrane {
   }
 
   private attachRawRequest(error: unknown, rawRequest: unknown): Error {
-    // Native streaming can refuse a shared formatter build before sending.
-    if (error instanceof MembraneNotReadyError) return error;
+    // A build refusal (the formatter reported not ready, or the normalizer
+    // refused the history; native streaming builds through the shared
+    // formatter build every round) carries no request of its own: pass it
+    // through as it is.
+    if (isBuildRefusal(error)) return error;
     const errorInfo = classifyError(error);
     errorInfo.rawRequest = rawRequest;
     return new MembraneError(errorInfo);
