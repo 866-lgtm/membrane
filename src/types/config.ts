@@ -144,9 +144,11 @@ export interface MembraneHooks {
    * much of it the model now reads as text. It runs synchronously inside the
    * build, once per event of every build: each attempt and each tool-loop
    * round rebuilds, so a repair the history keeps needing is reported each
-   * time. A hook that throws fails the build, before anything is sent.
-   * Only NativeFormatter's builds normalize, AnthropicXmlFormatter's native
-   * mode included; the XML, completions and Responses builds report none.
+   * time. A hook that throws fails the build, before anything is sent. A
+   * promise it returns isn't awaited, so its rejection is the caller's to
+   * handle. Only NativeFormatter's builds normalize, AnthropicXmlFormatter's
+   * native mode included; the XML, completions and Responses builds report
+   * none.
    */
   onNormalize?: (event: NormalizeEvent) => void;
 }
