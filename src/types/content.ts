@@ -40,10 +40,13 @@ export interface TextContent {
   cache_control?: CacheControl;
   /**
    * Opaque provider-native item this block was derived from (e.g. an OpenAI
-   * Responses output item). Provider-native formatters replay it verbatim;
-   * other providers must ignore it. A zero-width carrier (`text: ''` plus
-   * `rawItem`) has no normalized equivalent and must be filtered out of
-   * requests for providers that reject empty text blocks (Anthropic).
+   * Responses output item, or an Anthropic server-tool block). Formatters
+   * for its own wire replay it verbatim; other providers must ignore it. A
+   * zero-width carrier (`text: ''` plus `rawItem`) has no normalized
+   * equivalent. An Anthropic-shaped request sends one holding an Anthropic
+   * server-tool block as that block, in the assistant turn that produced it
+   * (`utils/anthropic-server-blocks.ts`), and filters out any other, since
+   * Anthropic rejects empty text blocks. Text serializations leave it out.
    */
   rawItem?: unknown;
 }

@@ -1,5 +1,6 @@
 import type { ProviderRequest } from '../types/index.js';
 import { resolveImageMediaType } from '../utils/image-media.js';
+import { carriesAnthropicServerBlock } from '../utils/anthropic-server-blocks.js';
 import type { OpenAIResponsesInputItem } from './openai-responses-api.js';
 
 type JsonObject = Record<string, unknown>;
@@ -25,9 +26,13 @@ export function normalizeResponsesInput(messages: ProviderRequest['messages']): 
     }
 
     // Native messages (including phase, status and developer/system roles)
-    // must survive replay verbatim. Only translate normalized content blocks.
+    // must survive replay verbatim. Only translate normalized content blocks,
+    // and Anthropic server-tool blocks, which are left out below.
     if (Array.isArray(rawMessage.content) && !rawMessage.content.some((block) =>
-      isObject(block) && ['text', 'image', 'tool_use', 'tool_result', 'redacted_thinking'].includes(asString(block.type))
+      isObject(block) && (
+        ['text', 'image', 'tool_use', 'tool_result', 'redacted_thinking'].includes(asString(block.type))
+        || carriesAnthropicServerBlock(block)
+      )
     )) {
       output.push(rawMessage);
       continue;
@@ -52,6 +57,10 @@ export function normalizeResponsesInput(messages: ProviderRequest['messages']): 
 
     for (const rawBlock of blocks) {
       if (!isObject(rawBlock)) continue;
+      // An Anthropic server-tool block, bare or on its zero-width carrier (an
+      // Anthropic-shaped builder sends one back for its own wire), has no
+      // form on this one.
+      if (carriesAnthropicServerBlock(rawBlock)) continue;
       if (rawBlock.type === 'text') {
         parts.push({ type: role === 'assistant' ? 'output_text' : 'input_text', text: asString(rawBlock.text) });
       } else if (rawBlock.type === 'image') {

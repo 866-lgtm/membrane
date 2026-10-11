@@ -91,6 +91,7 @@ import {
   strippedImagePlaceholder,
   shedImagesToFitByteBudget, assertWithinByteBudget,
 } from './utils/image-media.js';
+import { anthropicServerBlockFor } from './utils/anthropic-server-blocks.js';
 import { getDefaultPricing } from './registry/default-pricing.js';
 
 // ============================================================================
@@ -1591,11 +1592,21 @@ export class Membrane {
       const includeNamePrefix = !isAssistant;
       let hasText = false;
       for (const block of msg.content) {
+        // An Anthropic server-tool block (web search and the like), kept on a
+        // zero-width carrier, goes back as the block itself in the assistant
+        // turn that produced it (see utils/anthropic-server-blocks.ts). In a
+        // message sent as a user turn, such as another participant's, it has
+        // no place and is left out.
+        const serverBlock = anthropicServerBlockFor(block);
+        if (serverBlock) {
+          if (isAssistant) content.push(serverBlock);
+          continue;
+        }
         if (block.type === 'text') {
-          // Empty text blocks are rejected by the Anthropic API. In
-          // particular, zero-width rawItem carriers (opaque Responses items,
-          // see parseProviderContent) must not leak here. Filter BEFORE the
-          // name prefix below would make them non-empty.
+          // Empty text blocks are rejected by the Anthropic API. Any other
+          // zero-width rawItem carrier (an opaque Responses item, see
+          // parseProviderContent) has no form here and must not leak. Filter
+          // BEFORE the name prefix below would make it non-empty.
           if (block.text === '') continue;
           let text = block.text;
           if (includeNamePrefix && msg.participant && !hasText) {
@@ -1904,8 +1915,9 @@ export class Membrane {
           // tool records have no normalized ContentBlock equivalent. Retain a
           // zero-width carrier so Chronicle and the Responses formatter can
           // replay the raw item without surfacing synthetic prompt text.
-          // Anthropic-bound conversion paths filter these out (empty text
-          // blocks are a 400 there); the Responses formatter replays rawItem.
+          // The Responses formatter replays a Responses item; Anthropic-shaped
+          // requests send an Anthropic server-tool block back as itself and
+          // filter any other carrier out (empty text blocks are a 400 there).
           //
           // An item with a `type` this switch does not know (server_tool_use,
           // web_search_tool_result, search_result, mcp_tool_use, or whatever a
@@ -1913,9 +1925,7 @@ export class Membrane {
           // gets the same carrier treatment, holding the item itself, plus a
           // one-time warning so the gap surfaces instead of being inferred
           // later from missing content.
-          const carriedRawItem = item.rawItem ?? item;
-          if (!item.rawItem) warnUnconvertibleProviderItem(item.type);
-          blocks.push({ type: 'text', text: '', rawItem: carriedRawItem });
+          blocks.push(providerItemCarrier(item));
         }
       }
       return blocks;
@@ -2598,6 +2608,12 @@ export class Membrane {
             data: block.data,
             mimeType: block.mimeType,
           });
+        } else if (block && (block.rawItem || block.type)) {
+          // A provider block with no normalized form (an Anthropic server-tool
+          // block, an opaque Responses item) used to vanish here, so a turn
+          // that used a server tool reached the history without it. Keep it
+          // as the tool loops do.
+          content.push(providerItemCarrier(block));
         }
       }
     } else if (typeof providerResponse.content === 'string') {
@@ -4053,6 +4069,19 @@ export class Membrane {
       }
     }
   }
+}
+
+/**
+ * The zero-width carrier for a provider item no normalized ContentBlock
+ * represents (an Anthropic server-tool block, an opaque Responses item): the
+ * item rides on it as `rawItem`, so a formatter for its wire can send it back,
+ * and normalized consumers see no text. An item that already holds its native
+ * form as `rawItem` is carried as that form; one that doesn't is new to this
+ * module, and warns once per type.
+ */
+function providerItemCarrier(item: { type?: unknown; rawItem?: unknown }): ContentBlock {
+  if (!item.rawItem) warnUnconvertibleProviderItem(String(item.type));
+  return { type: 'text', text: '', rawItem: item.rawItem ?? item };
 }
 
 // Native tool names must match ^[a-zA-Z0-9_-]{1,128}$.

@@ -37,6 +37,7 @@ import { IncrementalXmlParser } from '../utils/stream-parser.js';
 import { assertCacheMarkersWithinLimit, clampCacheMarkers } from '../utils/cache-marker-budget.js';
 import { lastCacheableBlockIndex } from './native.js';
 import { resolveImageMediaType, isAcceptedImageMediaType, strippedImagePlaceholder } from '../utils/image-media.js';
+import { isZeroWidthCarrier } from '../utils/anthropic-server-blocks.js';
 
 // ============================================================================
 // Configuration
@@ -520,6 +521,10 @@ export class AnthropicXmlFormatter implements PrefillFormatter {
     for (let i = 0; i < content.length; i++) {
       const block = content[i]!;
       if (block.type === 'text') {
+        // A zero-width carrier (a provider item with no normalized form, such
+        // as an Anthropic server-tool block) has no text: an empty part would
+        // only add a line to the document.
+        if (isZeroWidthCarrier(block)) continue;
         parts.push(block.text);
       } else if (block.type === 'image') {
         if (block.source.type === 'base64') {

@@ -4,6 +4,7 @@
 
 import Anthropic, { type ClientOptions } from '@anthropic-ai/sdk';
 import { stripEmptyTextBlocks, stripEmptyTextRequest } from '../utils/empty-text.js';
+import { anthropicServerBlockFor, isAnthropicServerBlock, type AnthropicServerBlock } from '../utils/anthropic-server-blocks.js';
 import { resolveImageMediaType, isAcceptedImageMediaType, assertWithinByteBudget, shedImagesToFitByteBudget } from '../utils/image-media.js';
 import type {
   ProviderAdapter,
@@ -467,6 +468,18 @@ export class AnthropicAdapter implements ProviderAdapter {
                 // raw accumulation and mark it so consumers can refuse.
                 block.unparseableInput = currentBlockInputJson;
               }
+            }
+          } else if (isAnthropicServerBlock(block) && 'input' in block && currentBlockInputJson) {
+            // A server tool's call (server_tool_use, mcp_tool_use) streams its
+            // input as input_json_delta fragments, as a tool_use does, and its
+            // content_block_start carried `input: {}`. The block is sent back
+            // verbatim in later turns, so it must hold the input the model
+            // wrote. Fragments that don't parse (a call cut off mid-input)
+            // leave the start's input: the block stays the API's own shape.
+            try {
+              block.input = JSON.parse(currentBlockInputJson);
+            } catch {
+              // keep the start event's input
             }
           }
         }
@@ -1001,10 +1014,30 @@ export function detectImageMediaType(data: string | undefined, fallback?: string
   return isAcceptedImageMediaType(mediaType) ? mediaType! : 'image/jpeg';
 }
 
+/**
+ * Convert one turn's normalized content to Anthropic content blocks.
+ *
+ * It has no role: an Anthropic server-tool block, or its zero-width carrier,
+ * goes out as the block itself, which is right for the assistant turn that
+ * produced it. A caller converting content it will send as a user turn, such
+ * as another participant's, drops those first, as NativeFormatter and the
+ * native tool loop's builder do (see utils/anthropic-server-blocks.ts).
+ */
 export function toAnthropicContent(blocks: ContentBlock[]): Anthropic.ContentBlockParam[] {
   const result: Anthropic.ContentBlockParam[] = [];
-  
-  for (const block of stripEmptyTextBlocks(blocks)) {
+
+  // An Anthropic server-tool block (web search and the like), kept on a
+  // zero-width carrier, is that block on this wire: it is part of the turn
+  // the model produced (see utils/anthropic-server-blocks.ts). Swap it in
+  // before the empty-text cleanup, which would drop the carrier as empty text.
+  const sendable = stripEmptyTextBlocks(
+    blocks.map((block): ContentBlock | AnthropicServerBlock => anthropicServerBlockFor(block) ?? block),
+  );
+  for (const block of sendable) {
+    if (isAnthropicServerBlock(block)) {
+      result.push(block as unknown as Anthropic.ContentBlockParam);
+      continue;
+    }
     switch (block.type) {
       case 'text': {
         const textBlock: any = { type: 'text', text: block.text };

@@ -25,6 +25,7 @@ import type {
 import { responsesToolOutputParts } from '../providers/responses-input.js';
 
 import { resolveImageMediaType } from '../utils/image-media.js';
+import { carriesAnthropicServerBlock } from '../utils/anthropic-server-blocks.js';
 
 export const OPENAI_RESPONSES_ITEMS_METADATA_KEY = 'openaiResponsesItems';
 
@@ -99,6 +100,11 @@ export class OpenAIResponsesFormatter implements PrefillFormatter {
       };
 
       for (const block of message.content) {
+        // An Anthropic server-tool block (web search and the like, from a turn
+        // served by Anthropic), bare or on its carrier, is Anthropic's
+        // content: it has no form on this wire, and as an input item it
+        // would be sent as an item type this API doesn't have.
+        if (carriesAnthropicServerBlock(block)) continue;
         const rawItem = block.rawItem as NativeItem | undefined;
         if (!rawItem || typeof rawItem !== 'object') {
           pendingParts.push(block);

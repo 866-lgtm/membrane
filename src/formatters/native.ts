@@ -31,6 +31,7 @@ import type {
 import { normalizeToolPairs, mergeConsecutiveRoles } from './normalize-tool-pairs.js';
 import { resolveImageMediaType, isAcceptedImageMediaType, strippedImagePlaceholder } from '../utils/image-media.js';
 import { assertCacheMarkersWithinLimit } from '../utils/cache-marker-budget.js';
+import { anthropicServerBlockFor } from '../utils/anthropic-server-blocks.js';
 
 /** Index of the last content block that can carry cache_control. Anthropic
  *  rejects cache_control on thinking / redacted_thinking blocks, so a cache
@@ -249,6 +250,7 @@ export class NativeFormatter implements PrefillFormatter {
       // Convert content
       const content = this.convertContent(message.content, message.participant, {
         includeNames: participantMode === 'multiuser' && !isAssistant,
+        isAssistant,
       });
 
       if (
@@ -426,18 +428,29 @@ export class NativeFormatter implements PrefillFormatter {
   private convertContent(
     content: ContentBlock[],
     participant: string,
-    options: { includeNames: boolean }
+    options: { includeNames: boolean; isAssistant: boolean }
   ): unknown[] {
     const result: unknown[] = [];
     let hasUnsupportedMedia = false;
     let hasText = false;
 
     for (const block of content) {
+      // An Anthropic server-tool block (web search and the like), kept on a
+      // zero-width carrier, goes back as the block itself in the assistant
+      // turn that produced it (see utils/anthropic-server-blocks.ts). In a
+      // message sent as a user turn, such as another participant's, it has
+      // no place and is left out. An adapter for another wire leaves out a
+      // block type it has no form for.
+      const serverBlock = anthropicServerBlockFor(block);
+      if (serverBlock) {
+        if (options.isAssistant) result.push(serverBlock);
+        continue;
+      }
       if (block.type === 'text') {
-        // Empty text blocks are rejected by the Anthropic API. In particular,
-        // zero-width rawItem carriers (opaque provider-native items smuggled
-        // through normalized history) must not leak here. Filter BEFORE the
-        // name prefix below would make them non-empty.
+        // Empty text blocks are rejected by the Anthropic API. Any other
+        // zero-width rawItem carrier (an opaque provider-native item from
+        // another wire) has no form here and must not leak. Filter BEFORE
+        // the name prefix below would make it non-empty.
         if (block.text === '') continue;
         let text = block.text;
         if (options.includeNames && !hasText) {

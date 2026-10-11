@@ -31,6 +31,7 @@ import type {
   BlockEvent,
   StreamEmission,
 } from './types.js';
+import { isZeroWidthCarrier } from '../utils/anthropic-server-blocks.js';
 
 // ============================================================================
 // Configuration
@@ -342,6 +343,10 @@ export class CompletionsFormatter implements PrefillFormatter {
 
     for (const block of content) {
       if (block.type === 'text') {
+        // A zero-width carrier (a provider item with no normalized form, such
+        // as an Anthropic server-tool block) has no text: an empty part would
+        // only add a line to the prompt.
+        if (isZeroWidthCarrier(block)) continue;
         textParts.push(block.text);
       } else if (block.type === 'image') {
         hadImages = true;
