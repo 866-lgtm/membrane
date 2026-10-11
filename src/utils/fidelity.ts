@@ -17,14 +17,16 @@ import type { ContentBlock } from '../types/content.js';
  * removed by a cleanup policy. Removing an exactly empty text block ('') that
  * holds no raw form carries nothing and is not an alteration; neither is the
  * faithful rendering of harness or attempt blocks, or a block moved between
- * provider messages.
+ * provider messages or within one (the tool-pair rule puts a message's
+ * tool_result blocks first).
  *
  * Raw forms. Some blocks and messages carry the provider-native form they
  * were derived from, and the paths that understand it send that form in
  * place of the other fields:
  *   - the OpenAI Responses formatter sends a block's object `rawItem` (blocks
  *     of one message whose items share a type and id, or are identical
- *     without one, go out as that item once), and sends a message's
+ *     without one, go out as that item once; a later block whose item under
+ *     the same type and id differs isn't carried), and sends a message's
  *     `metadata.openaiResponsesItems` array in place of its content (nothing,
  *     for an empty array);
  *   - the Responses API adapter's input normalization sends a
@@ -123,6 +125,7 @@ export class FidelityNotes {
     for (const index of this.altered) notes.alter(index);
     notes.unattributed = this.unattributed;
     notes.uninstrumented = this.uninstrumented;
+    notes.mutatedInPlace = this.mutatedInPlace;
     return notes;
   }
 }
@@ -197,7 +200,10 @@ export type MessageOrigin =
 
 /**
  * A structural fingerprint of a provider request, for telling whether a
- * `beforeRequest` hook changed it (by replacement or in place).
+ * `beforeRequest` hook changed it (by replacement or in place). A request
+ * JSON can't serialize can't be compared, so its fingerprint never matches
+ * (a fresh random one each time): membrane can't tell whether the hook
+ * changed it, and the round, like those after it, reads unknown.
  */
 export function requestFingerprint(request: unknown): string {
   try {

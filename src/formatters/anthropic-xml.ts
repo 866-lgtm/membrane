@@ -577,8 +577,9 @@ export class AnthropicXmlFormatter implements PrefillFormatter {
         }
         i--;
         // The transcript renders a result's text; nested media becomes a
-        // note ([Image: …]) and other nested blocks have no rendering.
-        if (run.some((r) => Array.isArray(r.content) && r.content.some((sub) => sub.type !== 'text'))) onAltered?.();
+        // note ([Image: …]) and other nested blocks have no rendering. A
+        // result with rawXml goes out as that text, which is its content.
+        if (run.some((r) => !r.rawXml && Array.isArray(r.content) && r.content.some((sub) => sub.type !== 'text'))) onAltered?.();
         parts.push(...this.renderToolResultRun(run));
       } else if (block.type === 'document' || block.type === 'audio') {
         hasUnsupportedMedia = true;

@@ -256,7 +256,7 @@ export class CompletionsFormatter implements PrefillFormatter {
       // block is left out, which alters the consumer message.
       if (leftOut) options.fidelity?.alter(index);
 
-      // Skip empty messages (except if it's the final completion target).
+      // Skip empty messages.
       // Whitespace-only text is content: skipping it is an alteration. Only
       // exactly empty '' blocks with no raw form carry nothing (joined, two
       // of them read '\n').

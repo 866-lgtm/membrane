@@ -2427,12 +2427,15 @@ export class Membrane {
     // literals, not on variables). Leaving it in would silently leak the
     // normalized form into every adapter's options.
     const { normalizedRequest, refusalRetries, onRetrying, onWireCacheMarkers, fidelity, ...adapterOptions } = options;
-    // Fingerprint around the hook only when both a hook and a reader exist:
-    // an observer or a no-op hook keeps fidelity established. The hook is
-    // handed two objects, and a change made in place to either is also
-    // remembered: the provider request shares structure with state later
-    // rounds reuse, and the normalized request is what later rounds are
-    // built from (the native loop's working messages are its own objects).
+    // Fingerprint around the hook only when both a hook and a reader exist
+    // (the yielding loops pass notes only when they emit usage events, which
+    // carry the round report): an observer or a no-op hook keeps fidelity
+    // established. Serializing the request is the price of reporting a
+    // hooked round. The hook is handed two objects, and a change made in
+    // place to either is also remembered: the provider request shares
+    // structure with state later rounds reuse, and the normalized request is
+    // what later rounds are built from (the native loop's working messages
+    // are its own objects).
     const hooked = fidelity !== undefined && this.config.hooks?.beforeRequest !== undefined;
     const beforeHook = hooked ? requestFingerprint(request) : undefined;
     const normalizedBefore = hooked ? requestFingerprint(normalizedRequest) : undefined;
@@ -2972,10 +2975,11 @@ export class Membrane {
     next.attempts += add.attempts;
     next.inputTokens += add.inputTokens;
     next.outputTokens += add.outputTokens;
-    if (add.cacheCreationTokens) {
+    // As in the turn total: a count any attempt reported, a 0 included.
+    if (add.cacheCreationTokens != null) {
       next.cacheCreationTokens = (next.cacheCreationTokens ?? 0) + add.cacheCreationTokens;
     }
-    if (add.cacheReadTokens) {
+    if (add.cacheReadTokens != null) {
       next.cacheReadTokens = (next.cacheReadTokens ?? 0) + add.cacheReadTokens;
     }
     return next;
@@ -2988,8 +2992,8 @@ export class Membrane {
       attempts: 1,
       inputTokens: detailed.inputTokens ?? 0,
       outputTokens: detailed.outputTokens ?? 0,
-      ...(detailed.cacheCreationTokens ? { cacheCreationTokens: detailed.cacheCreationTokens } : {}),
-      ...(detailed.cacheReadTokens ? { cacheReadTokens: detailed.cacheReadTokens } : {}),
+      ...(detailed.cacheCreationTokens != null ? { cacheCreationTokens: detailed.cacheCreationTokens } : {}),
+      ...(detailed.cacheReadTokens != null ? { cacheReadTokens: detailed.cacheReadTokens } : {}),
     };
   }
 
@@ -3469,7 +3473,8 @@ export class Membrane {
             wrapThinkingTags: true,
             onWireCacheMarkers: (count) => { prefillResult.cacheMarkersApplied = count; },
             onRequest: (req: unknown) => { rawRequest = req; },
-            fidelity: roundFidelity,
+            // Only a reported round needs its notes, and a hook's fingerprint with them.
+            ...(emitUsage ? { fidelity: roundFidelity } : {}),
           }
         );
 
@@ -4022,7 +4027,8 @@ export class Membrane {
             onWireCacheMarkers: (markerCount: number) => {
               markersInLastRequest = markerCount;
             },
-            fidelity: roundFidelity,
+            // Only a reported round needs its notes, and a hook's fingerprint with them.
+            ...(emitUsage ? { fidelity: roundFidelity } : {}),
             refusalRetries: options.refusalRetries,
             // Discard the refused attempt: roll the accumulators back to
             // where this attempt began and tell the consumer to drop what it
