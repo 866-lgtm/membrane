@@ -128,6 +128,30 @@ describe('a context overflow in each provider\'s own words is context_length', (
     stubHttpFailure(400, { error: { code: 400, message: 'Invalid value at contents[0].role', status: 'INVALID_ARGUMENT' } });
     expect((await failure(new GeminiAdapter({ apiKey: 'zz-key-gemini' }))).type).toBe('invalid_request');
   });
+
+  it('a field that is too long is not a context overflow', async () => {
+    stubHttpFailure(400, {
+      error: {
+        message: "Invalid 'messages[0].content': string too long. Expected a string with maximum length 10485760, but got a string with length 10485761 instead.",
+        type: 'invalid_request_error',
+        param: 'messages[0].content',
+        code: 'string_above_max_length',
+      },
+    });
+    expect((await failure(new OpenAIAdapter({ apiKey: 'zz-key-openai' }))).type).toBe('invalid_request');
+  });
+
+  it('a 400 with no message is not read for length, though its body echoes the request', async () => {
+    // The echo is the prompt's own words, not the provider's: with no message to read, the status decides.
+    stubHttpFailure(400, {
+      error: {
+        code: 400,
+        status: 'INVALID_ARGUMENT',
+        details: [{ request: { contents: 'my prompt is too long for the context window, please help' } }],
+      },
+    });
+    expect((await failure(new GeminiAdapter({ apiKey: 'zz-key-gemini' }))).type).toBe('invalid_request');
+  });
 });
 
 describe('a credential failure sent as a 400 is auth', () => {
@@ -192,6 +216,19 @@ describe('a refusal of the account sent as a 400 is auth', () => {
 
   it('anthropic: a 400 about the request itself stays invalid_request', () => {
     const error = anthropic400('messages: roles must alternate between "user" and "assistant", but found multiple "user" roles in a row');
+    expect(error.type).toBe('invalid_request');
+    expect(error.httpStatus).toBe(400);
+  });
+
+  it('a 400 whose body echoes a refusal outside any message stays invalid_request', async () => {
+    stubHttpFailure(400, {
+      error: {
+        code: 400,
+        status: 'INVALID_ARGUMENT',
+        details: [{ request: { contents: 'Your credit balance is too low to access the Anthropic API, it said' } }],
+      },
+    });
+    const error = await failure(new GeminiAdapter({ apiKey: 'zz-key-gemini' }));
     expect(error.type).toBe('invalid_request');
     expect(error.httpStatus).toBe(400);
   });

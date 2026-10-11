@@ -372,10 +372,14 @@ const NON_RETRYABLE_RATE_LIMIT_CODES = new Set([
  * L" and "prompt is too long: N tokens > M maximum"; Gemini: "The input
  * token count (N) exceeds the maximum number of input tokens allowed (M)";
  * OpenAI: `context_length_exceeded` / "maximum context length". Read only
- * under a 400/422 (or with no status at all, after the 5xx arm).
+ * under a 400/422 (or with no status at all, after the 5xx arm), and with a
+ * status only over the provider's own error message (see
+ * errorFromProviderStatus). A bare "too long" is not among them: a provider
+ * says that of a field, such as a string past its maximum length, which no
+ * shorter history fixes.
  */
 const CONTEXT_LENGTH_PATTERN =
-  /context[ _-]?(?:length|limit|window)|maximum context|too many tokens|token limit|prompt is too long|too long|exceeds? the maximum number of (?:input )?tokens|input token count/i;
+  /context[ _-]?(?:length|limit|window)|maximum context|too many tokens|token limit|(?:prompt|input) is too long|exceeds? the maximum number of (?:input )?tokens|input token count/i;
 
 const RATE_LIMIT_PATTERN = /\b429\b|rate[ _-]?limit|too many requests/i;
 
@@ -401,6 +405,8 @@ const AUTH_CODES = new Set(['invalid_api_key', 'authentication_error', 'unauthen
  * the request succeeds until the account changes. They are read inside a
  * router's wrapper too: whoever's account it is, `auth` never sheds history,
  * whereas a router's quota (see quotaFailureIsTerminal) is better retried.
+ * Like the context-length forms, they are read only over the provider's own
+ * error message, never over a body that might echo the request.
  */
 const ACCOUNT_REFUSAL_PATTERN = /credit balance is too low|reached your specified API usage limits/i;
 
@@ -619,9 +625,14 @@ export function errorFromProviderStatus(params: {
     `${params.provider} API error ${status ?? code ?? 'failure'}: ${detail}${
       fields.param ? ` (param: ${fields.param})` : ''
     }`;
-  // A router's generic message ("Provider returned error") classifies by the
-  // upstream provider's own text beside it.
-  const evidence = fields.upstreamMessage ? `${detail}\n${fields.upstreamMessage}` : detail;
+  // With a status, the patterns read the provider's own error message: the
+  // body's message first, then the caller's, and a router's upstream message
+  // beside it (its generic "Provider returned error" classifies by the
+  // upstream provider's own text). Never a rendered body: a body with no
+  // message field can echo the request, and a prompt that says "context
+  // window" or "credit balance is too low" must not type the error.
+  const ownText = firstString(fields.message, params.message);
+  const evidence = [ownText, fields.upstreamMessage].filter((text): text is string => !!text).join('\n');
 
   const classification =
     status !== undefined
