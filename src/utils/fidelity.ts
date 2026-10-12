@@ -16,9 +16,12 @@ import type { ContentBlock } from '../types/content.js';
  * as text, nested tool-result media rendered as a note, whitespace-only text
  * removed by a cleanup policy. Removing an exactly empty text block ('') that
  * holds no raw form carries nothing and is not an alteration; neither is the
- * faithful rendering of harness or attempt blocks, or a block moved between
+ * faithful rendering of harness or attempt blocks, a block moved between
  * provider messages or within one (the tool-pair rule puts a message's
- * tool_result blocks first).
+ * tool_result blocks first), the participant-name prefix a multiuser
+ * conversation puts on a message's text, an image's media type written as
+ * its bytes declare it, or a block membrane adds of its own (a synthetic
+ * result for a stranded call).
  *
  * Raw forms. Some blocks and messages carry the provider-native form they
  * were derived from, and the paths that understand it send that form in
@@ -148,11 +151,12 @@ export function ownBlocks(fidelity: FidelityNotes | undefined, blocks: readonly 
 
 /**
  * The tool-pair normalizer's block-identity callback, for a build recording
- * `fidelity` (spread into `normalizeToolPairs`' options). The normalizer
- * makes a new object out of a consumer's block in one way: a tool_result
- * rewritten as text, an orphan or a duplicate. That alters exactly the
- * message the occurrence came from, and the replacement keeps its owner, so
- * a later adapter report about it is attributed.
+ * `fidelity` (spread into `normalizeToolPairs`' options). It hears a
+ * tool_result the normalizer rewrites as text, an orphan or a duplicate.
+ * That alters exactly the message the occurrence came from, and the
+ * replacement keeps its owner, so a later adapter report about it is
+ * attributed. (Phase 1's rename of a `toolUseId` key also copies a block,
+ * but NativeFormatter writes `tool_use_id` before the normalizer runs.)
  */
 export function followNormalizedBlocks(
   fidelity: FidelityNotes | undefined,

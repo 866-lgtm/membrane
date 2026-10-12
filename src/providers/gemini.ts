@@ -104,8 +104,10 @@ interface GeminiStreamState {
 
 /**
  * Gemini's usageMetadata follows proto3 JSON, which omits zero-valued counts:
- * when the object is present, a missing count is a reported 0. Only a
- * response with no usageMetadata at all leaves the counts unreported.
+ * when the object is present, a missing prompt, candidates or cache-read
+ * count is a reported 0. Only a response with no usageMetadata at all leaves
+ * the counts unreported. A turn without thinking keeps `thinkingTokens`
+ * absent, as it always has.
  */
 function geminiUnreportedUsage(usageMetadata: GeminiResponse['usageMetadata']): { unreportedUsage?: Array<'inputTokens' | 'outputTokens'> } {
   return usageMetadata ? {} : { unreportedUsage: ['inputTokens', 'outputTokens'] };

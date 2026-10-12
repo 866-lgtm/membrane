@@ -105,7 +105,7 @@ import {
   shedImagesToFitByteBudget, assertWithinByteBudget,
 } from './utils/image-media.js';
 import { getDefaultPricing } from './registry/default-pricing.js';
-import { FidelityNotes, followNormalizedBlocks, isRawItemCarrier, ownBlocks, requestFingerprint, type MessageOrigin } from './utils/fidelity.js';
+import { FidelityNotes, requestFingerprint, type MessageOrigin } from './utils/fidelity.js';
 
 // ============================================================================
 // Membrane Class

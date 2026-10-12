@@ -292,8 +292,8 @@ export class NativeFormatter implements PrefillFormatter {
     const normalized = normalizeToolPairs(providerMessages, {
       pendingToolCallIds: options.pendingToolCallIds,
       onEvent: options.onNormalize,
-      // A textified orphan tool_result alters the message that occurrence
-      // came from; a cache-suppression copy keeps its owner.
+      // A tool_result textified as an orphan or a duplicate alters the
+      // message that occurrence came from, and its replacement keeps the owner.
       ...followNormalizedBlocks(options.fidelity),
       // The caller's synthetic user text, used where the normalizer decides a
       // leading user turn is needed: after a contextPrefix, before

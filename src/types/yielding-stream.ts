@@ -102,7 +102,8 @@ export interface RoundReport {
    * usage it reports is: `inputTokens` excludes cache reads, so a
    * cache-inclusive provider's input count is restated without them
    * (`normalizeUsageToCacheExcluded`), and `inputTokens + cacheReadTokens` is
-   * the prompt the provider counted.
+   * the prompt the provider counted. An adapter whose convention is
+   * `'unknown'` passes its counts through as the provider gave them.
    */
   usage: RoundUsage;
   /**

@@ -133,7 +133,9 @@ export interface NormalizeOptions {
    * Hears each input block the normalizer rewrote as a new object with
    * different content: a tool_result textified because it was an orphan or
    * a duplicate. For a caller that follows its blocks by object identity
-   * (request fidelity).
+   * (request fidelity). Phase 1 also copies a tool_result spelled
+   * `toolUseId` to rename the key, without calling this; NativeFormatter,
+   * which passes it, writes `tool_use_id` before the normalizer runs.
    */
   onBlockRewritten?: (original: ProviderBlock, replacement: ProviderBlock) => void;
   /**
