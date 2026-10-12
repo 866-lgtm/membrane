@@ -273,6 +273,33 @@ async function signRequest(
 // Bedrock Adapter
 // ============================================================================
 
+/**
+ * A message's content as Bedrock requests send it: without its Anthropic
+ * server-tool blocks (web search and the like). Those go back to the
+ * Anthropic API in the turn that produced it, where their acceptance is
+ * checked live (see utils/anthropic-server-blocks.ts). Whether Bedrock
+ * accepts these block types is unknown, and a refusal would fail every
+ * request carrying the conversation, so Bedrock leaves them out, as it did
+ * before they were sent back anywhere.
+ *
+ * The builders put a message's cache breakpoint on its last block that can
+ * carry one, which a server block can be. Its marker then moves to the block
+ * the builders marked before server blocks were sent back: the last one that
+ * isn't thinking, as `lastCacheableBlockIndex` picks it.
+ */
+function withoutServerBlocks(content: any[]): any[] {
+  const kept = content.filter((block) => !isAnthropicServerBlock(block));
+  const marker = content.find((block) => isAnthropicServerBlock(block) && block.cache_control !== undefined)?.cache_control;
+  if (marker === undefined) return kept;
+  for (let i = kept.length - 1; i >= 0; i--) {
+    const type = kept[i]?.type;
+    if (type === 'thinking' || type === 'redacted_thinking') continue;
+    if (kept[i].cache_control === undefined) kept[i] = { ...kept[i], cache_control: marker };
+    break;
+  }
+  return kept;
+}
+
 export class BedrockAdapter implements ProviderAdapter {
   readonly name = 'bedrock';
   readonly cacheReceiptBasis = 'wire-request' as const;
@@ -442,13 +469,7 @@ export class BedrockAdapter implements ProviderAdapter {
       if (!Array.isArray(msg.content)) return msg;
       return {
         ...msg,
-        // An Anthropic server-tool block (web search and the like) goes back
-        // to the Anthropic API in the turn that produced it, where its
-        // acceptance is checked live. Whether Bedrock accepts these block
-        // types is unknown, and a refusal would fail every request carrying
-        // the conversation, so Bedrock leaves them out, as it did before
-        // they were sent back anywhere (see utils/anthropic-server-blocks.ts).
-        content: msg.content.filter((block: unknown) => !isAnthropicServerBlock(block)).map((block: any) => {
+        content: withoutServerBlocks(msg.content).map((block: any) => {
           if (block.type === 'image' && block.sourceUrl !== undefined) {
             const { sourceUrl, ...rest } = block;
             return stripCacheTtl(toWireImage(rest));

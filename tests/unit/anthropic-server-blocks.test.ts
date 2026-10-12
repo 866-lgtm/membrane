@@ -453,6 +453,16 @@ describe('wires with no form for them', () => {
     expect(withCarriers.messages).toEqual(without.messages);
   });
 
+  it('Bedrock moves a breakpoint that the builder put on a server block to the block it marked before', () => {
+    const messages = history([answer as ContentBlock, carrier(serverUse), carrier(searchResult)]);
+    messages[1] = { ...messages[1]!, cacheBreakpoint: true };
+    const built = new NativeFormatter().buildMessages(messages, { ...options, promptCaching: true }).messages as any[];
+    expect(built[1].content.at(-1)).toEqual({ ...searchResult, cache_control: { type: 'ephemeral' } });
+    const adapter = new BedrockAdapter({ accessKeyId: 'zz', secretAccessKey: 'zz', region: 'us-west-2' });
+    const request = (adapter as any).buildRequest({ model: 'anthropic.claude-sonnet-4-6', messages: built, maxTokens: 32 });
+    expect(request.messages[1].content).toEqual([{ ...answer, cache_control: { type: 'ephemeral' } }]);
+  });
+
   it('Bedrock leaves them out, as before: whether it accepts them is unknown', () => {
     const adapter = new BedrockAdapter({ accessKeyId: 'zz', secretAccessKey: 'zz', region: 'us-west-2' });
     const built = (adapter as any).buildRequest({ model: 'anthropic.claude-sonnet-4-6', messages: anthropicShaped(), maxTokens: 32 });
