@@ -13,8 +13,9 @@
   turn, still leaves it out. `toAnthropicContent` sends it when given
   `{ role: 'assistant' }`, and otherwise leaves it out, as it always left
   out a carrier.
-- Only the Anthropic API takes these blocks back. Membrane leaves them out of
-  every other provider's requests, Bedrock's included, in the build itself,
+- Membrane sends these blocks back only through `AnthropicAdapter`, the
+  provider whose acceptance of them was checked. It leaves them out of every
+  other provider's requests, Bedrock's included, in the build itself,
   before it places cache markers and merges turns, so those requests are what
   they were before: a provider adapter declares
   `replaysAnthropicServerBlocks`, and NativeFormatter takes

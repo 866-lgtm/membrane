@@ -1595,7 +1595,8 @@ export class Membrane {
         // An Anthropic server-tool block (web search and the like), kept on a
         // zero-width carrier, goes back as the block itself in the assistant
         // turn that produced it (see utils/anthropic-server-blocks.ts), when
-        // the provider takes it back (replaysAnthropicServerBlocks). In a
+        // Membrane replays them through this adapter
+        // (replaysAnthropicServerBlocks). In a
         // message sent as a user turn, such as another participant's, it has
         // no place and is left out.
         const serverBlock = anthropicServerBlockFor(block);

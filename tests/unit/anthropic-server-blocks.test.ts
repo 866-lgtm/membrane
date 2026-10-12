@@ -283,7 +283,7 @@ describe('the native tool loop', () => {
     expect(messages).toEqual(before);
   });
 
-  it('sends none to an adapter that doesn\'t take them back', async () => {
+  it('sends none through an adapter without the capability', async () => {
     const sent: any[] = [];
     const membrane = new Membrane(recordingAdapter(sent, false));
     await membrane.stream(request(), { onToolCalls: async (calls) => results(calls) });
@@ -469,7 +469,7 @@ describe('wires with no form for them', () => {
 // out before it places cache markers and merges consecutive turns, so it does
 // when told the provider doesn't take them (Andrew-2310's comparisons with
 // 39ce7863, room-203 #78633).
-describe('a provider that doesn\'t take them back', () => {
+describe('an adapter Membrane doesn\'t replay them through', () => {
   const T = (text: string): ContentBlock => ({ type: 'text', text });
   const U = (text: string): NormalizedMessage => ({ participant: 'User', content: [T(text)] });
   const A = (content: ContentBlock[], more: Partial<NormalizedMessage> = {}): NormalizedMessage => ({ participant: 'Claude', content, ...more });
@@ -502,7 +502,7 @@ describe('a provider that doesn\'t take them back', () => {
     expect(serverBlocksIn(build(messages, extra).messages).length).toBeGreaterThan(0);
   });
 
-  it('Membrane builds without them for an adapter that doesn\'t declare it takes them back; the Anthropic adapter declares it', async () => {
+  it('Membrane builds without them for an adapter that doesn\'t declare the capability; the Anthropic adapter declares it', async () => {
     const sent: any[] = [];
     const adapter: ProviderAdapter = {
       name: 'zz-other', supportsModel: () => true,

@@ -439,7 +439,7 @@ export class NativeFormatter implements PrefillFormatter {
       // An Anthropic server-tool block (web search and the like), kept on a
       // zero-width carrier, goes back as the block itself in the assistant
       // turn that produced it (see utils/anthropic-server-blocks.ts), when
-      // the provider takes it back (BuildOptions.anthropicServerBlocks). In a
+      // the build replays them (BuildOptions.anthropicServerBlocks). In a
       // message sent as a user turn, such as another participant's, it has
       // no place and is left out. An adapter for another wire leaves out a
       // block type it has no form for.
