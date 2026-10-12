@@ -96,9 +96,13 @@ export interface RoundReport {
    */
   stopReason: StopReason;
   /**
-   * This round's own usage as the provider reported it: a count it did not
-   * report is absent, not 0 (even where accounting keeps a 0 default), and a
-   * reported 0 is 0.
+   * This round's own usage, only what the provider reported: a count it did
+   * not report is absent, not 0 (even where accounting keeps a 0 default),
+   * and a reported 0 is 0. Counts are in membrane's one convention, as every
+   * usage it reports is: `inputTokens` excludes cache reads, so a
+   * cache-inclusive provider's input count is restated without them
+   * (`normalizeUsageToCacheExcluded`), and `inputTokens + cacheReadTokens` is
+   * the prompt the provider counted.
    */
   usage: RoundUsage;
   /**
@@ -122,7 +126,11 @@ export interface RoundReport {
    * form: content a consumer edited without dropping its raw form isn't
    * named, because the edit never reaches the wire (utils/fidelity.ts). A
    * zero-width carrier (`''` text holding an object `rawItem`) that a path
-   * leaves out is named.
+   * leaves out is named. Membrane's own messages (each assistant round, and
+   * the tool_result envelopes it builds from `provideToolResults`) aren't the
+   * consumer's and have no address here, so their alterations aren't
+   * reported and don't touch `fidelity`, which speaks for the consumer's
+   * messages.
    */
   altered: { messages: number[]; injected: Array<[number, number]> };
   /**

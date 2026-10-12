@@ -10,7 +10,8 @@
  * items for its whole content (an empty array sends nothing), a block's
  * `rawItem` for that block. The fields they replace aren't read, and round
  * reports count the message or block as carried when its items are
- * (utils/fidelity.ts).
+ * (utils/fidelity.ts). Blocks whose items share a type and id are one item,
+ * sent once; a block whose item differs under the same key isn't carried.
  */
 
 import type {
@@ -100,7 +101,9 @@ export class OpenAIResponsesFormatter implements PrefillFormatter {
         continue;
       }
 
-      const seenRawItems = new Set<string>();
+      // Each item sent, by its key: blocks of one item share it (the adapter
+      // gives them one object; a JSON round trip, equal copies).
+      const seenRawItems = new Map<string, NativeItem>();
       let pendingParts: ContentBlock[] = [];
       const flushPending = () => {
         if (pendingParts.length === 0) return;
@@ -119,9 +122,14 @@ export class OpenAIResponsesFormatter implements PrefillFormatter {
         const key = typeof rawItem.id === 'string'
           ? `${rawItem.type ?? ''}:${rawItem.id}`
           : JSON.stringify(rawItem);
-        if (!seenRawItems.has(key)) {
+        const sent = seenRawItems.get(key);
+        if (!sent) {
           items.push(rawItem);
-          seenRawItems.add(key);
+          seenRawItems.set(key, rawItem);
+        } else if (sent !== rawItem && JSON.stringify(sent) !== JSON.stringify(rawItem)) {
+          // Another block's item went out under this key, so this block's
+          // differing item isn't carried.
+          onAltered?.();
         }
       }
       flushPending();
@@ -201,7 +209,9 @@ export class OpenAIResponsesFormatter implements PrefillFormatter {
         });
       } else if (block.type === 'tool_result') {
         flushMessage();
-        if (responsesToolOutputLoses(block.content)) onAltered?.();
+        // A function_call_output has no error flag, so a failed result reads
+        // as a plain one.
+        if (responsesToolOutputLoses(block.content) || block.isError) onAltered?.();
         out.push({
           type: 'function_call_output',
           call_id: block.toolUseId,

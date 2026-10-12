@@ -33,17 +33,23 @@
   block or message counts as carried verbatim when its raw form is, and the
   fields it stands in for are not compared with it, so a consumer that edits
   content under a raw form must drop or replace the raw form, or the edit
-  doesn't reach the provider. A zero-width carrier (`''` text holding an
-  object `rawItem`) that a path leaves out, as every built-in path but the
-  Responses formatter does, alters its message.
+  doesn't reach the provider. Blocks whose items share a type and id are one
+  item, sent once, and a block whose item differs under the same key isn't
+  carried. A zero-width carrier (`''` text holding an object `rawItem`) that
+  a path leaves out, as every built-in path but the Responses formatter does,
+  alters its message.
 - **Provider adapters:** `ProviderRequestOptions.onContentAltered(block?)`
   takes the request's own block when one block was altered, and membrane
   attributes it to the message that block came from. Declaring adapters
   report through the final body, passthrough parameters and cleanup
   included. Anthropic and Bedrock now report whitespace-only text removed by
-  their empty-text cleanup (an exactly empty `''` block is still no loss), a
-  passthrough `messages` that replaces the built messages, and nested
-  tool-result blocks with no wire form.
+  their empty-text cleanup (an exactly empty `''` block is still no loss) and
+  a passthrough `messages` that replaces the built messages. Anthropic also
+  reports nested tool-result blocks with no Anthropic form; Bedrock passes
+  them through. The Responses API adapter reports what its input
+  normalization leaves out or changes, naming the block, and a failed tool
+  result, since a `function_call_output` has no error flag; the Responses
+  formatter reports such a result too.
 - `normalizeToolPairs` tells a caller that follows blocks by identity which
   ones it replaced with new objects: `NormalizeOptions.onBlockRewritten` for
   an orphan `tool_result` rewritten as text, and `onBlockCopied` for a block
@@ -52,5 +58,8 @@
 - `ProviderResponse.unreportedUsage` names the required counts
   (`inputTokens`, `outputTokens`) a provider did not report. Their 0 in
   `usage` stays for accounting, and round reports leave them out. Every
-  built-in adapter sets it. A round report's `usage` (`RoundUsage`) carries
-  token counts only, never accounting's `estimatedCost`.
+  built-in adapter that can lack a count names it (the mock always reports
+  both). A round report's `usage` (`RoundUsage`) carries token counts only,
+  never accounting's `estimatedCost`, in membrane's one convention:
+  `inputTokens` excludes cache reads, restated for a cache-inclusive
+  provider.

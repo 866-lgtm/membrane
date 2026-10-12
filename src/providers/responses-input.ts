@@ -14,10 +14,12 @@ type JsonObject = Record<string, unknown>;
 export function normalizeResponsesInput(
   messages: ProviderRequest['messages'],
   /**
-   * Hears each content block this normalization leaves out, and each tool
-   * result whose nested content it can't carry as it was.
+   * Hears each content block this normalization leaves out or changes, and
+   * each tool result whose nested content or error flag it can't carry as it
+   * was: given the request's own block, so membrane can name the message it
+   * came from (nothing, for a block that isn't an object).
    */
-  onDropped?: () => void,
+  onDropped?: (block?: unknown) => void,
 ): OpenAIResponsesInputItem[] {
   const output: unknown[] = [];
 
@@ -67,10 +69,10 @@ export function normalizeResponsesInput(
       } else if (rawBlock.type === 'image') {
         const imageUrl = responsesImageUrl(rawBlock);
         if (imageUrl && role !== 'assistant') parts.push({ type: 'input_image', image_url: imageUrl });
-        else onDropped?.();
+        else onDropped?.(rawBlock);
       } else if (rawBlock.type === 'tool_use') {
         flush();
-        output.push(normalizeStandaloneItem(rawBlock));
+        output.push(normalizeStandaloneItem(rawBlock, onDropped));
       } else if (rawBlock.type === 'tool_result') {
         flush();
         output.push(normalizeStandaloneItem(rawBlock, onDropped));
@@ -88,8 +90,10 @@ export function normalizeResponsesInput(
   return output as OpenAIResponsesInputItem[];
 }
 
-function normalizeStandaloneItem(item: JsonObject, onDropped?: () => void): unknown {
+function normalizeStandaloneItem(item: JsonObject, onDropped?: (block?: unknown) => void): unknown {
   if (item.type === 'tool_use') {
+    // Arguments are an object; anything else goes out as {}.
+    if (item.input !== undefined && !isObject(item.input)) onDropped?.(item);
     return {
       type: 'function_call',
       call_id: asString(item.id),
@@ -99,8 +103,10 @@ function normalizeStandaloneItem(item: JsonObject, onDropped?: () => void): unkn
   }
   if (item.type === 'tool_result') {
     const content = item.content;
-    // A nested value the output can't carry is stringified or replaced by a note.
-    if (responsesToolOutputLoses(content)) onDropped?.();
+    // A nested value the output can't carry is stringified or replaced by a
+    // note, and a function_call_output has no error flag, so a failed result
+    // reads as a plain one.
+    if (responsesToolOutputLoses(content) || item.isError === true || item.is_error === true) onDropped?.(item);
     return {
       type: 'function_call_output',
       call_id: asString(item.toolUseId) || asString(item.tool_use_id),
