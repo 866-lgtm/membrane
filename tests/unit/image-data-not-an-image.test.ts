@@ -283,7 +283,7 @@ describe('OpenAI-family and Gemini adapters', () => {
       config: { model, maxTokens: 32 },
       ...(lane === 'native tools'
         ? { toolMode: 'native' as const, tools: [{ name: 'shot', description: 'Take a screenshot', inputSchema: { type: 'object' } }] }
-        : {}),
+        : { toolMode: 'xml' as const }),
     }, { onChunk: () => {}, onRequest: (request) => { wire = request; } });
     expect(wire).toBeDefined();
     expect(JSON.stringify(wire)).not.toContain(NOTES);
@@ -478,6 +478,7 @@ describe('the XML tool loop', () => {
     const request: NormalizedRequest = {
       messages: [{ participant: 'User', content: [{ type: 'text', text: 'shoot' }] }],
       config: { model: 'zz-model', maxTokens: 100 },
+      toolMode: 'xml',
     };
     const resultFor = (id: string) => ({ toolUseId: id, toolName: 'shot', content: [{ type: 'text' as const, text: 'shot ok' }, notes() as any] });
     if (method === 'stream') {

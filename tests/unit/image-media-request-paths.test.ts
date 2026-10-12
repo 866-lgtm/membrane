@@ -160,7 +160,7 @@ describe('native tool-result history', () => {
 describe('request paths reaching the Anthropic SDK transport', () => {
   it.each([
     ['native top-level', new NativeFormatter(), [{ participant: 'User', content: [image()] }]],
-    ['XML top-level', new AnthropicXmlFormatter(), [{ participant: 'User', content: [image()] }]],
+    ['XML top-level', new AnthropicXmlFormatter({ toolMode: 'xml' }), [{ participant: 'User', content: [image()] }]],
     ['native tool-result history', new NativeFormatter(), history(image())],
   ] as const)('%s sends PNG with snake_case metadata', async (_name, formatter, messages) => {
     const fetchMock = vi.fn().mockImplementation(async () => new Response(JSON.stringify({
