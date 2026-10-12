@@ -36,8 +36,9 @@ describe('NativeFormatter nameFormat compatibility', () => {
         tsc, '--noEmit', '--strict', '--noImplicitOverride',
         '--skipLibCheck', '--target', 'ES2022', '--module', 'NodeNext', '--moduleResolution', 'NodeNext',
         // TypeScript 7 includes no @types package that isn't named, and refuses
-        // files named on the command line beside a tsconfig.json unless told to
-        // ignore it.
+        // files named on the command line while its working directory holds a
+        // tsconfig.json, unless told to ignore it (TS5112). That's the
+        // repository root's here, where it runs.
         '--types', 'node', '--ignoreConfig',
         fixture,
       ], {
