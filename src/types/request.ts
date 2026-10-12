@@ -112,6 +112,14 @@ export type ToolMode =
 // ============================================================================
 
 export interface NormalizedRequest {
+  /** Cache-layout receipt: the default basis is the post-format/post-hook,
+   * post-clamp ProviderRequest, retaining semantic markers on APIs without
+   * cache_control. Adapters declaring cacheReceiptBasis: 'wire-request' use
+   * their first final onRequest observation instead (Anthropic and Bedrock).
+   * Emitted once per complete attempt or logical streaming round, not again
+   * for internal streaming refusal retries. Observability only; never sent
+   * to providers. A wire-request adapter must report onRequest to emit it. */
+  onCacheWireReceipt?: (receipt: import('../cache-wire-receipt.js').CacheWireReceipt) => void;
   /**
    * Explicitly own the loss of old inline images when the serialized request
    * exceeds the API byte cap: oldest images are replaced with loud
@@ -152,12 +160,30 @@ export interface NormalizedRequest {
    */
   promptCaching?: boolean;
 
+  /** Marker ownership policy. `cm-owned` disables every formatter-generated
+   * system/context-prefix marker; only normalized message breakpoints survive. */
+  cacheMarkers?: 'membrane-system' | 'cm-owned';
+
   /**
    * Cache TTL for Anthropic prompt caching.
    * '5m' (default) = 5 minute TTL
    * '1h' = 1 hour TTL (extended caching)
    */
-  cacheTtl?: '5m' | '1h';
+  cacheTtl?: '5m' | '1h' | '24h';
+
+  /**
+   * Float a trailing cache_control marker onto the newest message when the
+   * native tool loop rebuilds the request between tool-execution rounds, so
+   * the growing tool-round suffix caches incrementally (each round writes
+   * only its delta and cache-reads everything before it). Placed only from
+   * the request's *residual* breakpoint budget — the marker is withheld when
+   * upstream markers already occupy all 4 Anthropic cache_control slots —
+   * so upstream breakpoints are never displaced or stripped.
+   * Defaults to true (when promptCaching is enabled). Set false for context
+   * strategies whose request prefix churns between rounds, where a trailing
+   * marker would be pure cache-write cost.
+   */
+  floatingCacheMarker?: boolean;
 
   /**
    * Context prefix for simulacrum seeding.

@@ -194,9 +194,15 @@ export interface StreamOptions {
   /** Abort signal for cancellation */
   signal?: AbortSignal;
   
-  /** Request timeout */
+  /** Request timeout (per provider call, not per turn) */
   timeoutMs?: number;
-  
+
+  /**
+   * Abort a call whose stream goes silent for this many ms. Parity with
+   * YieldingStreamOptions.idleTimeoutMs; the adapter owns the default.
+   */
+  idleTimeoutMs?: number;
+
   /** Request ID for correlation */
   requestId?: string;
   
@@ -231,6 +237,17 @@ export interface StreamOptions {
   /** Maximum tool execution depth (default: 10) */
   maxToolDepth?: number;
 
+  /**
+   * Cap on AUTOMATIC false-positive stop-sequence resumptions per turn —
+   * membrane's own re-streams, not the caller's work. Tool rounds are
+   * deliberately not counted: they are governed by maxToolDepth and caller
+   * policy. Distinct from maxToolDepth on purpose: raising the tool budget
+   * for deep chains must not also raise how often a turn may re-send its
+   * full context on membrane's own initiative (issue #39). Exceeding it
+   * ends the turn with stopReason 'round_limit'. Default: 24.
+   */
+  maxResumptionRounds?: number;
+
   /** Timeout for each tool execution */
   toolTimeoutMs?: number;
 
@@ -250,6 +267,21 @@ export interface StreamOptions {
 export interface CompleteOptions {
   /** Abort signal for cancellation */
   signal?: AbortSignal;
+
+  /**
+   * Re-issue the request when it ends with `stop_reason: 'refusal'`, up to
+   * this many times. Default 0 (off).
+   *
+   * Safe and invisible on this path: nothing has been emitted to the caller
+   * yet, so a discarded attempt leaves no trace beyond its output tokens
+   * (the replay is cache-warm on input). The streaming equivalent needs the
+   * caller to handle `RetryingEvent` — see YieldingStreamOptions.
+   *
+   * Near the content-policy threshold a refusal is probabilistic rather than
+   * a property of the payload, so re-asking is the cheapest correct response
+   * — cheaper and far less invasive than rewriting the conversation.
+   */
+  refusalRetries?: number;
 
   /** Request timeout */
   timeoutMs?: number;

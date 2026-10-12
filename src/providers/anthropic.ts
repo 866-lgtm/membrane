@@ -3,7 +3,8 @@
  */
 
 import Anthropic, { type ClientOptions } from '@anthropic-ai/sdk';
-import { assertWithinByteBudget, shedImagesToFitByteBudget } from '../utils/image-media.js';
+import { stripEmptyTextBlocks, stripEmptyTextRequest } from '../utils/empty-text.js';
+import { resolveImageMediaType, isAcceptedImageMediaType, assertWithinByteBudget, shedImagesToFitByteBudget } from '../utils/image-media.js';
 import type {
   ProviderAdapter,
   ProviderRequest,
@@ -20,8 +21,12 @@ import {
   authError,
   serverError,
   abortError,
+  unsupportedError,
 } from '../types/index.js';
 import { flattenRootSchemaUnion } from './anthropic-tool-schema.js';
+import { assertTerminalEventObserved } from './utils.js';
+import { fetchWithCredentials, validateCredential, type CredentialContext, type CredentialResolver } from './credentials.js';
+import { CacheKeepalive, type CacheKeepaliveConfig } from '../cache-keepalive.js';
 
 // ============================================================================
 // Model capability gates
@@ -68,9 +73,76 @@ function noTemperatureSupport(model: string): boolean {
   return NO_TEMPERATURE_MODELS.some(prefix => model.startsWith(prefix));
 }
 
+/** Beta flag for thinking blocks between tool calls on pre-4.6 Claude 4.
+ *  Shared with the Bedrock adapter, where it rides in the request body
+ *  (`anthropic_beta`) instead of an HTTP header. */
+export const INTERLEAVED_THINKING_BETA = 'interleaved-thinking-2025-05-14';
+
+/**
+ * Interleaved thinking (thinking blocks between tool calls) is native from
+ * Opus/Sonnet 4.6 onward; earlier Claude 4 models only do it behind the
+ * `interleaved-thinking-2025-05-14` beta flag. Matches Claude 4 ids with a
+ * minor version below 6 — dated snapshots (claude-opus-4-1-20250805), bare
+ * bases (claude-opus-4), and date-only 4.0 ids (claude-opus-4-20250514) are
+ * all covered, as are gateway-prefixed ids ('anthropic/claude-opus-4-5').
+ * Claude 3.x never matches (no interleaved support, beta or not); 4.6+ and
+ * the 5-series need no flag.
+ */
+export function needsInterleavedThinkingBeta(model: string): boolean {
+  const m = /claude-(?:opus|sonnet|haiku)-4(?:-(\d+))?/.exec(model);
+  if (!m) return false;
+  const minor = m[1];
+  if (minor === undefined) return true; // bare 'claude-opus-4'
+  if (minor.length >= 8) return true;   // 8-digit date right after the major = a 4.0 id
+  return parseInt(minor, 10) < 6;
+}
+
+/** Pull any anthropic-beta value out of a ClientOptions defaultHeaders bag,
+ *  which the SDK types as record | entries-array | Headers. Case-insensitive
+ *  on the key; non-string values (explicit null override, arrays) are treated
+ *  as absent. */
+function extractBetaHeader(headers: ClientOptions['defaultHeaders']): string | undefined {
+  if (!headers) return undefined;
+  if (typeof (headers as Headers).get === 'function') {
+    return (headers as Headers).get('anthropic-beta') ?? undefined;
+  }
+  const entries = Array.isArray(headers)
+    ? headers
+    : Object.entries(headers as Record<string, unknown>);
+  for (const [key, value] of entries) {
+    if (String(key).toLowerCase() === 'anthropic-beta' && typeof value === 'string') {
+      return value;
+    }
+  }
+  return undefined;
+}
+
+/** Resolve whether a thinking config is enabled on a request. Thinking can
+ *  arrive top-level OR smuggled through `extra` (see the sampling gate in
+ *  buildRequest) — both the sampling strip and the beta header must agree on
+ *  one answer, so they share this resolver. Exported for the Bedrock adapter,
+ *  which applies the same interleaved-thinking gate to its request body. */
+export function thinkingEnabled(request: ProviderRequest): boolean {
+  const extraThinking = (request.extra as { thinking?: { type?: string } } | undefined)?.thinking;
+  const thinkingConfig = request.thinking ?? extraThinking;
+  return thinkingConfig !== undefined && thinkingConfig.type !== 'disabled';
+}
+
 // ============================================================================
 // Adapter Configuration
 // ============================================================================
+
+/**
+ * What the dynamicHeaders callback is told about the request it stamps.
+ * `lane` names the transport shape: 'stream' is the conversational turn loop,
+ * 'complete' the non-streamed lane (compression, side-calls, keepalive
+ * touches). A stamp that describes WHY the agent's turn fired belongs on the
+ * stream lane only — a compression call running in the background is not the
+ * turn, and stamping it with the turn's cause would lie to the ledger.
+ */
+export interface DynamicHeadersContext {
+  lane: 'stream' | 'complete';
+}
 
 export interface AnthropicAdapterConfig {
   /** API key (defaults to ANTHROPIC_API_KEY env var) */
@@ -81,16 +153,42 @@ export interface AnthropicAdapterConfig {
    * is allowed to resolve environment auth). If explicitly provided, API-key
    * auth is disabled so requests do not send both auth schemes.
    */
-  authToken?: string | null;
+  authToken?: string | null | ((context: CredentialContext) => string | Promise<string>);
+
+  /** Resolve a bearer token and associated headers per HTTP attempt. Takes
+   * precedence over authToken/apiKey; refreshed once after HTTP 401. Applies
+   * to complete, stream, and cache-keepalive requests. */
+  credentials?: CredentialResolver;
   
   /** Base URL override */
   baseURL?: string;
 
   /** Default headers to include with Anthropic requests */
   defaultHeaders?: ClientOptions['defaultHeaders'];
+
+  /**
+   * Live per-request headers, evaluated at request time — for values that
+   * change between calls (e.g. household telemetry stamps such as
+   * `x-gate-debt-chunks`, read by an inference gateway and stripped there
+   * before the vendor ever sees them). Merged over the per-request beta
+   * headers for the OUTGOING request only; cache-keepalive replays
+   * deliberately resend their recorded headers, so a telemetry stamp is
+   * never replayed stale — an unstamped touch is honest, a stale stamp lies.
+   * null/undefined/'' values are dropped.
+   */
+  dynamicHeaders?: (ctx?: DynamicHeadersContext) => Record<string, string | number | null | undefined>;
   
   /** Default max tokens */
   defaultMaxTokens?: number;
+
+  /**
+   * Prompt-cache keepalive: hold this agent's cached prefix warm across idle
+   * gaps by replaying the last request with `max_tokens: 0`, which refreshes
+   * the entry's TTL at cache-READ price instead of letting it expire into a
+   * 2x cache write on the next wake. See `../cache-keepalive.ts`.
+   * Pass `{ enabled: false }` to turn off.
+   */
+  cacheKeepalive?: CacheKeepaliveConfig;
 }
 
 // ============================================================================
@@ -99,17 +197,49 @@ export interface AnthropicAdapterConfig {
 
 export class AnthropicAdapter implements ProviderAdapter {
   readonly name = 'anthropic';
+  readonly cacheReceiptBasis = 'wire-request' as const;
+
+  /**
+   * Verified live 2026-08-25 (claude-haiku-4-5, 4,650-token cached system
+   * prompt): call 1 returned input_tokens 8 / cache_creation_input_tokens 4650,
+   * call 2 input_tokens 8 / cache_read_input_tokens 4650. `input_tokens` never
+   * counts the cached span.
+   */
+  readonly usageCacheConvention = 'cache-excluded' as const;
   private client: Anthropic;
+  private readonly credentials?: CredentialResolver;
   private defaultMaxTokens: number;
+  /** Any anthropic-beta value from defaultHeaders (e.g. the oauth beta for
+   *  subscription tokens). Per-request headers REPLACE same-key defaults in
+   *  the SDK rather than merging, so when we add a per-request beta we must
+   *  re-carry this one alongside it or auth breaks. */
+  private defaultBeta: string | undefined;
+  /** Holds idle agents' cached prefixes warm; undefined when disabled. */
+  readonly cacheKeepalive: CacheKeepalive | undefined;
+  /** Live per-request header source (see AnthropicAdapterConfig.dynamicHeaders). */
+  private readonly dynamicHeaders?: (ctx?: DynamicHeadersContext) => Record<string, string | number | null | undefined>;
 
   constructor(config: AnthropicAdapterConfig = {}) {
     const clientOptions: ClientOptions = {
       baseURL: config.baseURL,
       defaultHeaders: config.defaultHeaders,
     };
+    this.defaultBeta = extractBetaHeader(config.defaultHeaders);
+    this.dynamicHeaders = config.dynamicHeaders;
 
-    if (config.authToken !== undefined) {
-      clientOptions.authToken = config.authToken;
+    const authToken = config.authToken;
+    const credentials: CredentialResolver | undefined = config.credentials ?? (typeof authToken === 'function'
+      ? async (context: CredentialContext) => ({ token: await authToken(context) })
+      : undefined);
+    this.credentials = credentials;
+    if (credentials) {
+      // Satisfy SDK auth validation without freezing a real credential. The
+      // fetch seam replaces this placeholder before every network attempt,
+      // including the SDK's stream and cache-keepalive transports.
+      clientOptions.authToken = 'membrane-resolved-at-request-time';
+      clientOptions.apiKey = null;
+    } else if (authToken !== undefined) {
+      clientOptions.authToken = authToken as string | null;
       clientOptions.apiKey = null;
     } else {
       clientOptions.apiKey = config.apiKey;
@@ -117,6 +247,67 @@ export class AnthropicAdapter implements ProviderAdapter {
 
     this.client = new Anthropic(clientOptions);
     this.defaultMaxTokens = config.defaultMaxTokens ?? 4096;
+
+    this.cacheKeepalive = config.cacheKeepalive?.enabled === false
+      ? undefined
+      : new CacheKeepalive(
+          // Replay path. Deliberately bypasses buildRequest(): the payload is
+          // the already-built wire request from a real call, and rebuilding it
+          // risks a byte diff that silently converts a 0.1x read into a 2x write.
+          async (wire, headers) => this.createMessage(
+            wire as unknown as Anthropic.MessageCreateParamsNonStreaming, headers,
+          ),
+          config.cacheKeepalive ?? {},
+        );
+  }
+
+  /** One SDK operation owns its failure state: concurrent calls cannot
+   * overwrite each other's auth error or cancel each other's requests. */
+  private credentialSession(signal?: AbortSignal) {
+    const credentials = this.credentials;
+    if (!credentials) return { client: this.client, signal, failure: () => undefined };
+    const abort = new AbortController();
+    const combined = signal ? AbortSignal.any([signal, abort.signal]) : abort.signal;
+    let failure: MembraneError | undefined;
+    const client = this.client.withOptions({
+      fetch: (input, init) => {
+        const headers = new Headers(init?.headers);
+        headers.delete('x-api-key');
+        return fetchWithCredentials(input, { ...init, headers }, async context => {
+          try {
+            const credential = await credentials(context);
+            validateCredential(credential);
+            const resolvedHeaders = new Headers(credential.headers);
+            resolvedHeaders.delete('x-api-key');
+            return { ...credential, headers: Object.fromEntries(resolvedHeaders) };
+          } catch (error) {
+            if (combined.aborted) throw error;
+            failure = error instanceof MembraneError ? error : authError(
+              `Credential resolution failed: ${error instanceof Error ? error.message : String(error)}`, error,
+            );
+            // SDK 0.52 retries thrown fetch errors as connection failures.
+            // Abort this operation to bypass that loop, then restore the
+            // original error at the complete/stream/keepalive boundary.
+            abort.abort(failure);
+            throw failure;
+          }
+        });
+      },
+    });
+    return { client, signal: combined, failure: () => failure };
+  }
+
+  private async createMessage(
+    request: Anthropic.MessageCreateParamsNonStreaming,
+    headers?: Record<string, string>,
+    signal?: AbortSignal,
+  ): Promise<Anthropic.Message> {
+    const session = this.credentialSession(signal);
+    try {
+      return await session.client.messages.create(request, { headers, signal: session.signal });
+    } catch (error) {
+      throw session.failure() ?? error;
+    }
   }
 
   supportsModel(modelId: string): boolean {
@@ -131,10 +322,15 @@ export class AnthropicAdapter implements ProviderAdapter {
     const fullRequest = { ...anthropicRequest, stream: false as const };
     options?.onRequest?.(fullRequest);
 
+    const headers = this.betaHeaders(request);
+    this.cacheKeepalive?.record(
+      fullRequest as unknown as Record<string, unknown>, headers, 'complete',
+    );
+
     try {
-      const response = await this.client.messages.create(fullRequest, {
-        signal: options?.signal,
-      });
+      const response = await this.createMessage(
+        fullRequest, this.liveHeaders(headers, 'complete'), options?.signal,
+      );
 
       return this.parseResponse(response, fullRequest);
     } catch (error) {
@@ -152,13 +348,39 @@ export class AnthropicAdapter implements ProviderAdapter {
     const fullRequest = { ...anthropicRequest, stream: true };
     options?.onRequest?.(fullRequest);
 
+    // Snapshot the primary lane's prefix so it can be held warm across idle
+    // gaps. `stream: true` is dropped at replay time (transport, not cache key).
+    this.cacheKeepalive?.record(
+      fullRequest as unknown as Record<string, unknown>,
+      this.betaHeaders(request),
+      'stream',
+    );
+
     // Idle timeout: abort if no SSE event arrives within the deadline.
     // The SDK's timeout only covers the initial HTTP response headers;
     // once streaming starts, a silently dropped connection waits forever.
-    const idleMs = options?.idleTimeoutMs ?? 120_000;
+    // Default raised 120s → 600s (2026-07-20): on Opus 4.7+/Fable-class models
+    // thinking streams with display:"omitted" by default — a long think emits
+    // NO deltas, and the SDK swallows SSE ping keepalives, so a healthy
+    // request can legitimately be silent for minutes mid-stream. At 120s the
+    // watchdog repeatedly killed real, billing, actively-thinking turns
+    // (Cairn, 2026-07-20: every >120s think died for an hour straight). 600s
+    // matches the SDK's own request timeout; the watchdog now only catches
+    // truly dead connections, at the cost of slower detection.
+    const idleMs = options?.idleTimeoutMs ?? 600_000;
+    // TTFT can legitimately exceed the inter-event idle: on a large context
+    // with a cache miss, the API sends only SSE `ping` keepalives until
+    // message_start — and the SDK swallows pings before they reach this loop
+    // (core/streaming: `if (sse.event === 'ping') continue`). The watchdog is
+    // therefore BLIND until the first real event; killing at idleMs turned
+    // every long-TTFT request into a spurious "idle timeout" (Cairn, 600k
+    // context, 2026-07-20: repeated deaths at exactly 120s). Give the first
+    // event a much longer deadline; keep the tight idle for gaps after that.
+    const firstEventMs = options?.firstEventTimeoutMs ?? Math.max(idleMs, 600_000);
     const idleAbort = new AbortController();
     let idleTimer: ReturnType<typeof setTimeout> | null = null;
     let idleTimedOut = false;
+    let sawEvent = false;
 
     // Link caller's signal so external cancellation still works
     const onExternalAbort = () => idleAbort.abort();
@@ -169,14 +391,19 @@ export class AnthropicAdapter implements ProviderAdapter {
 
     const resetIdleTimer = () => {
       if (idleTimer) clearTimeout(idleTimer);
-      idleTimer = setTimeout(() => { idleTimedOut = true; idleAbort.abort(); }, idleMs);
+      idleTimer = setTimeout(
+        () => { idleTimedOut = true; idleAbort.abort(); },
+        sawEvent ? idleMs : firstEventMs,
+      );
     };
 
     resetIdleTimer();
+    const session = this.credentialSession(idleAbort.signal);
 
     try {
-      const stream = await this.client.messages.stream(anthropicRequest, {
-        signal: idleAbort.signal,
+      const stream = await session.client.messages.stream(anthropicRequest, {
+        signal: session.signal,
+        headers: this.liveHeaders(this.betaHeaders(request), 'stream'),
       });
 
       // Accumulate response metadata from SSE events directly, so we can
@@ -192,6 +419,7 @@ export class AnthropicAdapter implements ProviderAdapter {
       let inferenceGeo: string | undefined;
       let serviceTier: string | undefined;
       let stopReason: string = 'end_turn';
+      let sawTerminalEvent = false;
       let stopSequence: string | undefined;
       let stopDetails: unknown;
 
@@ -207,8 +435,46 @@ export class AnthropicAdapter implements ProviderAdapter {
       // thinking blocks with no thinking_delta at all (signature only).
       const wrapThinkingTags = options?.wrapThinkingTags === true;
       let thinkingTagOpen = false;
+      // Index of a block that has started and not yet been stopped. A stream
+      // can end with one still open: measured live against claude-haiku-4-5
+      // (2026-08-25), a tool call truncated by max_tokens emits
+      // content_block_start + input_json_delta fragments and then goes
+      // straight to message_delta — no content_block_stop at all.
+      let openBlockIndex = -1;
+
+      const finalizeContentBlock = (blockIdx: number, sawBlockStop: boolean): void => {
+        const block = contentBlocks[blockIdx];
+        if (block) {
+          if (block.type === 'text') {
+            block.text = currentBlockContent;
+          } else if (block.type === 'thinking') {
+            block.thinking = currentBlockContent;
+            if (thinkingTagOpen) {
+              callbacks.onChunk('</thinking>\n');
+              thinkingTagOpen = false;
+            }
+          } else if (block.type === 'tool_use') {
+            if (!sawBlockStop) {
+              // Arguments never finished arriving, so `input` is still the
+              // empty object content_block_start carried — a plausible no-arg
+              // call that nothing downstream can distinguish from a real one.
+              block.unparseableInput = currentBlockInputJson;
+            } else if (currentBlockInputJson) {
+              try {
+                block.input = JSON.parse(currentBlockInputJson);
+              } catch {
+                // Same fabrication, reached by a block that did stop: keep the
+                // raw accumulation and mark it so consumers can refuse.
+                block.unparseableInput = currentBlockInputJson;
+              }
+            }
+          }
+        }
+        callbacks.onContentBlock?.(blockIdx, contentBlocks[blockIdx]);
+      };
 
       for await (const event of stream) {
+        sawEvent = true;
         resetIdleTimer();
         if (event.type === 'message_start') {
           model = event.message.model;
@@ -231,6 +497,7 @@ export class AnthropicAdapter implements ProviderAdapter {
 
         } else if (event.type === 'content_block_start') {
           currentBlockIndex = event.index;
+          openBlockIndex = event.index;
           currentBlockContent = '';
           currentBlockInputJson = '';
           contentBlocks[currentBlockIndex] = { ...event.content_block };
@@ -264,22 +531,8 @@ export class AnthropicAdapter implements ProviderAdapter {
 
         } else if (event.type === 'content_block_stop') {
           // Finalize block — use event.index for defensive correctness
-          const blockIdx = (event as { index: number }).index;
-          const block = contentBlocks[blockIdx];
-          if (block) {
-            if (block.type === 'text') {
-              block.text = currentBlockContent;
-            } else if (block.type === 'thinking') {
-              block.thinking = currentBlockContent;
-              if (thinkingTagOpen) {
-                callbacks.onChunk('</thinking>\n');
-                thinkingTagOpen = false;
-              }
-            } else if (block.type === 'tool_use' && currentBlockInputJson) {
-              try { block.input = JSON.parse(currentBlockInputJson); } catch { /* partial JSON */ }
-            }
-          }
-          callbacks.onContentBlock?.(blockIdx, contentBlocks[blockIdx]);
+          finalizeContentBlock((event as { index: number }).index, true);
+          openBlockIndex = -1;
 
         } else if (event.type === 'message_delta') {
           // All content blocks are finalized by the time message_delta arrives.
@@ -291,6 +544,7 @@ export class AnthropicAdapter implements ProviderAdapter {
             stop_details?: unknown;
           };
           stopReason = delta.stop_reason ?? 'end_turn';
+          sawTerminalEvent = true;
           stopSequence = delta.stop_sequence ?? undefined;
           // stop_details carries refusal metadata (e.g., category: 'reasoning_extraction')
           stopDetails = delta.stop_details ?? undefined;
@@ -315,8 +569,21 @@ export class AnthropicAdapter implements ProviderAdapter {
       if (idleTimer) clearTimeout(idleTimer);
       options?.signal?.removeEventListener('abort', onExternalAbort);
 
+      // A block still open here never received its content_block_stop: the
+      // turn ended mid-block. Finalize it so the accumulated text is not lost
+      // and a truncated tool call is marked rather than persisted as `{}`.
+      if (openBlockIndex >= 0) {
+        finalizeContentBlock(openBlockIndex, false);
+        openBlockIndex = -1;
+      }
+
       // Force-close the HTTP connection so we don't block on SSE drain
       try { stream.controller.abort(); } catch { /* already closed */ }
+
+      // message_delta is this adapter's terminal event — the loop breaks on
+      // it. Falling out of the for-await without one means the SSE connection
+      // closed mid-turn, and stopReason is still its 'end_turn' initialiser.
+      assertTerminalEventObserved(sawTerminalEvent, 'Anthropic', fullRequest);
 
       return {
         content: contentBlocks,
@@ -358,17 +625,55 @@ export class AnthropicAdapter implements ProviderAdapter {
       if (idleTimer) clearTimeout(idleTimer);
       options?.signal?.removeEventListener('abort', onExternalAbort);
 
-      if (idleTimedOut && error instanceof Error && error.name === 'AbortError') {
+      // Our own idle watchdog fired: whatever shape the SDK wrapped the
+      // abort into (AbortError, APIUserAbortError "Request was aborted.",
+      // a connection error), the CAUSE is the stalled stream — classify as
+      // the retryable timeout, never as a user abort / unknown error.
+      if (idleTimedOut) {
         throw new MembraneError({
           type: 'timeout',
-          message: `SSE stream idle timeout — no events received within ${idleMs}ms`,
+          message: sawEvent
+            ? `SSE stream idle timeout — no events received within ${idleMs}ms`
+            : `SSE stream first-event timeout — no message_start within ${firstEventMs}ms (TTFT deadline)`,
           retryable: true,
           rawError: error,
           rawRequest: fullRequest,
         });
       }
-      throw this.handleError(error, fullRequest);
+      throw this.handleError(session.failure() ?? error, fullRequest);
     }
+  }
+
+  /** Per-request headers for both create() and stream(): the interleaved-
+   *  thinking beta when thinking is enabled on a pre-4.6 Claude 4 model.
+   *  Any default anthropic-beta (oauth) is re-carried in the same header —
+   *  the SDK replaces same-key defaults instead of merging, and the API
+   *  accepts comma-separated betas. Undefined when nothing to add, so the
+   *  defaults apply untouched. */
+  /** Base headers + the live dynamicHeaders stamp. Request time only: the
+   *  keepalive recorder receives the base headers BEFORE this merge, so
+   *  replayed touches never carry a stale telemetry value. */
+  private liveHeaders(base: Record<string, string> | undefined, lane: DynamicHeadersContext['lane']): Record<string, string> | undefined {
+    const dyn = this.dynamicHeaders?.({ lane });
+    if (!dyn) return base;
+    const out: Record<string, string> = { ...(base ?? {}) };
+    for (const [k, v] of Object.entries(dyn)) {
+      if (v !== null && v !== undefined && v !== '') out[k] = String(v);
+    }
+    return Object.keys(out).length ? out : undefined;
+  }
+
+  private betaHeaders(request: ProviderRequest): Record<string, string> | undefined {
+    if (!thinkingEnabled(request) || !needsInterleavedThinkingBeta(request.model)) {
+      return undefined;
+    }
+    // Set-join so a default that already carries the interleaved beta
+    // doesn't emit it twice (the API tolerates duplicates; this is hygiene).
+    const betas = new Set(
+      (this.defaultBeta ?? '').split(',').map((b) => b.trim()).filter(Boolean),
+    );
+    betas.add(INTERLEAVED_THINKING_BETA);
+    return { 'anthropic-beta': [...betas].join(',') };
   }
 
   private buildRequest(request: ProviderRequest): Anthropic.MessageCreateParams {
@@ -383,9 +688,20 @@ export class AnthropicAdapter implements ProviderAdapter {
       return {
         ...msg,
         content: msg.content.map((block: any) => {
-          if (block.type === 'image' && block.sourceUrl !== undefined) {
+          if (block.type === 'image') {
             const { sourceUrl, ...rest } = block;
-            return rest;
+            if (block.source?.type !== 'base64') return rest;
+            // Overwrite media_type in place: a wire-shaped source keeps its key
+            // order, so an already-correct image serializes to the same bytes
+            // as before; only camelCase input gains a trailing media_type.
+            const { mediaType, ...source } = block.source;
+            return {
+              ...rest,
+              source: {
+                ...source,
+                media_type: detectImageMediaType(source.data, source.media_type ?? mediaType),
+              },
+            };
           }
           if (block.type === 'tool_result' && Array.isArray(block.content)) {
             return {
@@ -436,9 +752,7 @@ export class AnthropicAdapter implements ProviderAdapter {
     // otherwise `extra: { thinking, temperature }` reproduces the exact 400
     // this gate exists to prevent (same bug class as the extra-sampling bypass,
     // one field over).
-    const extraThinking = (request.extra as { thinking?: { type?: string } } | undefined)?.thinking;
-    const thinkingConfig = request.thinking ?? extraThinking;
-    const thinkingOn = thinkingConfig !== undefined && thinkingConfig.type !== 'disabled';
+    const thinkingOn = thinkingEnabled(request);
 
     if (request.temperature !== undefined && !stripSampling && !thinkingOn) {
       params.temperature = request.temperature;
@@ -505,6 +819,7 @@ export class AnthropicAdapter implements ProviderAdapter {
       Object.assign(params, rest);
     }
 
+    stripEmptyTextRequest(params);
     return params;
   }
 
@@ -526,6 +841,10 @@ export class AnthropicAdapter implements ProviderAdapter {
   }
 
   private handleError(error: unknown, rawRequest?: unknown): MembraneError {
+    // Already-classified failures (e.g. the stream-integrity guards) keep
+    // their type and retryability instead of being re-derived from a string.
+    if (error instanceof MembraneError) return error;
+
     if (error instanceof Anthropic.APIError) {
       // Mid-stream SSE `error` events are rethrown by the SDK as APIError
       // with status === undefined (sdk core/streaming.js), so the HTTP
@@ -556,7 +875,12 @@ export class AnthropicAdapter implements ProviderAdapter {
         return authError(message, error, rawRequest);
       }
 
-      if (message.includes('context') || message.includes('too long')) {
+      // Context-length is a client-side request-shape problem — it only ever
+      // arrives as a 400 (invalid_request_error). Without the status guard, a
+      // transient 5xx whose body happens to contain "context" or "too long"
+      // (e.g. "Internal error: context processing failed") was misclassified
+      // as non-retryable context_length, silently suppressing retries.
+      if (status === 400 && (message.includes('context') || message.includes('too long'))) {
         return contextLengthError(message, error, rawRequest);
       }
 
@@ -595,7 +919,12 @@ export class AnthropicAdapter implements ProviderAdapter {
       }
     }
 
-    if (error instanceof Error && error.name === 'AbortError') {
+    if (
+      error instanceof Error &&
+      (error.name === 'AbortError' ||
+        error.name === 'APIUserAbortError' ||
+        error.message === 'Request was aborted.')
+    ) {
       return abortError(undefined, rawRequest);
     }
 
@@ -634,7 +963,7 @@ function toAnthropicToolResultContent(
   blocks: ContentBlock[],
 ): Array<Anthropic.TextBlockParam | Anthropic.ImageBlockParam> {
   const out: Array<Anthropic.TextBlockParam | Anthropic.ImageBlockParam> = [];
-  for (const block of blocks) {
+  for (const block of stripEmptyTextBlocks(blocks)) {
     if (block.type === 'text') {
       out.push({ type: 'text', text: block.text });
     } else if (block.type === 'image') {
@@ -643,7 +972,7 @@ function toAnthropicToolResultContent(
           type: 'image',
           source: {
             type: 'base64',
-            media_type: detectImageMediaType(block.source.data, block.source.mediaType as string) as 'image/jpeg' | 'image/png' | 'image/gif' | 'image/webp',
+            media_type: detectImageMediaType(block.source.data, block.source.mediaType ?? (block.source as { media_type?: string }).media_type) as 'image/jpeg' | 'image/png' | 'image/gif' | 'image/webp',
             data: block.source.data,
           },
         });
@@ -667,28 +996,17 @@ function toAnthropicToolResultContent(
  *  can lose or mislabel mediaType (e.g. a PNG tagged image/jpeg), which the
  *  Anthropic API rejects with a 400. Trust the bytes; fall back to the declared
  *  type, then jpeg. */
-function detectImageMediaType(data: string | undefined, fallback?: string): string {
-  try {
-    const b = Buffer.from((data || "").slice(0, 24), "base64");
-    if (b[0]===0x89&&b[1]===0x50&&b[2]===0x4e&&b[3]===0x47) return "image/png";
-    if (b[0]===0xff&&b[1]===0xd8&&b[2]===0xff) return "image/jpeg";
-    if (b[0]===0x47&&b[1]===0x49&&b[2]===0x46) return "image/gif";
-    if (b[0]===0x52&&b[1]===0x49&&b[2]===0x46) return "image/webp";
-  } catch {}
-  const f = (fallback || "").toLowerCase();
-  if (f==="image/jpeg"||f==="image/png"||f==="image/gif"||f==="image/webp") return f;
-  return "image/jpeg";
+export function detectImageMediaType(data: string | undefined, fallback?: string): string {
+  const mediaType = resolveImageMediaType(data, fallback);
+  return isAcceptedImageMediaType(mediaType) ? mediaType! : 'image/jpeg';
 }
 
 export function toAnthropicContent(blocks: ContentBlock[]): Anthropic.ContentBlockParam[] {
   const result: Anthropic.ContentBlockParam[] = [];
   
-  for (const block of blocks) {
+  for (const block of stripEmptyTextBlocks(blocks)) {
     switch (block.type) {
       case 'text': {
-        // Empty text blocks (including zero-width rawItem carriers for opaque
-        // provider-native items) are rejected by the Anthropic API — drop them.
-        if (block.text === '') break;
         const textBlock: any = { type: 'text', text: block.text };
         // Preserve cache_control if present
         if (block.cache_control) {
@@ -704,7 +1022,7 @@ export function toAnthropicContent(blocks: ContentBlock[]): Anthropic.ContentBlo
             type: 'image',
             source: {
               type: 'base64',
-              media_type: detectImageMediaType(block.source.data, block.source.mediaType as string) as 'image/jpeg' | 'image/png' | 'image/gif' | 'image/webp',
+              media_type: detectImageMediaType(block.source.data, block.source.mediaType ?? (block.source as { media_type?: string }).media_type) as 'image/jpeg' | 'image/png' | 'image/gif' | 'image/webp',
               data: block.source.data,
             },
           });
@@ -723,6 +1041,23 @@ export function toAnthropicContent(blocks: ContentBlock[]): Anthropic.ContentBlo
             type: 'base64',
             media_type: block.source.mediaType as 'application/pdf',
             data: block.source.data,
+          },
+          // Anthropic's document block carries the filename as `title`; it was
+          // being dropped, so the model lost the one hint about what the PDF is.
+          ...(block.filename ? { title: block.filename } : {}),
+        });
+        break;
+
+      case 'generated_image':
+        // A provider-generated image is a base64 image with a MIME type, which
+        // is exactly Anthropic's image block — carrying it across costs nothing
+        // and lets an image Gemini produced re-enter Anthropic history.
+        result.push({
+          type: 'image',
+          source: {
+            type: 'base64',
+            media_type: block.mimeType as 'image/jpeg' | 'image/png' | 'image/gif' | 'image/webp',
+            data: block.data,
           },
         });
         break;
@@ -763,10 +1098,51 @@ export function toAnthropicContent(blocks: ContentBlock[]): Anthropic.ContentBlo
           data: (block as any).data,
         } as any);
         break;
+
+      default: {
+        // The REQUEST path cannot degrade gracefully: a dropped block reaches
+        // the model as an absence, and it answers about content it was never
+        // shown. `audio` and `video` have no Anthropic Messages representation
+        // at all, and a block type added later would silently join them. Fail
+        // loudly at the boundary instead — the caller can strip or transcode.
+        const unsupportedType = (block as { type?: string }).type ?? 'unknown';
+        throw unsupportedError(
+          `Anthropic has no representation for a "${unsupportedType}" content block, and dropping`
+          + ' it would send the model a message missing content the caller supplied.'
+          + ' Remove or convert the block before sending it on this provider.'
+        );
+      }
     }
   }
 
   return result;
+}
+
+/** Unrecognised response block types warn once each, not once per conversion. */
+const warnedUnconvertibleResponseBlocks = new Set<string>();
+
+/**
+ * The RESPONSE path can degrade gracefully where the request path cannot: the
+ * provider's own block is in hand, so keeping it verbatim on a zero-width
+ * carrier loses nothing recoverable and lets formatters replay it. Warn once
+ * per type so a new provider block type surfaces without flooding the log.
+ */
+function preserveUnconvertibleBlock(block: unknown, sourceLabel: string): ContentBlock {
+  const blockType = (block as { type?: string })?.type ?? 'unknown';
+  if (!warnedUnconvertibleResponseBlocks.has(blockType)) {
+    warnedUnconvertibleResponseBlocks.add(blockType);
+    console.warn(
+      `[membrane:${sourceLabel}] no normalized ContentBlock for provider block type`
+      + ` "${blockType}" — preserving it verbatim as a rawItem carrier so it can be`
+      + ' replayed, but its content is not visible to normalized consumers.'
+    );
+  }
+  return { type: 'text', text: '', rawItem: block } as ContentBlock;
+}
+
+/** Test seam: the once-per-type warn latch is process-wide otherwise. */
+export function resetUnconvertibleBlockWarnings(): void {
+  warnedUnconvertibleResponseBlocks.clear();
 }
 
 /**
@@ -799,11 +1175,14 @@ export function fromAnthropicContent(blocks: Anthropic.ContentBlock[]): ContentB
         break;
         
       default:
-        // Handle redacted_thinking or unknown types
         if ((block as any).type === 'redacted_thinking') {
           // Preserve the encrypted `data` payload — without it the block
           // cannot be round-tripped and prior reasoning is lost.
           result.push({ type: 'redacted_thinking', data: (block as any).data } as any);
+        } else {
+          // server_tool_use, web_search_tool_result, search_result, mcp_tool_use
+          // and anything Anthropic adds later used to fall out here silently.
+          result.push(preserveUnconvertibleBlock(block, 'anthropic'));
         }
         break;
     }

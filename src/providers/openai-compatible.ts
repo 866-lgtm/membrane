@@ -30,7 +30,7 @@ import {
   abortError,
   networkError,
 } from '../types/index.js';
-import { safeParseJson, createCombinedSignal, SSELineParser } from './utils.js';
+import { safeParseJson, textOnlyToolResultContent, createCombinedSignal, SSELineParser, isDeadlineAbort, deadlineTimeoutError, throwOnStreamErrorFrame, assertTerminalEventObserved } from './utils.js';
 
 // ============================================================================
 // Types
@@ -51,7 +51,24 @@ interface OpenAIMessage {
    *  channel from `content`). Captured into a thinking block, and re-sent on
    *  prior assistant turns to preserve chain-of-thought. */
   reasoning?: string;
+  /** Same trace under the DeepSeek spelling, used e.g. by Xiaomi's official
+   *  MiMo API in both messages and stream deltas. Read as an alias of
+   *  `reasoning`; `reasoning` wins when a backend sends both. */
+  reasoning_content?: string;
   reasoning_details?: unknown;
+}
+
+/**
+ * The reasoning trace of a message or stream delta, under either spelling.
+ * `reasoning` wins unless it is blank while `reasoning_content` has substance —
+ * a whitespace-only `reasoning` must not hide the real trace. Whitespace is not
+ * trimmed away otherwise: a lone ' ' or '\n' stream delta is part of the trace.
+ */
+function reasoningOf(m: { reasoning?: unknown; reasoning_content?: unknown } | undefined): string | undefined {
+  const reasoning = typeof m?.reasoning === 'string' ? m.reasoning : undefined;
+  const alias = typeof m?.reasoning_content === 'string' ? m.reasoning_content : undefined;
+  if (reasoning && (reasoning.trim() || !alias?.trim())) return reasoning;
+  return alias ?? reasoning;
 }
 
 /**
@@ -99,6 +116,9 @@ interface OpenAIResponse {
     prompt_tokens: number;
     completion_tokens: number;
     total_tokens: number;
+    prompt_tokens_details?: {
+      cached_tokens?: number;
+    };
   };
 }
 
@@ -136,7 +156,7 @@ export interface OpenAICompatibleAdapterConfig {
  */
 function splitToolResultContent(content: unknown): { text: string; imageParts: OpenAIContentPart[] } {
   if (typeof content === 'string') return { text: content, imageParts: [] };
-  if (!Array.isArray(content)) return { text: JSON.stringify(content), imageParts: [] };
+  if (!Array.isArray(content)) return { text: textOnlyToolResultContent(content), imageParts: [] };
 
   const imageParts: OpenAIContentPart[] = [];
   const rest: any[] = [];
@@ -153,17 +173,25 @@ function splitToolResultContent(content: unknown): { text: string; imageParts: O
       rest.push(block);
     }
   }
-  if (imageParts.length === 0) return { text: JSON.stringify(content), imageParts };
+  if (imageParts.length === 0) return { text: textOnlyToolResultContent(content), imageParts };
 
   const note = `[${imageParts.length === 1 ? 'image' : `${imageParts.length} images`} from this tool result attached in the following user message]`;
   const restText = rest.length === 0
     ? ''
-    : rest.every(b => b?.type === 'text') ? rest.map(b => b.text).join('\n') : JSON.stringify(rest);
+    : rest.every(b => b?.type === 'text') ? rest.map(b => b.text).join('\n') : textOnlyToolResultContent(rest);
   return { text: restText ? `${restText}\n${note}` : note, imageParts };
 }
 
 export class OpenAICompatibleAdapter implements ProviderAdapter {
   readonly name: string;
+
+  /**
+   * NOT ESTABLISHED, and not establishable per-adapter: this fronts arbitrary
+   * OpenAI-shaped third-party endpoints whose caching semantics vary by vendor.
+   * Moot today — the adapter never populates `cacheReadTokens`, so the warn
+   * never fires; it becomes live the moment cache reporting is added here.
+   */
+  readonly usageCacheConvention = 'unknown' as const;
   private baseURL: string;
   private apiKey: string;
   private defaultMaxTokens: number;
@@ -209,6 +237,10 @@ export class OpenAICompatibleAdapter implements ProviderAdapter {
   ): Promise<ProviderResponse> {
     const openAIRequest = this.buildRequest(request);
     openAIRequest.stream = true;
+    // OpenAI only emits the final usage chunk for Chat Completions streams
+    // when explicitly requested. Without this, live agent calls report zero
+    // input/cache tokens even though the usage dashboard records them.
+    openAIRequest.stream_options = { include_usage: true };
     options?.onRequest?.(openAIRequest);
 
     const { signal: combinedSignal, cleanup } = createCombinedSignal(options?.signal, options?.timeoutMs);
@@ -235,59 +267,96 @@ export class OpenAICompatibleAdapter implements ProviderAdapter {
       let accumulated = '';
       let reasoning = '';
       let finishReason = 'stop';
+      let sawTerminalEvent = false;
       let toolCalls: OpenAIToolCall[] = [];
+      let streamUsage: OpenAIResponse['usage'] | undefined;
+
+      // One frame handler for both the streamed lines and the EOF flush — the
+      // trailing buffer carries real terminal frames, not leftovers.
+      const processDataLine = (data: string): void => {
+        if (data === '[DONE]') {
+          sawTerminalEvent = true;
+          return;
+        }
+
+        // Parse first; only JSON noise is ignorable. Everything after the
+        // parse must NOT be swallowed by the catch below.
+        let parsed: Record<string, any>;
+        try {
+          parsed = JSON.parse(data);
+        } catch {
+          return; // Ignore parse errors (partial/keep-alive lines)
+        }
+
+        throwOnStreamErrorFrame(parsed, this.name, openAIRequest);
+
+        try {
+          const delta = parsed.choices?.[0]?.delta;
+
+          if (delta?.content) {
+            accumulated += delta.content;
+            callbacks.onChunk(delta.content);
+          }
+
+          // Reasoning-model trace arrives on its own channel (not `content`),
+          // as `reasoning` or `reasoning_content` depending on the backend.
+          const reasoningDelta = reasoningOf(delta);
+          if (reasoningDelta !== undefined) {
+            reasoning += reasoningDelta;
+          }
+
+          // Handle streaming tool calls
+          if (delta?.tool_calls) {
+            for (const tc of delta.tool_calls) {
+              const index = tc.index ?? 0;
+              if (!toolCalls[index]) {
+                toolCalls[index] = {
+                  id: tc.id ?? '',
+                  type: 'function',
+                  function: { name: '', arguments: '' },
+                };
+              }
+              if (tc.id) toolCalls[index].id = tc.id;
+              if (tc.function?.name) toolCalls[index].function.name = tc.function.name;
+              if (tc.function?.arguments) {
+                toolCalls[index].function.arguments += tc.function.arguments;
+              }
+            }
+          }
+
+          if (parsed.choices?.[0]?.finish_reason) {
+            finishReason = parsed.choices[0].finish_reason;
+            sawTerminalEvent = true;
+          }
+
+          // Usage rides the final chunk when stream_options.include_usage is set
+          if (parsed.usage) {
+            streamUsage = parsed.usage;
+          }
+        } catch {
+          // Ignore parse errors in stream
+        }
+      };
 
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
 
         const chunk = decoder.decode(value, { stream: true });
-        const dataLines = sseParser.feed(chunk);
-
-        for (const data of dataLines) {
-          if (data === '[DONE]') continue;
-
-          try {
-            const parsed = JSON.parse(data);
-            const delta = parsed.choices?.[0]?.delta;
-
-            if (delta?.content) {
-              accumulated += delta.content;
-              callbacks.onChunk(delta.content);
-            }
-
-            // Reasoning-model trace arrives on its own channel (not `content`).
-            if (typeof delta?.reasoning === 'string') {
-              reasoning += delta.reasoning;
-            }
-
-            // Handle streaming tool calls
-            if (delta?.tool_calls) {
-              for (const tc of delta.tool_calls) {
-                const index = tc.index ?? 0;
-                if (!toolCalls[index]) {
-                  toolCalls[index] = {
-                    id: tc.id ?? '',
-                    type: 'function',
-                    function: { name: '', arguments: '' },
-                  };
-                }
-                if (tc.id) toolCalls[index].id = tc.id;
-                if (tc.function?.name) toolCalls[index].function.name = tc.function.name;
-                if (tc.function?.arguments) {
-                  toolCalls[index].function.arguments += tc.function.arguments;
-                }
-              }
-            }
-
-            if (parsed.choices?.[0]?.finish_reason) {
-              finishReason = parsed.choices[0].finish_reason;
-            }
-          } catch {
-            // Ignore parse errors in stream
-          }
+        for (const data of sseParser.feed(chunk)) {
+          processDataLine(data);
         }
       }
+
+      // A final `data:` line that arrived without its trailing newline is still
+      // buffered here. Servers and proxies do close right after writing the
+      // last event, so dropping it would report a finished turn as a dropped
+      // connection at the guard below.
+      for (const data of sseParser.flush()) {
+        processDataLine(data);
+      }
+
+      assertTerminalEventObserved(sawTerminalEvent, this.name, openAIRequest);
 
       // Build response with accumulated data
       const message: OpenAIMessage = {
@@ -301,7 +370,7 @@ export class OpenAICompatibleAdapter implements ProviderAdapter {
         message.tool_calls = toolCalls;
       }
 
-      return this.parseStreamedResponse(message, finishReason, request.model, openAIRequest);
+      return this.parseStreamedResponse(message, finishReason, request.model, streamUsage, openAIRequest);
 
     } catch (error) {
       throw this.handleError(error, openAIRequest);
@@ -342,10 +411,16 @@ export class OpenAICompatibleAdapter implements ProviderAdapter {
       }
     }
     
+    // Newer OpenAI models (gpt-5+, o-series) require max_completion_tokens instead of max_tokens
+    const completionTokensModels = ['gpt-5', 'o1', 'o3', 'o4'];
+    const useCompletionTokens = completionTokensModels.some(prefix => request.model.startsWith(prefix));
+
     const params: any = {
       model: request.model,
       messages,
-      max_tokens: request.maxTokens || this.defaultMaxTokens,
+      ...(useCompletionTokens
+        ? { max_completion_tokens: request.maxTokens || this.defaultMaxTokens }
+        : { max_tokens: request.maxTokens || this.defaultMaxTokens }),
     };
     
     if (request.temperature !== undefined) {
@@ -377,11 +452,34 @@ export class OpenAICompatibleAdapter implements ProviderAdapter {
       params.tools = this.convertTools(request.tools as any[]);
     }
     
+    // Earlier OpenAI models accept only "in_memory" or "24h" here. Membrane's
+    // 5m/1h values are Anthropic cache-control TTLs and must not leak onto this
+    // API. Extended prompt caching is independent of response-object storage.
+    if (request.cacheTtl === '24h') {
+      params.prompt_cache_retention = '24h';
+    }
+
     // Apply extra params (filter out internal membrane fields + control flags)
     if (request.extra) {
-      const { normalizedMessages, prompt, force_think_first, ...rest } =
+      const { normalizedMessages, prompt, force_think_first, reasoning, ...rest } =
         request.extra as Record<string, unknown>;
+      // `reasoning` is a Responses-API / LiteRouter param that OpenAI's direct
+      // Chat Completions endpoint rejects ("Unknown parameter: 'reasoning'").
+      // Old Chronicle branches may carry it in providerParams from when the
+      // agent was created under a compatible proxy; stripping it here keeps
+      // those branches usable after switching to OpenAI direct without
+      // touching the working LiteRouter config or the 24h cache setup.
       Object.assign(params, rest);
+
+      // Chat Completions spells the effort as a scalar `reasoning_effort`, so
+      // translate the stripped `reasoning: {effort}` instead of dropping it
+      // (dropping it left gpt-5.1 on its default effort, none). An explicit
+      // `reasoning_effort` in extra wins. The agent's reasoning kill switch
+      // removes `reasoning` upstream, so disabled still sends nothing.
+      const effort = (reasoning as { effort?: unknown } | undefined)?.effort;
+      if (typeof effort === 'string' && params.reasoning_effort === undefined) {
+        params.reasoning_effort = effort;
+      }
 
       // Round-0 think forcing. `force_think_first` is a control flag (set from
       // the recipe via framework-agent-config), NOT an API param — it is
@@ -596,19 +694,26 @@ export class OpenAICompatibleAdapter implements ProviderAdapter {
     message: OpenAIMessage,
     finishReason: string,
     requestedModel: string,
+    streamUsage?: OpenAIResponse['usage'],
     rawRequest?: unknown
   ): ProviderResponse {
+    const cachedTokens = streamUsage?.prompt_tokens_details?.cached_tokens ?? 0;
+
     return {
       content: this.messageToContent(message),
       stopReason: this.mapFinishReason(finishReason),
       stopSequence: undefined,
       usage: {
-        inputTokens: 0, // Not available in streaming
-        outputTokens: 0,
+        inputTokens: streamUsage?.prompt_tokens ?? 0,
+        outputTokens: streamUsage?.completion_tokens ?? 0,
+        // prompt_tokens_details.cached_tokens is OpenAI's shape: a SUBSET of
+        // prompt_tokens. Declared per-response since the adapter-wide
+        // convention is 'unknown' (arbitrary vendors).
+        ...(cachedTokens > 0 ? { cacheReadTokens: cachedTokens, cacheConvention: 'cache-inclusive' as const } : {}),
       },
       model: requestedModel,
       rawRequest,
-      raw: { message, finish_reason: finishReason },
+      raw: { message, finish_reason: finishReason, usage: streamUsage },
     };
   }
 
@@ -618,7 +723,7 @@ export class OpenAICompatibleAdapter implements ProviderAdapter {
     const content: ContentBlock[] = [];
 
     // Reasoning trace first (mirrors Anthropic thinking-block ordering).
-    const reasoning = (message as OpenAIMessage).reasoning;
+    const reasoning = reasoningOf(message);
     if (typeof reasoning === 'string' && reasoning.trim()) {
       content.push({ type: 'thinking', thinking: reasoning } as ContentBlock);
     }
@@ -659,6 +764,14 @@ export class OpenAICompatibleAdapter implements ProviderAdapter {
   }
 
   private handleError(error: unknown, rawRequest?: unknown): MembraneError {
+    // A deadline abort is a timeout and stays one. Collapsing it into a bare
+    // abortError() here is what erased the identity before Membrane's
+    // caller-signal > timeout > error ladder could read it.
+    if (isDeadlineAbort(error)) return deadlineTimeoutError(error, rawRequest);
+    // Already-classified failures (e.g. the stream-integrity guards) keep
+    // their type and retryability instead of being re-derived from a string.
+    if (error instanceof MembraneError) return error;
+
     if (error instanceof Error) {
       const message = error.message;
 
@@ -734,7 +847,7 @@ export function toOpenAIMessages(
       } else if (block.type === 'tool_result') {
         toolResults.push({
           id: block.toolUseId,
-          content: typeof block.content === 'string' ? block.content : JSON.stringify(block.content),
+          content: textOnlyToolResultContent(block.content),
         });
       }
     }
@@ -773,7 +886,7 @@ export function toOpenAIMessages(
 export function fromOpenAIMessage(message: OpenAIMessage): ContentBlock[] {
   const result: ContentBlock[] = [];
 
-  const reasoning = message.reasoning;
+  const reasoning = reasoningOf(message);
   if (typeof reasoning === 'string' && reasoning.trim()) {
     result.push({ type: 'thinking', thinking: reasoning } as ContentBlock);
   }

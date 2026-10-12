@@ -24,3 +24,24 @@ export * from './formatters/index.js';
 
 // Context management
 export * from './context/index.js';
+
+// Prompt-cache keepalive (Anthropic 1h cache)
+export {
+  CacheKeepalive,
+  ineligibleReason as cacheKeepaliveIneligibleReason,
+  lineageKey as cacheLineageKey,
+} from './cache-keepalive.js';
+export type {
+  CacheKeepaliveConfig,
+  KeepaliveEvent,
+  KeepaliveCall,
+  KeepaliveUsage,
+  KeepaliveLane,
+  KeepaliveSend,
+} from './cache-keepalive.js';
+
+export {
+  computeCacheWireReceipt,
+  type CacheWireReceipt,
+  type CacheWireMarkerReceipt,
+} from './cache-wire-receipt.js';

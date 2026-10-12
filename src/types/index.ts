@@ -73,7 +73,10 @@ export type {
 export type {
   StopReason,
   BasicUsage,
+  CallUsage,
   DetailedUsage,
+  TurnRoundUsage,
+  DiscardedAttemptsUsage,
   CostBreakdown,
   StopInfo,
   ModelInfo,
@@ -101,6 +104,7 @@ export type {
   ProviderRequestOptions,
   ProviderResponse,
   StreamCallbacks,
+  UsageCacheConvention,
 } from './provider.js';
 
 // Streaming
@@ -162,9 +166,12 @@ export {
   networkError,
   timeoutError,
   abortError,
+  TimeoutAbortError,
+  isTimeoutAbortError,
   safetyError,
   unsupportedError,
   classifyError,
+  isOverloadedError,
 } from './errors.js';
 
 // Config

@@ -215,6 +215,34 @@ export function abortError(message: string = 'Request was aborted', rawRequest?:
   });
 }
 
+/**
+ * A request cancelled by the adapter's OWN deadline (`timeoutMs`), as opposed
+ * to a caller's signal or a stray abort.
+ *
+ * It is both facts at once, and callers need both: a timeout by `type` (so
+ * `classifyError` and the abort-reason ladder report `'timeout'`), and an
+ * abort by provenance (so the streaming paths still hand back an
+ * `AbortedResponse` with whatever partial content arrived, rather than
+ * throwing). Non-retryable: the deadline that fired belongs to this call, and
+ * retrying inside it would only spend the caller's budget again.
+ */
+export class TimeoutAbortError extends MembraneError {
+  constructor(message: string = 'Request timed out', raw?: unknown, rawRequest?: unknown) {
+    super({
+      type: 'timeout',
+      message,
+      retryable: false,
+      rawError: raw,
+      rawRequest,
+    });
+    this.name = 'TimeoutAbortError';
+  }
+}
+
+export function isTimeoutAbortError(error: unknown): error is TimeoutAbortError {
+  return error instanceof TimeoutAbortError;
+}
+
 export function safetyError(message: string, raw?: unknown, rawRequest?: unknown): MembraneError {
   return new MembraneError({
     type: 'safety',
@@ -238,6 +266,24 @@ export function unsupportedError(message: string, rawRequest?: unknown): Membran
 // ============================================================================
 // Error Classification
 // ============================================================================
+
+/**
+ * Provider capacity exhaustion — Anthropic 529 overloaded_error, whichever
+ * path it arrived by (structured status from the provider handler, or the
+ * message-matched fallbacks in classifyError). Used only to CHOOSE the retry
+ * schedule among already-retryable errors, never to decide retryability.
+ * Matches the same deliberately narrow tokens as classifyError's fallback
+ * (status/`529`/exact `overloaded_error`) — a bare 'overloaded' in prose
+ * (e.g. "worker pool overloaded") must not put an unrelated error onto the
+ * ~10-minute schedule. The provider handlers' own bare-'overloaded' safety
+ * nets attach httpStatus 529, so those still land here via the status check.
+ */
+export function isOverloadedError(info: ErrorInfo): boolean {
+  if (!info.retryable) return false;
+  if (info.httpStatus === 529) return true;
+  const m = info.message.toLowerCase();
+  return m.includes('529') || m.includes('overloaded_error');
+}
 
 export function classifyError(error: unknown): ErrorInfo {
   if (error instanceof MembraneError) {

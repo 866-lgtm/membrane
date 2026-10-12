@@ -14,13 +14,21 @@ import type {
 } from '../types/index.js';
 import {
   MembraneError,
+  invalidRequestError,
   rateLimitError,
   contextLengthError,
   authError,
   serverError,
   abortError,
 } from '../types/index.js';
-import { createCombinedSignal } from './utils.js';
+import { stripEmptyTextRequest } from '../utils/empty-text.js';
+import { createCombinedSignal, isDeadlineAbort, deadlineTimeoutError, assertTerminalEventObserved } from './utils.js';
+import {
+  INTERLEAVED_THINKING_BETA,
+  needsInterleavedThinkingBeta,
+  thinkingEnabled,
+  detectImageMediaType,
+} from './anthropic.js';
 
 // ============================================================================
 // Adapter Configuration
@@ -44,6 +52,16 @@ export interface BedrockAdapterConfig {
 
   /** Anthropic API version header (defaults to 2023-06-01) */
   anthropicVersion?: string;
+
+  /**
+   * Endpoint override (no trailing slash), e.g. an inference gateway leg
+   * like `https://gate.animalabs.ai/bedrock/apse1`. Defaults to
+   * `https://bedrock-runtime.{region}.amazonaws.com`. When pointing at a
+   * gateway, set accessKeyId to the gate token — the gateway reads it from
+   * the SigV4 Credential field, discards the client signature, and re-signs
+   * with real AWS creds that never leave the gateway box.
+   */
+  baseURL?: string;
 }
 
 // ============================================================================
@@ -64,6 +82,8 @@ interface BedrockMessageRequest {
   stop_sequences?: string[];
   tools?: unknown[];
   thinking?: { type: 'enabled'; budget_tokens: number };
+  /** Beta flags. On bedrock-runtime these ride in the body, not a header. */
+  anthropic_beta?: string[];
 }
 
 interface BedrockMessageResponse {
@@ -113,7 +133,23 @@ interface BedrockStreamEvent {
   usage?: {
     input_tokens: number;
     output_tokens: number;
+    cache_creation_input_tokens?: number | null;
+    cache_read_input_tokens?: number | null;
   };
+}
+
+/**
+ * Bedrock accepts `cache_control: { type: 'ephemeral' }` but rejects the
+ * direct-API `ttl` extension ("cache_control.ttl: Extra inputs are not
+ * permitted"). Drop the ttl, keep the marker — the cache still works, at
+ * Bedrock's fixed default TTL.
+ */
+function stripCacheTtl<T extends Record<string, any>>(block: T): T {
+  if (block?.cache_control && typeof block.cache_control === 'object' && 'ttl' in block.cache_control) {
+    const { ttl, ...cacheControl } = block.cache_control;
+    return { ...block, cache_control: cacheControl };
+  }
+  return block;
 }
 
 // ============================================================================
@@ -238,6 +274,16 @@ async function signRequest(
 
 export class BedrockAdapter implements ProviderAdapter {
   readonly name = 'bedrock';
+  readonly cacheReceiptBasis = 'wire-request' as const;
+
+  /**
+   * Bedrock serves Anthropic models over the Anthropic Messages payload shape
+   * and this adapter reads Anthropic's own field names
+   * (`cache_read_input_tokens` / `cache_creation_input_tokens`), so it inherits
+   * the convention verified live against api.anthropic.com on 2026-08-25.
+   * Derived from the wire contract, not measured against Bedrock directly.
+   */
+  readonly usageCacheConvention = 'cache-excluded' as const;
 
   private accessKeyId: string;
   private secretAccessKey: string;
@@ -245,6 +291,7 @@ export class BedrockAdapter implements ProviderAdapter {
   private region: string;
   private defaultMaxTokens: number;
   private anthropicVersion: string;
+  private baseURL?: string;
 
   constructor(config: BedrockAdapterConfig = {}) {
     this.accessKeyId = config.accessKeyId ?? process.env.AWS_ACCESS_KEY_ID ?? '';
@@ -253,6 +300,7 @@ export class BedrockAdapter implements ProviderAdapter {
     this.region = config.region ?? process.env.AWS_REGION ?? 'us-west-2';
     this.defaultMaxTokens = config.defaultMaxTokens ?? 4096;
     this.anthropicVersion = config.anthropicVersion ?? 'bedrock-2023-05-31';
+    this.baseURL = config.baseURL?.replace(/\/$/, '');
 
     if (!this.accessKeyId || !this.secretAccessKey) {
       throw new Error('AWS credentials required: accessKeyId and secretAccessKey');
@@ -262,6 +310,18 @@ export class BedrockAdapter implements ProviderAdapter {
   supportsModel(modelId: string): boolean {
     // Support both Bedrock model IDs and standard Claude model IDs
     return modelId.includes('claude') || modelId.startsWith('anthropic.');
+  }
+
+  /**
+   * Cross-region inference-profile prefix for this adapter's region.
+   * Claude 4-era models on Bedrock reject on-demand invocation of the
+   * direct id ("Invocation ... with on-demand throughput isn't supported")
+   * and require the profile form — verified live 2026-07-31.
+   */
+  private inferenceProfilePrefix(): string {
+    if (this.region.startsWith('eu-')) return 'eu.';
+    if (this.region.startsWith('ap-')) return 'apac.';
+    return 'us.';
   }
 
   /**
@@ -275,12 +335,19 @@ export class BedrockAdapter implements ProviderAdapter {
 
     // If already in Bedrock format, use as-is
     // Supports both direct model IDs (anthropic.claude-...) and
-    // cross-region inference profile IDs (us.anthropic.claude-..., eu.anthropic.claude-..., apac.anthropic.claude-...)
-    if (modelId.startsWith('anthropic.') || /^[a-z]{2,4}\.anthropic\./.test(modelId)) {
+    // cross-region inference profile IDs (us.anthropic.claude-..., eu.anthropic.claude-...,
+    // apac.anthropic.claude-..., global.anthropic.claude-... — `global` is 6 chars, hence {2,6}).
+    if (modelId.startsWith('anthropic.') || /^[a-z]{2,6}\.anthropic\./.test(modelId)) {
       return modelId;
     }
 
-    // Map common Claude model IDs to Bedrock format
+    const profile = this.inferenceProfilePrefix();
+
+    // Map common Claude model IDs to Bedrock format. The 3.x entries keep
+    // their historical direct-id form (those models predate inference
+    // profiles; all are EOL on Bedrock as of 2026-07 anyway, so the exact
+    // shape is moot). 4-era entries use the profile form — the direct id
+    // no longer invokes.
     const modelMap: Record<string, string> = {
       'claude-3-5-sonnet-20241022': 'anthropic.claude-3-5-sonnet-20241022-v2:0',
       'claude-3-5-sonnet-latest': 'anthropic.claude-3-5-sonnet-20241022-v2:0',
@@ -289,13 +356,15 @@ export class BedrockAdapter implements ProviderAdapter {
       'claude-3-opus-20240229': 'anthropic.claude-3-opus-20240229-v1:0',
       'claude-3-sonnet-20240229': 'anthropic.claude-3-sonnet-20240229-v1:0',
       'claude-3-haiku-20240307': 'anthropic.claude-3-haiku-20240307-v1:0',
-      'claude-sonnet-4-20250514': 'anthropic.claude-sonnet-4-20250514-v1:0',
-      'claude-opus-4-20250514': 'anthropic.claude-opus-4-20250514-v1:0',
-      // Haiku 4.5 aliases
-      'claude-haiku-4-5-20251001': 'anthropic.claude-3-5-haiku-20241022-v1:0',
+      'claude-sonnet-4-20250514': `${profile}anthropic.claude-sonnet-4-20250514-v1:0`,
+      'claude-opus-4-20250514': `${profile}anthropic.claude-opus-4-20250514-v1:0`,
+      // Haiku 4.5 previously aliased to 3.5 Haiku (a stand-in from before
+      // Haiku 4.5 reached Bedrock). 3.5 Haiku is EOL on Bedrock now, so the
+      // alias routed every plain-id caller to a guaranteed error.
+      'claude-haiku-4-5-20251001': `${profile}anthropic.claude-haiku-4-5-20251001-v1:0`,
     };
 
-    return modelMap[modelId] ?? `anthropic.${modelId}-v1:0`;
+    return modelMap[modelId] ?? `${profile}anthropic.${modelId}-v1:0`;
   }
 
   async complete(
@@ -340,7 +409,33 @@ export class BedrockAdapter implements ProviderAdapter {
 
   private buildRequest(request: ProviderRequest, bedrockModelId?: string): BedrockMessageRequest {
     // Strip provider-specific fields (e.g., sourceUrl for Gemini) from image blocks
-    // before sending to Bedrock/Anthropic, which rejects extra inputs
+    // before sending to Bedrock/Anthropic, which rejects extra inputs.
+    //
+    // Same treatment for cache_control.ttl: Bedrock's prompt cache runs at the
+    // fixed default (5m) TTL — the ttl field is a direct-API extension and
+    // Bedrock rejects it as an extra input. The marker itself is fine and
+    // caching works without the field, so strip just the ttl and keep the
+    // breakpoint. Transport quirks belong to the transport, not to every
+    // caller that sets cacheTtl. (Connectome issue #35.)
+    // Bedrock is strict about the wire shape of image sources: internal blocks
+    // carry camelCase `mediaType`, the API requires snake_case `media_type`.
+    // The Anthropic adapter converts on both paths (toAnthropicContent /
+    // toAnthropicToolResultContent); without the same conversion here a
+    // tool-returned image 400s with "media_type: Field required" mid-turn
+    // (observed on eidoverse snapshot results, 2026-08-08). Applies to
+    // top-level image blocks AND images nested inside tool_result content.
+    const toWireImage = (block: any): any => {
+      const source = block.source;
+      if (!source || source.type !== 'base64') return block;
+      const { mediaType, media_type, ...restSource } = source;
+      return {
+        ...block,
+        source: {
+          ...restSource,
+          media_type: detectImageMediaType(source.data, (media_type ?? mediaType) as string),
+        },
+      };
+    };
     const sanitizedMessages = (request.messages as any[]).map((msg: any) => {
       if (!Array.isArray(msg.content)) return msg;
       return {
@@ -348,9 +443,20 @@ export class BedrockAdapter implements ProviderAdapter {
         content: msg.content.map((block: any) => {
           if (block.type === 'image' && block.sourceUrl !== undefined) {
             const { sourceUrl, ...rest } = block;
-            return rest;
+            return stripCacheTtl(toWireImage(rest));
           }
-          return block;
+          if (block.type === 'image') {
+            return stripCacheTtl(toWireImage(block));
+          }
+          if (block.type === 'tool_result' && Array.isArray(block.content)) {
+            return stripCacheTtl({
+              ...block,
+              content: block.content.map((inner: any) =>
+                inner?.type === 'image' ? toWireImage(inner) : inner,
+              ),
+            });
+          }
+          return stripCacheTtl(block);
         }),
       };
     });
@@ -370,6 +476,10 @@ export class BedrockAdapter implements ProviderAdapter {
       if (needsFlatten && Array.isArray(request.system)) {
         const blocks = request.system as Array<{ type: string; text: string }>;
         params.system = blocks.map(b => b.text).join('\n\n');
+      } else if (Array.isArray(request.system)) {
+        params.system = (request.system as Array<Record<string, any>>).map(
+          b => stripCacheTtl(b)
+        ) as BedrockMessageRequest['system'];
       } else {
         params.system = request.system as BedrockMessageRequest['system'];
       }
@@ -393,7 +503,7 @@ export class BedrockAdapter implements ProviderAdapter {
     }
 
     if (request.tools && request.tools.length > 0) {
-      params.tools = request.tools;
+      params.tools = (request.tools as Array<Record<string, any>>).map(t => stripCacheTtl(t));
     }
 
     // Handle extended thinking
@@ -407,6 +517,28 @@ export class BedrockAdapter implements ProviderAdapter {
       Object.assign(params, rest);
     }
 
+    // Validate independently of the beta gate: a malformed caller value must
+    // neither disappear during the merge nor reach Bedrock on newer models.
+    const consumerBetas: unknown = params.anthropic_beta;
+    if (consumerBetas !== undefined && (
+      !Array.isArray(consumerBetas) ||
+      [...consumerBetas].some(beta => typeof beta !== 'string')
+    )) {
+      throw invalidRequestError('Bedrock anthropic_beta must be an array of strings.');
+    }
+
+    // Interleaved thinking on pre-4.6 Claude 4: same gate as the Anthropic
+    // adapter, but bedrock-runtime takes betas as the `anthropic_beta` body
+    // field rather than an HTTP header. Runs after the extra-assign so a
+    // consumer-supplied anthropic_beta is merged (Set-deduped), not clobbered.
+    // The gate only matches Claude 4 <4.6 ids, so legacy 3.x models (which
+    // reject unknown beta flags) never receive the field.
+    if (thinkingEnabled(request) && needsInterleavedThinkingBeta(request.model)) {
+      const existing = params.anthropic_beta ?? [];
+      params.anthropic_beta = [...new Set([...existing, INTERLEAVED_THINKING_BETA])];
+    }
+
+    stripEmptyTextRequest(params);
     return params;
   }
 
@@ -416,7 +548,7 @@ export class BedrockAdapter implements ProviderAdapter {
     signal?: AbortSignal
   ): Promise<BedrockMessageResponse> {
     const url = new URL(
-      `https://bedrock-runtime.${this.region}.amazonaws.com/model/${encodeURIComponent(modelId)}/invoke`
+      `${this.baseURL ?? `https://bedrock-runtime.${this.region}.amazonaws.com`}/model/${encodeURIComponent(modelId)}/invoke`
     );
 
     const body = JSON.stringify(request);
@@ -459,7 +591,7 @@ export class BedrockAdapter implements ProviderAdapter {
     signal?: AbortSignal
   ): Promise<ProviderResponse> {
     const url = new URL(
-      `https://bedrock-runtime.${this.region}.amazonaws.com/model/${encodeURIComponent(modelId)}/invoke-with-response-stream`
+      `${this.baseURL ?? `https://bedrock-runtime.${this.region}.amazonaws.com`}/model/${encodeURIComponent(modelId)}/invoke-with-response-stream`
     );
 
     const body = JSON.stringify(request);
@@ -498,7 +630,11 @@ export class BedrockAdapter implements ProviderAdapter {
     let finalMessage: BedrockMessageResponse | undefined;
     let inputTokens = 0;
     let outputTokens = 0;
+    let cacheCreationTokens: number | undefined;
+    let cacheReadTokens: number | undefined;
     let stopReason: string = 'end_turn';
+    let sawTerminalEvent = false;
+    let stopSequence: string | undefined;
     let fullText = '';
 
     const reader = response.body?.getReader();
@@ -611,7 +747,19 @@ export class BedrockAdapter implements ProviderAdapter {
                 }
 
                 if (eventData.type === 'message_start' && eventData.message) {
-                  inputTokens = eventData.message.usage?.input_tokens ?? 0;
+                  // Cache metrics ride the same usage objects as on the direct
+                  // API. Dropping them (pre-2026-07-31) made caching look
+                  // permanently inert on Bedrock streams: complete() surfaced
+                  // them, stream() zeroed them, and every ledger/pricing
+                  // consumer downstream saw zeros. (Connectome issue #35.)
+                  const startUsage = eventData.message.usage;
+                  inputTokens = startUsage?.input_tokens ?? 0;
+                  if (startUsage?.cache_creation_input_tokens != null) {
+                    cacheCreationTokens = startUsage.cache_creation_input_tokens;
+                  }
+                  if (startUsage?.cache_read_input_tokens != null) {
+                    cacheReadTokens = startUsage.cache_read_input_tokens;
+                  }
                 } else if (eventData.type === 'content_block_start') {
                   currentBlockIndex = eventData.index ?? 0;
                   contentBlocks[currentBlockIndex] = eventData.content_block as { type: string };
@@ -632,6 +780,15 @@ export class BedrockAdapter implements ProviderAdapter {
                     if (contentBlocks[currentBlockIndex]) {
                       contentBlocks[currentBlockIndex]!.signature = (contentBlocks[currentBlockIndex]!.signature ?? '') + (eventData.delta as any).signature;
                     }
+                  } else if (eventData.delta?.type === 'input_json_delta' && (eventData.delta as any).partial_json !== undefined) {
+                    // Tool-call arguments stream as input_json_delta fragments.
+                    // Dropping these (pre-2026-07-21 behavior) gutted every
+                    // tool_use block: stop_reason said tool_use but the block
+                    // lost its input — and then its id/name in final assembly.
+                    const blk = contentBlocks[currentBlockIndex] as (typeof contentBlocks)[number] & { partialJson?: string };
+                    if (blk) {
+                      blk.partialJson = (blk.partialJson ?? '') + (eventData.delta as any).partial_json;
+                    }
                   }
                 } else if (eventData.type === 'content_block_stop') {
                   // Mirror the Anthropic adapter: fire onContentBlock a second
@@ -640,13 +797,40 @@ export class BedrockAdapter implements ProviderAdapter {
                   // on the dual-fire convention (e.g. membrane's native
                   // yielding path) silently drops block_complete on Bedrock.
                   const blockIdx = (eventData as { index?: number }).index ?? currentBlockIndex;
+                  // Finalize tool_use blocks: parse accumulated argument JSON
+                  // into `input` before the block_complete fire, so consumers
+                  // of the dual-fire convention see a complete tool call.
+                  const stoppedBlk = contentBlocks[blockIdx] as ((typeof contentBlocks)[number] & { partialJson?: string; input?: unknown }) | undefined;
+                  if (stoppedBlk?.type === 'tool_use' && stoppedBlk.partialJson !== undefined) {
+                    try { stoppedBlk.input = JSON.parse(stoppedBlk.partialJson || '{}'); } catch { /* keep prior input */ }
+                  }
                   callbacks.onContentBlock?.(blockIdx, contentBlocks[blockIdx]);
                 } else if (eventData.type === 'message_delta') {
+                  sawTerminalEvent = true;
                   if (eventData.usage) {
                     outputTokens = eventData.usage.output_tokens;
+                    // message_delta carries cumulative cache metrics — use as
+                    // authoritative when present (same contract as the
+                    // Anthropic adapter).
+                    if (eventData.usage.cache_creation_input_tokens != null) {
+                      cacheCreationTokens = eventData.usage.cache_creation_input_tokens;
+                    }
+                    if (eventData.usage.cache_read_input_tokens != null) {
+                      cacheReadTokens = eventData.usage.cache_read_input_tokens;
+                    }
                   }
                   if (eventData.delta?.stop_reason) {
                     stopReason = eventData.delta.stop_reason;
+                  }
+                  // WHICH stop sequence fired, not just that one did. Dropping
+                  // this (pre-2026-07-26) broke prefill/XML tool use on
+                  // Bedrock entirely: membrane's tool gate matches
+                  // stopSequence === '</function_calls>', so calls were never
+                  // parsed or executed, the close tag was never restored, and
+                  // the turn continuation looped forever on the dangling
+                  // block (~6 output tokens per full-prefill round).
+                  if (eventData.delta?.stop_sequence) {
+                    stopSequence = eventData.delta.stop_sequence;
                   }
                 }
               }
@@ -674,6 +858,11 @@ export class BedrockAdapter implements ProviderAdapter {
       );
     }
 
+    // The empty-response guard above only catches a stream that produced
+    // NOTHING; a stream truncated after any content passed it and was
+    // reported as a clean end_turn. message_delta is the terminal event.
+    assertTerminalEventObserved(sawTerminalEvent, 'Bedrock', { modelId, ...request });
+
     // Build response from accumulated data
     finalMessage = {
       id: 'msg_stream',
@@ -687,13 +876,27 @@ export class BedrockAdapter implements ProviderAdapter {
           // Pass through verbatim — carries the encrypted `data` payload
           return { ...b } as unknown as { type: 'text'; text?: string };
         }
+        if (b.type === 'tool_use') {
+          // Preserve id/name and the input accumulated from input_json_delta
+          // fragments — the generic text mapping below would strip them and
+          // parseResponse would then drop the block (requires id && name).
+          const tb = b as { type: string; id?: string; name?: string; input?: unknown; partialJson?: string };
+          let input: unknown = tb.input ?? {};
+          if (tb.partialJson) {
+            try { input = JSON.parse(tb.partialJson); } catch { /* keep prior input */ }
+          }
+          return { type: 'tool_use', id: tb.id, name: tb.name, input } as unknown as { type: 'text'; text?: string };
+        }
         return { type: b.type as 'text', text: b.text };
       }),
       model: modelId,
       stop_reason: stopReason as BedrockMessageResponse['stop_reason'],
+      stop_sequence: stopSequence ?? null,
       usage: {
         input_tokens: inputTokens,
         output_tokens: outputTokens,
+        ...(cacheCreationTokens != null ? { cache_creation_input_tokens: cacheCreationTokens } : {}),
+        ...(cacheReadTokens != null ? { cache_read_input_tokens: cacheReadTokens } : {}),
       },
     };
 
@@ -744,6 +947,14 @@ export class BedrockAdapter implements ProviderAdapter {
   }
 
   private handleError(error: unknown, rawRequest?: unknown): MembraneError {
+    // A deadline abort is a timeout and stays one. Collapsing it into a bare
+    // abortError() here is what erased the identity before Membrane's
+    // caller-signal > timeout > error ladder could read it.
+    if (isDeadlineAbort(error)) return deadlineTimeoutError(error, rawRequest);
+    // Already-classified failures (e.g. the stream-integrity guards) keep
+    // their type and retryability instead of being re-derived from a string.
+    if (error instanceof MembraneError) return error;
+
     if (error instanceof BedrockError) {
       const status = error.status;
       const message = error.message;

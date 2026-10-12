@@ -1,6 +1,6 @@
 {
   "name": "@animalabs/membrane",
-  "version": "0.5.73",
+  "version": "0.5.86",
   "description": "LLM middleware - a selective boundary that transforms what passes through",
   "repository": {
     "type": "git",
@@ -24,7 +24,8 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
-    "test:coverage": "vitest run --coverage"
+    "test:coverage": "vitest run --coverage",
+    "version": "node scripts/release-changelog.mjs && git add CHANGELOG.md changelog.d"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.52.0"

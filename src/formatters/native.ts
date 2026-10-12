@@ -29,7 +29,8 @@ import type {
   StreamEmission,
 } from './types.js';
 import { normalizeToolPairs, mergeConsecutiveRoles } from './normalize-tool-pairs.js';
-import { isAcceptedImageMediaType, strippedImagePlaceholder } from '../utils/image-media.js';
+import { resolveImageMediaType, isAcceptedImageMediaType, strippedImagePlaceholder } from '../utils/image-media.js';
+import { assertCacheMarkersWithinLimit } from '../utils/cache-marker-budget.js';
 
 /** Index of the last content block that can carry cache_control. Anthropic
  *  rejects cache_control on thinking / redacted_thinking blocks, so a cache
@@ -162,11 +163,12 @@ export class NativeFormatter implements PrefillFormatter {
   readonly name = 'native';
   readonly usesPrefill = false;
 
-  private config: Required<NativeFormatterConfig>;
+  readonly nameFormat: string;
+  private config: Required<FormatterConfig>;
 
   constructor(config: NativeFormatterConfig = {}) {
+    this.nameFormat = config.nameFormat ?? '{name}: ';
     this.config = {
-      nameFormat: config.nameFormat ?? '{name}: ',
       unsupportedMedia: config.unsupportedMedia ?? 'error',
       warnOnStrip: config.warnOnStrip ?? true,
     };
@@ -184,6 +186,7 @@ export class NativeFormatter implements PrefillFormatter {
       tools,
       systemPrompt,
       promptCaching = false,
+      cacheMarkers = 'membrane-system',
       cacheTtl,
       hasCacheMarker,
       contextPrefix,
@@ -209,7 +212,7 @@ export class NativeFormatter implements PrefillFormatter {
     // Add context prefix as first assistant message (for simulacrum seeding)
     if (contextPrefix) {
       const prefixBlock: Record<string, unknown> = { type: 'text', text: contextPrefix };
-      if (promptCaching && cacheControl) {
+      if (promptCaching && cacheControl && cacheMarkers === 'membrane-system') {
         prefixBlock.cache_control = cacheControl;
         markedBreakpoints++;
       }
@@ -248,6 +251,13 @@ export class NativeFormatter implements PrefillFormatter {
         includeNames: participantMode === 'multiuser' && !isAssistant,
       });
 
+      if (
+        cacheMarkers === 'cm-owned' &&
+        content.some((block) => Boolean((block as Record<string, unknown>).cache_control))
+      ) {
+        throw new Error('cm-owned cache markers reject imported block-level cache_control');
+      }
+
       if (content.length === 0) {
         continue; // Skip empty messages
       }
@@ -275,6 +285,18 @@ export class NativeFormatter implements PrefillFormatter {
       }
     }
 
+    // Block-level cache_control can also arrive via convertContent passthrough
+    // (stale request-time markers on imported/stored blocks — Arc exports carry
+    // them). Recount ALL message-level cache_control blocks — deliberate marks
+    // and passthroughs alike — so the system fallback below can't stack on top.
+    markedBreakpoints = 0;
+    for (const msg of providerMessages) {
+      if (!Array.isArray(msg.content)) continue;
+      for (const b of msg.content as Record<string, unknown>[]) {
+        if (b.cache_control) markedBreakpoints++;
+      }
+    }
+
     // Tool-pair normalizer: wire-boundary safety net for Anthropic's
     // structural rules on tool cycles. See `normalize-tool-pairs.ts`
     // for the full rationale. Runs BEFORE mergeConsecutiveRoles so the
@@ -290,7 +312,13 @@ export class NativeFormatter implements PrefillFormatter {
     // Build system content. Cache the system block only as a fallback — when no
     // message breakpoint was marked (see note above; otherwise a message
     // breakpoint already caches tools+system as part of its prefix).
-    const cacheSystem = cacheControl && markedBreakpoints === 0 ? cacheControl : undefined;
+    if (markedBreakpoints > 4) {
+      throw new Error(`cache_control limit exceeded: ${markedBreakpoints} markers (maximum 4)`);
+    }
+    const cacheSystem =
+      cacheMarkers === 'membrane-system' && cacheControl && markedBreakpoints === 0
+        ? cacheControl
+        : undefined;
     let systemContent: unknown;
     if (typeof systemPrompt === 'string') {
       if (cacheSystem) {
@@ -315,6 +343,12 @@ export class NativeFormatter implements PrefillFormatter {
 
     // Native tools
     const nativeTools = tools?.length ? this.convertToNativeTools(tools) : undefined;
+    if (cacheMarkers === 'cm-owned') {
+      assertCacheMarkersWithinLimit(
+        { messages: mergedMessages, system: systemContent, tools: nativeTools },
+        'native'
+      );
+    }
 
     return {
       messages: mergedMessages,
@@ -376,10 +410,14 @@ export class NativeFormatter implements PrefillFormatter {
         typeof item === 'object' &&
         (item as { type?: string }).type === 'image'
       ) {
-        const src = (item as { source?: { media_type?: string } }).source;
-        if (!isAcceptedImageMediaType(src?.media_type)) {
-          return strippedImagePlaceholder(src?.media_type);
+        const src = (item as { source?: { type?: string; data?: string; mediaType?: string; media_type?: string } }).source;
+        if (src?.type === 'url') return item;
+        const mediaType = resolveImageMediaType(src?.data, src?.mediaType ?? src?.media_type);
+        if (!isAcceptedImageMediaType(mediaType)) {
+          return strippedImagePlaceholder(mediaType);
         }
+        const { mediaType: _declared, ...source } = src ?? {};
+        return { ...item, source: { ...source, media_type: mediaType } };
       }
       return item;
     });
@@ -392,6 +430,7 @@ export class NativeFormatter implements PrefillFormatter {
   ): unknown[] {
     const result: unknown[] = [];
     let hasUnsupportedMedia = false;
+    let hasText = false;
 
     for (const block of content) {
       if (block.type === 'text') {
@@ -401,10 +440,11 @@ export class NativeFormatter implements PrefillFormatter {
         // name prefix below would make them non-empty.
         if (block.text === '') continue;
         let text = block.text;
-        if (options.includeNames) {
-          const prefix = this.config.nameFormat.replace('{name}', participant);
+        if (options.includeNames && !hasText) {
+          const prefix = this.nameFormat.replace('{name}', () => participant);
           text = prefix + text;
         }
+        hasText = true;
         const textBlock: Record<string, unknown> = { type: 'text', text };
         if (block.cache_control) {
           textBlock.cache_control = block.cache_control;
@@ -412,16 +452,17 @@ export class NativeFormatter implements PrefillFormatter {
         result.push(textBlock);
       } else if (block.type === 'image') {
         if (block.source.type === 'base64') {
-          if (!isAcceptedImageMediaType(block.source.mediaType)) {
+          const mediaType = resolveImageMediaType(block.source.data, block.source.mediaType);
+          if (!isAcceptedImageMediaType(mediaType)) {
             // Unacceptable media type (e.g. image/svg): degrade to a text
             // placeholder instead of poisoning the whole request.
-            result.push(strippedImagePlaceholder(block.source.mediaType));
+            result.push(strippedImagePlaceholder(mediaType));
           } else {
             const imageBlock: Record<string, unknown> = {
               type: 'image',
               source: {
                 type: 'base64',
-                media_type: block.source.mediaType,
+                media_type: mediaType,
                 data: block.source.data,
               },
             };

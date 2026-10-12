@@ -110,6 +110,31 @@ export interface ToolUseContent {
   id: string;
   name: string;
   input: Record<string, unknown>;
+  /**
+   * Verbatim document text this call was parsed from in prefill/XML mode:
+   * the full `<function_calls>…</function_calls>` block, shared by every
+   * invoke parsed from that block. Prefill formatters replay it exactly
+   * instead of synthesizing a rendering — in prefill mode the context IS
+   * the document the agent authored, and a paraphrase of its own action
+   * both corrupts the record and teaches the model a syntax the parser
+   * does not accept (membrane#36). Analogous to `signature` on a thinking
+   * block. Absent on native-tools blocks and on legacy stored blocks.
+   */
+  rawXml?: string;
+  /**
+   * Raw accumulated argument text that FAILED to parse as JSON, kept verbatim.
+   *
+   * Present only when the provider's streamed `input_json_delta` fragments did
+   * not assemble into valid JSON — a call truncated mid-arguments (max_tokens)
+   * is the usual cause. `input` then holds whatever the provider's
+   * content_block_start carried, which for Anthropic is `{}`: a wire-valid
+   * tool call with empty arguments, indistinguishable from a genuine no-arg
+   * call once it is written to durable history. Presence of this field means
+   * `input` is NOT the model's arguments, so a consumer can refuse the block
+   * (or attempt its own repair) instead of trusting a plausible `{}`.
+   */
+  unparseableInput?: string;
+
   /** See {@link TextContent.rawItem}. */
   rawItem?: unknown;
 }
@@ -117,8 +142,20 @@ export interface ToolUseContent {
 export interface ToolResultContent {
   type: 'tool_result';
   toolUseId: string;
+  /**
+   * Tool name, persisted so XML replay can reconstruct the legacy
+   * `<tool_name>` element byte-identically to the live injection.
+   */
+  toolName?: string;
   content: string | ContentBlock[];
   isError?: boolean;
+  /**
+   * Verbatim document text this result was parsed from in prefill/XML mode:
+   * the full `<function_results>…</function_results>` block as the harness
+   * originally placed it in the document, shared by every result parsed
+   * from that block. Replayed exactly on the prefill path (membrane#36).
+   */
+  rawXml?: string;
   /** See {@link TextContent.rawItem}. */
   rawItem?: unknown;
 }
