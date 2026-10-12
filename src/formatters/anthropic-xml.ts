@@ -8,6 +8,7 @@
  * - <thinking> blocks for extended thinking
  */
 
+import { NativeFormatter } from './native.js';
 import type {
   NormalizedMessage,
   ContentBlock,
@@ -122,6 +123,8 @@ export class AnthropicXmlFormatter implements PrefillFormatter {
   readonly reportsAlterations = true;
   readonly name = 'anthropic-xml';
   readonly usesPrefill = true;
+  readonly supportsNativeTools = true;
+  readonly supportsXmlTools = true;
 
   /** See PrefillFormatter.configuredToolMode — undefined when the caller left the mode to Membrane. */
   readonly configuredToolMode: 'xml' | 'native' | undefined;
@@ -146,6 +149,14 @@ export class AnthropicXmlFormatter implements PrefillFormatter {
   // ==========================================================================
 
   buildMessages(messages: NormalizedMessage[], options: BuildOptions): BuildResult {
+    // Native mode is a native conversation, not an XML transcript with a tools
+    // array attached. Keep explicit XML's prefill/continuation protocol separate.
+    if ((options.toolMode ?? this.config.toolMode) === 'native') {
+      return new NativeFormatter({
+        unsupportedMedia: this.config.unsupportedMedia,
+        warnOnStrip: this.config.warnOnStrip,
+      }).buildMessages(messages, options);
+    }
     const {
       assistantParticipant,
       tools,
@@ -502,6 +513,11 @@ export class AnthropicXmlFormatter implements PrefillFormatter {
   // ==========================================================================
   // RESPONSE PARSING
   // ==========================================================================
+  //
+  // These decode the XML tool protocol whatever mode this formatter builds
+  // in: called directly, they read `<function_calls>` in any text they're
+  // given. Membrane calls them only when a request's resolved protocol is XML;
+  // a native-mode response takes its tool calls from the provider's blocks.
 
   createStreamParser(): StreamParser {
     return new IncrementalXmlParser();

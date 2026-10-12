@@ -81,9 +81,22 @@ class ResponsesPassthroughParser implements StreamParser {
 
 type NativeItem = { type?: string; id?: string; [key: string]: unknown };
 
+/**
+ * The identity under which a block's rawItem is replayed: by type and id, or
+ * by its JSON when it has no id. Blocks of one message whose raw items share
+ * a key replay that item once.
+ */
+export function responsesRawItemKey(rawItem: { type?: unknown; id?: unknown }): string {
+  return typeof rawItem.id === 'string'
+    ? `${rawItem.type ?? ''}:${rawItem.id}`
+    : JSON.stringify(rawItem);
+}
+
 export class OpenAIResponsesFormatter implements PrefillFormatter {
   readonly name = 'openai-responses';
   readonly usesPrefill = false;
+  readonly supportsNativeTools = true;
+  readonly supportsXmlTools = false;
   /** buildMessages records every consumer message it doesn't carry verbatim (utils/fidelity.ts). */
   readonly reportsAlterations = true;
 
@@ -119,9 +132,7 @@ export class OpenAIResponsesFormatter implements PrefillFormatter {
         }
 
         flushPending();
-        const key = typeof rawItem.id === 'string'
-          ? `${rawItem.type ?? ''}:${rawItem.id}`
-          : JSON.stringify(rawItem);
+        const key = responsesRawItemKey(rawItem);
         const sent = seenRawItems.get(key);
         if (!sent) {
           items.push(rawItem);

@@ -147,23 +147,22 @@ export function ownBlocks(fidelity: FidelityNotes | undefined, blocks: readonly 
 }
 
 /**
- * The tool-pair normalizer's block-identity callbacks, for a build recording
+ * The tool-pair normalizer's block-identity callback, for a build recording
  * `fidelity` (spread into `normalizeToolPairs`' options). The normalizer
- * makes new objects out of a consumer's blocks in two places. An orphan
- * tool_result rewritten as text alters exactly the message that occurrence
- * came from. A copy made to drop `cache_control` carries the same content,
- * so it keeps its owner and a later adapter report about it is attributed.
+ * makes a new object out of a consumer's block in one way: a tool_result
+ * rewritten as text, an orphan or a duplicate. That alters exactly the
+ * message the occurrence came from, and the replacement keeps its owner, so
+ * a later adapter report about it is attributed.
  */
 export function followNormalizedBlocks(
   fidelity: FidelityNotes | undefined,
-): Pick<NormalizeOptions, 'onBlockRewritten' | 'onBlockCopied'> {
+): Pick<NormalizeOptions, 'onBlockRewritten'> {
   if (!fidelity) return {};
   return {
     onBlockRewritten: (original, replacement) => {
       fidelity.alterBlock(original);
       fidelity.ownCopy(original, replacement);
     },
-    onBlockCopied: (original, copy) => fidelity.ownCopy(original, copy),
   };
 }
 

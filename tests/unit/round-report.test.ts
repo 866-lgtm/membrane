@@ -317,7 +317,7 @@ describe('beforeRequest hooks', () => {
 
 describe('XML prefill rounds', () => {
   function xmlRequest(messages: NormalizedRequest['messages']): NormalizedRequest {
-    return { messages, config: { model: 'test-model', maxTokens: 1000 }, tools: [noopTool] };
+    return { messages, config: { model: 'test-model', maxTokens: 1000 }, toolMode: 'xml', tools: [noopTool] };
   }
   const toolRound = '<function_calls><invoke name="noop"></invoke></function_calls>';
 
@@ -368,7 +368,7 @@ describe('XML prefill rounds', () => {
       },
     };
     const membrane = new Membrane(adapter, { logger: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() } });
-    const { rounds } = await drive(membrane, { messages: [{ participant: 'User', content: [{ type: 'text', text: 'hi' }] }], config: { model: 'test', maxTokens: 100 } });
+    const { rounds } = await drive(membrane, { messages: [{ participant: 'User', content: [{ type: 'text', text: 'hi' }] }], config: { model: 'test', maxTokens: 100 }, toolMode: 'xml' });
     expect(rounds.map((r) => [r.index, r.usage.inputTokens, r.fidelity])).toEqual([
       [0, 101, 'established'],
       [1, 102, 'established'],
@@ -507,7 +507,7 @@ describe('producer-boundary losses', () => {
     });
     const { rounds } = await drive(membrane, {
       messages: [{ participant: 'User', content: [{ type: 'text', text: 'ORIGINAL' }] }],
-      config: { model: 'test-model', maxTokens: 1000 }, tools: [noopTool], promptCaching: false,
+      config: { model: 'test-model', maxTokens: 1000 }, toolMode: 'xml', tools: [noopTool], promptCaching: false,
     });
     expect(sent.every((m) => m.includes('CHANGED'))).toBe(true);
     expect(rounds.map((r) => r.fidelity)).toEqual(['unknown', 'unknown']);
@@ -557,7 +557,7 @@ describe('producer-boundary losses', () => {
   it('XML history: nested tool-result media rendered as a note is reported against its message', async () => {
     const adapter = new MockAdapter({ streamChunkDelayMs: 0, completeDelayMs: 0, responseQueue: ['done.'] });
     const { rounds } = await drive(new Membrane(adapter), {
-      config: { model: 'test-model', maxTokens: 1000 }, promptCaching: false,
+      config: { model: 'test-model', maxTokens: 1000 }, toolMode: 'xml', promptCaching: false,
       messages: [
         { participant: 'Claude', content: [{ type: 'tool_use', id: 't1', name: 'noop', input: {} }] },
         { participant: 'User', content: [{ type: 'tool_result', toolUseId: 't1', content: [{ type: 'text', text: 'picture' }, { type: 'image', source: { type: 'base64', mediaType: 'image/png', data: 'iVBORw0KGgo=' } }] }] },
@@ -700,7 +700,7 @@ describe('Greptile\'s review of #104', () => {
       const adapter = new MockAdapter({ streamChunkDelayMs: 0, completeDelayMs: 0, responseQueue: [toolRound, toolRound, 'done.'] });
       const { rounds } = await drive(new Membrane(adapter), {
         messages: [{ participant: 'User', content: [text('go')] }],
-        config: { model: 'test-model', maxTokens: 1000 }, tools: [noopTool],
+        config: { model: 'test-model', maxTokens: 1000 }, toolMode: 'xml', tools: [noopTool],
       }, {
         inject: [
           [{ participant: 'Ann', content: [toolResult('x')] }],
@@ -715,7 +715,7 @@ describe('Greptile\'s review of #104', () => {
     async function xmlRound(messages: NormalizedRequest['messages']) {
       const adapter = new MockAdapter({ streamChunkDelayMs: 0, completeDelayMs: 0, responseQueue: ['done.'] });
       const { rounds } = await drive(new Membrane(adapter), {
-        messages, config: { model: 'test-model', maxTokens: 1000 }, promptCaching: false,
+        messages, config: { model: 'test-model', maxTokens: 1000 }, toolMode: 'xml', promptCaching: false,
       });
       return { round: rounds[0]!, sent: JSON.stringify(adapter.getLastRequest()?.messages) };
     }
@@ -773,7 +773,20 @@ describe('Greptile\'s review of #104', () => {
       ],
       altered: [0],
     },
-  ])('a textified orphan tool_result alters exactly the message it came from: $name', ({ messages, altered }) => {
+    {
+      // A second result for a call that was already answered is textified too.
+      name: 'a duplicate result for an answered call',
+      messages: (): NormalizedRequest['messages'] => [
+        { participant: 'User', content: [text('start')] },
+        { participant: 'Claude', content: [toolUse('c1')] },
+        { participant: 'User', content: [toolResult('c1', 'first')] },
+        { participant: 'Claude', content: [text('noted')] },
+        { participant: 'User', content: [toolResult('c1', 'again')] },
+        { participant: 'User', content: [text('go')] },
+      ],
+      altered: [4],
+    },
+  ])('a textified tool_result alters exactly the message it came from: $name', ({ messages, altered }) => {
     it('the yielding native loop', async () => {
       const { rounds } = await drive(new Membrane(new ScriptedAdapter([finalTurn()])), nativeRequest(messages()));
       expect(rounds[0]!.altered.messages).toEqual(altered);
@@ -788,11 +801,10 @@ describe('Greptile\'s review of #104', () => {
     });
   });
 
-  describe('a block the normalizer copies to drop cache_control keeps its owner', () => {
+  describe('a stranded call\'s round reports the breakpoint block the Anthropic cleanup removes', () => {
     // The stranded tool_use gets a synthetic [pending] result in the next user
-    // envelope, and every cache_control from that envelope on is removed by
-    // copying the block. The breakpoint sits on a whitespace-only last block,
-    // which the Anthropic cleanup then removes: its report names the copy.
+    // envelope. The breakpoint sits on a whitespace-only last block, which the
+    // Anthropic cleanup then removes, and its report names that block's message.
     const messages = (): NormalizedRequest['messages'] => [
       { participant: 'User', content: [text('start')] },
       { participant: 'Claude', content: [toolUse('stranded')] },
@@ -811,22 +823,6 @@ describe('Greptile\'s review of #104', () => {
       expect(sent).not.toContain('"  "');
       expect(rounds[0]!.altered.messages).toEqual([2]);
       expect(rounds[0]!.fidelity).toBe('established');
-    });
-
-    it('through NativeFormatter.buildMessages', () => {
-      const notes = new FidelityNotes();
-      const built = new NativeFormatter().buildMessages(messages(), {
-        assistantParticipant: 'Claude', participantMode: 'multiuser', promptCaching: true, fidelity: notes,
-      } as any);
-      const copy = (built.messages as Array<{ content: unknown }>)
-        .flatMap((m) => (Array.isArray(m.content) ? m.content : []))
-        .find((b: any) => b.type === 'text' && b.text === '  ');
-      // The suppression's copy, not the block the builder registered.
-      expect(copy).toBeDefined();
-      expect((copy as Record<string, unknown>).cache_control).toBeUndefined();
-      notes.alterBlock(copy);
-      expect(sorted(notes.altered)).toEqual([2]);
-      expect(notes.established).toBe(true);
     });
   });
 
@@ -917,7 +913,7 @@ describe('slimepriestess\'s review of #104', () => {
       });
       const { rounds } = await drive(membrane, {
         messages: [{ participant: 'User', content: [{ type: 'text', text: 'go' }] }],
-        config: { model: 'test-model', maxTokens: 1000 }, tools: [noopTool], promptCaching: false,
+        config: { model: 'test-model', maxTokens: 1000 }, toolMode: 'xml', tools: [noopTool], promptCaching: false,
       });
       expect(maxTokens).toEqual([1000, 7]);
       expect(rounds.map((r) => r.fidelity)).toEqual(['unknown', 'unknown']);
@@ -973,7 +969,7 @@ describe('slimepriestess\'s review of #104', () => {
     it('XML prefill: a tool_result\'s rawXml goes out in place of its content', async () => {
       const adapter = new MockAdapter({ streamChunkDelayMs: 0, completeDelayMs: 0, responseQueue: ['done.'] });
       const { rounds } = await drive(new Membrane(adapter), {
-        config: { model: 'test-model', maxTokens: 1000 }, promptCaching: false,
+        config: { model: 'test-model', maxTokens: 1000 }, toolMode: 'xml', promptCaching: false,
         messages: [
           { participant: 'User', content: [{ type: 'text', text: 'run it' }] },
           { participant: 'Claude', content: [{ type: 'tool_use', id: 't1', name: 'noop', input: {} } as ContentBlock] },
@@ -1194,7 +1190,7 @@ describe('an automated review of #104\'s own range', () => {
   it('XML history: a result sent as its rawXml is carried, nested media and all', async () => {
     const adapter = new MockAdapter({ streamChunkDelayMs: 0, completeDelayMs: 0, responseQueue: ['done.'] });
     const { rounds } = await drive(new Membrane(adapter), {
-      config: { model: 'test-model', maxTokens: 1000 }, promptCaching: false,
+      config: { model: 'test-model', maxTokens: 1000 }, toolMode: 'xml', promptCaching: false,
       messages: [
         { participant: 'Claude', content: [{ type: 'tool_use', id: 't1', name: 'noop', input: {}, rawXml: '<function_calls><invoke name="noop"></invoke></function_calls>' }] },
         { participant: 'User', content: [{ type: 'tool_result', toolUseId: 't1', rawXml: '<function_results><result>picture [Image]</result></function_results>', content: [{ type: 'text', text: 'picture' }, { type: 'image', source: { type: 'base64', mediaType: 'image/png', data: 'iVBORw0KGgo=' } }] }] },
@@ -1211,7 +1207,7 @@ describe('an automated review of #104\'s own range', () => {
     const huge: ContentBlock = { type: 'image', source: { type: 'base64', mediaType: 'image/png', data: pngHeader + big } } as ContentBlock;
     const adapter = new MockAdapter({ streamChunkDelayMs: 0, completeDelayMs: 0, responseQueue: ['done.'] });
     const request: NormalizedRequest = {
-      config: { model: 'test-model', maxTokens: 1000 }, tools: [noopTool], promptCaching: false,
+      config: { model: 'test-model', maxTokens: 1000 }, toolMode: 'xml', tools: [noopTool], promptCaching: false,
       messages: Array.from({ length: 8 }, (_, i) => ({ participant: 'User', content: [text(`picture ${i}`), huge] })),
     };
     request.shedOversizeImages = true;
