@@ -1,38 +1,190 @@
 /**
- * Image media-type sanitation shared by every request-build path.
+ * Image handling shared by every request-build path.
  *
- * sharp-readable but API-rejected formats (image/svg, image/tiff, ...) can
- * enter an agent's event store through permissive ingest surfaces; one such
- * block then 400s EVERY subsequent compile (invalid_request) and hard-downs
- * the agent (LabClaude 2026-07-11: an SVG attachment). Every place that turns
- * a normalized image block into a provider image block must either emit an
- * accepted media type or degrade to a loud text placeholder the agent can see.
+ * A provider refuses a whole request when one of its images is data it
+ * doesn't accept, and an image in an agent's history goes out with every
+ * later request, so one such block fails every compile until it is removed
+ * (LabClaude 2026-07-11: an SVG attachment). Ingest labels can't be trusted
+ * to catch it: an SVG arrives as image/svg+xml, but a text file renamed
+ * `notes.png` arrives as image/png. So every place that turns image data
+ * into a provider image, base64 data or a `data:` URL, asks
+ * `imageForRequest` with its destination's accepted formats. The decision
+ * recognizes each format by its header: an accepted image is labelled by
+ * what its header shows, and anything else becomes a text placeholder the
+ * agent can see. A header is not proof the rest decodes. A remote image URL
+ * goes out as it is, for the provider to fetch.
  */
 
-export const API_ACCEPTED_IMAGE_MEDIA_TYPES: ReadonlySet<string> = new Set([
-  'image/jpeg',
-  'image/png',
-  'image/gif',
-  'image/webp',
-]);
+export type RasterImageMediaType = 'image/jpeg' | 'image/png' | 'image/gif' | 'image/webp';
+export type ImageMediaType = RasterImageMediaType | 'image/heic' | 'image/heif';
 
-/** Resolve supported image signatures before trusting an ingest label.
- * Unknown bytes retain the declared type so callers can still reject unsupported
- * formats. Inspect only the header rather than decoding the entire image. */
-export function resolveImageMediaType(data: string | undefined, declared?: string): string | undefined {
+/** What the request builders send as images, and what every destination
+ *  takes unless it documents otherwise. */
+export const RASTER_IMAGE_TYPES: ReadonlySet<RasterImageMediaType> =
+  new Set(['image/jpeg', 'image/png', 'image/gif', 'image/webp']);
+
+/** Gemini's image formats as its image-understanding docs list them
+ *  (ai.google.dev/gemini-api/docs/image-understanding, read 2026-10-12):
+ *  PNG, JPEG, WebP, HEIC and HEIF, and no GIF. */
+export const GEMINI_IMAGE_TYPES: ReadonlySet<ImageMediaType> =
+  new Set(['image/png', 'image/jpeg', 'image/webp', 'image/heic', 'image/heif']);
+
+/** What OpenAI's image edits take from the GPT image models: PNG, WebP and
+ *  JPEG, and no GIF (openai-node's images.ts, ImageEditParamsBase.image, as
+ *  of 2026-10-06). */
+export const OPENAI_IMAGE_EDIT_TYPES: ReadonlySet<ImageMediaType> =
+  new Set(['image/png', 'image/jpeg', 'image/webp']);
+
+const FORMAT_NAMES: ReadonlyArray<[ImageMediaType, string]> = [
+  ['image/jpeg', 'JPEG'], ['image/png', 'PNG'], ['image/gif', 'GIF'],
+  ['image/webp', 'WebP'], ['image/heic', 'HEIC'], ['image/heif', 'HEIF'],
+];
+
+const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+
+/** HEIF still images by their `ftyp` box's major brand (ISO/IEC 23008-12):
+ *  heic and heix are HEVC-coded images, mif1 any HEIF image. Image sequences
+ *  have brands of their own and aren't images here. */
+const HEIF_BRANDS: Readonly<Record<string, ImageMediaType>> = {
+  heic: 'image/heic', heix: 'image/heic', mif1: 'image/heif',
+};
+
+/** The format whose header the data starts with, if any. Only the first 18
+ *  bytes are decoded, which hold every header recognized here. */
+function formatOf(data: unknown): ImageMediaType | undefined {
   // Malformed blocks can carry non-string fields at runtime; treat them as
-  // unknown bytes / no label rather than throwing out of a request build.
-  const bytes = Buffer.from((typeof data === 'string' ? data : '').slice(0, 24), 'base64');
-  if (bytes.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) return 'image/png';
+  // data that is no image rather than throwing out of a request build.
+  // Leading whitespace, which the decoder skips, would use up the window.
+  const bytes = Buffer.from((typeof data === 'string' ? data : '').trimStart().slice(0, 24), 'base64');
+  if (bytes.subarray(0, 8).equals(PNG_SIGNATURE)) return 'image/png';
   if (bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) return 'image/jpeg';
   const header = bytes.toString('latin1');
   if (header.startsWith('GIF87a') || header.startsWith('GIF89a')) return 'image/gif';
   if (header.startsWith('RIFF') && header.slice(8, 12) === 'WEBP') return 'image/webp';
-  return typeof declared === 'string' ? declared.toLowerCase() : undefined;
+  if (header.slice(4, 8) === 'ftyp') return HEIF_BRANDS[header.slice(8, 12)];
+  return undefined;
 }
 
-export function isAcceptedImageMediaType(mediaType: string | null | undefined): boolean {
-  return API_ACCEPTED_IMAGE_MEDIA_TYPES.has((mediaType ?? '').toLowerCase());
+export type ImageForRequest<T extends ImageMediaType = RasterImageMediaType> =
+  | { mediaType: T; placeholder?: undefined }
+  | { mediaType?: undefined; placeholder: { type: 'text'; text: string } };
+
+/**
+ * What a request carries for base64 image data: the media type its header
+ * shows, whatever label it arrived with, when that format is one `accepted`
+ * holds; otherwise a text placeholder in its place. `accepted` is what the
+ * destination takes, the four raster formats unless it documents otherwise.
+ * `declared` is the label the data arrived with; it only goes into the
+ * placeholder and the warning.
+ *
+ * The placeholder is loud on purpose: the agent must be clearly aware an
+ * image was withheld, since silence reads as "there was no image". Each one
+ * also warns on stderr for ops visibility.
+ */
+export function imageForRequest<T extends ImageMediaType = RasterImageMediaType>(
+  data: unknown,
+  declared: unknown,
+  accepted: ReadonlySet<T> = RASTER_IMAGE_TYPES as ReadonlySet<ImageMediaType> as ReadonlySet<T>,
+): ImageForRequest<T> {
+  const format = formatOf(data);
+  if (format && (accepted as ReadonlySet<ImageMediaType>).has(format)) return { mediaType: format as T };
+  // The label comes from ingest and goes into a system note, so it is quoted
+  // and cut short: a quote, a newline or a bracket in it stays inside quotes.
+  const label = typeof declared === 'string' && declared !== ''
+    ? ` (it was labelled ${JSON.stringify(declared.slice(0, 64))})`
+    : '';
+  const names = FORMAT_NAMES
+    .filter(([type]) => (accepted as ReadonlySet<ImageMediaType>).has(type))
+    .map(([, name]) => name);
+  const formats = names.length > 1 ? `${names.slice(0, -1).join(', ')} or ${names[names.length - 1]}` : names.join('');
+  // The formats named are this request path's, which can be stricter than
+  // what the provider itself takes: a builder sends only the four raster
+  // formats even to an API that also takes HEIC.
+  console.warn(`[membrane] image block stripped: its data is not a ${formats} image${label}`);
+  return {
+    placeholder: {
+      type: 'text',
+      text:
+        `[system: an image that belongs here was NOT shown to you — its data is not a ${formats} ` +
+        `image, the formats this request can carry${label}. You are not seeing this image. ` +
+        `If it matters, ask for it in one of those formats.]`,
+    },
+  };
+}
+
+const DATA_URL = /^data:([^,]*),/i;
+
+export type UrlImageForRequest<T extends ImageMediaType = RasterImageMediaType> =
+  | { url: string; mediaType?: T; data?: string; placeholder?: undefined }
+  | { placeholder: { type: 'text'; text: string }; url?: undefined; mediaType?: undefined; data?: undefined };
+
+/**
+ * What a request carries for an image given by URL. A `data:` URL holds its
+ * image inline, so its bytes take `imageForRequest`'s decision: an accepted
+ * image comes back with its media type, its base64 data and a `data:` URL
+ * labelled by its header (the same URL when it already was), and anything
+ * else comes back as the placeholder. Any other URL comes back as it is,
+ * for the provider to fetch.
+ */
+export function urlImageForRequest<T extends ImageMediaType = RasterImageMediaType>(
+  url: string,
+  accepted?: ReadonlySet<T>,
+): UrlImageForRequest<T> {
+  const head = typeof url === 'string' ? DATA_URL.exec(url) : null;
+  if (!head) {
+    // A data: URL without the comma that starts its data holds no image.
+    if (typeof url === 'string' && /^data:/i.test(url)) {
+      return { placeholder: imageForRequest('', url.slice(5).split(';')[0] || undefined, accepted).placeholder! };
+    }
+    return { url };
+  }
+  const [type = '', ...params] = head[1]!.split(';');
+  const payload = url.slice(head[0].length);
+  // A data: URL without ;base64 holds its bytes percent-encoded.
+  const base64 = params.some((param) => param.trim().toLowerCase() === 'base64');
+  const data = base64
+    ? payload
+    : Buffer.from(payload.replace(/%([0-9a-f]{2})/gi, (_, hex: string) => String.fromCharCode(parseInt(hex, 16))), 'latin1')
+      .toString('base64');
+  const image = imageForRequest(data, type || undefined, accepted);
+  if (image.placeholder) return { placeholder: image.placeholder };
+  // A URL already labelled by its header goes out as it came; only one whose
+  // label disagrees, or whose bytes are percent-encoded, is rewritten.
+  const labelled = base64 && type.trim().toLowerCase() === image.mediaType;
+  return { url: labelled ? url : `data:${image.mediaType};base64,${data}`, mediaType: image.mediaType, data };
+}
+
+/** Tool-result content as a request carries it, under the builders' formats:
+ *  each base64 image labelled by its header, an image in a `data:` URL the
+ *  same way, and anything else replaced by `imageForRequest`'s placeholder. An
+ *  image may carry its data in a `source`, or MCP-style as `data` and
+ *  `mimeType`; either way an accepted one comes back with a base64 `source`.
+ *  Remote URL images and other blocks pass through, non-array content is
+ *  returned as it is, and the content itself is not mutated. */
+export function toolResultContentForRequest(content: unknown): unknown {
+  if (!Array.isArray(content)) return content;
+  return content.map((item) => {
+    if (!item || typeof item !== 'object' || (item as { type?: unknown }).type !== 'image') return item;
+    const block = item as { source?: { type?: string; url?: unknown; data?: unknown; mediaType?: unknown; media_type?: unknown }; data?: unknown; mimeType?: unknown };
+    const src = block.source;
+    if (src?.type === 'url') {
+      const image = urlImageForRequest(src.url as string);
+      if (image.placeholder) return image.placeholder;
+      if (!image.data) return item;
+      return { ...item, source: { type: 'base64', media_type: image.mediaType, data: image.data } };
+    }
+    if (!src && typeof block.data === 'string') {
+      // MCP-shaped image content, which some tool results carry as it came.
+      const { mediaType, placeholder } = imageForRequest(block.data, block.mimeType);
+      if (placeholder) return placeholder;
+      const { data, mimeType: _declared, ...rest } = block;
+      return { ...rest, source: { type: 'base64', media_type: mediaType, data } };
+    }
+    const { mediaType, placeholder } = imageForRequest(src?.data, src?.mediaType ?? src?.media_type);
+    if (placeholder) return placeholder;
+    const { mediaType: _declared, ...source } = src ?? {};
+    return { ...item, source: { ...source, media_type: mediaType } };
+  });
 }
 
 /** Requests are also capped by SIZE (~32MB serialized) independent of token
@@ -146,20 +298,4 @@ export function shedImagesToFitByteBudget(
       `the upstream compile exceeded the byte wall — check maxLiveImageBytes / image policy.`,
   );
   return shed;
-}
-
-/** Loud agent-facing stand-in for an image the API would reject. The agent
- *  must be clearly aware an image was stripped — silence here reads as
- *  "there was no image". Also warns on stderr for ops visibility. */
-export function strippedImagePlaceholder(mediaType: unknown): { type: 'text'; text: string } {
-  console.warn(
-    `[membrane] image block stripped: unsupported media type "${String(mediaType)}"`,
-  );
-  return {
-    type: 'text',
-    text:
-      `[system: an image that belongs here was NOT shown to you — its media type ` +
-      `"${String(mediaType)}" is not accepted by the model API (only jpeg/png/gif/webp are). ` +
-      `You are not seeing this image. If it matters, ask for it in a supported format.]`,
-  };
 }

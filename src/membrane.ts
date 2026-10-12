@@ -86,9 +86,8 @@ import {
   warnUnconvertibleProviderItem,
 } from './utils/usage.js';
 import {
-  resolveImageMediaType,
-  isAcceptedImageMediaType,
-  strippedImagePlaceholder,
+  imageForRequest,
+  toolResultContentForRequest,
   shedImagesToFitByteBudget, assertWithinByteBudget,
 } from './utils/image-media.js';
 import { getDefaultPricing } from './registry/default-pricing.js';
@@ -1002,11 +1001,12 @@ export class Membrane {
             // Track the tool results
             executedToolResults.push(...results);
 
-            // Check if results contain images (requires split-turn injection)
-            if (hasImageInToolResults(results)) {
-              // Use split-turn injection for images
-              const splitContent = formatToolResultsForSplitTurn(results);
-
+            // Check if results contain images (requires split-turn injection).
+            // The split is for images that will be sent: when every image
+            // became a placeholder, there is nothing to put in the user turn,
+            // and the standard path carries the placeholders as text.
+            const splitContent = hasImageInToolResults(results) ? formatToolResultsForSplitTurn(results) : null;
+            if (splitContent?.hasImages) {
               // Emit block events for tool results (image path)
               const toolResultBlockIndex = parser.getBlockIndex();
               onBlock?.({
@@ -1624,7 +1624,9 @@ export class Membrane {
           content.push({
             type: 'tool_result',
             tool_use_id: block.toolUseId,
-            content: block.content,
+            // Its images take the same route as the message's own below, so
+            // every adapter is handed only images the API accepts.
+            content: toolResultContentForRequest(block.content),
             is_error: block.isError,
           });
         } else if (block.type === 'thinking') {
@@ -1642,12 +1644,13 @@ export class Membrane {
           content.push({ ...(block as unknown as Record<string, unknown>) });
         } else if (block.type === 'image') {
           if (block.source.type === 'base64') {
-            const mediaType = resolveImageMediaType(block.source.data, block.source.mediaType);
-            if (!isAcceptedImageMediaType(mediaType)) {
-              // API-unacceptable media type (e.g. image/svg): degrade to a
-              // loud text placeholder instead of poisoning the whole request
-              // (one bad stored block otherwise 400s every compile forever).
-              content.push(strippedImagePlaceholder(mediaType));
+            const { mediaType, placeholder } = imageForRequest(block.source.data, block.source.mediaType);
+            if (placeholder) {
+              // Not an image the API accepts (an SVG, or data that is no image
+              // at all): degrade to a loud text placeholder instead of
+              // poisoning the whole request (one bad stored block otherwise
+              // 400s every compile forever).
+              content.push(placeholder);
             } else {
               const imageBlock: Record<string, unknown> = {
                 type: 'image',
@@ -3501,10 +3504,10 @@ export class Membrane {
             // Track the tool results
             executedToolResults.push(...results);
 
-            // Check if results contain images
-            if (hasImageInToolResults(results)) {
-              const splitContent = formatToolResultsForSplitTurn(results);
-
+            // Check if results contain images that will be sent (see the
+            // streaming path: an all-placeholder result takes the standard path)
+            const splitContent = hasImageInToolResults(results) ? formatToolResultsForSplitTurn(results) : null;
+            if (splitContent?.hasImages) {
               // Emit block events for tool results
               if (emitBlocks) {
                 stream.emit({

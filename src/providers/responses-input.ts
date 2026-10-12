@@ -1,5 +1,5 @@
 import type { ProviderRequest } from '../types/index.js';
-import { resolveImageMediaType } from '../utils/image-media.js';
+import { imageForRequest, urlImageForRequest } from '../utils/image-media.js';
 import type { OpenAIResponsesInputItem } from './openai-responses-api.js';
 
 type JsonObject = Record<string, unknown>;
@@ -25,11 +25,13 @@ export function normalizeResponsesInput(messages: ProviderRequest['messages']): 
     }
 
     // Native messages (including phase, status and developer/system roles)
-    // must survive replay verbatim. Only translate normalized content blocks.
+    // must survive replay verbatim. Only translate normalized content blocks,
+    // and decide an input_image whose data: URL holds no accepted image.
     if (Array.isArray(rawMessage.content) && !rawMessage.content.some((block) =>
       isObject(block) && ['text', 'image', 'tool_use', 'tool_result', 'redacted_thinking'].includes(asString(block.type))
     )) {
-      output.push(rawMessage);
+      const content = nativeParts(rawMessage.content);
+      output.push(content === rawMessage.content ? rawMessage : { ...rawMessage, content });
       continue;
     }
     const role = typeof rawMessage.role === 'string' ? rawMessage.role : 'user';
@@ -55,8 +57,8 @@ export function normalizeResponsesInput(messages: ProviderRequest['messages']): 
       if (rawBlock.type === 'text') {
         parts.push({ type: role === 'assistant' ? 'output_text' : 'input_text', text: asString(rawBlock.text) });
       } else if (rawBlock.type === 'image') {
-        const imageUrl = responsesImageUrl(rawBlock);
-        if (imageUrl && role !== 'assistant') parts.push({ type: 'input_image', image_url: imageUrl });
+        const part = responsesImagePart(rawBlock);
+        if (part && role !== 'assistant') parts.push(part);
       } else if (rawBlock.type === 'tool_use') {
         flush();
         output.push(normalizeStandaloneItem(rawBlock));
@@ -68,7 +70,7 @@ export function normalizeResponsesInput(messages: ProviderRequest['messages']): 
         output.push(reasoningInputItem(rawBlock));
       } else {
         // Already-native input_text/output_text/input_image/refusal parts.
-        parts.push(rawBlock);
+        parts.push(nativePart(rawBlock));
       }
     }
     flush();
@@ -98,6 +100,10 @@ function normalizeStandaloneItem(item: JsonObject): unknown {
   }
   if (item.type === 'redacted_thinking') {
     return reasoningInputItem(item);
+  }
+  if (item.type === 'function_call_output' && Array.isArray(item.output)) {
+    const output = nativeParts(item.output);
+    return output === item.output ? item : { ...item, output };
   }
   return item;
 }
@@ -139,12 +145,9 @@ export function responsesToolOutputParts(content: unknown): unknown[] | null {
     } else if (block.type === 'text') {
       parts.push({ type: 'input_text', text: asString(block.text) });
     } else if (block.type === 'image') {
-      const imageUrl = responsesImageUrl(block);
-      parts.push(imageUrl
-        ? { type: 'input_image', image_url: imageUrl }
-        : { type: 'input_text', text: '[image omitted: unsupported image source]' });
+      parts.push(responsesImagePart(block) ?? { type: 'input_text', text: '[image omitted: unsupported image source]' });
     } else if (block.type === 'input_text' || block.type === 'input_image') {
-      parts.push(block);
+      parts.push(nativePart(block));
     } else {
       parts.push({ type: 'input_text', text: JSON.stringify(block) });
     }
@@ -152,15 +155,75 @@ export function responsesToolOutputParts(content: unknown): unknown[] | null {
   return parts;
 }
 
-function responsesImageUrl(block: JsonObject): string | undefined {
+type ResponsesImagePart = { type: 'input_image'; image_url: string } | { type: 'input_text'; text: string };
+
+/** An image block as a Responses input part: an input_image for an accepted
+ *  image or a remote URL, imageForRequest's placeholder as input_text for
+ *  data that is no accepted image, and undefined for a block with no usable
+ *  source. */
+function responsesImagePart(block: JsonObject): ResponsesImagePart | undefined {
   const source = isObject(block.source) ? block.source : undefined;
-  if (!source) return typeof block.image_url === 'string' ? block.image_url : undefined;
-  if (source.type === 'url') return asString(source.url) || undefined;
+  if (!source) return typeof block.image_url === 'string' && block.image_url ? urlPart(block.image_url) : undefined;
+  if (source.type === 'url') {
+    const url = asString(source.url);
+    return url ? urlPart(url) : undefined;
+  }
   if (source.type !== 'base64') return undefined;
   const data = asString(source.data);
-  const declared = asString(source.mediaType) || asString(source.media_type) || 'image/png';
-  const mediaType = resolveImageMediaType(data, declared);
-  return data ? `data:${mediaType};base64,${data}` : undefined;
+  const { mediaType, placeholder } = imageForRequest(data, source.mediaType ?? source.media_type);
+  return placeholder
+    ? { type: 'input_text', text: placeholder.text }
+    : { type: 'input_image', image_url: `data:${mediaType};base64,${data}` };
+}
+
+/** An image URL as a Responses part: a data: URL's image labelled by its
+ *  header, or the placeholder for data the API doesn't accept; any other URL
+ *  as it is, for the API to fetch. */
+function urlPart(url: string): ResponsesImagePart {
+  const image = urlImageForRequest(url);
+  return image.placeholder ? { type: 'input_text', text: image.placeholder.text } : { type: 'input_image', image_url: image.url };
+}
+
+/** An already-native part as the request carries it. Native parts replay
+ *  verbatim, except an input_image whose data: URL holds no accepted image:
+ *  the API would refuse it on every request, so it becomes the placeholder. */
+function nativePart(part: JsonObject): JsonObject {
+  if (part.type !== 'input_image' || typeof part.image_url !== 'string' || !part.image_url) return part;
+  const image = urlImageForRequest(part.image_url);
+  return image.placeholder ? { type: 'input_text', text: image.placeholder.text } : part;
+}
+
+/** Native input items as an API-mode request carries them: replayed
+ *  verbatim, except an input_image, in a message's content or a
+ *  function_call_output's output, whose data: URL holds no accepted image,
+ *  which becomes the placeholder. The same array, and the same items, when
+ *  nothing changes, so valid items replay byte for byte. */
+export function nativeInputForRequest(items: ProviderRequest['messages']): OpenAIResponsesInputItem[] {
+  let changed = false;
+  const out = (items as unknown[]).map((item) => {
+    if (!isObject(item)) return item;
+    const key = Array.isArray(item.content) ? 'content'
+      : item.type === 'function_call_output' && Array.isArray(item.output) ? 'output' : null;
+    if (!key) return item;
+    const parts = nativeParts(item[key] as unknown[]);
+    if (parts === item[key]) return item;
+    changed = true;
+    return { ...item, [key]: parts };
+  });
+  return (changed ? out : items) as OpenAIResponsesInputItem[];
+}
+
+/** nativePart over a native content or output array: the same array when no
+ *  part changes, so a valid native item replays verbatim. */
+function nativeParts(parts: unknown[]): unknown[] {
+  let changed = false;
+  const decided = parts.map((part) => {
+    if (!isObject(part)) return part;
+    const next = nativePart(part);
+    if (next !== part) changed = true;
+    return next;
+  });
+  return changed ? decided : parts;
 }
 
 function asString(value: unknown): string {

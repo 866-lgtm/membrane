@@ -30,7 +30,7 @@ import {
   abortError,
   networkError,
 } from '../types/index.js';
-import { safeParseJson, textOnlyToolResultContent, createCombinedSignal, SSELineParser, isDeadlineAbort, deadlineTimeoutError, throwOnStreamErrorFrame, assertTerminalEventObserved } from './utils.js';
+import { safeParseJson, textOnlyToolResultContent, openAIImagePart, createCombinedSignal, SSELineParser, isDeadlineAbort, deadlineTimeoutError, throwOnStreamErrorFrame, assertTerminalEventObserved } from './utils.js';
 
 // ============================================================================
 // Types
@@ -442,19 +442,10 @@ export class OpenAICompatibleAdapter implements ProviderAdapter {
               reasoningText += (reasoningText ? '\n' : '') + block.thinking;
             }
           } else if (block.type === 'image') {
-            // Convert Anthropic-style image to OpenAI image_url with data URI
-            if (block.source?.type === 'base64') {
-              const mediaType = block.source.media_type ?? block.source.mediaType ?? 'image/png';
-              contentParts.push({
-                type: 'image_url',
-                image_url: { url: `data:${mediaType};base64,${block.source.data}` },
-              });
-            } else if (block.source?.type === 'url') {
-              contentParts.push({
-                type: 'image_url',
-                image_url: { url: block.source.url },
-              });
-            }
+            // Convert Anthropic-style image to OpenAI image_url with data URI,
+            // or to the placeholder for data these APIs don't accept
+            const part = openAIImagePart(block.source);
+            if (part) contentParts.push(part);
           } else if (block.type === 'tool_use') {
             toolCalls.push({
               id: block.id,

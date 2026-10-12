@@ -56,10 +56,10 @@ describe('GeminiAdapter audio input', () => {
 
   it('still converts image blocks (regression)', async () => {
     const req = await buildRequest([
-      { type: 'image', source: { type: 'base64', data: 'SU1HAA==', media_type: 'image/png' } },
+      { type: 'image', source: { type: 'base64', data: 'iVBORw0KGgo=', media_type: 'image/png' } },
     ]);
     expect(req.contents[0].parts).toContainEqual({
-      inlineData: { mimeType: 'image/png', data: 'SU1HAA==' },
+      inlineData: { mimeType: 'image/png', data: 'iVBORw0KGgo=' },
     });
   });
 });

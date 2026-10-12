@@ -10,7 +10,7 @@
  */
 
 import { createHash, randomUUID } from 'node:crypto';
-import { normalizeResponsesInput } from './responses-input.js';
+import { nativeInputForRequest, normalizeResponsesInput } from './responses-input.js';
 import { fetchWithCredentials, type CredentialResolver } from './credentials.js';
 
 import type {
@@ -447,9 +447,12 @@ export class OpenAIResponsesAPIAdapter implements ProviderAdapter {
 
     // These invariants define the adapter's stateless native-item contract and
     // cannot be overridden through provider params.
+    // The API takes native items as they are, but an input_image whose data:
+    // URL holds no image would be refused on every request, so it goes as the
+    // placeholder in either mode.
     responsesRequest.input = this.subscription
       ? normalizeResponsesInput(request.messages)
-      : request.messages as OpenAIResponsesInputItem[];
+      : nativeInputForRequest(request.messages);
     responsesRequest.store = false;
     responsesRequest.include = this.mergeEncryptedReasoningInclude(responsesRequest.include);
     if (this.subscription) {

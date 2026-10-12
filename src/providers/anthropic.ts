@@ -4,7 +4,7 @@
 
 import Anthropic, { type ClientOptions } from '@anthropic-ai/sdk';
 import { stripEmptyTextBlocks, stripEmptyTextRequest } from '../utils/empty-text.js';
-import { resolveImageMediaType, isAcceptedImageMediaType, assertWithinByteBudget, shedImagesToFitByteBudget } from '../utils/image-media.js';
+import { imageForRequest, urlImageForRequest, assertWithinByteBudget, shedImagesToFitByteBudget } from '../utils/image-media.js';
 import type {
   ProviderAdapter,
   ProviderRequest,
@@ -690,16 +690,33 @@ export class AnthropicAdapter implements ProviderAdapter {
         content: msg.content.map((block: any) => {
           if (block.type === 'image') {
             const { sourceUrl, ...rest } = block;
+            if (block.source?.type === 'url') {
+              // A data: URL holds its image inline, so it goes as base64 data
+              // labelled by its header, or as the placeholder. Any other URL is
+              // the API's to fetch.
+              const image = urlImageForRequest(block.source.url);
+              if (image.placeholder) {
+                return rest.cache_control ? { ...image.placeholder, cache_control: rest.cache_control } : image.placeholder;
+              }
+              if (image.data) return { ...rest, source: { type: 'base64', media_type: image.mediaType, data: image.data } };
+              return rest;
+            }
             if (block.source?.type !== 'base64') return rest;
             // Overwrite media_type in place: a wire-shaped source keeps its key
             // order, so an already-correct image serializes to the same bytes
             // as before; only camelCase input gains a trailing media_type.
             const { mediaType, ...source } = block.source;
+            const image = imageForRequest(source.data, source.media_type ?? mediaType);
+            if (image.placeholder) {
+              // Data that is no accepted image goes as the placeholder text,
+              // keeping any cache breakpoint the image carried.
+              return rest.cache_control ? { ...image.placeholder, cache_control: rest.cache_control } : image.placeholder;
+            }
             return {
               ...rest,
               source: {
                 ...source,
-                media_type: detectImageMediaType(source.data, source.media_type ?? mediaType),
+                media_type: image.mediaType,
               },
             };
           }
@@ -968,19 +985,9 @@ function toAnthropicToolResultContent(
       out.push({ type: 'text', text: block.text });
     } else if (block.type === 'image') {
       if (block.source.type === 'base64') {
-        out.push({
-          type: 'image',
-          source: {
-            type: 'base64',
-            media_type: detectImageMediaType(block.source.data, block.source.mediaType ?? (block.source as { media_type?: string }).media_type) as 'image/jpeg' | 'image/png' | 'image/gif' | 'image/webp',
-            data: block.source.data,
-          },
-        });
+        out.push(anthropicImage(block.source.data, block.source.mediaType ?? (block.source as { media_type?: string }).media_type));
       } else if (block.source.type === 'url') {
-        out.push({
-          type: 'image',
-          source: { type: 'url', url: block.source.url },
-        });
+        out.push(anthropicUrlImage(block.source.url));
       }
     }
   }
@@ -992,13 +999,25 @@ function toAnthropicToolResultContent(
  * Preserves cache_control for prompt caching
  */
 
-/** Detect image media type from the base64 payload's magic bytes. Storage/ingest
- *  can lose or mislabel mediaType (e.g. a PNG tagged image/jpeg), which the
- *  Anthropic API rejects with a 400. Trust the bytes; fall back to the declared
- *  type, then jpeg. */
-export function detectImageMediaType(data: string | undefined, fallback?: string): string {
-  const mediaType = resolveImageMediaType(data, fallback);
-  return isAcceptedImageMediaType(mediaType) ? mediaType! : 'image/jpeg';
+/** Base64 image data as an Anthropic block: an image labelled by its bytes,
+ *  since storage and ingest can lose or mislabel the type (a PNG tagged
+ *  image/jpeg is a 400), or imageForRequest's placeholder text when the data
+ *  is no image the API accepts. */
+function anthropicImage(data: string, declared: unknown): Anthropic.ImageBlockParam | Anthropic.TextBlockParam {
+  const image = imageForRequest(data, declared);
+  if (image.placeholder) return image.placeholder;
+  return { type: 'image', source: { type: 'base64', media_type: image.mediaType, data } };
+}
+
+/** An image URL as an Anthropic block: a data: URL's image as base64 data
+ *  labelled by its header, or the placeholder for data the API doesn't
+ *  accept; any other URL as a url source, for the API to fetch. */
+function anthropicUrlImage(url: string): Anthropic.ImageBlockParam | Anthropic.TextBlockParam {
+  const image = urlImageForRequest(url);
+  if (image.placeholder) return image.placeholder;
+  return image.data
+    ? { type: 'image', source: { type: 'base64', media_type: image.mediaType!, data: image.data } }
+    : { type: 'image', source: { type: 'url', url: image.url } };
 }
 
 export function toAnthropicContent(blocks: ContentBlock[]): Anthropic.ContentBlockParam[] {
@@ -1018,19 +1037,9 @@ export function toAnthropicContent(blocks: ContentBlock[]): Anthropic.ContentBlo
         
       case 'image':
         if (block.source.type === 'base64') {
-          result.push({
-            type: 'image',
-            source: {
-              type: 'base64',
-              media_type: detectImageMediaType(block.source.data, block.source.mediaType ?? (block.source as { media_type?: string }).media_type) as 'image/jpeg' | 'image/png' | 'image/gif' | 'image/webp',
-              data: block.source.data,
-            },
-          });
+          result.push(anthropicImage(block.source.data, block.source.mediaType ?? (block.source as { media_type?: string }).media_type));
         } else if (block.source.type === 'url') {
-          result.push({
-            type: 'image',
-            source: { type: 'url', url: block.source.url },
-          });
+          result.push(anthropicUrlImage(block.source.url));
         }
         break;
         
@@ -1052,14 +1061,7 @@ export function toAnthropicContent(blocks: ContentBlock[]): Anthropic.ContentBlo
         // A provider-generated image is a base64 image with a MIME type, which
         // is exactly Anthropic's image block — carrying it across costs nothing
         // and lets an image Gemini produced re-enter Anthropic history.
-        result.push({
-          type: 'image',
-          source: {
-            type: 'base64',
-            media_type: block.mimeType as 'image/jpeg' | 'image/png' | 'image/gif' | 'image/webp',
-            data: block.data,
-          },
-        });
+        result.push(anthropicImage(block.data, block.mimeType));
         break;
         
       case 'tool_use':

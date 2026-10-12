@@ -29,7 +29,7 @@ import type {
   StreamEmission,
 } from './types.js';
 import { normalizeToolPairs, mergeConsecutiveRoles } from './normalize-tool-pairs.js';
-import { resolveImageMediaType, isAcceptedImageMediaType, strippedImagePlaceholder } from '../utils/image-media.js';
+import { imageForRequest, toolResultContentForRequest } from '../utils/image-media.js';
 import { assertCacheMarkersWithinLimit } from '../utils/cache-marker-budget.js';
 
 /** Index of the last content block that can carry cache_control. Anthropic
@@ -400,29 +400,6 @@ export class NativeFormatter implements PrefillFormatter {
   // PRIVATE HELPERS
   // ==========================================================================
 
-  /** Replace API-unacceptable image blocks nested in tool_result content with
-   *  text placeholders. Non-array content passes through untouched. */
-  private static sanitizeToolResultContent(content: unknown): unknown {
-    if (!Array.isArray(content)) return content;
-    return content.map((item) => {
-      if (
-        item &&
-        typeof item === 'object' &&
-        (item as { type?: string }).type === 'image'
-      ) {
-        const src = (item as { source?: { type?: string; data?: string; mediaType?: string; media_type?: string } }).source;
-        if (src?.type === 'url') return item;
-        const mediaType = resolveImageMediaType(src?.data, src?.mediaType ?? src?.media_type);
-        if (!isAcceptedImageMediaType(mediaType)) {
-          return strippedImagePlaceholder(mediaType);
-        }
-        const { mediaType: _declared, ...source } = src ?? {};
-        return { ...item, source: { ...source, media_type: mediaType } };
-      }
-      return item;
-    });
-  }
-
   private convertContent(
     content: ContentBlock[],
     participant: string,
@@ -452,11 +429,12 @@ export class NativeFormatter implements PrefillFormatter {
         result.push(textBlock);
       } else if (block.type === 'image') {
         if (block.source.type === 'base64') {
-          const mediaType = resolveImageMediaType(block.source.data, block.source.mediaType);
-          if (!isAcceptedImageMediaType(mediaType)) {
-            // Unacceptable media type (e.g. image/svg): degrade to a text
-            // placeholder instead of poisoning the whole request.
-            result.push(strippedImagePlaceholder(mediaType));
+          const { mediaType, placeholder } = imageForRequest(block.source.data, block.source.mediaType);
+          if (placeholder) {
+            // Not an image the API accepts (an SVG, or data that is no image
+            // at all): degrade to a text placeholder instead of poisoning the
+            // whole request.
+            result.push(placeholder);
           } else {
             const imageBlock: Record<string, unknown> = {
               type: 'image',
@@ -498,7 +476,7 @@ export class NativeFormatter implements PrefillFormatter {
         result.push({
           type: 'tool_result',
           tool_use_id: block.toolUseId,
-          content: NativeFormatter.sanitizeToolResultContent(block.content),
+          content: toolResultContentForRequest(block.content),
           is_error: block.isError,
         });
       } else if (block.type === 'thinking') {

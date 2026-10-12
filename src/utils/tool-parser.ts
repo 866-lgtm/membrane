@@ -19,7 +19,7 @@ import type {
   ToolDefinition,
 } from '../types/index.js';
 import { createHash } from 'node:crypto';
-import { resolveImageMediaType, isAcceptedImageMediaType, strippedImagePlaceholder } from './image-media.js';
+import { imageForRequest } from './image-media.js';
 import { readToolSchema, type ParameterDeclaration, type ToolSchemaReading } from './tool-schema.js';
 
 // ============================================================================
@@ -595,6 +595,27 @@ export function endsWithPartialToolBlock(text: string): boolean {
 const STRUCTURAL_TAG_RE =
   /<\/?(?:antml:)?(?:function_calls|function_results|invoke|result|stdout|error|tool_name)\b/;
 
+/** A tool-result image's data and the label it came with, whether it carries
+ *  them in a `source` or MCP-style as `data` and `mimeType`. */
+function toolResultImage(block: unknown): { data: unknown; declared: unknown } {
+  const b = block as { source?: { data?: unknown; mediaType?: unknown; media_type?: unknown }; data?: unknown; mimeType?: unknown };
+  return b.source
+    ? { data: b.source.data, declared: b.source.mediaType ?? b.source.media_type }
+    : { data: b.data, declared: b.mimeType };
+}
+
+/** The text that stands for a tool-result image where XML can't carry it:
+ *  the format and size of an image the request would send, or the
+ *  placeholder for data it wouldn't. The placeholder quotes the image's
+ *  label, so callers guard it as they guard the result's own text. */
+function imageNote(block: Extract<ToolResultContentBlock, { type: 'image' }>): string {
+  const { data, declared } = toolResultImage(block);
+  const { mediaType, placeholder } = imageForRequest(data, declared);
+  if (placeholder) return placeholder.text;
+  const sizeKb = Math.round(((data as string).length * 0.75) / 1024);
+  return `[Image: ${mediaType}, ~${sizeKb}KB]`;
+}
+
 function renderResultContentString(result: ToolResult): string {
   if (typeof result.content === 'string') {
     return result.content;
@@ -606,8 +627,7 @@ function renderResultContentString(result: ToolResult): string {
     } else if (block.type === 'image') {
       // For XML mode, we can't embed images directly
       // Add a note about the image for the model
-      const sizeKb = Math.round((block.source.data.length * 0.75) / 1024);
-      parts.push(`[Image: ${block.source.mediaType}, ~${sizeKb}KB]`);
+      parts.push(imageNote(block));
     }
   }
   return parts.join('\n');
@@ -1356,17 +1376,18 @@ export function formatToolResultsForSplitTurn(results: ToolResult[]): SplitTurnC
         if (block.type === 'text') {
           textParts.push(guardResultContent(block.text));
         } else if (block.type === 'image') {
-          const mediaType = resolveImageMediaType(block.source.data, block.source.mediaType);
-          if (!isAcceptedImageMediaType(mediaType)) {
-            textParts.push(strippedImagePlaceholder(mediaType).text);
+          const { data, declared } = toolResultImage(block);
+          const { mediaType, placeholder } = imageForRequest(data, declared);
+          if (placeholder) {
+            textParts.push(guardResultContent(placeholder.text));
           } else {
             resultHasImages = true;
             resultImages.push({
               type: 'image',
               source: {
                 type: 'base64',
-                media_type: mediaType!,
-                data: block.source.data,
+                media_type: mediaType,
+                data: data as string,
               },
             });
           }
@@ -1439,8 +1460,7 @@ function formatSingleResultXml(result: ToolResult): string {
         xml += guardResultContent(block.text);
       } else if (block.type === 'image') {
         // For remaining results after split, images become text placeholders
-        const sizeKb = Math.round((block.source.data.length * 0.75) / 1024);
-        xml += `[Image: ${block.source.mediaType}, ~${sizeKb}KB]`;
+        xml += guardResultContent(imageNote(block));
       }
     }
   }

@@ -24,7 +24,7 @@ import type {
 } from './types.js';
 import { responsesToolOutputParts } from '../providers/responses-input.js';
 
-import { resolveImageMediaType } from '../utils/image-media.js';
+import { imageForRequest, urlImageForRequest } from '../utils/image-media.js';
 
 export const OPENAI_RESPONSES_ITEMS_METADATA_KEY = 'openaiResponsesItems';
 
@@ -177,9 +177,19 @@ export class OpenAIResponsesFormatter implements PrefillFormatter {
         });
       } else if (block.type === 'image' && !isAssistant) {
         const source = block.source;
-        messageParts.push(source.type === 'url'
-          ? { type: 'input_image', image_url: source.url }
-          : { type: 'input_image', image_url: `data:${resolveImageMediaType(source.data, source.mediaType)};base64,${source.data}` });
+        if (source.type === 'url') {
+          // A data: URL holds its image inline and takes the same decision;
+          // any other URL is the API's to fetch.
+          const image = urlImageForRequest(source.url);
+          messageParts.push(image.placeholder
+            ? { type: 'input_text', text: image.placeholder.text }
+            : { type: 'input_image', image_url: image.url });
+        } else {
+          const { mediaType, placeholder } = imageForRequest(source.data, source.mediaType);
+          messageParts.push(placeholder
+            ? { type: 'input_text', text: placeholder.text }
+            : { type: 'input_image', image_url: `data:${mediaType};base64,${source.data}` });
+        }
       } else if (block.type === 'tool_use') {
         flushMessage();
         out.push({

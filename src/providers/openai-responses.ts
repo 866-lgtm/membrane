@@ -23,7 +23,7 @@
  * routing and vendor configs (`openairesponses-*` prefix).
  */
 
-import { resolveImageMediaType } from '../utils/image-media.js';
+import { imageForRequest, OPENAI_IMAGE_EDIT_TYPES } from '../utils/image-media.js';
 import type {
   ProviderAdapter,
   ProviderRequest,
@@ -321,15 +321,17 @@ export class OpenAIResponsesAdapter implements ProviderAdapter {
         if (block?.type === 'image') {
           const source = block.source;
           if (source?.type === 'base64' && source.data) {
-            const mimeType = resolveImageMediaType(source.data, source.media_type ?? source.mediaType) ?? 'image/png';
-            refs.push({ dataUrl: `data:${mimeType};base64,${source.data}`, msgIndex, blockIndex });
+            // Data that is no image the edits endpoint takes stays
+            // unattached, and the transcript shows it as an omitted image.
+            const { mediaType } = imageForRequest(source.data, source.media_type ?? source.mediaType, OPENAI_IMAGE_EDIT_TYPES);
+            if (mediaType) refs.push({ dataUrl: `data:${mediaType};base64,${source.data}`, msgIndex, blockIndex });
           }
         } else if (block?.type === 'generated_image' && typeof block.data === 'string' && block.data) {
           // A previous output of this adapter carried forward verbatim in
           // history (consumers that keep ProviderResponse content rather
           // than rebuilding from a channel). It is an image like any other.
-          const mimeType = resolveImageMediaType(block.data, block.mimeType) ?? 'image/png';
-          refs.push({ dataUrl: `data:${mimeType};base64,${block.data}`, msgIndex, blockIndex });
+          const { mediaType } = imageForRequest(block.data, block.mimeType, OPENAI_IMAGE_EDIT_TYPES);
+          if (mediaType) refs.push({ dataUrl: `data:${mediaType};base64,${block.data}`, msgIndex, blockIndex });
         }
       });
     });
@@ -456,7 +458,8 @@ export class OpenAIResponsesAdapter implements ProviderAdapter {
    * consecutive same-role messages share one header. Text blocks are kept
    * verbatim. Image blocks become `[Image N]` (N = 1-based position in the
    * attached `image[]` list) when the image is attached, or
-   * `[Image omitted]` when it fell outside the input-image cap. An
+   * `[Image omitted]` when it fell outside the input-image cap or its data
+   * is no image the edits endpoint takes. An
    * assistant message that only carried an image therefore still appears
    * as an assistant turn — that is what lets a previous generation read as
    * the assistant's own prior output. The prompt ends with an open

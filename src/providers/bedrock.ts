@@ -27,8 +27,8 @@ import {
   INTERLEAVED_THINKING_BETA,
   needsInterleavedThinkingBeta,
   thinkingEnabled,
-  detectImageMediaType,
 } from './anthropic.js';
+import { imageForRequest, urlImageForRequest } from '../utils/image-media.js';
 
 // ============================================================================
 // Adapter Configuration
@@ -424,15 +424,30 @@ export class BedrockAdapter implements ProviderAdapter {
     // tool-returned image 400s with "media_type: Field required" mid-turn
     // (observed on eidoverse snapshot results, 2026-08-08). Applies to
     // top-level image blocks AND images nested inside tool_result content.
+    // Data that is no image the API accepts goes as imageForRequest's
+    // placeholder text instead, keeping any cache breakpoint the image carried.
     const toWireImage = (block: any): any => {
       const source = block.source;
+      if (source?.type === 'url') {
+        // A data: URL holds its image inline, so it goes as base64 data or
+        // the placeholder; any other URL goes as it is.
+        const image = urlImageForRequest(source.url);
+        if (image.placeholder) {
+          return block.cache_control ? { ...image.placeholder, cache_control: block.cache_control } : image.placeholder;
+        }
+        return image.data ? { ...block, source: { type: 'base64', media_type: image.mediaType, data: image.data } } : block;
+      }
       if (!source || source.type !== 'base64') return block;
       const { mediaType, media_type, ...restSource } = source;
+      const image = imageForRequest(source.data, media_type ?? mediaType);
+      if (image.placeholder) {
+        return block.cache_control ? { ...image.placeholder, cache_control: block.cache_control } : image.placeholder;
+      }
       return {
         ...block,
         source: {
           ...restSource,
-          media_type: detectImageMediaType(source.data, (media_type ?? mediaType) as string),
+          media_type: image.mediaType,
         },
       };
     };
