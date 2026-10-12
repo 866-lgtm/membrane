@@ -212,6 +212,14 @@ export interface ProviderAdapter {
    * maintenance messages). Wrappers must forward this capability. */
   readonly requiresNativeResponsesInput?: boolean;
 
+  /** Whether this provider takes an assistant turn's Anthropic server-tool
+   * blocks back (web search and the like). Only the Anthropic API does, where
+   * their acceptance is checked live; Membrane leaves them out of any other
+   * adapter's requests before cache markers are placed
+   * (BuildOptions.anthropicServerBlocks). Decorators must forward this
+   * capability. */
+  readonly replaysAnthropicServerBlocks?: boolean;
+
   /** Representation used for cache-layout receipts. The default provider-request
    * basis preserves post-hook semantic breakpoints even when this adapter's API
    * does not transmit cache_control. wire-request opts into the final body

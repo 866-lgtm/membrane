@@ -22,7 +22,6 @@ import {
   abortError,
 } from '../types/index.js';
 import { stripEmptyTextRequest } from '../utils/empty-text.js';
-import { isAnthropicServerBlock } from '../utils/anthropic-server-blocks.js';
 import { createCombinedSignal, isDeadlineAbort, deadlineTimeoutError, assertTerminalEventObserved } from './utils.js';
 import {
   INTERLEAVED_THINKING_BETA,
@@ -273,33 +272,6 @@ async function signRequest(
 // Bedrock Adapter
 // ============================================================================
 
-/**
- * A message's content as Bedrock requests send it: without its Anthropic
- * server-tool blocks (web search and the like). Those go back to the
- * Anthropic API in the turn that produced it, where their acceptance is
- * checked live (see utils/anthropic-server-blocks.ts). Whether Bedrock
- * accepts these block types is unknown, and a refusal would fail every
- * request carrying the conversation, so Bedrock leaves them out, as it did
- * before they were sent back anywhere.
- *
- * The builders put a message's cache breakpoint on its last block that can
- * carry one, which a server block can be. Its marker then moves to the block
- * the builders marked before server blocks were sent back: the last one that
- * isn't thinking, as `lastCacheableBlockIndex` picks it.
- */
-function withoutServerBlocks(content: any[]): any[] {
-  const kept = content.filter((block) => !isAnthropicServerBlock(block));
-  const marker = content.find((block) => isAnthropicServerBlock(block) && block.cache_control !== undefined)?.cache_control;
-  if (marker === undefined) return kept;
-  for (let i = kept.length - 1; i >= 0; i--) {
-    const type = kept[i]?.type;
-    if (type === 'thinking' || type === 'redacted_thinking') continue;
-    if (kept[i].cache_control === undefined) kept[i] = { ...kept[i], cache_control: marker };
-    break;
-  }
-  return kept;
-}
-
 export class BedrockAdapter implements ProviderAdapter {
   readonly name = 'bedrock';
   readonly cacheReceiptBasis = 'wire-request' as const;
@@ -447,9 +419,8 @@ export class BedrockAdapter implements ProviderAdapter {
     // caller that sets cacheTtl. (Connectome issue #35.)
     // Bedrock is strict about the wire shape of image sources: internal blocks
     // carry camelCase `mediaType`, the API requires snake_case `media_type`.
-    // The Anthropic adapter's buildRequest converts both kinds: top-level
-    // images in place, and images in tool_result content through
-    // toAnthropicToolResultContent. Without the same conversion here a
+    // The Anthropic adapter converts on both paths (toAnthropicContent /
+    // toAnthropicToolResultContent); without the same conversion here a
     // tool-returned image 400s with "media_type: Field required" mid-turn
     // (observed on eidoverse snapshot results, 2026-08-08). Applies to
     // top-level image blocks AND images nested inside tool_result content.
@@ -469,7 +440,7 @@ export class BedrockAdapter implements ProviderAdapter {
       if (!Array.isArray(msg.content)) return msg;
       return {
         ...msg,
-        content: withoutServerBlocks(msg.content).map((block: any) => {
+        content: msg.content.map((block: any) => {
           if (block.type === 'image' && block.sourceUrl !== undefined) {
             const { sourceUrl, ...rest } = block;
             return stripCacheTtl(toWireImage(rest));

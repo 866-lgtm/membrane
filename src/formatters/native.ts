@@ -251,6 +251,7 @@ export class NativeFormatter implements PrefillFormatter {
       const content = this.convertContent(message.content, message.participant, {
         includeNames: participantMode === 'multiuser' && !isAssistant,
         isAssistant,
+        serverBlocks: options.anthropicServerBlocks !== false,
       });
 
       if (
@@ -428,7 +429,7 @@ export class NativeFormatter implements PrefillFormatter {
   private convertContent(
     content: ContentBlock[],
     participant: string,
-    options: { includeNames: boolean; isAssistant: boolean }
+    options: { includeNames: boolean; isAssistant: boolean; serverBlocks: boolean }
   ): unknown[] {
     const result: unknown[] = [];
     let hasUnsupportedMedia = false;
@@ -437,13 +438,14 @@ export class NativeFormatter implements PrefillFormatter {
     for (const block of content) {
       // An Anthropic server-tool block (web search and the like), kept on a
       // zero-width carrier, goes back as the block itself in the assistant
-      // turn that produced it (see utils/anthropic-server-blocks.ts). In a
+      // turn that produced it (see utils/anthropic-server-blocks.ts), when
+      // the provider takes it back (BuildOptions.anthropicServerBlocks). In a
       // message sent as a user turn, such as another participant's, it has
       // no place and is left out. An adapter for another wire leaves out a
       // block type it has no form for.
       const serverBlock = anthropicServerBlockFor(block);
       if (serverBlock) {
-        if (options.isAssistant) result.push(serverBlock);
+        if (options.isAssistant && options.serverBlocks) result.push(serverBlock);
         continue;
       }
       if (block.type === 'text') {

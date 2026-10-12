@@ -235,9 +235,9 @@ describe('the native tool loop', () => {
   const call = { type: 'tool_use', id: 'toolu_zz1', name: 'record', input: { fact: 'zz' } };
   const toolTurn = [thinking1, serverUse, searchResult, thinking2, call];
 
-  function recordingAdapter(sent: any[]): ProviderAdapter {
+  function recordingAdapter(sent: any[], replaysAnthropicServerBlocks = true): ProviderAdapter {
     return {
-      name: 'anthropic', supportsModel: () => true,
+      name: 'anthropic', supportsModel: () => true, replaysAnthropicServerBlocks,
       complete: async () => { throw new Error('Unexpected complete'); },
       stream: async (request) => {
         sent.push(structuredClone(request));
@@ -281,6 +281,15 @@ describe('the native tool loop', () => {
     });
     expect(serverBlocksIn(sent[0].messages.slice(2))).toEqual([]);
     expect(messages).toEqual(before);
+  });
+
+  it('sends none to an adapter that doesn\'t take them back', async () => {
+    const sent: any[] = [];
+    const membrane = new Membrane(recordingAdapter(sent, false));
+    await membrane.stream(request(), { onToolCalls: async (calls) => results(calls) });
+    expect(sent).toHaveLength(2);
+    expect(sent[1].messages[1]).toEqual({ role: 'assistant', content: [thinking1, thinking2, call] });
+    expect(serverBlocksIn(sent)).toEqual([]);
   });
 
   it.each(['stream', 'streamYielding'] as const)('%s sends the round\'s server blocks back with its tool result', async (method) => {
@@ -453,20 +462,60 @@ describe('wires with no form for them', () => {
     expect(withCarriers.messages).toEqual(without.messages);
   });
 
-  it('Bedrock moves a breakpoint that the builder put on a server block to the block it marked before', () => {
-    const messages = history([answer as ContentBlock, carrier(serverUse), carrier(searchResult)]);
-    messages[1] = { ...messages[1]!, cacheBreakpoint: true };
-    const built = new NativeFormatter().buildMessages(messages, { ...options, promptCaching: true }).messages as any[];
-    expect(built[1].content.at(-1)).toEqual({ ...searchResult, cache_control: { type: 'ephemeral' } });
-    const adapter = new BedrockAdapter({ accessKeyId: 'zz', secretAccessKey: 'zz', region: 'us-west-2' });
-    const request = (adapter as any).buildRequest({ model: 'anthropic.claude-sonnet-4-6', messages: built, maxTokens: 32 });
-    expect(request.messages[1].content).toEqual([{ ...answer, cache_control: { type: 'ephemeral' } }]);
+});
+
+// A provider that doesn't take server blocks back, such as Bedrock, gets the
+// request it got before they went back at all. Only the build can leave them
+// out before it places cache markers and merges consecutive turns, so it does
+// when told the provider doesn't take them (Andrew-2310's comparisons with
+// 39ce7863, room-203 #78633).
+describe('a provider that doesn\'t take them back', () => {
+  const T = (text: string): ContentBlock => ({ type: 'text', text });
+  const U = (text: string): NormalizedMessage => ({ participant: 'User', content: [T(text)] });
+  const A = (content: ContentBlock[], more: Partial<NormalizedMessage> = {}): NormalizedMessage => ({ participant: 'Claude', content, ...more });
+  const C = (item: unknown) => carrier(item);
+  const use2 = { ...serverUse, id: 'srvtoolu_zz2' };
+  const result2 = { ...searchResult, tool_use_id: 'srvtoolu_zz2' };
+  const clientCall = { type: 'tool_use', id: 'toolu_zz9', name: 'client', input: {} } as ContentBlock;
+  const clientResult = { type: 'tool_result', toolUseId: 'toolu_zz9', content: 'zz ok' } as ContentBlock;
+  const cases: Array<[string, NormalizedMessage[], Record<string, unknown>]> = [
+    ['a turn ending in server blocks, with a breakpoint', [U('ask'), A([answer as ContentBlock, C(serverUse), C(searchResult)], { cacheBreakpoint: true }), U('next')], {}],
+    ['a server-only last turn', [U('ask'), A([C(serverUse), C(searchResult)])], {}],
+    ['a server-only turn in the middle', [U('ask'), A([C(serverUse), C(searchResult)]), U('next')], {}],
+    ['a marker on the message after a server-only turn', [U('first'), A([T('first answer')]), U('second'), A([C(serverUse), C(searchResult)]), U('third')],
+      { hasCacheMarker: (_message: NormalizedMessage, index: number) => index === 4 }],
+    ['assistant shards merged after their markers', [U('ask'), A([T('before'), C(serverUse), C(searchResult)], { cacheBreakpoint: true }), A([T('after')]), U('next')], {}],
+    ['shards around a client tool call', [U('ask'), A([T('before'), C(serverUse), C(searchResult)], { cacheBreakpoint: true }), A([T('after'), clientCall]),
+      { participant: 'User', content: [clientResult] }, U('next')], {}],
+    ['two marked shards', [U('ask'), A([T('before'), C(serverUse), C(searchResult)], { cacheBreakpoint: true }), A([T('middle'), C(use2), C(result2)], { cacheBreakpoint: true }), U('next')], {}],
+    ['a breakpoint on a server-only turn, with the system fallback', [U('ask'), A([C(serverUse), C(searchResult)], { cacheBreakpoint: true }), U('next')], { systemPrompt: 'zz system' }],
+  ];
+  const build = (messages: NormalizedMessage[], extra: Record<string, unknown>, serverBlocks?: boolean) =>
+    new NativeFormatter().buildMessages(messages, {
+      ...options, promptCaching: true, ...extra, ...(serverBlocks === undefined ? {} : { anthropicServerBlocks: serverBlocks }),
+    });
+  const withoutCarriers = (messages: NormalizedMessage[]): NormalizedMessage[] =>
+    messages.map((message) => ({ ...message, content: message.content.filter((block) => !anthropicServerBlockFor(block)) }));
+
+  it.each(cases)('%s: NativeFormatter builds exactly what it built with the carriers absent', (_name, messages, extra) => {
+    expect(build(messages, extra, false)).toEqual(build(withoutCarriers(messages), extra));
+    expect(serverBlocksIn(build(messages, extra).messages).length).toBeGreaterThan(0);
   });
 
-  it('Bedrock leaves them out, as before: whether it accepts them is unknown', () => {
-    const adapter = new BedrockAdapter({ accessKeyId: 'zz', secretAccessKey: 'zz', region: 'us-west-2' });
-    const built = (adapter as any).buildRequest({ model: 'anthropic.claude-sonnet-4-6', messages: anthropicShaped(), maxTokens: 32 });
-    expect(built.messages[1].content).toEqual([thinking1, thinking2, answer]);
-    expect(serverBlocksIn(built.messages)).toEqual([]);
+  it('Membrane builds without them for an adapter that doesn\'t declare it takes them back; the Anthropic adapter declares it', async () => {
+    const sent: any[] = [];
+    const adapter: ProviderAdapter = {
+      name: 'zz-other', supportsModel: () => true,
+      complete: async (request) => {
+        sent.push(structuredClone(request));
+        return { content: [{ type: 'text', text: 'zz ok' }], stopReason: 'end_turn', usage: { inputTokens: 1, outputTokens: 1 }, raw: {} } as any;
+      },
+      stream: async () => { throw new Error('Unexpected stream'); },
+    };
+    const membrane = new Membrane(adapter, { formatter: new NativeFormatter() });
+    await membrane.complete({ messages: history(), assistantParticipant: 'Claude', config: { model: 'zz', maxTokens: 32 } });
+    expect(sent[0].messages[1].content).toEqual([thinking1, thinking2, answer]);
+    expect(new AnthropicAdapter({ apiKey: 'zz-key', cacheKeepalive: { enabled: false } }).replaysAnthropicServerBlocks).toBe(true);
+    expect(new BedrockAdapter({ accessKeyId: 'zz', secretAccessKey: 'zz', region: 'us-west-2' }).replaysAnthropicServerBlocks).toBeUndefined();
   });
 });

@@ -1594,12 +1594,13 @@ export class Membrane {
       for (const block of msg.content) {
         // An Anthropic server-tool block (web search and the like), kept on a
         // zero-width carrier, goes back as the block itself in the assistant
-        // turn that produced it (see utils/anthropic-server-blocks.ts). In a
+        // turn that produced it (see utils/anthropic-server-blocks.ts), when
+        // the provider takes it back (replaysAnthropicServerBlocks). In a
         // message sent as a user turn, such as another participant's, it has
         // no place and is left out.
         const serverBlock = anthropicServerBlockFor(block);
         if (serverBlock) {
-          if (isAssistant) content.push(serverBlock);
+          if (isAssistant && this.adapter.replaysAnthropicServerBlocks === true) content.push(serverBlock);
           continue;
         }
         if (block.type === 'text') {
@@ -2244,6 +2245,7 @@ export class Membrane {
       maxParticipantsForStop,
       contextPrefix: request.contextPrefix,
       prefillUserMessage: request.prefillUserMessage,
+      anthropicServerBlocks: this.adapter.replaysAnthropicServerBlocks === true,
     });
 
     // Byte-wall policy point (2026-07-12): transformRequest serves BOTH

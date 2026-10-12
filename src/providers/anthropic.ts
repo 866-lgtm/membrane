@@ -199,6 +199,8 @@ export interface AnthropicAdapterConfig {
 export class AnthropicAdapter implements ProviderAdapter {
   readonly name = 'anthropic';
   readonly cacheReceiptBasis = 'wire-request' as const;
+  /** The API takes server-tool blocks back in the turn that produced them (checked live; see utils/anthropic-server-blocks.ts). */
+  readonly replaysAnthropicServerBlocks = true;
 
   /**
    * Verified live 2026-08-25 (claude-haiku-4-5, 4,650-token cached system

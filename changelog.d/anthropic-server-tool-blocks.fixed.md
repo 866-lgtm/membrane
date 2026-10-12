@@ -12,13 +12,21 @@
   assistant's own turns: another participant's message, sent as a user
   turn, still leaves it out. `toAnthropicContent` sends it when given
   `{ role: 'assistant' }`, and otherwise leaves it out, as it always left
-  out a carrier. Bedrock requests
-  still leave these blocks out: whether Bedrock accepts them is unknown, and
-  a refusal there would fail every request carrying the conversation.
-  Requests for a stored history with such a turn change bytes from that turn
-  on: the first one after upgrading misses the prompt cache there, and the
-  search results are input tokens on every later request. A turn stored through
-  `complete()` before this release has no carrier to send.
+  out a carrier.
+- Only the Anthropic API takes these blocks back. Membrane leaves them out of
+  every other provider's requests, Bedrock's included, in the build itself,
+  before it places cache markers and merges turns, so those requests are what
+  they were before: a provider adapter declares
+  `replaysAnthropicServerBlocks`, and NativeFormatter takes
+  `anthropicServerBlocks` (on by default, as a token count wants). Whether
+  Bedrock accepts them is unknown, and a refusal there would fail every
+  request carrying the conversation. A caller that builds with NativeFormatter
+  itself for another provider passes `anthropicServerBlocks: false`.
+- Anthropic API requests for a stored history with such a turn change from
+  that turn on: a prompt-cache prefix written before upgrading that reaches
+  past the turn no longer matches, and the search results are input tokens on
+  every later request. A turn stored through `complete()` before this release
+  has no carrier to send.
 - Streaming: a server tool's call (`server_tool_use`, `mcp_tool_use`) kept
   the empty `input` of its `content_block_start`, because only a `tool_use`
   assembled its `input_json_delta` fragments. It now holds the input the

@@ -83,6 +83,17 @@ export interface BuildOptions {
   /** Context prefix for simulacrum seeding (injected as first cached assistant message) */
   contextPrefix?: string;
 
+  /**
+   * Whether an assistant turn's Anthropic server-tool blocks (web search and
+   * the like, kept on zero-width carriers) go back as the blocks themselves.
+   * Only the Anthropic API takes them back: Membrane sets this from its
+   * adapter's `replaysAnthropicServerBlocks`. Off, they are left out before
+   * cache markers are placed and messages merged, exactly as a carrier was
+   * before they went back at all. On by default, so a direct caller, such as
+   * a token count, builds what the Anthropic API is sent.
+   */
+  anthropicServerBlocks?: boolean;
+
   /** Custom content for the synthetic user message when first message is assistant role.
    *  In prefill formatters: defaults to '<cmd>cat untitled.txt</cmd>' with a CLI simulation
    *  system prompt when no system prompt is configured, or '[Start]' when a system prompt is set. */
