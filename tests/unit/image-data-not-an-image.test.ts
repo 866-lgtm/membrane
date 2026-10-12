@@ -373,17 +373,35 @@ describe('data: URLs', () => {
     ]);
   });
 
-  it('the Bedrock adapter sends a data: URL image as base64 data or the placeholder', () => {
+  it('the Bedrock adapter sends a data: URL image as base64 data or the placeholder, keeping its cache breakpoint', () => {
     const built = (bedrock() as any).buildRequest({
       model: 'claude-sonnet-4-5',
       messages: [{ role: 'user', content: [
         urlImage(PNG_URL),
+        { ...urlImage(NOTES_URL), cache_control: { type: 'ephemeral' } },
         { type: 'tool_result', tool_use_id: 'shot_1', content: [urlImage(NOTES_URL)] },
       ] }],
     });
-    const [image, result] = built.messages[0].content;
+    const [image, placeholder, result] = built.messages[0].content;
     expect(image).toEqual({ type: 'image', source: { type: 'base64', media_type: 'image/png', data: PNG } });
+    expect(placeholder).toEqual({ type: 'text', text: expect.stringContaining(SAID), cache_control: { type: 'ephemeral' } });
     expect(result.content).toEqual([{ type: 'text', text: expect.stringContaining(SAID) }]);
+  });
+
+  it('the Bedrock adapter keeps a tool-result image\'s cache breakpoint on its placeholder', () => {
+    const built = (bedrock() as any).buildRequest({
+      model: 'claude-sonnet-4-5',
+      messages: [{ role: 'user', content: [
+        { type: 'tool_result', tool_use_id: 'shot_1', content: [
+          { ...notes(), cache_control: { type: 'ephemeral' } },
+          { ...urlImage(NOTES_URL), cache_control: { type: 'ephemeral' } },
+        ] },
+      ] }],
+    });
+    expect(built.messages[0].content[0].content).toEqual([
+      { type: 'text', text: expect.stringContaining(SAID), cache_control: { type: 'ephemeral' } },
+      { type: 'text', text: expect.stringContaining(SAID), cache_control: { type: 'ephemeral' } },
+    ]);
   });
 
   it('the Responses formatter sends a data: URL image that is no image as input_text, and a remote URL as it is', () => {

@@ -114,8 +114,8 @@ export function imageForRequest<T extends ImageMediaType = RasterImageMediaType>
 
 const DATA_URL = /^data:([^,]*),/i;
 
-export type UrlImageForRequest<T extends ImageMediaType = RasterImageMediaType> =
-  | { url: string; mediaType?: T; data?: string; placeholder?: undefined }
+export type UrlImageForRequest =
+  | { url: string; mediaType?: RasterImageMediaType; data?: string; placeholder?: undefined }
   | { placeholder: { type: 'text'; text: string }; url?: undefined; mediaType?: undefined; data?: undefined };
 
 /**
@@ -126,15 +126,12 @@ export type UrlImageForRequest<T extends ImageMediaType = RasterImageMediaType> 
  * else comes back as the placeholder. Any other URL comes back as it is,
  * for the provider to fetch.
  */
-export function urlImageForRequest<T extends ImageMediaType = RasterImageMediaType>(
-  url: string,
-  accepted?: ReadonlySet<T>,
-): UrlImageForRequest<T> {
+export function urlImageForRequest(url: string): UrlImageForRequest {
   const head = typeof url === 'string' ? DATA_URL.exec(url) : null;
   if (!head) {
     // A data: URL without the comma that starts its data holds no image.
     if (typeof url === 'string' && /^data:/i.test(url)) {
-      return { placeholder: imageForRequest('', url.slice(5).split(';')[0] || undefined, accepted).placeholder! };
+      return { placeholder: imageForRequest('', url.slice(5).split(';')[0] || undefined).placeholder! };
     }
     return { url };
   }
@@ -146,7 +143,7 @@ export function urlImageForRequest<T extends ImageMediaType = RasterImageMediaTy
     ? payload
     : Buffer.from(payload.replace(/%([0-9a-f]{2})/gi, (_, hex: string) => String.fromCharCode(parseInt(hex, 16))), 'latin1')
       .toString('base64');
-  const image = imageForRequest(data, type || undefined, accepted);
+  const image = imageForRequest(data, type || undefined);
   if (image.placeholder) return { placeholder: image.placeholder };
   // A URL already labelled by its header goes out as it came; only one whose
   // label disagrees, or whose bytes are percent-encoded, is rewritten.
