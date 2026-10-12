@@ -724,6 +724,8 @@ export function toOpenAIMessages(
 
     for (const block of msg.content) {
       if (block.type === 'text') {
+        // A zero-width carrier holds a block this wire has no form for.
+        if (isZeroWidthCarrier(block)) continue;
         textParts.push(block.text);
       } else if (block.type === 'thinking') {
         if (typeof (block as { thinking?: string }).thinking === 'string') {

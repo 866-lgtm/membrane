@@ -9,10 +9,11 @@
  * They are part of the turn as the model produced it. When signed thinking
  * sits in the same turn, the API refuses the turn with the blocks left out
  * ("thinking ... blocks in the latest assistant message cannot be modified"),
- * and a model replayed without its search results no longer has them. So an
- * Anthropic-shaped request sends each one back in its carrier's place, in the
- * assistant turn that produced it, and request shapes for other wires leave
- * it out: it has no form there.
+ * and a model replayed without its search results no longer has them. So
+ * Membrane sends each one back in its carrier's place, in the assistant turn
+ * that produced it, through an adapter that declares
+ * replaysAnthropicServerBlocks (AnthropicAdapter). Its other builds, Bedrock's
+ * included, and request shapes for other wires leave it out.
  */
 
 /**

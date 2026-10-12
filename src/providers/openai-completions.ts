@@ -28,6 +28,7 @@ import {
   networkError,
 } from '../types/index.js';
 import { createCombinedSignal, SSELineParser, isDeadlineAbort, deadlineTimeoutError, throwOnStreamErrorFrame, assertTerminalEventObserved } from './utils.js';
+import { isZeroWidthCarrier } from '../utils/anthropic-server-blocks.js';
 
 // ============================================================================
 // Types
@@ -404,6 +405,8 @@ export class OpenAICompletionsAdapter implements ProviderAdapter {
 
       for (const block of content) {
         if (block.type === 'text') {
+          // A zero-width carrier holds a block this wire has no form for.
+          if (isZeroWidthCarrier(block)) continue;
           textParts.push(block.text);
         } else if (block.type === 'image' || block.type === 'image_url') {
           hadImages = true;

@@ -214,8 +214,9 @@ export interface ProviderAdapter {
 
   /** Whether Membrane sends an assistant turn's Anthropic server-tool blocks
    * (web search and the like) back through this adapter. Only AnthropicAdapter
-   * declares it: the Anthropic API's acceptance of them was checked live, and
-   * whether another provider accepts them is unknown. For any other adapter
+   * declares it: a live check had the Anthropic API accept web search's two
+   * (server_tool_use, web_search_tool_result), and whether another provider
+   * accepts them is unknown. For any other adapter
    * Membrane leaves them out before cache markers are placed
    * (BuildOptions.anthropicServerBlocks). Decorators must forward this
    * capability. */

@@ -776,7 +776,8 @@ export class OpenAIAdapter implements ProviderAdapter {
  * Convert normalized content blocks to OpenAI message format
  */
 export function toOpenAIContent(blocks: ContentBlock[]): string | null {
-  const textBlocks = blocks.filter(b => b.type === 'text') as Array<{ type: 'text'; text: string }>;
+  // A zero-width carrier holds a block this wire has no form for.
+  const textBlocks = blocks.filter(b => b.type === 'text' && !isZeroWidthCarrier(b)) as Array<{ type: 'text'; text: string }>;
   if (textBlocks.length === 0) return null;
   return textBlocks.map(b => b.text).join('\n');
 }

@@ -199,7 +199,7 @@ export interface AnthropicAdapterConfig {
 export class AnthropicAdapter implements ProviderAdapter {
   readonly name = 'anthropic';
   readonly cacheReceiptBasis = 'wire-request' as const;
-  /** The API takes server-tool blocks back in the turn that produced them (checked live; see utils/anthropic-server-blocks.ts). */
+  /** Membrane sends server-tool blocks back through this adapter, in the turn that produced them. A live check had the API accept web search's two (see utils/anthropic-server-blocks.ts). */
   readonly replaysAnthropicServerBlocks = true;
 
   /**
@@ -477,15 +477,15 @@ export class AnthropicAdapter implements ProviderAdapter {
             // content_block_start carried `input: {}`. The block is sent back
             // verbatim in later turns, so it must hold the input the model
             // wrote. Fragments that don't parse (a call cut off mid-input)
-            // leave the start's `input: {}`. The block can't carry a marker,
-            // since the API gets it as it is, so the log says so instead.
+            // leave the start's input. The block goes back as it is, so the
+            // log names it.
             try {
               block.input = JSON.parse(currentBlockInputJson);
             } catch {
               console.warn(
                 `[membrane:anthropic] the streamed input of ${String(block.type)} ${String(block.id ?? '(no id)')} ` +
                 `didn't parse (${currentBlockInputJson.length} characters` +
-                `${sawBlockStop ? '' : ', cut off before its block stopped'}); it keeps the start's input {}`,
+                `${sawBlockStop ? '' : ', cut off before its block stopped'}); it keeps the start's input`,
               );
             }
           }

@@ -1,7 +1,8 @@
 /**
  * Anthropic server-tool blocks (web search and the like) round-trip: response
- * parsing keeps each on a zero-width carrier, every Anthropic-shaped request
- * sends it back in its place, and request shapes for other wires leave it out.
+ * parsing keeps each on a zero-width carrier, Membrane sends it back in its
+ * place through the Anthropic adapter, and its other builds and request shapes
+ * for other wires leave it out.
  */
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { Membrane } from '../../src/membrane.js';
@@ -12,10 +13,10 @@ import { OpenAIResponsesFormatter } from '../../src/formatters/openai-responses.
 import { AnthropicAdapter, toAnthropicContent } from '../../src/providers/anthropic.js';
 import { BedrockAdapter } from '../../src/providers/bedrock.js';
 import { GeminiAdapter } from '../../src/providers/gemini.js';
-import { OpenAIAdapter } from '../../src/providers/openai.js';
-import { OpenAICompatibleAdapter } from '../../src/providers/openai-compatible.js';
+import { OpenAIAdapter, toOpenAIContent } from '../../src/providers/openai.js';
+import { OpenAICompatibleAdapter, toOpenAIMessages } from '../../src/providers/openai-compatible.js';
 import { OpenAICompletionsAdapter } from '../../src/providers/openai-completions.js';
-import { OpenRouterAdapter } from '../../src/providers/openrouter.js';
+import { OpenRouterAdapter, toOpenRouterMessages } from '../../src/providers/openrouter.js';
 import { normalizeResponsesInput } from '../../src/providers/responses-input.js';
 import { ANTHROPIC_SERVER_BLOCK_TYPES, anthropicServerBlockFor } from '../../src/utils/anthropic-server-blocks.js';
 import type { ContentBlock, NormalizedMessage, NormalizedRequest, ProviderAdapter, ProviderRequest } from '../../src/types/index.js';
@@ -283,10 +284,22 @@ describe('the native tool loop', () => {
     expect(messages).toEqual(before);
   });
 
-  it('sends none through an adapter without the capability', async () => {
+  it.each([
+    ['stream', 'declared false'], ['stream', 'not declared'], ['streamYielding', 'not declared'],
+  ] as const)('%s sends none through an adapter whose capability is %s', async (method, how) => {
     const sent: any[] = [];
-    const membrane = new Membrane(recordingAdapter(sent, false));
-    await membrane.stream(request(), { onToolCalls: async (calls) => results(calls) });
+    const adapter = recordingAdapter(sent, false);
+    if (how === 'not declared') delete (adapter as { replaysAnthropicServerBlocks?: boolean }).replaysAnthropicServerBlocks;
+    const membrane = new Membrane(adapter);
+    if (method === 'stream') {
+      await membrane.stream(request(), { onToolCalls: async (calls) => results(calls) });
+    } else {
+      const stream = membrane.streamYielding(request());
+      for await (const event of stream) {
+        if (event.type === 'error') throw event.error;
+        if (event.type === 'tool-calls') stream.provideToolResults(results(event.calls));
+      }
+    }
     expect(sent).toHaveLength(2);
     expect(sent[1].messages[1]).toEqual({ role: 'assistant', content: [thinking1, thinking2, call] });
     expect(serverBlocksIn(sent)).toEqual([]);
@@ -370,6 +383,20 @@ describe('the Anthropic adapter\'s stream', () => {
     expect(res.content).toEqual([{ type: 'mcp_tool_use', id: 'mcptoolu_zz1', name: 'zz_lookup', server_name: 'zz', input: { key: 'zz' } }]);
   });
 
+  it('keeps the start\'s input when a server call is cut off before its block stopped, and says so', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const res = await streamed([
+      { type: 'message_start', message: { model: 'claude-zz-1', usage: { input_tokens: 10 } } },
+      { type: 'content_block_start', index: 0, content_block: { type: 'mcp_tool_use', id: 'mcptoolu_zz2', name: 'zz_lookup', server_name: 'zz', input: {} } },
+      { type: 'content_block_delta', index: 0, delta: { type: 'input_json_delta', partial_json: '{"q": "zz' } },
+      { type: 'message_delta', delta: { stop_reason: 'max_tokens' }, usage: { output_tokens: 5 } },
+    ]);
+    expect(res.content).toEqual([{ type: 'mcp_tool_use', id: 'mcptoolu_zz2', name: 'zz_lookup', server_name: 'zz', input: {} }]);
+    expect(warn.mock.calls.map((c) => String(c[0]))).toContainEqual(
+      expect.stringMatching(/mcp_tool_use mcptoolu_zz2 didn't parse \(9 characters, cut off before its block stopped\); it keeps the start's input$/),
+    );
+  });
+
   it('keeps the start\'s input {} when a server call\'s fragments don\'t parse, and says so', async () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     const res = await streamed([
@@ -381,7 +408,7 @@ describe('the Anthropic adapter\'s stream', () => {
     ]);
     expect(res.content).toEqual([{ type: 'server_tool_use', id: 'srvtoolu_zz1', name: 'web_search', input: {} }]);
     expect(warn.mock.calls.map((c) => String(c[0]))).toContainEqual(
-      expect.stringMatching(/server_tool_use srvtoolu_zz1 didn't parse \(17 characters\); it keeps the start's input \{\}/),
+      expect.stringMatching(/server_tool_use srvtoolu_zz1 didn't parse \(17 characters\); it keeps the start's input$/),
     );
   });
 });
@@ -446,6 +473,13 @@ describe('wires with no form for them', () => {
     ['OpenAI-compatible', (m: any[]) =>
       (new OpenAICompatibleAdapter({ apiKey: 'zz', baseURL: 'http://localhost' }) as any).convertMessages(m)],
     ['Gemini', (m: any[]) => (new GeminiAdapter({ apiKey: 'zz' }) as any).convertMessages(m, 'gemini-2.5-pro')],
+    ['OpenAI completions', (m: any[]) => {
+      const adapter = new OpenAICompletionsAdapter({ baseURL: 'http://zz-host.invalid/v1', apiKey: 'zz' }) as any;
+      return m.map((message) => adapter.extractTextContent(message.content));
+    }],
+    ['exported toOpenAIMessages', (m: any[]) => toOpenAIMessages(m)],
+    ['exported toOpenRouterMessages', (m: any[]) => toOpenRouterMessages(m)],
+    ['exported toOpenAIContent', (m: any[]) => m.map((message) => toOpenAIContent(message.content))],
   ])('the %s adapter writes a turn as if its carriers weren\'t there', (_name, convert) => {
     const ask = { role: 'user', content: [{ type: 'text', text: 'zz ask' }] };
     const withCarriers = convert([ask, { role: 'assistant', content: [carrier(serverUse), carrier(searchResult), responsesCarrier, answer] }]);
