@@ -153,23 +153,33 @@ export interface OpenAIResponsesAPIAdapterConfig {
 /**
  * The `strict` a function tool is sent with: an explicit boolean as given,
  * `false` when omitted or null (see {@link OpenAIResponsesAPIAdapter.convertTools}),
- * and a refusal naming the tool for anything else.
+ * and a refusal naming the tool for anything else. The refusal says what kind
+ * of value it found, quoting only a short string, so a caller's value isn't
+ * copied into logs whole.
  */
-function functionToolStrictness(toolName: unknown, strict: unknown): boolean {
+function functionToolStrictness(toolName: unknown, strict: unknown, position: number): boolean {
   if (strict === undefined || strict === null) return false;
   if (typeof strict === 'boolean') return strict;
   const spelled = typeof strict === 'string'
-    ? JSON.stringify(strict)
+    ? strict.length <= MAX_QUOTED_STRICT_CHARS ? JSON.stringify(strict) : `a ${strict.length}-character string`
     : Array.isArray(strict)
       ? 'an array'
-      : typeof strict === 'object'
-        ? 'an object'
-        : `${typeof strict} ${String(strict)}`;
+      : typeof strict === 'function'
+        ? 'a function'
+        : typeof strict === 'object'
+          ? 'an object'
+          : `${typeof strict} ${String(strict)}`;
+  const tool = typeof toolName === 'string' && toolName !== ''
+    ? `function tool ${JSON.stringify(toolName)}`
+    : `the function tool at tools[${position}], which has no name,`;
   throw invalidRequestError(
-    `OpenAI Responses API: function tool ${JSON.stringify(toolName ?? null)} has strict set to ` +
+    `OpenAI Responses API: ${tool} has strict set to ` +
       `${spelled}; strict must be true, false, null or omitted (omitted and null are sent as false).`
   );
 }
+
+/** The longest `strict` string a refusal quotes; a longer one is given by its length. */
+const MAX_QUOTED_STRICT_CHARS = 40;
 
 /** A cache key is any JSON string, a header value is not: anything beyond
  * short visible ASCII is sent as a digest, which is just as stable. */
@@ -520,7 +530,7 @@ export class OpenAIResponsesAPIAdapter implements ProviderAdapter {
   }
 
   /**
-   * Every function tool reaches the wire with a boolean `strict`.
+   * Every function tool this converts reaches the wire with a boolean `strict`.
    *
    * Left out, strictness is whatever the provider defaults to, and strict
    * validation treats every property as one the model must send. A tool schema
@@ -533,22 +543,27 @@ export class OpenAIResponsesAPIAdapter implements ProviderAdapter {
    * change what the model may send, so neither is a safe guess.
    *
    * This holds on all three function paths: a flat Responses function, a
-   * nested Chat-style `{ type: 'function', function }`, and a definition built
-   * from `inputSchema`/`input_schema`/`parameters`. Non-function tools carry
-   * no such field and pass through unchanged.
+   * nested Chat-style `{ type: 'function', function }` (whose `strict` is read
+   * from the function, or from the wrapper when the function's is omitted or
+   * null), and a definition built from `inputSchema`/`input_schema`/
+   * `parameters`. Every other tool passes through as the caller wrote it: a
+   * non-function tool, which has no such field, and a container such as a
+   * Responses namespace tool, whose member functions keep whatever `strict`
+   * they were given. Membrane builds no container tools, so one arrives only
+   * as a caller wrote it, in the API's own shape.
    */
   private convertTools(tools: unknown[]): unknown[] {
-    return tools.map((rawTool: any) => {
+    return tools.map((rawTool: any, position) => {
       if (rawTool?.type && rawTool.type !== 'function') return rawTool;
 
-      // Responses function definitions are flat. Accept them verbatim, while
-      // also adapting Membrane and Chat Completions function schemas.
+      // Responses function definitions are flat: kept as given, apart from
+      // strict. Membrane and Chat Completions function schemas are adapted.
       if (rawTool?.type === 'function' && rawTool.name) {
-        return { ...rawTool, strict: functionToolStrictness(rawTool.name, rawTool.strict) };
+        return { ...rawTool, strict: functionToolStrictness(rawTool.name, rawTool.strict, position) };
       }
       if (rawTool?.type === 'function' && rawTool.function) {
         const fn = rawTool.function;
-        return { type: 'function', ...fn, strict: functionToolStrictness(fn.name, fn.strict) };
+        return { type: 'function', ...fn, strict: functionToolStrictness(fn.name, fn.strict ?? rawTool.strict, position) };
       }
       return {
         type: 'function',
@@ -559,7 +574,7 @@ export class OpenAIResponsesAPIAdapter implements ProviderAdapter {
           rawTool?.inputSchema ??
           rawTool?.input_schema ??
           { type: 'object', properties: {} },
-        strict: functionToolStrictness(rawTool?.name, rawTool?.strict),
+        strict: functionToolStrictness(rawTool?.name, rawTool?.strict, position),
       };
     });
   }

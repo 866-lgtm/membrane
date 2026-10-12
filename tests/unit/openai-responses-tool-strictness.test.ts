@@ -4,12 +4,14 @@
  * Connectome's tools are plain JSON Schema: a property outside `required` may
  * be omitted. Left without a `strict` field, a function tool's validation is
  * the provider's default, and strict validation makes every property one the
- * model must send — Astra's save_recent_image selectors arrived presented as
- * required (snag: connectome-save-recent-image-schema-requires-exclusive-
- * selectors). So every function tool reaches the wire with a boolean: omitted
- * or null becomes false, an explicit boolean is kept, and anything else is
- * refused, naming the tool, before a request is sent. That holds in API-key and
- * subscription modes and on all three function spellings convertTools accepts.
+ * model must send. A Connectome resident's save_recent_image selectors arrived
+ * presented as required; that the provider's default caused it is an
+ * inference, since these tests mock the provider and no live request was
+ * made. So every function tool convertTools takes reaches the wire with a
+ * boolean: omitted or null becomes false, an explicit boolean is kept, and
+ * anything else is refused, naming the tool, before a request is sent. That
+ * holds in API-key and subscription modes and on all three function spellings
+ * convertTools accepts.
  */
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { OpenAIResponsesAPIAdapter } from '../../src/providers/openai-responses-api.js';
@@ -63,11 +65,14 @@ const ACCEPTED: Array<[string, StrictField, boolean]> = [
   ['explicit false', { strict: false }, false],
 ];
 
-const REFUSED: Array<[string, unknown]> = [
-  ['the string "true"', 'true'],
-  ['the number 1', 1],
-  ['an object', {}],
-  ['an array', []],
+/** Each refused value, and how the refusal spells it: a short string quoted, anything else by its kind. */
+const REFUSED: Array<[string, unknown, string]> = [
+  ['the string "true"', 'true', '"true"'],
+  ['a string too long to quote', 'x'.repeat(41), 'a 41-character string'],
+  ['the number 1', 1, 'number 1'],
+  ['an object', {}, 'an object'],
+  ['an array', [], 'an array'],
+  ['a function', () => true, 'a function'],
 ];
 
 function completedJson(): Response {
@@ -153,15 +158,58 @@ describe.each(Object.entries(MODES))('Responses function-tool strictness, %s', (
       expect(sentTools(fetchMock)).toEqual([spelling.wire(expected)]);
     });
 
-    it.each(REFUSED)('refuses strict set to %s, naming the tool, before sending', async (_case, value) => {
+    it.each(REFUSED)('refuses strict set to %s, naming the tool, before sending', async (_case, value, spelled) => {
       const fetchMock = stubFetch(mode.response);
       const sending = mode.adapter().complete(request([spelling.tool({ strict: value })]));
 
       await expect(sending).rejects.toBeInstanceOf(MembraneError);
       await expect(sending).rejects.toMatchObject({ type: 'invalid_request', retryable: false });
-      await expect(sending).rejects.toThrow(/function tool "probe" has strict set to/);
+      await expect(sending).rejects.toThrow(`function tool "probe" has strict set to ${spelled}; strict must be true, false, null or omitted`);
       expect(fetchMock).not.toHaveBeenCalled();
     });
+  });
+
+  it('names a tool without a name by its position', async () => {
+    const fetchMock = stubFetch(mode.response);
+    const sending = mode.adapter().complete(request([
+      SPELLINGS['a tool definition']!.tool({}),
+      { description: 'Nameless.', inputSchema: SCHEMA, strict: 'yes' },
+    ]));
+
+    await expect(sending).rejects.toThrow('the function tool at tools[1], which has no name, has strict set to "yes";');
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('keeps a flat function as given apart from strict: its other fields stay, and no parameters are added', async () => {
+    const fetchMock = stubFetch(mode.response);
+    const flat = { type: 'function', name: 'probe', description: 'Probe.', defer_loading: true };
+    await mode.adapter().complete(request([flat]));
+
+    expect(sentTools(fetchMock)).toEqual([{ ...flat, strict: false }]);
+  });
+
+  it('reads a Chat-style wrapper\'s own strict when its function\'s is omitted or null', async () => {
+    const wrapped = (outer: unknown, inner: StrictField = {}) => ({
+      type: 'function',
+      strict: outer,
+      function: { name: 'probe', description: 'Probe.', parameters: SCHEMA, ...inner },
+    });
+    const sent = async (tool: unknown) => {
+      const fetchMock = stubFetch(mode.response);
+      await mode.adapter().complete(request([tool]));
+      return sentTools(fetchMock);
+    };
+    const wire = SPELLINGS['a flat Responses function']!.wire;
+
+    expect(await sent(wrapped(true))).toEqual([wire(true)]);
+    // null is unstated, as everywhere in the rule, so the wrapper's explicit value stands.
+    expect(await sent(wrapped(true, { strict: null }))).toEqual([wire(true)]);
+    // The function's own explicit boolean is the one sent.
+    expect(await sent(wrapped(true, { strict: false }))).toEqual([wire(false)]);
+
+    const refusing = stubFetch(mode.response);
+    await expect(mode.adapter().complete(request([wrapped('yes')]))).rejects.toThrow('function tool "probe" has strict set to "yes";');
+    expect(refusing).not.toHaveBeenCalled();
   });
 
   it('applies the same rule to tools supplied as a provider-params override', async () => {
@@ -200,6 +248,14 @@ describe.each(Object.entries(MODES))('Responses function-tool strictness, %s', (
     expect(tools[0]).toEqual(webSearch);
     expect(tools[1]).toEqual(custom);
     expect(tools[2]).toMatchObject({ type: 'function', name: 'probe', strict: false });
+  });
+
+  it('passes a container tool through as the caller wrote it, member functions included', async () => {
+    const fetchMock = stubFetch(mode.response);
+    const namespace = { type: 'namespace', name: 'files', tools: [{ type: 'function', name: 'read', parameters: SCHEMA }] };
+    await mode.adapter().complete({ ...request([]), extra: { tools: [namespace] } });
+
+    expect(sentTools(fetchMock)).toEqual([namespace]);
   });
 });
 
