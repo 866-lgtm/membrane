@@ -85,7 +85,11 @@ interface BedrockMessageRequest {
   top_k?: number;
   stop_sequences?: string[];
   tools?: unknown[];
-  thinking?: { type: 'enabled'; budget_tokens: number };
+  /** As membrane builds it: enabled with a budget, or adaptive, either with
+   *  `display` and binding controls when they're set. */
+  thinking?:
+    | { type: 'enabled'; budget_tokens: number; display?: 'summarized' | 'omitted'; block_binding?: { prefix_mismatch_behavior: 'error' | 'drop_block' } }
+    | { type: 'adaptive'; display?: 'summarized' | 'omitted'; block_binding?: { prefix_mismatch_behavior: 'error' | 'drop_block' } };
   /** Beta flags. On bedrock-runtime these ride in the body, not a header. */
   anthropic_beta?: string[];
 }

@@ -56,15 +56,28 @@ export interface GenerationConfig {
      * `RoundReport.thinking`, and elsewhere as the provider's own
      * `input_transformations` on the raw response.
      *
-     * Setting it sends `thinking.block_binding` with the
+     * Setting it sends `thinking.block_binding`, with the
      * `thinking-binding-controls-2026-08-01` beta (the Anthropic and Bedrock
-     * adapters), also to a model whose thinking is always on, whose thinking
-     * config is otherwise left out. Fable 5 and Fable 5.1 accepted that
-     * config on 2026-10-10. Mythos hasn't been tried, and the family has
-     * refused thinking configs with a 400 before, so for a Mythos model
-     * setting it may fail every request; Bedrock may refuse the beta. Left
-     * unset, neither is sent, and the account's default applies, which isn't
-     * the same on every account.
+     * adapters), inside the thinking config membrane builds: thinking enabled
+     * with a budget that fits under `maxTokens`, adaptive thinking, or a model
+     * whose thinking is always on. Such a model's thinking config is otherwise
+     * left out; with this set it gets `{ type: 'adaptive', block_binding }`,
+     * plus `display` when that is set. Fable 5 and Fable 5.1 accepted the
+     * binding config on 2026-10-10, and with `display: 'summarized'` beside it
+     * on 2026-10-12, returning signed thinking with its text. Mythos hasn't
+     * been tried, and the family has refused thinking configs with a 400
+     * before, so for a Mythos model setting it may fail every request.
+     * Bedrock's acceptance of the beta hasn't been tried either.
+     *
+     * A request that carries no thinking config carries no binding, and the
+     * account's default applies there: thinking disabled, an enabled budget
+     * that can't fit under `maxTokens` (membrane then leaves thinking out),
+     * and a request ending in an assistant prefill, including an XML
+     * continuation, which never sends thinking. A `thinking` object passed
+     * through `providerParams` replaces the one membrane builds, binding
+     * included, so give `block_binding` inside it; the beta follows the body
+     * that is sent. Left unset, nothing is sent, and the account's default
+     * applies, which isn't the same on every account.
      */
     blockBinding?: { prefixMismatchBehavior: 'error' | 'drop_block' };
   };

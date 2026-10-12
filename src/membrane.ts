@@ -2196,8 +2196,9 @@ export class Membrane {
    * sends them no sampling params (`temperature`, `top_p`, `top_k`) and no
    * thinking config, which the family has rejected with a 400. The exception
    * is the binding controls (`thinking.blockBinding`), sent as
-   * `{ type: 'adaptive', block_binding }`, which Fable 5 and Fable 5.1
-   * accepted (2026-10-10; Fable 5.1 also accepted a budgeted config then).
+   * `{ type: 'adaptive', block_binding }` (with `display` when set), which
+   * Fable 5 and Fable 5.1 accepted (2026-10-10; Fable 5.1 also accepted a
+   * budgeted config then).
    */
   private static isAlwaysThinkingModel(model: string | undefined): boolean {
     return /\b(fable|mythos)\b/i.test(model ?? '');
@@ -2220,13 +2221,14 @@ export class Membrane {
     const binding = blockBinding
       ? { block_binding: { prefix_mismatch_behavior: blockBinding.prefixMismatchBehavior } }
       : {};
-    // Thinking is always on for these: only binding controls are sent, when asked for.
+    const display = config.thinking?.display;
+    // Thinking is always on for these: a thinking config is sent only to carry
+    // binding controls, with display as the other configs carry it.
     if (Membrane.isAlwaysThinkingModel(config.model)) {
-      return blockBinding ? { type: 'adaptive', ...binding } : undefined;
+      return blockBinding ? { type: 'adaptive', ...(display ? { display } : {}), ...binding } : undefined;
     }
     if (!config.thinking?.enabled) return undefined;
 
-    const display = config.thinking.display;
     if ((config.thinking.type ?? 'enabled') === 'adaptive') {
       return { type: 'adaptive', ...(display ? { display } : {}), ...binding };
     }

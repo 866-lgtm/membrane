@@ -21,6 +21,7 @@ import { describe, it, expect, afterEach, vi } from 'vitest';
 import { Membrane } from '../../src/membrane.js';
 import { AnthropicAdapter, readInputTransformations } from '../../src/providers/anthropic.js';
 import { BedrockAdapter } from '../../src/providers/bedrock.js';
+import { FidelityNotes } from '../../src/utils/fidelity.js';
 import { chunkFrame, streamBody } from '../helpers/bedrock-event-stream.js';
 import type {
   ContentBlock,
@@ -126,14 +127,28 @@ describe('the request asks for the controls', () => {
     ]);
   });
 
-  it('sends a model whose thinking is always on only the controls, and still no sampling params', async () => {
-    const adapter = new BindingAdapter([finalTurn(), finalTurn()]);
+  it('sends a model whose thinking is always on only the controls, with display when set, and still no sampling params', async () => {
+    const adapter = new BindingAdapter([finalTurn(), finalTurn(), finalTurn(), finalTurn()]);
     const membrane = new Membrane(adapter);
     await rounds(membrane, request([user('hi')], { model: 'claude-fable-5-1', temperature: 0.3 }));
     await rounds(membrane, request([user('hi')], { model: 'claude-fable-5-1', temperature: 0.3, thinking: { enabled: true, budgetTokens: 2000 } }));
+    await rounds(membrane, request([user('hi')], { model: 'claude-fable-5-1', thinking: { enabled: true, display: 'summarized', blockBinding: DROP } }));
+    await rounds(membrane, request([user('hi')], { model: 'claude-fable-5-1', thinking: { enabled: true, display: 'summarized' } }));
     expect(adapter.requests[0]!.thinking).toEqual({ type: 'adaptive', block_binding: { prefix_mismatch_behavior: 'drop_block' } });
     expect(adapter.requests[1]!.thinking).toBeUndefined();
-    expect(adapter.requests.map((r) => r.temperature)).toEqual([undefined, undefined]);
+    expect(adapter.requests[2]!.thinking).toEqual({ type: 'adaptive', display: 'summarized', block_binding: { prefix_mismatch_behavior: 'drop_block' } });
+    // Display alone sends these models nothing: a config goes only to carry the controls.
+    expect(adapter.requests[3]!.thinking).toBeUndefined();
+    expect(adapter.requests.map((r) => r.temperature)).toEqual([undefined, undefined, undefined, undefined]);
+  });
+
+  it('carries no binding where membrane sends no thinking config: thinking disabled, or a budget that can\'t fit', async () => {
+    const adapter = new BindingAdapter([finalTurn(), finalTurn()]);
+    const membrane = new Membrane(adapter);
+    await rounds(membrane, request([user('hi')], { thinking: { enabled: false, blockBinding: DROP } }));
+    // A 2000 budget can't fit under maxTokens 1500 beside the API's 1024 floor, so thinking is left out.
+    await rounds(membrane, request([user('hi')], { maxTokens: 1500 }));
+    expect(adapter.requests.map((r) => r.thinking)).toEqual([undefined, undefined]);
   });
 
   it('Anthropic: adds the beta to the header when the built request carries the controls, beside the interleaved beta and a default one', async () => {
@@ -158,6 +173,20 @@ describe('the request asks for the controls', () => {
     ]);
   });
 
+  it('Anthropic, streamed: the stream\'s headers carry the beta when the body carries the controls', async () => {
+    const seen: Array<Record<string, string> | undefined> = [];
+    const adapter = new AnthropicAdapter({ apiKey: 'sk-test', cacheKeepalive: { enabled: false } });
+    (adapter as any).client = { messages: { stream: async (_body: unknown, opts: { headers?: Record<string, string> }) => {
+      seen.push(opts.headers);
+      return fakeStream(streamed([]));
+    } } };
+    const base = { messages: [{ role: 'user', content: 'hi' }], maxTokens: 4000, model: 'claude-opus-5-5' } as const;
+    await adapter.stream({ ...base, thinking: { type: 'enabled', budget_tokens: 2000, block_binding: { prefix_mismatch_behavior: 'drop_block' } } } as any, { onChunk: () => {} });
+    await adapter.stream({ ...base, thinking: { type: 'enabled', budget_tokens: 2000 } } as any, { onChunk: () => {} });
+    expect(seen[0]?.['anthropic-beta']?.split(',')).toContain(BETA);
+    expect(seen[1]?.['anthropic-beta']?.split(',') ?? []).not.toContain(BETA);
+  });
+
   it('Bedrock: adds the beta to anthropic_beta, merged with the caller\'s', () => {
     const adapter = new BedrockAdapter({ accessKeyId: 'k', secretAccessKey: 's', region: 'us-east-1' }) as any;
     const built = adapter.buildRequest({
@@ -166,6 +195,12 @@ describe('the request asks for the controls', () => {
       extra: { anthropic_beta: ['context-1m-2025-08-07'] },
     });
     expect(built.anthropic_beta).toEqual(['context-1m-2025-08-07', 'interleaved-thinking-2025-05-14', BETA]);
+    // A thinking config passed through `extra` is what goes out, so it counts here too.
+    const viaExtra = adapter.buildRequest({
+      model: 'claude-opus-5-5', maxTokens: 4000, messages: [{ role: 'user', content: 'hi' }],
+      extra: { thinking: { type: 'enabled', budget_tokens: 2000, block_binding: { prefix_mismatch_behavior: 'drop_block' } } },
+    });
+    expect(viaExtra.anthropic_beta).toEqual([BETA]);
     const plain = adapter.buildRequest({ model: 'claude-opus-5-5', maxTokens: 4000, messages: [{ role: 'user', content: 'hi' }] });
     expect(plain.anthropic_beta).toBeUndefined();
   });
@@ -237,6 +272,7 @@ describe('the adapters carry the provider\'s report', () => {
     }) } };
     const response = await adapter.complete(wire() as any);
     expect(response.inputTransformations).toEqual([{ ...dropped[0], block: sentThinking }]);
+    expect(response.inputTransformations![0]!.block).toBe(sentThinking);
   });
 
   it('keeps an entry type it doesn\'t know, and a path it can\'t resolve, without a block', () => {
@@ -268,6 +304,34 @@ describe('the adapters carry the provider\'s report', () => {
     expect(response.inputTransformations![0]!.block).toBe(sent.messages[1]!.content[0]);
     const body = JSON.parse((fetchMock.mock.calls[0] as unknown as [unknown, { body: string }])[1].body);
     expect(body.anthropic_beta).toEqual([BETA]);
+  });
+
+  it('Bedrock, streamed: a message_delta\'s report replaces message_start\'s', async () => {
+    const served = [{ type: 'thinking_mismatch_allowed', reason: 'prefix_binding_mismatch', path: 'messages.1.content.0' }];
+    const frames = [
+      chunkFrame({ type: 'message_start', message: { usage: { input_tokens: 9 }, input_transformations: dropped } }),
+      chunkFrame({ type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } }),
+      chunkFrame({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'ok' } }),
+      chunkFrame({ type: 'content_block_stop', index: 0 }),
+      chunkFrame({ type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 1 }, input_transformations: served }),
+      chunkFrame({ type: 'message_stop' }),
+    ];
+    vi.stubGlobal('fetch', vi.fn(async () => ({ ok: true, status: 200, body: streamBody(frames) })));
+    const adapter = new BedrockAdapter({ accessKeyId: 'k', secretAccessKey: 's', region: 'us-east-1' });
+    const response = await adapter.stream(wire() as any, { onChunk: () => {} });
+    expect(response.inputTransformations!.map((e) => e.type)).toEqual(['thinking_mismatch_allowed']);
+  });
+
+  it('Bedrock, unstreamed: from the response body, with the request\'s own block', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => ({ ok: true, status: 200, json: async () => ({
+      content: [{ type: 'text', text: 'ok' }], stop_reason: 'end_turn', model: 'claude-opus-5-5',
+      usage: { input_tokens: 9, output_tokens: 1 }, input_transformations: dropped,
+    }) })));
+    const adapter = new BedrockAdapter({ accessKeyId: 'k', secretAccessKey: 's', region: 'us-east-1' });
+    const sent = wire();
+    const response = await adapter.complete(sent as any);
+    expect(response.inputTransformations).toEqual([{ ...dropped[0], block: sentThinking }]);
+    expect(response.inputTransformations![0]!.block).toBe(sent.messages[1]!.content[0]);
   });
 });
 
@@ -318,6 +382,15 @@ describe('yielding rounds place each entry in the consumer\'s coordinates', () =
     ]);
   });
 
+  it('names a redacted block by its data', async () => {
+    const redacted = { type: 'redacted_thinking', data: 'D1' } as unknown as ContentBlock;
+    const adapter = new BindingAdapter([finalTurn([
+      { type: 'thinking_dropped', reason: 'prefix_binding_mismatch', path: 'messages.1.content.0' },
+    ])]);
+    const [round] = await rounds(new Membrane(adapter), request([user('u1'), reply(redacted, text('a1')), user('u2')]));
+    expect(round!.thinking!.dropped).toEqual([{ reason: 'prefix_binding_mismatch', path: 'messages.1.content.0', message: 1, block: 0 }]);
+  });
+
   it('names no block when two blocks of the message carry the same signature', async () => {
     const twice = reply(thinking('S2'), thinking('S2'), text('a2'));
     const adapter = new BindingAdapter([finalTurn([
@@ -352,5 +425,24 @@ describe('yielding rounds place each entry in the consumer\'s coordinates', () =
     delete req.toolMode;
     const [round] = await rounds(new Membrane(adapter), req);
     expect(round!.thinking!.dropped).toEqual([{ reason: 'prefix_binding_mismatch', path: 'messages.5.content.0' }]);
+  });
+});
+
+describe('FidelityNotes.ownerOf', () => {
+  it('names the one message a block was emitted for, and none for a block emitted for two', () => {
+    // No builder emits one object for two messages, so the rule is driven directly here.
+    const notes = new FidelityNotes();
+    const once = { type: 'thinking', thinking: '', signature: 'S1' };
+    const shared = { type: 'thinking', thinking: '', signature: 'S2' };
+    notes.own(once, 2);
+    notes.own(once, 2);
+    notes.own(shared, 1);
+    notes.own(shared, 3);
+    expect(notes.ownerOf(once)).toBe(2);
+    expect(notes.ownerOf(shared)).toBeUndefined();
+    expect(notes.ownerOf({ type: 'thinking', thinking: '', signature: 'S1' })).toBeUndefined();
+    // So an alteration of it can't say which message lost content.
+    notes.alterBlock(shared);
+    expect(notes.unattributed).toBe(true);
   });
 });
