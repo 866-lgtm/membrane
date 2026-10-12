@@ -6,7 +6,7 @@
   `[batch, index]` into the array as supplied, for every batch still
   retained; tool blocks stripped from an injected message make it altered.
   `fidelity` is `unknown` whenever an empty list would prove nothing: an
-  uninstrumented formatter or adapter, opt-in image shedding, a
+  uninstrumented formatter or adapter, an image opt-in shedding replaced, a
   `beforeRequest` hook that changed either of its arguments (the provider
   request by replacement or in place, or the normalized request in place;
   an in-place change keeps every later round `unknown` too), or an adapter
@@ -51,10 +51,9 @@
   result, since a `function_call_output` has no error flag; the Responses
   formatter reports such a result too.
 - `normalizeToolPairs` tells a caller that follows blocks by identity which
-  ones it replaced with new objects: `NormalizeOptions.onBlockRewritten` for
-  an orphan `tool_result` rewritten as text, and `onBlockCopied` for a block
-  copied to drop `cache_control`. Membrane's builders use them to attribute
-  those occurrences.
+  ones it rewrote as new objects: `NormalizeOptions.onBlockRewritten` hears a
+  `tool_result` rewritten as text, an orphan or a duplicate. NativeFormatter
+  uses it to attribute those occurrences.
 - `ProviderResponse.unreportedUsage` names the required counts
   (`inputTokens`, `outputTokens`) a provider did not report. Their 0 in
   `usage` stays for accounting, and round reports leave them out. Every
@@ -62,4 +61,5 @@
   both). A round report's `usage` (`RoundUsage`) carries token counts only,
   never accounting's `estimatedCost`, in membrane's one convention:
   `inputTokens` excludes cache reads, restated for a cache-inclusive
-  provider.
+  provider. An adapter whose cache convention is `'unknown'` passes its
+  counts through as the provider gave them.

@@ -266,6 +266,16 @@ describe('native yielding rounds', () => {
     expect(rounds[0]!.fidelity).toBe('unknown');
   });
 
+  it('stays established when opt-in image shedding has nothing to shed', async () => {
+    const pngHeader = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]).toString('base64');
+    const small: ContentBlock = { type: 'image', source: { type: 'base64', mediaType: 'image/png', data: pngHeader } } as ContentBlock;
+    const request = nativeRequest([{ participant: 'User', content: [{ type: 'text', text: 'picture' }, small] }]);
+    request.shedOversizeImages = true;
+    const { rounds } = await drive(new Membrane(new ScriptedAdapter([finalTurn()])), request);
+    expect(rounds[0]!.fidelity).toBe('established');
+    expect(rounds[0]!.altered).toEqual({ messages: [], injected: [] });
+  });
+
   it('emits no round reports when usage events are off', async () => {
     const adapter = new ScriptedAdapter([finalTurn()]);
     const { rounds, events } = await drive(new Membrane(adapter), nativeRequest([
@@ -317,7 +327,7 @@ describe('beforeRequest hooks', () => {
 
 describe('XML prefill rounds', () => {
   function xmlRequest(messages: NormalizedRequest['messages']): NormalizedRequest {
-    return { messages, config: { model: 'test-model', maxTokens: 1000 }, tools: [noopTool] };
+    return { messages, config: { model: 'test-model', maxTokens: 1000 }, toolMode: 'xml', tools: [noopTool] };
   }
   const toolRound = '<function_calls><invoke name="noop"></invoke></function_calls>';
 
@@ -368,7 +378,7 @@ describe('XML prefill rounds', () => {
       },
     };
     const membrane = new Membrane(adapter, { logger: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() } });
-    const { rounds } = await drive(membrane, { messages: [{ participant: 'User', content: [{ type: 'text', text: 'hi' }] }], config: { model: 'test', maxTokens: 100 } });
+    const { rounds } = await drive(membrane, { messages: [{ participant: 'User', content: [{ type: 'text', text: 'hi' }] }], config: { model: 'test', maxTokens: 100 }, toolMode: 'xml' });
     expect(rounds.map((r) => [r.index, r.usage.inputTokens, r.fidelity])).toEqual([
       [0, 101, 'established'],
       [1, 102, 'established'],
@@ -434,6 +444,14 @@ describe('usage at the adapter boundary: a reported 0 is 0, an unreported count 
       '{"candidates":[{"content":{"parts":[{"text":"k"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":40,"candidatesTokenCount":2,"totalTokenCount":42}}',
     ]);
     expect((await adapter.stream(request, { onChunk: () => {} } as any)).usage.cacheReadTokens).toBe(0);
+    // A stream that never carries usageMetadata reports nothing.
+    stubFetchWithSseLines([
+      '{"candidates":[{"content":{"parts":[{"text":"o"}]}}]}',
+      '{"candidates":[{"content":{"parts":[{"text":"k"}]},"finishReason":"STOP"}]}',
+    ]);
+    const unreportedStream = await adapter.stream(request, { onChunk: () => {} } as any);
+    expect(unreportedStream.unreportedUsage).toEqual(['inputTokens', 'outputTokens']);
+    expect('cacheReadTokens' in unreportedStream.usage).toBe(false);
   });
 });
 
@@ -507,7 +525,7 @@ describe('producer-boundary losses', () => {
     });
     const { rounds } = await drive(membrane, {
       messages: [{ participant: 'User', content: [{ type: 'text', text: 'ORIGINAL' }] }],
-      config: { model: 'test-model', maxTokens: 1000 }, tools: [noopTool], promptCaching: false,
+      config: { model: 'test-model', maxTokens: 1000 }, toolMode: 'xml', tools: [noopTool], promptCaching: false,
     });
     expect(sent.every((m) => m.includes('CHANGED'))).toBe(true);
     expect(rounds.map((r) => r.fidelity)).toEqual(['unknown', 'unknown']);
@@ -557,7 +575,7 @@ describe('producer-boundary losses', () => {
   it('XML history: nested tool-result media rendered as a note is reported against its message', async () => {
     const adapter = new MockAdapter({ streamChunkDelayMs: 0, completeDelayMs: 0, responseQueue: ['done.'] });
     const { rounds } = await drive(new Membrane(adapter), {
-      config: { model: 'test-model', maxTokens: 1000 }, promptCaching: false,
+      config: { model: 'test-model', maxTokens: 1000 }, toolMode: 'xml', promptCaching: false,
       messages: [
         { participant: 'Claude', content: [{ type: 'tool_use', id: 't1', name: 'noop', input: {} }] },
         { participant: 'User', content: [{ type: 'tool_result', toolUseId: 't1', content: [{ type: 'text', text: 'picture' }, { type: 'image', source: { type: 'base64', mediaType: 'image/png', data: 'iVBORw0KGgo=' } }] }] },
@@ -700,7 +718,7 @@ describe('Greptile\'s review of #104', () => {
       const adapter = new MockAdapter({ streamChunkDelayMs: 0, completeDelayMs: 0, responseQueue: [toolRound, toolRound, 'done.'] });
       const { rounds } = await drive(new Membrane(adapter), {
         messages: [{ participant: 'User', content: [text('go')] }],
-        config: { model: 'test-model', maxTokens: 1000 }, tools: [noopTool],
+        config: { model: 'test-model', maxTokens: 1000 }, toolMode: 'xml', tools: [noopTool],
       }, {
         inject: [
           [{ participant: 'Ann', content: [toolResult('x')] }],
@@ -715,7 +733,7 @@ describe('Greptile\'s review of #104', () => {
     async function xmlRound(messages: NormalizedRequest['messages']) {
       const adapter = new MockAdapter({ streamChunkDelayMs: 0, completeDelayMs: 0, responseQueue: ['done.'] });
       const { rounds } = await drive(new Membrane(adapter), {
-        messages, config: { model: 'test-model', maxTokens: 1000 }, promptCaching: false,
+        messages, config: { model: 'test-model', maxTokens: 1000 }, toolMode: 'xml', promptCaching: false,
       });
       return { round: rounds[0]!, sent: JSON.stringify(adapter.getLastRequest()?.messages) };
     }
@@ -773,7 +791,31 @@ describe('Greptile\'s review of #104', () => {
       ],
       altered: [0],
     },
-  ])('a textified orphan tool_result alters exactly the message it came from: $name', ({ messages, altered }) => {
+    {
+      // A second result for a call that was already answered is textified too.
+      name: 'a duplicate result for an answered call',
+      messages: (): NormalizedRequest['messages'] => [
+        { participant: 'User', content: [text('start')] },
+        { participant: 'Claude', content: [toolUse('c1')] },
+        { participant: 'User', content: [toolResult('c1', 'first')] },
+        { participant: 'Claude', content: [text('noted')] },
+        { participant: 'User', content: [toolResult('c1', 'again')] },
+        { participant: 'User', content: [text('go')] },
+      ],
+      altered: [4],
+    },
+    {
+      // A second result for the call in the same message is textified too.
+      name: 'a duplicate result beside the one that answered its call',
+      messages: (): NormalizedRequest['messages'] => [
+        { participant: 'User', content: [text('start')] },
+        { participant: 'Claude', content: [toolUse('c1')] },
+        { participant: 'User', content: [toolResult('c1', 'first'), toolResult('c1', 'again')] },
+        { participant: 'User', content: [text('go')] },
+      ],
+      altered: [2],
+    },
+  ])('a textified tool_result alters exactly the message it came from: $name', ({ messages, altered }) => {
     it('the yielding native loop', async () => {
       const { rounds } = await drive(new Membrane(new ScriptedAdapter([finalTurn()])), nativeRequest(messages()));
       expect(rounds[0]!.altered.messages).toEqual(altered);
@@ -786,13 +828,25 @@ describe('Greptile\'s review of #104', () => {
       expect(sorted(notes.altered)).toEqual(altered);
       expect(notes.established).toBe(true);
     });
+
+    it('the replacement keeps its owner, so a later report about it names the same message', () => {
+      const notes = new FidelityNotes();
+      const built = new NativeFormatter().buildMessages(messages(), { assistantParticipant: 'Claude', participantMode: 'multiuser', fidelity: notes } as any);
+      const replacements = (built.messages as Array<{ content: unknown }>)
+        .flatMap((m) => (Array.isArray(m.content) ? m.content : []))
+        .filter((b: any) => b.type === 'text' && /^\[(orphan|duplicate) tool_result for /.test(b.text));
+      expect(replacements.length).toBeGreaterThan(0);
+      for (const replacement of replacements) notes.alterBlock(replacement);
+      expect(sorted(notes.altered)).toEqual(altered);
+      expect(notes.established).toBe(true);
+    });
   });
 
-  describe('a block the normalizer copies to drop cache_control keeps its owner', () => {
+
+  describe('a stranded call\'s round reports the breakpoint block the Anthropic cleanup removes', () => {
     // The stranded tool_use gets a synthetic [pending] result in the next user
-    // envelope, and every cache_control from that envelope on is removed by
-    // copying the block. The breakpoint sits on a whitespace-only last block,
-    // which the Anthropic cleanup then removes: its report names the copy.
+    // envelope. The breakpoint sits on a whitespace-only last block, which the
+    // Anthropic cleanup then removes, and its report names that block's message.
     const messages = (): NormalizedRequest['messages'] => [
       { participant: 'User', content: [text('start')] },
       { participant: 'Claude', content: [toolUse('stranded')] },
@@ -811,22 +865,6 @@ describe('Greptile\'s review of #104', () => {
       expect(sent).not.toContain('"  "');
       expect(rounds[0]!.altered.messages).toEqual([2]);
       expect(rounds[0]!.fidelity).toBe('established');
-    });
-
-    it('through NativeFormatter.buildMessages', () => {
-      const notes = new FidelityNotes();
-      const built = new NativeFormatter().buildMessages(messages(), {
-        assistantParticipant: 'Claude', participantMode: 'multiuser', promptCaching: true, fidelity: notes,
-      } as any);
-      const copy = (built.messages as Array<{ content: unknown }>)
-        .flatMap((m) => (Array.isArray(m.content) ? m.content : []))
-        .find((b: any) => b.type === 'text' && b.text === '  ');
-      // The suppression's copy, not the block the builder registered.
-      expect(copy).toBeDefined();
-      expect((copy as Record<string, unknown>).cache_control).toBeUndefined();
-      notes.alterBlock(copy);
-      expect(sorted(notes.altered)).toEqual([2]);
-      expect(notes.established).toBe(true);
     });
   });
 
@@ -917,7 +955,7 @@ describe('slimepriestess\'s review of #104', () => {
       });
       const { rounds } = await drive(membrane, {
         messages: [{ participant: 'User', content: [{ type: 'text', text: 'go' }] }],
-        config: { model: 'test-model', maxTokens: 1000 }, tools: [noopTool], promptCaching: false,
+        config: { model: 'test-model', maxTokens: 1000 }, toolMode: 'xml', tools: [noopTool], promptCaching: false,
       });
       expect(maxTokens).toEqual([1000, 7]);
       expect(rounds.map((r) => r.fidelity)).toEqual(['unknown', 'unknown']);
@@ -973,7 +1011,7 @@ describe('slimepriestess\'s review of #104', () => {
     it('XML prefill: a tool_result\'s rawXml goes out in place of its content', async () => {
       const adapter = new MockAdapter({ streamChunkDelayMs: 0, completeDelayMs: 0, responseQueue: ['done.'] });
       const { rounds } = await drive(new Membrane(adapter), {
-        config: { model: 'test-model', maxTokens: 1000 }, promptCaching: false,
+        config: { model: 'test-model', maxTokens: 1000 }, toolMode: 'xml', promptCaching: false,
         messages: [
           { participant: 'User', content: [{ type: 'text', text: 'run it' }] },
           { participant: 'Claude', content: [{ type: 'tool_use', id: 't1', name: 'noop', input: {} } as ContentBlock] },
@@ -1093,6 +1131,13 @@ describe('an automated review of #104\'s own range', () => {
     expect('cacheCreationTokens' in unreportedEvent.usage).toBe(false);
   });
 
+  it('turn totals keep a reported thinkingTokens 0', async () => {
+    const request = nativeRequest([{ participant: 'User', content: [text('hi')] }]);
+    const streamed = await drive(new Membrane(new UsageAdapter({ inputTokens: 40, outputTokens: 2, thinkingTokens: 0 })), request);
+    const usageEvent = streamed.events.find((e) => e.type === 'usage') as Extract<StreamEvent, { type: 'usage' }>;
+    expect(usageEvent.usage).toMatchObject({ thinkingTokens: 0 });
+  });
+
   it('a round\'s usage is in membrane\'s convention: a cache-inclusive input count is restated without its cache reads', async () => {
     class InclusiveAdapter extends ScriptedAdapter {
       readonly usageCacheConvention = 'cache-inclusive' as const;
@@ -1194,7 +1239,7 @@ describe('an automated review of #104\'s own range', () => {
   it('XML history: a result sent as its rawXml is carried, nested media and all', async () => {
     const adapter = new MockAdapter({ streamChunkDelayMs: 0, completeDelayMs: 0, responseQueue: ['done.'] });
     const { rounds } = await drive(new Membrane(adapter), {
-      config: { model: 'test-model', maxTokens: 1000 }, promptCaching: false,
+      config: { model: 'test-model', maxTokens: 1000 }, toolMode: 'xml', promptCaching: false,
       messages: [
         { participant: 'Claude', content: [{ type: 'tool_use', id: 't1', name: 'noop', input: {}, rawXml: '<function_calls><invoke name="noop"></invoke></function_calls>' }] },
         { participant: 'User', content: [{ type: 'tool_result', toolUseId: 't1', rawXml: '<function_results><result>picture [Image]</result></function_results>', content: [{ type: 'text', text: 'picture' }, { type: 'image', source: { type: 'base64', mediaType: 'image/png', data: 'iVBORw0KGgo=' } }] }] },
@@ -1211,7 +1256,7 @@ describe('an automated review of #104\'s own range', () => {
     const huge: ContentBlock = { type: 'image', source: { type: 'base64', mediaType: 'image/png', data: pngHeader + big } } as ContentBlock;
     const adapter = new MockAdapter({ streamChunkDelayMs: 0, completeDelayMs: 0, responseQueue: ['done.'] });
     const request: NormalizedRequest = {
-      config: { model: 'test-model', maxTokens: 1000 }, tools: [noopTool], promptCaching: false,
+      config: { model: 'test-model', maxTokens: 1000 }, toolMode: 'xml', tools: [noopTool], promptCaching: false,
       messages: Array.from({ length: 8 }, (_, i) => ({ participant: 'User', content: [text(`picture ${i}`), huge] })),
     };
     request.shedOversizeImages = true;
@@ -1224,5 +1269,33 @@ describe('an automated review of #104\'s own range', () => {
     const notes = new FidelityNotes();
     notes.mutatedInPlace = true;
     expect(notes.copy().mutatedInPlace).toBe(true);
+  });
+});
+
+describe.each([
+  { name: 'an audio block without a base64 source', block: { type: 'audio', source: { type: 'url', url: 'https://example.test/a.mp3' } } },
+  { name: 'a video block', block: { type: 'video', source: { type: 'base64', mediaType: 'video/mp4', data: 'AAAA' } } },
+  { name: 'a generated image', block: { type: 'generated_image', data: 'AAAA', mimeType: 'image/png' } },
+  { name: 'an unaccepted image nested in a tool result', nested: true },
+])('NativeFormatter reports what it leaves out: $name', ({ block, nested }) => {
+  const text = (value: string): ContentBlock => ({ type: 'text', text: value });
+  const toolUse = (id: string): ContentBlock => ({ type: 'tool_use', id, name: 'noop', input: {} }) as ContentBlock;
+  const sorted = (indices: Iterable<number>) => [...indices].sort((x, y) => x - y);
+  it('names the message it came from', () => {
+    const notes = new FidelityNotes();
+    const messages: NormalizedRequest['messages'] = nested
+      ? [
+        { participant: 'User', content: [text('start')] },
+        { participant: 'Claude', content: [toolUse('c1')] },
+        { participant: 'User', content: [{ type: 'tool_result', toolUseId: 'c1', content: [text('picture'), svgImage] } as ContentBlock] },
+        { participant: 'User', content: [text('go')] },
+      ]
+      : [
+        { participant: 'User', content: [text('start')] },
+        { participant: 'User', content: [text('listen'), block as unknown as ContentBlock] },
+      ];
+    new NativeFormatter().buildMessages(messages, { assistantParticipant: 'Claude', participantMode: 'multiuser', fidelity: notes } as any);
+    expect(sorted(notes.altered)).toEqual([nested ? 2 : 1]);
+    expect(notes.established).toBe(true);
   });
 });

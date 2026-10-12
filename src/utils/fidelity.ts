@@ -16,9 +16,12 @@ import type { ContentBlock } from '../types/content.js';
  * as text, nested tool-result media rendered as a note, whitespace-only text
  * removed by a cleanup policy. Removing an exactly empty text block ('') that
  * holds no raw form carries nothing and is not an alteration; neither is the
- * faithful rendering of harness or attempt blocks, or a block moved between
+ * faithful rendering of harness or attempt blocks, a block moved between
  * provider messages or within one (the tool-pair rule puts a message's
- * tool_result blocks first).
+ * tool_result blocks first), the participant-name prefix a multiuser
+ * conversation puts on a message's text, an image's media type written as
+ * its bytes declare it, or a block membrane adds of its own (a synthetic
+ * result for a stranded call).
  *
  * Raw forms. Some blocks and messages carry the provider-native form they
  * were derived from, and the paths that understand it send that form in
@@ -49,11 +52,12 @@ import type { ContentBlock } from '../types/content.js';
  * were handed, and register the blocks they emit (`own`), so an adapter that
  * reports altering a block (`ProviderRequestOptions.onContentAltered`) is
  * attributed to the message that block came from. When content changes in a
- * way no index can be attached to (opt-in image shedding after role merging, a
- * beforeRequest hook that changed either of its arguments), the notes are
- * marked unattributed; when any part of the build or transport does not report
- * alterations at all, they are marked uninstrumented. Either makes the round's
- * fidelity 'unknown', so an empty alteration list is never mistaken for proof.
+ * way no index can be attached to (an image opt-in shedding replaced after
+ * role merging, a beforeRequest hook that changed either of its arguments),
+ * the notes are marked unattributed; when any part of the build or transport
+ * does not report alterations at all, they are marked uninstrumented. Either
+ * makes the round's fidelity 'unknown', so an empty alteration list is never
+ * mistaken for proof.
  */
 export class FidelityNotes {
   /** Indices, in the builder's input messages, whose content was not carried verbatim. */
@@ -153,23 +157,23 @@ export function ownBlocks(fidelity: FidelityNotes | undefined, blocks: readonly 
 }
 
 /**
- * The tool-pair normalizer's block-identity callbacks, for a build recording
- * `fidelity` (spread into `normalizeToolPairs`' options). The normalizer
- * makes new objects out of a consumer's blocks in two places. An orphan
- * tool_result rewritten as text alters exactly the message that occurrence
- * came from. A copy made to drop `cache_control` carries the same content,
- * so it keeps its owner and a later adapter report about it is attributed.
+ * The tool-pair normalizer's block-identity callback, for a build recording
+ * `fidelity` (spread into `normalizeToolPairs`' options). It hears a
+ * tool_result the normalizer rewrites as text, an orphan or a duplicate.
+ * That alters exactly the message the occurrence came from, and the
+ * replacement keeps its owner, so a later adapter report about it is
+ * attributed. (Phase 1's rename of a `toolUseId` key also copies a block,
+ * but NativeFormatter writes `tool_use_id` before the normalizer runs.)
  */
 export function followNormalizedBlocks(
   fidelity: FidelityNotes | undefined,
-): Pick<NormalizeOptions, 'onBlockRewritten' | 'onBlockCopied'> {
+): Pick<NormalizeOptions, 'onBlockRewritten'> {
   if (!fidelity) return {};
   return {
     onBlockRewritten: (original, replacement) => {
       fidelity.alterBlock(original);
       fidelity.ownCopy(original, replacement);
     },
-    onBlockCopied: (original, copy) => fidelity.ownCopy(original, copy),
   };
 }
 

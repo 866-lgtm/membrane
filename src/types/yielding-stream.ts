@@ -102,7 +102,8 @@ export interface RoundReport {
    * usage it reports is: `inputTokens` excludes cache reads, so a
    * cache-inclusive provider's input count is restated without them
    * (`normalizeUsageToCacheExcluded`), and `inputTokens + cacheReadTokens` is
-   * the prompt the provider counted.
+   * the prompt the provider counted. An adapter whose convention is
+   * `'unknown'` passes its counts through as the provider gave them.
    */
   usage: RoundUsage;
   /**
@@ -136,9 +137,10 @@ export interface RoundReport {
   /**
    * 'established' when every step of the build and transport reports its
    * alterations and none was unattributable; 'unknown' otherwise (an
-   * uninstrumented path, opt-in image shedding, a beforeRequest hook that
-   * changed either of its arguments, or an earlier round's hook that changed
-   * one in place). With 'unknown', an empty `altered` proves nothing.
+   * uninstrumented path, an image opt-in shedding replaced, a beforeRequest
+   * hook that changed either of its arguments, or an earlier round's hook
+   * that changed one in place). With 'unknown', an empty `altered` proves
+   * nothing.
    */
   fidelity: 'established' | 'unknown';
   /**
