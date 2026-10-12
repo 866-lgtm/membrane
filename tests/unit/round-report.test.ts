@@ -3,7 +3,7 @@
  *
  * A consumer that needs to know what a round's request actually carried —
  * agent-framework's receipt clocks are the first — reads one report per
- * provider round whose response stands. The contract (room-221 #43302):
+ * provider round whose response stands. The contract:
  *
  *   - `altered` names consumer messages the request did not carry verbatim,
  *     in the consumer's coordinates: `NormalizedRequest.messages` indices,
@@ -410,7 +410,7 @@ describe('usage at the adapter boundary: a reported 0 is 0, an unreported count 
     expect('cacheReadTokens' in (await adapter.complete(request)).usage).toBe(false);
   });
 
-  it('Gemini: proto3 omits a zero count, so a count missing from a present usageMetadata is a reported 0 (slimepriestess, room-338)', async () => {
+  it('Gemini: proto3 omits a zero count, so a count missing from a present usageMetadata is a reported 0', async () => {
     const respond = (usageMetadata: unknown) => vi.fn().mockResolvedValue(new Response(JSON.stringify({
       candidates: [{ content: { parts: [{ text: 'ok' }] }, finishReason: 'STOP' }],
       ...(usageMetadata ? { usageMetadata } : {}),
@@ -485,7 +485,7 @@ class ScriptedAnthropic extends AnthropicAdapter {
   }
 }
 
-describe('producer-boundary losses (Hugo, room-220 #45131 and #45179)', () => {
+describe('producer-boundary losses', () => {
   const nativeAnthropicRequest = (extra: Partial<NormalizedRequest> = {}): NormalizedRequest => ({
     messages: [{ participant: 'User', content: [{ type: 'text', text: 'ORIGINAL' }] }],
     config: { model: 'claude-sonnet-4-5', maxTokens: 1000 },
@@ -584,7 +584,7 @@ describe('producer-boundary losses (Hugo, room-220 #45131 and #45179)', () => {
     expect(rounds[0]!.usage.outputTokens).toBe(10);
   });
 
-  it('a block object reused in two messages is emitted once per occurrence: removing both alters both; a report about the consumer\'s own object is unknown (Hugo #45748, #45945)', async () => {
+  it('a block object reused in two messages is emitted once per occurrence: removing both alters both; a report about the consumer\'s own object is unknown', async () => {
     const shared = { type: 'text', text: '   ' } as ContentBlock;
     const messages = (): NormalizedRequest['messages'] => [
       { participant: 'Claude', content: [{ type: 'tool_use', id: 't1', name: 'noop', input: {} }] },
@@ -621,7 +621,7 @@ describe('producer-boundary losses (Hugo, room-220 #45131 and #45179)', () => {
     expect(ambiguous.rounds[0]!.fidelity).toBe('unknown');
   });
 
-  it('only the attempt that stands reports: a refused attempt\'s alteration is discarded, the standing attempt\'s kept (Hugo #45945)', async () => {
+  it('only the attempt that stands reports: a refused attempt\'s alteration is discarded, the standing attempt\'s kept', async () => {
     const messages = (): NormalizedRequest['messages'] => [
       { participant: 'Claude', content: [{ type: 'tool_use', id: 't1', name: 'noop', input: {} }] },
       { participant: 'User', content: [{ type: 'tool_result', toolUseId: 't1', content: [{ type: 'text', text: 'first' }] }] },
@@ -651,7 +651,7 @@ describe('producer-boundary losses (Hugo, room-220 #45131 and #45179)', () => {
   });
 });
 
-describe('Greptile\'s review of #104 (room-256)', () => {
+describe('Greptile\'s review of #104', () => {
   const text = (value: string): ContentBlock => ({ type: 'text', text: value });
   const toolUse = (id: string): ContentBlock => ({ type: 'tool_use', id, name: 'noop', input: {} }) as ContentBlock;
   const toolResult = (toolUseId: string | undefined, content: unknown = 'stray'): ContentBlock =>
@@ -763,7 +763,7 @@ describe('Greptile\'s review of #104 (room-256)', () => {
     },
     {
       // A result with no id is textified as '<missing>'; a separate result whose
-      // id is literally '<missing>' is paired and carried (Hazel, room-256 #49551).
+      // id is literally '<missing>' is paired and carried.
       name: 'a missing id beside a literal \'<missing>\' id',
       messages: (): NormalizedRequest['messages'] => [
         { participant: 'User', content: [toolResult(undefined, 'no id')] },
@@ -856,7 +856,7 @@ describe('Greptile\'s review of #104 (room-256)', () => {
   });
 });
 
-describe('slimepriestess\'s review of #104 (room-338)', () => {
+describe('slimepriestess\'s review of #104', () => {
   const text = (value: string): ContentBlock => ({ type: 'text', text: value });
   const sorted = (indices: Iterable<number>) => [...indices].sort((a, b) => a - b);
 
@@ -1048,7 +1048,7 @@ describe('slimepriestess\'s review of #104 (room-338)', () => {
   });
 });
 
-describe('the house\'s third review of #104 (sw-mb104)', () => {
+describe('an automated review of #104\'s own range', () => {
   const text = (value: string): ContentBlock => ({ type: 'text', text: value });
   const buildOptions = (notes: FidelityNotes) => ({ assistantParticipant: 'Claude', participantMode: 'multiuser', fidelity: notes }) as any;
 
@@ -1072,7 +1072,7 @@ describe('the house\'s third review of #104 (sw-mb104)', () => {
     }
   }
 
-  it('turn totals and a refused attempt\'s record keep a reported 0, and leave an unreported count absent (I2)', async () => {
+  it('turn totals and a refused attempt\'s record keep a reported 0, and leave an unreported count absent', async () => {
     const request = nativeRequest([{ participant: 'User', content: [text('hi')] }]);
     const zero = { inputTokens: 40, outputTokens: 2, cacheReadTokens: 0, cacheCreationTokens: 0 };
     const completed = await new Membrane(new UsageAdapter(zero, 1)).complete(request, { refusalRetries: 1 });
@@ -1093,7 +1093,7 @@ describe('the house\'s third review of #104 (sw-mb104)', () => {
     expect('cacheCreationTokens' in unreportedEvent.usage).toBe(false);
   });
 
-  it('a round\'s usage is in membrane\'s convention: a cache-inclusive input count is restated without its cache reads (I4)', async () => {
+  it('a round\'s usage is in membrane\'s convention: a cache-inclusive input count is restated without its cache reads', async () => {
     class InclusiveAdapter extends ScriptedAdapter {
       readonly usageCacheConvention = 'cache-inclusive' as const;
     }
@@ -1102,7 +1102,7 @@ describe('the house\'s third review of #104 (sw-mb104)', () => {
     expect(rounds[0]!.usage).toMatchObject({ inputTokens: 200, cacheReadTokens: 800 });
   });
 
-  it('Responses formatter: a block whose item differs under the same type and id isn\'t carried; an equal copy is (I5)', () => {
+  it('Responses formatter: a block whose item differs under the same type and id isn\'t carried; an equal copy is', () => {
     const item = { type: 'message', id: 'msg_1', role: 'assistant', content: [{ type: 'output_text', text: 'FIRST' }] };
     const copy = JSON.parse(JSON.stringify(item));
     const edited = { ...item, content: [{ type: 'output_text', text: 'REDACTED' }] };
@@ -1116,7 +1116,7 @@ describe('the house\'s third review of #104 (sw-mb104)', () => {
     expect(notes.established).toBe(true);
   });
 
-  it('Responses input normalization names the block it changed: an assistant image, a non-object input, a failed result (I6, I11, I34)', () => {
+  it('Responses input normalization names the block it changed: an assistant image, a non-object input, a failed result', () => {
     const image = { type: 'image', source: { type: 'url', url: 'https://example.invalid/a.png' } };
     const call = { type: 'tool_use', id: 'c1', name: 'noop', input: 'not-an-object' };
     const failed = { type: 'tool_result', toolUseId: 'c1', content: 'boom', isError: true };
@@ -1144,7 +1144,7 @@ describe('the house\'s third review of #104 (sw-mb104)', () => {
     expect(standalone).toBe(1);
   });
 
-  it('Responses formatter: a failed tool result alters its message, since a function_call_output has no error flag (I11)', () => {
+  it('Responses formatter: a failed tool result alters its message, since a function_call_output has no error flag', () => {
     const notes = new FidelityNotes();
     new OpenAIResponsesFormatter().buildMessages([
       { participant: 'Claude', content: [{ type: 'tool_use', id: 'c1', name: 'noop', input: {} }] },
@@ -1155,7 +1155,7 @@ describe('the house\'s third review of #104 (sw-mb104)', () => {
     expect([...notes.altered]).toEqual([1]);
   });
 
-  it('a hook that returns a different provider request makes that round unknown, and the next, built afresh, established (I7)', async () => {
+  it('a hook that returns a different provider request makes that round unknown, and the next, built afresh, established', async () => {
     const adapter = new ScriptedAdapter([toolUseTurn('t1'), finalTurn()]);
     let call = 0;
     const membrane = new Membrane(adapter, {
@@ -1166,7 +1166,7 @@ describe('the house\'s third review of #104 (sw-mb104)', () => {
     expect(rounds.map((r) => r.fidelity)).toEqual(['unknown', 'established']);
   });
 
-  it('without usage events, a hooked stream doesn\'t serialize its request to compare it (I9)', async () => {
+  it('without usage events, a hooked stream doesn\'t serialize its request to compare it', async () => {
     let serialized = 0;
     const probe = { toJSON: () => { serialized++; return 'probe'; } };
     const request = nativeRequest([{ participant: 'User', content: [text('hi')], metadata: { probe } }]);
@@ -1177,7 +1177,7 @@ describe('the house\'s third review of #104 (sw-mb104)', () => {
     expect(serialized).toBeGreaterThan(0);
   });
 
-  it('OpenAI chat completions (complete): a reported 0 is 0, an unreported count absent (I12)', async () => {
+  it('OpenAI chat completions (complete): a reported 0 is 0, an unreported count absent', async () => {
     const respond = (usage: unknown) => vi.fn().mockResolvedValue(new Response(JSON.stringify({
       id: 'cc_1', object: 'chat.completion', created: 0, model: 'gpt-zz',
       choices: [{ index: 0, message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }],
@@ -1191,7 +1191,7 @@ describe('the house\'s third review of #104 (sw-mb104)', () => {
     expect('cacheReadTokens' in (await adapter.complete(request)).usage).toBe(false);
   });
 
-  it('XML history: a result sent as its rawXml is carried, nested media and all (I13)', async () => {
+  it('XML history: a result sent as its rawXml is carried, nested media and all', async () => {
     const adapter = new MockAdapter({ streamChunkDelayMs: 0, completeDelayMs: 0, responseQueue: ['done.'] });
     const { rounds } = await drive(new Membrane(adapter), {
       config: { model: 'test-model', maxTokens: 1000 }, promptCaching: false,
@@ -1205,7 +1205,7 @@ describe('the house\'s third review of #104 (sw-mb104)', () => {
     expect(rounds[0]!.fidelity).toBe('established');
   });
 
-  it('XML prefill: opt-in image shedding in the initial build makes the round unknown (I15)', async () => {
+  it('XML prefill: opt-in image shedding in the initial build makes the round unknown', async () => {
     const big = Buffer.alloc(6 * 1024 * 1024, 7).toString('base64');
     const pngHeader = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]).toString('base64');
     const huge: ContentBlock = { type: 'image', source: { type: 'base64', mediaType: 'image/png', data: pngHeader + big } } as ContentBlock;
@@ -1220,7 +1220,7 @@ describe('the house\'s third review of #104 (sw-mb104)', () => {
     expect(rounds[0]!.fidelity).toBe('unknown');
   });
 
-  it('a copy of the notes keeps an in-place hook change (I26)', () => {
+  it('a copy of the notes keeps an in-place hook change', () => {
     const notes = new FidelityNotes();
     notes.mutatedInPlace = true;
     expect(notes.copy().mutatedInPlace).toBe(true);
