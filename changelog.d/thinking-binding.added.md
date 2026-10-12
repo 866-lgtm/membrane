@@ -11,8 +11,10 @@
   hasn't been tried, and that family has refused thinking configs with a
   400 before, so setting it for a Mythos model may fail every request;
   Bedrock's acceptance of the beta hasn't been tried either. A request with
-  no thinking config carries no binding: thinking disabled, a budget that
-  can't fit under `maxTokens`, or a request ending in an assistant prefill.
+  no thinking config carries no binding: thinking disabled (Fable and Mythos
+  think whatever `enabled` says, so they carry it whenever it's asked for), a
+  budget that can't fit under `maxTokens`, or a request the XML or
+  completions formatter builds to end in an assistant prefill.
   A `thinking` object passed through `providerParams` replaces membrane's,
   binding included. Unset, nothing is sent, and the account's default
   applies.

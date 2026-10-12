@@ -74,10 +74,13 @@ export interface GenerationConfig {
      * thinking-capable model on Bedrock may refuse the request with a 400.
      *
      * A request that carries no thinking config carries no binding, and the
-     * account's default applies there: thinking disabled, an enabled budget
-     * that can't fit under `maxTokens` (membrane then leaves thinking out),
-     * and a request ending in an assistant prefill, including an XML
-     * continuation, which never sends thinking. A `thinking` object passed
+     * account's default applies there: thinking disabled on a model whose
+     * thinking can be turned off (Fable and Mythos think whatever `enabled`
+     * says, so they carry the binding whenever it's asked for), an enabled
+     * budget that can't fit under `maxTokens` (membrane then leaves thinking
+     * out), and a request the XML or completions formatter builds to end in
+     * an assistant prefill, including an XML continuation, which never sends
+     * thinking. A `thinking` object passed
      * through `providerParams` replaces the one membrane builds, binding
      * included, so give `block_binding` inside it; the beta follows the body
      * that is sent. Left unset, nothing is sent, and the account's default

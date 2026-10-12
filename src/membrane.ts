@@ -2177,9 +2177,11 @@ export class Membrane {
    * sends them no sampling params (`temperature`, `top_p`, `top_k`) and no
    * thinking config, which the family has rejected with a 400. The exception
    * is the binding controls (`thinking.blockBinding`), sent as
-   * `{ type: 'adaptive', block_binding }` (with `display` when set), which
-   * Fable 5 and Fable 5.1 accepted (2026-10-10; Fable 5.1 also accepted a
-   * budgeted config then).
+   * `{ type: 'adaptive', block_binding }`, which Fable 5 and Fable 5.1
+   * accepted on 2026-10-10 (Fable 5.1 also accepted a budgeted config then),
+   * and with `display` beside it when set, which they accepted on 2026-10-12.
+   * They think whatever `thinking.enabled` says, so the binding goes whenever
+   * it's asked for.
    */
   private static isAlwaysThinkingModel(model: string | undefined): boolean {
     return /\b(fable|mythos)\b/i.test(model ?? '');

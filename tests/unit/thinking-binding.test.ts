@@ -128,18 +128,21 @@ describe('the request asks for the controls', () => {
   });
 
   it('sends a model whose thinking is always on only the controls, with display when set, and still no sampling params', async () => {
-    const adapter = new BindingAdapter([finalTurn(), finalTurn(), finalTurn(), finalTurn()]);
+    const adapter = new BindingAdapter([finalTurn(), finalTurn(), finalTurn(), finalTurn(), finalTurn()]);
     const membrane = new Membrane(adapter);
     await rounds(membrane, request([user('hi')], { model: 'claude-fable-5-1', temperature: 0.3 }));
     await rounds(membrane, request([user('hi')], { model: 'claude-fable-5-1', temperature: 0.3, thinking: { enabled: true, budgetTokens: 2000 } }));
     await rounds(membrane, request([user('hi')], { model: 'claude-fable-5-1', thinking: { enabled: true, display: 'summarized', blockBinding: DROP } }));
     await rounds(membrane, request([user('hi')], { model: 'claude-fable-5-1', thinking: { enabled: true, display: 'summarized' } }));
+    await rounds(membrane, request([user('hi')], { model: 'claude-fable-5-1', thinking: { enabled: false, blockBinding: DROP } }));
     expect(adapter.requests[0]!.thinking).toEqual({ type: 'adaptive', block_binding: { prefix_mismatch_behavior: 'drop_block' } });
     expect(adapter.requests[1]!.thinking).toBeUndefined();
     expect(adapter.requests[2]!.thinking).toEqual({ type: 'adaptive', display: 'summarized', block_binding: { prefix_mismatch_behavior: 'drop_block' } });
     // Display alone sends these models nothing: a config goes only to carry the controls.
     expect(adapter.requests[3]!.thinking).toBeUndefined();
-    expect(adapter.requests.map((r) => r.temperature)).toEqual([undefined, undefined, undefined, undefined]);
+    // These models think whatever `enabled` says, so the controls go when asked for.
+    expect(adapter.requests[4]!.thinking).toEqual({ type: 'adaptive', block_binding: { prefix_mismatch_behavior: 'drop_block' } });
+    expect(adapter.requests.map((r) => r.temperature)).toEqual([undefined, undefined, undefined, undefined, undefined]);
   });
 
   it('carries no binding where membrane sends no thinking config: thinking disabled, or a budget that can\'t fit', async () => {
