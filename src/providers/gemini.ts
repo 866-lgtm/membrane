@@ -119,15 +119,34 @@ function geminiUsageToProviderUsage(
     }
   }
 
+  const cachedTokens = usageMetadata?.cachedContentTokenCount || undefined;
+  // A cached span larger than the whole prompt can't be inside the prompt
+  // count, so this response's prompt count can only be the fresh input: it is
+  // read as cache-excluded, against the adapter's declared convention (see
+  // GeminiAdapter.usageCacheConvention, whose basis is Google's definition,
+  // not a measured implicit hit).
+  const promptExcludesCache = cachedTokens !== undefined && cachedTokens > promptTokens;
+  if (promptExcludesCache && !warnedPromptExcludesCache) {
+    warnedPromptExcludesCache = true;
+    console.warn(
+      `[membrane:gemini] cachedContentTokenCount(${cachedTokens}) exceeds promptTokenCount(${promptTokens}),`
+      + ' so this prompt count cannot include the cached span. The response is read as cache-excluded'
+      + ' (promptTokenCount is the fresh input); the adapter declares cache-inclusive from Google\'s'
+      + ' definition of the field.'
+    );
+  }
+
   return {
     inputTokens: promptTokens,
     outputTokens: candidatesTokens + (thoughtsTokens ?? 0),
     ...(thoughtsTokens != null ? { thinkingTokens: thoughtsTokens } : {}),
-    cacheReadTokens: usageMetadata?.cachedContentTokenCount
-      ? usageMetadata.cachedContentTokenCount
-      : undefined,
+    cacheReadTokens: cachedTokens,
+    ...(promptExcludesCache ? { cacheConvention: 'cache-excluded' as const } : {}),
   };
 }
+
+/** Whether the cached-above-prompt warning has been printed (once per process). */
+let warnedPromptExcludesCache = false;
 
 // ============================================================================
 // Adapter Configuration
@@ -162,14 +181,18 @@ export class GeminiAdapter implements ProviderAdapter {
    * cachedContent is set, this is still the total effective prompt size
    * meaning this includes the number of tokens in the cached content", and
    * that `totalTokenCount` is "prompt + thoughts + response candidates",
-   * with no cached term of its own. That second sentence is about explicit
-   * caching (`cachedContent`), which membrane never sets: a hit through
-   * membrane is implicit, and for it the inclusion is inferred from the
-   * field's definition and the total, not stated. No probe has measured
-   * one: on 2026-08-25, three identical 10,893-token calls to
-   * gemini-3.5-flash-lite never reported the field (implicit caching did not
-   * trigger), and explicit `cachedContents` is refused on the free tier
-   * (429, TotalCachedContentStorageTokensPerModelFreeTier limit=0).
+   * with no cached term of its own. The "When cachedContent is set" sentence
+   * is about explicit caching (`cachedContent`), which membrane never sets
+   * itself: a hit through membrane is implicit unless a caller passes
+   * `cachedContent` through `providerParams`, and for an implicit hit the
+   * inclusion is inferred from the field's definition and the total, not
+   * stated. A response whose cached count exceeds its prompt count can't be
+   * read that way, so it is read as cache-excluded, with a warning (see
+   * geminiUsageToProviderUsage). No probe has measured an implicit hit: on
+   * 2026-08-25, three identical 10,893-token calls to gemini-3.5-flash-lite
+   * never reported the field (implicit caching did not trigger), and
+   * explicit `cachedContents` is refused on the free tier (429,
+   * TotalCachedContentStorageTokensPerModelFreeTier limit=0).
    */
   readonly usageCacheConvention = 'cache-inclusive' as const;
   private apiKey: string;

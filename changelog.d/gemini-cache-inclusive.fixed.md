@@ -1,7 +1,3 @@
-- Gemini's usage is read as cache-inclusive: `promptTokenCount` counts the
-  cached span `cachedContentTokenCount` reports, so `inputTokens` is now the
-  fresh input and a cache hit is counted once by cost, the cache-hit ratio
-  and any consumer summing input, cache reads and cache writes. Google's
-  UsageMetadata reference states the inclusion for explicit cached content;
-  for the implicit hits membrane meets it is inferred from the field's
-  definition, and has not been measured.
+- Gemini's usage is read as cache-inclusive: `promptTokenCount` counts the cached span `cachedContentTokenCount` reports. That is Google's UsageMetadata definition, stated for explicit cached content; for the implicit hits membrane meets it is inferred from the field's definition, and no hit has been measured. So in Membrane's responses `inputTokens` is now the fresh input on a Gemini cache hit, as it is for every provider, and a hit is counted once by the cache-hit ratio, by cost and by any consumer summing input, cache reads and cache writes. A response whose cached count exceeds its prompt count can't include it, so that response is read as cache-excluded instead, with a one-time warning.
+  - **What callers see:** on a Gemini cache hit, `inputTokens` falls by the cached span, and the estimated cost falls with it: the cached span is priced once, at the model's cache-read rate. A pricing row without a cache-read rate leaves that span unpriced, as cache reads are for every provider, where it used to ride in `inputTokens` at the input rate; every Gemini row in the default table has one. Usage recorded before the upgrade keeps the old reading, so a sum across the upgrade steps down.
+  - **Unchanged:** a direct `GeminiAdapter` caller still gets `promptTokenCount` as `inputTokens`, with `usageCacheConvention: 'cache-inclusive'` declaring how to read it, as with every adapter. A response without a cache read is unchanged.

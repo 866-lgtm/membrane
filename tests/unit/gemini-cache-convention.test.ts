@@ -1,11 +1,14 @@
 /**
- * Gemini's `promptTokenCount` counts the cached span that
- * `cachedContentTokenCount` reports (Google's UsageMetadata reference: "this
- * is still the total effective prompt size meaning this includes the number
- * of tokens in the cached content"; see GeminiAdapter.usageCacheConvention for
- * what that sentence covers). So membrane reads Gemini as cache-inclusive and
- * subtracts the cached span: every consumer that sums fresh input, cache
- * reads and cache writes as one convention counts a hit once.
+ * Membrane reads Gemini's `promptTokenCount` as counting the cached span that
+ * `cachedContentTokenCount` reports, and subtracts it, so every consumer that
+ * sums fresh input, cache reads and cache writes as one convention counts a
+ * hit once. The basis is Google's UsageMetadata definition ("this is still
+ * the total effective prompt size meaning this includes the number of tokens
+ * in the cached content"), which it states for explicit cached content; for
+ * an implicit hit it is inferred, and no hit has been measured (see
+ * GeminiAdapter.usageCacheConvention). A response the inclusive reading
+ * can't explain, with more cached tokens than prompt tokens, is read as
+ * cache-excluded. The usage below is constructed, not a captured hit.
  */
 import { describe, it, expect, afterEach, vi } from 'vitest';
 import { GeminiAdapter } from '../../src/providers/gemini.js';
@@ -65,9 +68,55 @@ describe('Gemini usage is cache-inclusive', () => {
     expect(response.details.usage.cacheReadTokens).toBe(8_000);
   });
 
-  it('leaves a response without a cache read as it was', async () => {
-    stubComplete({ promptTokenCount: 10_000, candidatesTokenCount: 5, totalTokenCount: 10_005 });
+  it('leaves a response without a cache read as it was, on complete() and stream()', async () => {
+    const usage = { promptTokenCount: 10_000, candidatesTokenCount: 5, totalTokenCount: 10_005 };
+    stubComplete(usage);
+    const completed = await new Membrane(new GeminiAdapter({ apiKey: 'zz-key-not-used' })).complete(REQUEST);
+    expect(completed.usage.inputTokens).toBe(10_000);
+    expect(completed.details.usage.cacheReadTokens ?? 0).toBe(0);
+    stubStream(usage);
+    const streamed = await new Membrane(new GeminiAdapter({ apiKey: 'zz-key-not-used' })).stream(REQUEST) as NormalizedResponse;
+    expect(streamed.usage.inputTokens).toBe(10_000);
+    expect(streamed.details.usage.cacheReadTokens ?? 0).toBe(0);
+  });
+
+  it('prices a hit once: the fresh span at the input rate, the cached span at the cache-read rate', async () => {
+    // gemini-3.5-flash-lite in the default table: $0.30 input, $0.03 cache read, $2.50 output per million.
+    const expected = { input: 2_000 * 0.30 / 1e6, cacheRead: 8_000 * 0.03 / 1e6, output: 5 * 2.50 / 1e6 };
+    for (const run of ['complete', 'stream'] as const) {
+      if (run === 'complete') stubComplete(HIT); else stubStream(HIT);
+      const membrane = new Membrane(new GeminiAdapter({ apiKey: 'zz-key-not-used' }));
+      const response = run === 'complete' ? await membrane.complete(REQUEST) : await membrane.stream(REQUEST) as NormalizedResponse;
+      const cost = response.usage.estimatedCost!;
+      expect(cost.input, run).toBeCloseTo(expected.input, 12);
+      expect(cost.cacheRead, run).toBeCloseTo(expected.cacheRead, 12);
+      expect(cost.total, run).toBeCloseTo(expected.input + expected.cacheRead + expected.output, 12);
+    }
+  });
+});
+
+describe('a response the inclusive reading cannot explain', () => {
+  it('a cached span equal to the whole prompt is still inside it: no fresh input', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    stubComplete({ promptTokenCount: 8_000, cachedContentTokenCount: 8_000, candidatesTokenCount: 5, totalTokenCount: 8_005 });
     const response = await new Membrane(new GeminiAdapter({ apiKey: 'zz-key-not-used' })).complete(REQUEST);
-    expect(response.usage.inputTokens).toBe(10_000);
+    expect(response.usage.inputTokens).toBe(0);
+    expect(response.details.usage.cacheReadTokens).toBe(8_000);
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it('a cached span above the prompt count is read as cache-excluded, with one warning', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const usage = { promptTokenCount: 2_000, cachedContentTokenCount: 8_000, candidatesTokenCount: 5, totalTokenCount: 2_005 };
+    stubComplete(usage);
+    const completed = await new Membrane(new GeminiAdapter({ apiKey: 'zz-key-not-used' })).complete(REQUEST);
+    expect(completed.usage.inputTokens).toBe(2_000);
+    expect(completed.details.usage.cacheReadTokens).toBe(8_000);
+    stubStream(usage);
+    const streamed = await new Membrane(new GeminiAdapter({ apiKey: 'zz-key-not-used' })).stream(REQUEST) as NormalizedResponse;
+    expect(streamed.usage.inputTokens).toBe(2_000);
+    // Once per process (each test file has its own modules), though two responses exceeded.
+    const lines = warn.mock.calls.map((call) => String(call[0])).filter((line) => line.includes('exceeds promptTokenCount'));
+    expect(lines).toHaveLength(1);
   });
 });
