@@ -67,7 +67,11 @@ export interface GenerationConfig {
      * on 2026-10-12, returning signed thinking with its text. Mythos hasn't
      * been tried, and the family has refused thinking configs with a 400
      * before, so for a Mythos model setting it may fail every request.
-     * Bedrock's acceptance of the beta hasn't been tried either.
+     * Bedrock's acceptance of the beta hasn't been tried either. The Bedrock
+     * adapter sends the interleaved-thinking beta only to models that take
+     * it, since legacy 3.x models there refuse unknown beta flags, but it
+     * sends this one whenever the body carries the binding, so an older
+     * thinking-capable model on Bedrock may refuse the request with a 400.
      *
      * A request that carries no thinking config carries no binding, and the
      * account's default applies there: thinking disabled, an enabled budget
