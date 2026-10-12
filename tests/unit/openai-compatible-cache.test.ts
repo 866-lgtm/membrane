@@ -1,7 +1,7 @@
 /**
  * OpenAI-compatible prompt-cache request and stream-usage regression tests.
  *
- * Two live fixes for Polaris on OpenAI direct (gpt-5.1 via openai-compatible):
+ * Two live fixes for an agent on OpenAI direct (gpt-5.1 via openai-compatible):
  *
  *   1. `cacheTtl: '24h'` becomes `prompt_cache_retention: '24h'` on the wire,
  *      WITHOUT turning on `store` (extended prompt caching is independent of
