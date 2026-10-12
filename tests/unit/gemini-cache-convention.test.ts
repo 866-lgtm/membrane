@@ -11,7 +11,7 @@
  * cache-excluded. The usage below is constructed, not a captured hit.
  */
 import { describe, it, expect, afterEach, vi } from 'vitest';
-import { GeminiAdapter } from '../../src/providers/gemini.js';
+import { GeminiAdapter, resetPromptExcludesCacheWarning } from '../../src/providers/gemini.js';
 import { Membrane } from '../../src/membrane.js';
 import type { NormalizedRequest, NormalizedResponse } from '../../src/types/index.js';
 
@@ -106,6 +106,7 @@ describe('a response the inclusive reading cannot explain', () => {
   });
 
   it('a cached span above the prompt count is read as cache-excluded, with one warning', async () => {
+    resetPromptExcludesCacheWarning(); // the latch is process-wide: this test doesn't depend on order
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     const usage = { promptTokenCount: 2_000, cachedContentTokenCount: 8_000, candidatesTokenCount: 5, totalTokenCount: 2_005 };
     stubComplete(usage);
@@ -115,7 +116,7 @@ describe('a response the inclusive reading cannot explain', () => {
     stubStream(usage);
     const streamed = await new Membrane(new GeminiAdapter({ apiKey: 'zz-key-not-used' })).stream(REQUEST) as NormalizedResponse;
     expect(streamed.usage.inputTokens).toBe(2_000);
-    // Once per process (each test file has its own modules), though two responses exceeded.
+    // Once per process, though two responses exceeded.
     const lines = warn.mock.calls.map((call) => String(call[0])).filter((line) => line.includes('exceeds promptTokenCount'));
     expect(lines).toHaveLength(1);
   });

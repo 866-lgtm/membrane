@@ -148,6 +148,11 @@ function geminiUsageToProviderUsage(
 /** Whether the cached-above-prompt warning has been printed (once per process). */
 let warnedPromptExcludesCache = false;
 
+/** Test seam: the cached-above-prompt warning's latch is process-wide otherwise. */
+export function resetPromptExcludesCacheWarning(): void {
+  warnedPromptExcludesCache = false;
+}
+
 // ============================================================================
 // Adapter Configuration
 // ============================================================================
