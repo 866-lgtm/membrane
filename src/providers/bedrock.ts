@@ -22,6 +22,7 @@ import {
   abortError,
 } from '../types/index.js';
 import { stripEmptyTextRequest } from '../utils/empty-text.js';
+import { isAnthropicServerBlock } from '../utils/anthropic-server-blocks.js';
 import { createCombinedSignal, isDeadlineAbort, deadlineTimeoutError, assertTerminalEventObserved } from './utils.js';
 import {
   INTERLEAVED_THINKING_BETA,
@@ -419,8 +420,9 @@ export class BedrockAdapter implements ProviderAdapter {
     // caller that sets cacheTtl. (Connectome issue #35.)
     // Bedrock is strict about the wire shape of image sources: internal blocks
     // carry camelCase `mediaType`, the API requires snake_case `media_type`.
-    // The Anthropic adapter converts on both paths (toAnthropicContent /
-    // toAnthropicToolResultContent); without the same conversion here a
+    // The Anthropic adapter's buildRequest converts both kinds: top-level
+    // images in place, and images in tool_result content through
+    // toAnthropicToolResultContent. Without the same conversion here a
     // tool-returned image 400s with "media_type: Field required" mid-turn
     // (observed on eidoverse snapshot results, 2026-08-08). Applies to
     // top-level image blocks AND images nested inside tool_result content.
@@ -440,7 +442,13 @@ export class BedrockAdapter implements ProviderAdapter {
       if (!Array.isArray(msg.content)) return msg;
       return {
         ...msg,
-        content: msg.content.map((block: any) => {
+        // An Anthropic server-tool block (web search and the like) goes back
+        // to the Anthropic API in the turn that produced it, where its
+        // acceptance is checked live. Whether Bedrock accepts these block
+        // types is unknown, and a refusal would fail every request carrying
+        // the conversation, so Bedrock leaves them out, as it did before
+        // they were sent back anywhere (see utils/anthropic-server-blocks.ts).
+        content: msg.content.filter((block: unknown) => !isAnthropicServerBlock(block)).map((block: any) => {
           if (block.type === 'image' && block.sourceUrl !== undefined) {
             const { sourceUrl, ...rest } = block;
             return stripCacheTtl(toWireImage(rest));

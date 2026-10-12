@@ -30,6 +30,7 @@ import {
   networkError,
 } from '../types/index.js';
 import { safeParseJson, textOnlyToolResultContent, createCombinedSignal, SSELineParser, isDeadlineAbort, deadlineTimeoutError, throwOnStreamErrorFrame, assertTerminalEventObserved } from './utils.js';
+import { isZeroWidthCarrier } from '../utils/anthropic-server-blocks.js';
 
 // ============================================================================
 // Types
@@ -501,6 +502,10 @@ export class OpenAIAdapter implements ProviderAdapter {
 
         for (const block of msg.content) {
           if (block.type === 'text') {
+            // A zero-width carrier (a provider item with no normalized form,
+            // such as an Anthropic server-tool block) has no text and no form
+            // on this wire: an empty part would only add a blank line.
+            if (isZeroWidthCarrier(block)) continue;
             contentParts.push({ type: 'text', text: block.text });
           } else if (block.type === 'image') {
             // Convert Anthropic-style image to OpenAI image_url with data URI

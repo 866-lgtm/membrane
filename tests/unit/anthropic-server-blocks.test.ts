@@ -32,7 +32,6 @@ const searchResult = {
 };
 const thinking2 = { type: 'thinking', thinking: '', signature: 'zz-sig-2' };
 const answer = { type: 'text', text: 'zz answer' };
-const SERVER_TYPES = ['server_tool_use', 'web_search_tool_result'];
 
 const carrier = (item: unknown, extra: Record<string, unknown> = {}): ContentBlock =>
   ({ type: 'text', text: '', rawItem: item, ...extra }) as ContentBlock;
@@ -52,11 +51,11 @@ const history = (assistant: ContentBlock[] = turn()): NormalizedMessage[] => [
 ];
 const options = { participantMode: 'simple' as const, assistantParticipant: 'Claude', humanParticipant: 'User' };
 
-/** Every object in `value` whose `type` is a server block type. */
+/** Every object in `value` whose `type` is one of the listed server block types. */
 function serverBlocksIn(value: unknown): unknown[] {
   if (Array.isArray(value)) return value.flatMap(serverBlocksIn);
   if (!value || typeof value !== 'object') return [];
-  const own = SERVER_TYPES.includes((value as { type?: string }).type ?? '') ? [value] : [];
+  const own = ANTHROPIC_SERVER_BLOCK_TYPES.has((value as { type?: string }).type ?? '') ? [value] : [];
   return [...own, ...Object.values(value).flatMap(serverBlocksIn)];
 }
 
@@ -138,10 +137,11 @@ describe('NativeFormatter', () => {
     expect(JSON.stringify(built.messages)).toContain('zz answer');
   });
 
-  it('builds under cm-owned markers though the stored carrier holds one', () => {
-    const marked = carrier(searchResult, { cache_control: { type: 'ephemeral' } });
+  it('builds under cm-owned markers though a stored block or its carrier holds one', () => {
+    const blockMarked = carrier({ ...serverUse, cache_control: { type: 'ephemeral' } });
+    const carrierMarked = carrier(searchResult, { cache_control: { type: 'ephemeral' } });
     const built = new NativeFormatter().buildMessages(
-      history([thinking1 as ContentBlock, carrier(serverUse), marked, answer as ContentBlock]),
+      history([thinking1 as ContentBlock, blockMarked, carrierMarked, answer as ContentBlock]),
       { ...options, promptCaching: true, cacheMarkers: 'cm-owned' },
     );
     expect(built.messages[1]!.content).toEqual([thinking1, serverUse, searchResult, answer]);
@@ -160,12 +160,19 @@ describe('NativeFormatter', () => {
 });
 
 describe('toAnthropicContent', () => {
-  it('converts each carrier to its server block in place and leaves out another wire\'s item', () => {
-    expect(toAnthropicContent([...turn(), responsesCarrier])).toEqual(sentTurn);
+  it('in an assistant turn, converts each carrier to its server block in place and leaves out another wire\'s item', () => {
+    expect(toAnthropicContent([...turn(), responsesCarrier], { role: 'assistant' })).toEqual(sentTurn);
   });
 
-  it('sends a server block given as itself', () => {
-    expect(toAnthropicContent([serverUse as unknown as ContentBlock, answer as ContentBlock])).toEqual([serverUse, answer]);
+  it('in an assistant turn, sends a server block given as itself', () => {
+    expect(toAnthropicContent([serverUse as unknown as ContentBlock, answer as ContentBlock], { role: 'assistant' }))
+      .toEqual([serverUse, answer]);
+  });
+
+  it.each([[undefined], ['user' as const]])('with role %s, leaves them out, bare or on a carrier', (role) => {
+    const given = role ? { role } : undefined;
+    expect(toAnthropicContent([...turn(), responsesCarrier], given)).toEqual([thinking1, thinking2, answer]);
+    expect(toAnthropicContent([serverUse as unknown as ContentBlock, answer as ContentBlock], given)).toEqual([answer]);
   });
 });
 
@@ -195,6 +202,30 @@ describe('complete()', () => {
       config,
     });
     expect(bodies[1].messages[1]).toEqual({ role: 'assistant', content: sentTurn });
+  });
+
+  it('keeps a provider item with no normalized form as its native item, as the Responses adapter gives it', async () => {
+    // The Responses adapter's compaction item: a normalized-looking wrapper
+    // whose rawItem is the item the API sent.
+    const native = { type: 'compaction', id: 'cmp_zz1', encrypted_content: 'zz-cmp' };
+    const adapter: ProviderAdapter = {
+      name: 'openai-responses', supportsModel: () => true,
+      complete: async () => ({
+        content: [
+          { type: 'compaction', id: 'cmp_zz1', encryptedContent: 'zz-cmp', outputIndex: 0, rawItem: native },
+          { type: 'text', text: 'zz answer' },
+        ],
+        stopReason: 'end_turn',
+        usage: { inputTokens: 1, outputTokens: 1 },
+        raw: {},
+      }) as any,
+      stream: async () => { throw new Error('Unexpected stream'); },
+    };
+    const membrane = new Membrane(adapter, { formatter: new OpenAIResponsesFormatter() });
+    const res = await membrane.complete({
+      messages: [history()[0]!], assistantParticipant: 'Claude', config: { model: 'gpt-zz', maxTokens: 32 },
+    });
+    expect(res.content).toEqual([carrier(native), answer]);
   });
 });
 
@@ -308,6 +339,42 @@ describe('the Anthropic adapter\'s stream', () => {
     );
     expect(res.content).toEqual([serverUse, searchResult, answer]);
   });
+
+  async function streamed(events: unknown[]): Promise<any> {
+    const adapter = new AnthropicAdapter({ apiKey: 'zz-key', cacheKeepalive: { enabled: false } });
+    (adapter as any).client = { messages: { stream: async () => fakeStream(events) } };
+    return adapter.stream(
+      { model: 'claude-zz-1', maxTokens: 64, messages: [{ role: 'user', content: [{ type: 'text', text: 'zz ask' }] }] } as any,
+      { onChunk: () => {} } as any,
+    );
+  }
+
+  it('assembles an MCP connector call\'s input the same way', async () => {
+    const res = await streamed([
+      { type: 'message_start', message: { model: 'claude-zz-1', usage: { input_tokens: 10 } } },
+      { type: 'content_block_start', index: 0, content_block: { type: 'mcp_tool_use', id: 'mcptoolu_zz1', name: 'zz_lookup', server_name: 'zz', input: {} } },
+      { type: 'content_block_delta', index: 0, delta: { type: 'input_json_delta', partial_json: '{"key": ' } },
+      { type: 'content_block_delta', index: 0, delta: { type: 'input_json_delta', partial_json: '"zz"}' } },
+      { type: 'content_block_stop', index: 0 },
+      { type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 5 } },
+    ]);
+    expect(res.content).toEqual([{ type: 'mcp_tool_use', id: 'mcptoolu_zz1', name: 'zz_lookup', server_name: 'zz', input: { key: 'zz' } }]);
+  });
+
+  it('keeps the start\'s input {} when a server call\'s fragments don\'t parse, and says so', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const res = await streamed([
+      { type: 'message_start', message: { model: 'claude-zz-1', usage: { input_tokens: 10 } } },
+      { type: 'content_block_start', index: 0, content_block: { type: 'server_tool_use', id: 'srvtoolu_zz1', name: 'web_search', input: {} } },
+      { type: 'content_block_delta', index: 0, delta: { type: 'input_json_delta', partial_json: '{"query": "zz lat' } },
+      { type: 'content_block_stop', index: 0 },
+      { type: 'message_delta', delta: { stop_reason: 'max_tokens' }, usage: { output_tokens: 5 } },
+    ]);
+    expect(res.content).toEqual([{ type: 'server_tool_use', id: 'srvtoolu_zz1', name: 'web_search', input: {} }]);
+    expect(warn.mock.calls.map((c) => String(c[0]))).toContainEqual(
+      expect.stringMatching(/server_tool_use srvtoolu_zz1 didn't parse \(17 characters\); it keeps the start's input \{\}/),
+    );
+  });
 });
 
 describe('wires with no form for them', () => {
@@ -365,6 +432,19 @@ describe('wires with no form for them', () => {
   });
 
   it.each([
+    ['OpenAI', (m: any[]) => (new OpenAIAdapter({ apiKey: 'zz' }) as any).convertMessages(m)],
+    ['OpenRouter', (m: any[]) => (new OpenRouterAdapter({ apiKey: 'zz' }) as any).convertMessages(m)],
+    ['OpenAI-compatible', (m: any[]) =>
+      (new OpenAICompatibleAdapter({ apiKey: 'zz', baseURL: 'http://localhost' }) as any).convertMessages(m)],
+    ['Gemini', (m: any[]) => (new GeminiAdapter({ apiKey: 'zz' }) as any).convertMessages(m, 'gemini-2.5-pro')],
+  ])('the %s adapter writes a turn as if its carriers weren\'t there', (_name, convert) => {
+    const ask = { role: 'user', content: [{ type: 'text', text: 'zz ask' }] };
+    const withCarriers = convert([ask, { role: 'assistant', content: [carrier(serverUse), carrier(searchResult), responsesCarrier, answer] }]);
+    const without = convert([ask, { role: 'assistant', content: [answer] }]);
+    expect(withCarriers).toEqual(without);
+  });
+
+  it.each([
     ['XML', () => new AnthropicXmlFormatter()],
     ['completions', () => new CompletionsFormatter()],
   ] as const)('the %s formatter writes the turn as if its carriers weren\'t there', (_name, create) => {
@@ -373,9 +453,10 @@ describe('wires with no form for them', () => {
     expect(withCarriers.messages).toEqual(without.messages);
   });
 
-  it('Bedrock, the Anthropic wire on AWS, passes them through', () => {
+  it('Bedrock leaves them out, as before: whether it accepts them is unknown', () => {
     const adapter = new BedrockAdapter({ accessKeyId: 'zz', secretAccessKey: 'zz', region: 'us-west-2' });
     const built = (adapter as any).buildRequest({ model: 'anthropic.claude-sonnet-4-6', messages: anthropicShaped(), maxTokens: 32 });
-    expect(built.messages[1].content).toEqual(sentTurn);
+    expect(built.messages[1].content).toEqual([thinking1, thinking2, answer]);
+    expect(serverBlocksIn(built.messages)).toEqual([]);
   });
 });

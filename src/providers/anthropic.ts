@@ -475,11 +475,16 @@ export class AnthropicAdapter implements ProviderAdapter {
             // content_block_start carried `input: {}`. The block is sent back
             // verbatim in later turns, so it must hold the input the model
             // wrote. Fragments that don't parse (a call cut off mid-input)
-            // leave the start's input: the block stays the API's own shape.
+            // leave the start's `input: {}`. The block can't carry a marker,
+            // since the API gets it as it is, so the log says so instead.
             try {
               block.input = JSON.parse(currentBlockInputJson);
             } catch {
-              // keep the start event's input
+              console.warn(
+                `[membrane:anthropic] the streamed input of ${String(block.type)} ${String(block.id ?? '(no id)')} ` +
+                `didn't parse (${currentBlockInputJson.length} characters` +
+                `${sawBlockStop ? '' : ', cut off before its block stopped'}); it keeps the start's input {}`,
+              );
             }
           }
         }
@@ -1017,21 +1022,30 @@ export function detectImageMediaType(data: string | undefined, fallback?: string
 /**
  * Convert one turn's normalized content to Anthropic content blocks.
  *
- * It has no role: an Anthropic server-tool block, or its zero-width carrier,
- * goes out as the block itself, which is right for the assistant turn that
- * produced it. A caller converting content it will send as a user turn, such
- * as another participant's, drops those first, as NativeFormatter and the
- * native tool loop's builder do (see utils/anthropic-server-blocks.ts).
+ * With `role: 'assistant'`, an Anthropic server-tool block, or its zero-width
+ * carrier, goes out as the block itself, in the place it had in the turn that
+ * produced it, as NativeFormatter and the native tool loop's builder send it
+ * (see utils/anthropic-server-blocks.ts). Otherwise it's left out, as those
+ * builders leave it out of a user turn, which has no place for one. A caller
+ * that names no role gets that too, as it always got for a carrier.
  */
-export function toAnthropicContent(blocks: ContentBlock[]): Anthropic.ContentBlockParam[] {
+export function toAnthropicContent(
+  blocks: ContentBlock[],
+  options: { role?: 'user' | 'assistant' } = {},
+): Anthropic.ContentBlockParam[] {
   const result: Anthropic.ContentBlockParam[] = [];
 
   // An Anthropic server-tool block (web search and the like), kept on a
   // zero-width carrier, is that block on this wire: it is part of the turn
-  // the model produced (see utils/anthropic-server-blocks.ts). Swap it in
-  // before the empty-text cleanup, which would drop the carrier as empty text.
+  // the model produced (see utils/anthropic-server-blocks.ts). In an
+  // assistant turn, swap it in before the empty-text cleanup, which would
+  // drop the carrier as empty text; in any other, leave it out.
   const sendable = stripEmptyTextBlocks(
-    blocks.map((block): ContentBlock | AnthropicServerBlock => anthropicServerBlockFor(block) ?? block),
+    blocks.flatMap((block): Array<ContentBlock | AnthropicServerBlock> => {
+      const serverBlock = anthropicServerBlockFor(block);
+      if (serverBlock === undefined) return [block];
+      return options.role === 'assistant' ? [serverBlock] : [];
+    }),
   );
   for (const block of sendable) {
     if (isAnthropicServerBlock(block)) {
