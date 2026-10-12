@@ -47,5 +47,7 @@
   formatters, the OpenAI, OpenAI-compatible, OpenRouter and OpenAI
   completions adapters, and the exported `toOpenAIMessages`,
   `toOpenRouterMessages` and `toOpenAIContent`, no longer write a zero-width
-  carrier as an empty text part or line. In XML
+  carrier as an empty text part or line. `toOpenAIContent` now answers
+  `null`, its answer for no text, for a turn whose only text blocks are
+  carriers, where it gave `''`. In XML
   (prefill) mode the turn is text, so these blocks still aren't sent there.
