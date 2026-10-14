@@ -259,7 +259,12 @@ export interface YieldingStreamOptions {
    * model sends nothing still ends. On expiry the stream ends with an
    * `aborted` event whose reason is `'timeout'`, carrying what arrived. It
    * bounds the wait for the first event too. Time between provider calls,
-   * such as waiting for `provideToolResults()`, never counts.
+   * such as waiting for `provideToolResults()`, never counts. A stretch with
+   * no parsed event counts as no progress whatever the model is doing:
+   * reasoning a provider doesn't stream, while it sends only keepalives, can
+   * expire it, so set it above the longest such stretch you expect (Anthropic
+   * thinking with `display: "omitted"` sends no deltas while it thinks, which
+   * can last minutes).
    */
   progressTimeoutMs?: number;
 

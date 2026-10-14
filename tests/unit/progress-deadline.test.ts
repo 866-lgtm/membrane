@@ -145,8 +145,9 @@ async function collect(stream: AsyncIterable<StreamEvent>, onEvent?: (event: Str
 // ---------------------------------------------------------------------------
 
 describe('createProgressDeadline', () => {
-  it('aborts with the deadline mark, naming itself, when nothing renews it', async () => {
+  it('aborts with the deadline mark, naming itself and when the call began, when nothing renews it', async () => {
     vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-10-14T12:00:00.000Z'));
     const deadline = createProgressDeadline(undefined, 1000);
     vi.advanceTimersByTime(999);
     expect(deadline.signal!.aborted).toBe(false);
@@ -156,7 +157,28 @@ describe('createProgressDeadline', () => {
     const error = deadlineTimeoutError(deadline.signal!.reason);
     expect(error).toBeInstanceOf(TimeoutAbortError);
     expect(error.type).toBe('timeout');
-    expect(error.message).toBe('No stream progress within 1000ms');
+    expect(error.message).toBe(
+      'No stream progress within 1000ms: the call began at 2026-10-14T12:00:00.000Z, provider events: 0',
+    );
+    deadline.cleanup();
+  });
+
+  it('says in its message how many events the call had and when the last came', () => {
+    // A log that keeps only the message can tell a call that stopped partway
+    // from one that never produced an event (the case above).
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-10-14T12:00:00.000Z'));
+    const deadline = createProgressDeadline(undefined, 1000);
+    vi.advanceTimersByTime(200);
+    deadline.renew!();
+    vi.advanceTimersByTime(300);
+    deadline.renew!();
+    vi.advanceTimersByTime(1000);
+    expect(deadline.signal!.aborted).toBe(true);
+    expect(deadlineTimeoutError(deadline.signal!.reason).message).toBe(
+      'No stream progress within 1000ms: the call began at 2026-10-14T12:00:00.000Z, ' +
+      'provider events: 2, the last at 2026-10-14T12:00:00.500Z',
+    );
     deadline.cleanup();
   });
 
@@ -224,7 +246,9 @@ describe('deadlines past the platform timer limit', () => {
     expect(deadline.signal!.aborted).toBe(false);
     vi.advanceTimersByTime(1);
     expect(deadline.signal!.aborted).toBe(true);
-    expect(deadlineTimeoutError(deadline.signal!.reason).message).toBe(`No stream progress within ${PAST_LIMIT_MS}ms`);
+    expect(deadlineTimeoutError(deadline.signal!.reason).message).toMatch(
+      new RegExp(`^No stream progress within ${PAST_LIMIT_MS}ms: the call began at \\S+, provider events: 0$`),
+    );
     deadline.cleanup();
   });
 
@@ -356,7 +380,9 @@ describe('Anthropic: the deadline follows SDK events, not keepalives', () => {
       .complete(REQUEST, { progressTimeoutMs: PROGRESS_MS })
       .then(() => undefined, (e: unknown) => e);
     expect(error).toBeInstanceOf(TimeoutAbortError);
-    expect((error as TimeoutAbortError).message).toBe(`No stream progress within ${PROGRESS_MS}ms`);
+    expect((error as TimeoutAbortError).message).toMatch(
+      new RegExp(`^No stream progress within ${PROGRESS_MS}ms: the call began at \\S+, provider events: 0$`),
+    );
   });
 });
 
