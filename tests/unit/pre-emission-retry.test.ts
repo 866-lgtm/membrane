@@ -150,6 +150,9 @@ const XML_TOOL_CALL =
  */
 const SCHEDULES = {
   retry: {
+    // One attempt for a 5xx or a connection failure, so the cases below see
+    // only the 529 and 429 rules; the base default has cases of its own.
+    maxRetries: 1,
     retryDelayMs: 3,
     maxRetryDelayMs: 3,
     backoffMultiplier: 1,
@@ -194,7 +197,7 @@ describe('streamYielding() retries a call that failed before it delivered anythi
 
     expect(adapter.sends).toBe(3);
     const backoffs = ofType(events, 'backoff');
-    expect(backoffs.map((e) => [e.reason, e.attempt, e.maxAttempts])).toEqual([
+    expect(backoffs.map((e) => [e.schedule, e.attempt, e.maxAttempts])).toEqual([
       ['overloaded', 1, 3],
       ['overloaded', 2, 3],
     ]);
@@ -217,7 +220,7 @@ describe('streamYielding() retries a call that failed before it delivered anythi
     const events = await drive(new Membrane(adapter, SCHEDULES).streamYielding(XML_REQUEST));
 
     expect(adapter.sends).toBe(2);
-    expect(ofType(events, 'backoff').map((e) => [e.reason, e.attempt])).toEqual([['overloaded', 1]]);
+    expect(ofType(events, 'backoff').map((e) => [e.schedule, e.attempt])).toEqual([['overloaded', 1]]);
     expect(tokensOf(events)).toBe('zz recovered');
     const [complete] = ofType(events, 'complete');
     expect(complete!.response.details.timing.attempts).toBe(2);
@@ -230,8 +233,8 @@ describe('streamYielding() retries a call that failed before it delivered anythi
 
     expect(adapter.sends).toBe(2);
     // The base schedule, unjittered, and the 429 floor of five attempts.
-    expect(ofType(events, 'backoff').map((e) => [e.reason, e.attempt, e.maxAttempts, e.delayMs])).toEqual([
-      ['rate_limit', 1, 4, 3],
+    expect(ofType(events, 'backoff').map((e) => [e.schedule, e.attempt, e.maxAttempts, e.delayMs])).toEqual([
+      ['base', 1, 4, 3],
     ]);
     expect(ofType(events, 'complete')).toHaveLength(1);
   });
@@ -504,7 +507,7 @@ describe('retryRateLimits: false leaves a 429 to the caller', () => {
     const events = await drive(native(adapter).streamYielding(NATIVE_REQUEST, { retryRateLimits: false }));
 
     expect(adapter.sends).toBe(2);
-    expect(ofType(events, 'backoff').map((e) => e.reason)).toEqual(['overloaded']);
+    expect(ofType(events, 'backoff').map((e) => e.schedule)).toEqual(['overloaded']);
     expect(ofType(events, 'complete')).toHaveLength(1);
   });
 
@@ -589,6 +592,6 @@ describe('a stated wait longer than the ceiling is given to the caller, not retr
 
 // Keeps the BackoffEvent type import honest: the event's shape is public.
 const _shape: BackoffEvent = {
-  type: 'backoff', reason: 'overloaded', attempt: 1, maxAttempts: 1, delayMs: 0, error: new Error('zz'),
+  type: 'backoff', schedule: 'overloaded', attempt: 1, maxAttempts: 1, delayMs: 0, error: overloaded529(),
 };
 void _shape;

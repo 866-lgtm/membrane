@@ -14,11 +14,17 @@ import type { NormalizeEvent, PrefillFormatter } from '../formatters/types.js';
 
 export interface RetryConfig {
   /**
-   * Bound on TOTAL attempts for a retryable error, the first included: 3
-   * means one try and up to two retries; 0 or 1 means no retries
-   * (default: 0). A retryable rate limit (429) gets at least 5 attempts
-   * whatever this says, and a provider capacity error (529) gets the larger
-   * of this and `overloaded.maxRetries`, on the `overloaded` schedule.
+   * Bound on TOTAL attempts for a retryable error that ends a provider call
+   * before it delivered anything, the first included: 5 means one try and up
+   * to four retries; 0 or 1 means no retries (default: 5). It covers a 5xx,
+   * a provider's 408 and a connection failure, on every entry point and
+   * adapter; an adapter's own idle or first-event deadline is left to the
+   * caller. A retryable rate limit (429) gets at least 5 attempts whatever
+   * this says (unless the call sets `retryRateLimits: false`), and a provider
+   * capacity error (529) gets the larger of this and `overloaded.maxRetries`,
+   * on the `overloaded` schedule. Membrane is the only layer that retries:
+   * AnthropicAdapter turns its SDK client's own retries off. A host with a
+   * retry layer of its own can set 1 here, and read `MembraneError.attempts`.
    */
   maxRetries: number;
 
@@ -39,9 +45,8 @@ export interface RetryConfig {
    * jitter so a fleet backing off doesn't re-create the stampede in sync.
    *
    * maxRetries: 0 here disables this dedicated policy entirely: 529s then
-   * follow the base retry config like any other retryable server error
-   * (no forced retries, base schedule, no stream-path retry) — the exact
-   * pre-policy behavior.
+   * follow the base retry config like any other retryable server error, on
+   * every path (the base schedule, within the base maxRetries).
    */
   overloaded: OverloadedRetryConfig;
 }
@@ -240,7 +245,11 @@ export interface MembraneConfig {
 // ============================================================================
 
 export const DEFAULT_RETRY_CONFIG: RetryConfig = {
-  maxRetries: 0,
+  // 5 attempts = 4 waits: 1s → 2s → 4s → 8s, about 15 seconds of patience
+  // for a 5xx or a dropped connection before anything was delivered. That
+  // replaces the retries AnthropicAdapter's SDK client used to make inside
+  // each attempt, which are off now that membrane is the one retry layer.
+  maxRetries: 5,
   retryDelayMs: 1000,
   backoffMultiplier: 2,
   maxRetryDelayMs: 30000,

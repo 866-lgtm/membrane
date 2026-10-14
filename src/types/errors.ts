@@ -764,6 +764,30 @@ export function withRawRequest(error: MembraneError, rawRequest: unknown): Membr
   return error;
 }
 
+const DEADLINE_EXPIRY = Symbol('membrane.deadlineExpiry');
+
+/**
+ * Mark an error as an adapter's own deadline running out on a call that was
+ * under way, such as AnthropicAdapter's idle and first-event watchdogs. It
+ * stays the retryable timeout a caller sees, but membrane doesn't send the
+ * call again: the deadline was the call's budget, and another full one is the
+ * caller's to give. (A deadline that aborts the request is a
+ * TimeoutAbortError, which isn't retryable at all.) Keeps the error's
+ * identity.
+ */
+export function deadlineExpired<E extends MembraneError>(error: E): E {
+  try {
+    Object.defineProperty(error, DEADLINE_EXPIRY, { value: true });
+  } catch { /* A frozen error is retried like any other timeout. */ }
+  return error;
+}
+
+/** Whether an error was marked with deadlineExpired. */
+export function isDeadlineExpiry(error: unknown): boolean {
+  return typeof error === 'object' && error !== null
+    && (error as Record<symbol, unknown>)[DEADLINE_EXPIRY] === true;
+}
+
 /**
  * Record on a failed provider call's error how many times membrane sent the
  * request (ErrorInfo.attempts). Keeps the error's identity, as withRawRequest

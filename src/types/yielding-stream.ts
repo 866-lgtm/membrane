@@ -13,6 +13,7 @@ import type { NormalizedMessage } from './message.js';
 import type { ToolCall, ToolResult, ToolContext } from './tools.js';
 import type { DetailedUsage, NormalizedResponse, StopReason } from './response.js';
 import type { ChunkMeta, BlockEvent } from './streaming.js';
+import type { MembraneError } from './errors.js';
 
 // ============================================================================
 // Stream Events
@@ -100,9 +101,10 @@ export interface RetryingEvent {
 
 /**
  * Backoff event — a provider call failed before it delivered anything, with
- * an error membrane retries (a 529 overload, or a 429 rate limit unless
- * `retryRateLimits` is false), and membrane waits `delayMs` before sending
- * the call again. It can come in any round of a tool loop.
+ * an error membrane retries (a 529 overload, a 429 rate limit unless
+ * `retryRateLimits` is false, a 5xx, a 408 or a connection failure), and
+ * membrane waits `delayMs` before sending the call again. It can come in any
+ * round of a tool loop.
  *
  * Unlike `retrying`, there is nothing to discard: the failed call emitted
  * nothing. The event lets a consumer show or log the wait. cancel(), or the
@@ -110,8 +112,12 @@ export interface RetryingEvent {
  */
 export interface BackoffEvent {
   type: 'backoff';
-  /** The schedule the wait is on: `overloaded` for a 529, `rate_limit` for a 429. */
-  reason: 'overloaded' | 'rate_limit';
+  /**
+   * The schedule the wait is drawn from: `overloaded` for a 529 (see
+   * RetryConfig.overloaded), `base` for everything else. What failed is on
+   * `error` (its `type`, `httpStatus` and `retryAfterMs`).
+   */
+  schedule: 'overloaded' | 'base';
   /** 1-based index of the retry about to be issued. */
   attempt: number;
   /** The most retries membrane makes for this call. */
@@ -119,7 +125,7 @@ export interface BackoffEvent {
   /** How long membrane waits before sending the call again, in milliseconds. */
   delayMs: number;
   /** The error the failed call ended with. */
-  error: Error;
+  error: MembraneError;
 }
 
 /**

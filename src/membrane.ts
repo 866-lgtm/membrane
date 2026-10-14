@@ -61,7 +61,7 @@ import {
   isAbortedResponse,
   unsupportedError,
 } from './types/index.js';
-import { withAttempts } from './types/errors.js';
+import { withAttempts, isDeadlineExpiry } from './types/errors.js';
 import type { BuildResult } from './formatters/types.js';
 import { computeCacheWireReceipt } from './cache-wire-receipt.js';
 import {
@@ -497,19 +497,13 @@ export class Membrane {
         const classifiedError = this.attachRawRequest(error, rawRequest);
         const errorInfo = classifyError(classifiedError);
 
-        // Retryable rate limits (429) get up to 5 attempts regardless of
-        // config, while overload (529) uses its own longer schedule. Terminal
-        // billing/quota codes are excluded by classification. The default
-        // maxRetries of 0 would otherwise turn a capacity blip into a dead
-        // turn. Other retryable errors only retry when maxRetries > 0.
-        // overloaded.maxRetries: 0 disables the dedicated policy entirely;
-        // the 529 then follows the base config like any retryable server
-        // error (exactly the pre-policy behavior), rather than being
-        // silently re-promoted to the long schedule by a positive base limit.
-        const plan = this.retryPlan(errorInfo, tries, {
-          retryRateLimits: options.retryRateLimits,
-          streaming: false,
-        });
+        // The one retry policy (retryPlan): a 529 on the overloaded schedule,
+        // a 429 with its floor of five, any other retryable error within
+        // maxRetries. Terminal billing/quota codes are excluded by
+        // classification, and an adapter's own deadline is the caller's.
+        const plan = isDeadlineExpiry(classifiedError)
+          ? undefined
+          : this.retryPlan(errorInfo, tries, { retryRateLimits: options.retryRateLimits });
 
         if (plan) {
           // Check hook for retry decision
@@ -2063,8 +2057,11 @@ export class Membrane {
    * Returns the (possibly modified) request, or the original if no hook is
    * configured. This is the single point that all request-build sites should
    * route through before invoking the adapter, so observers / mutators
-   * (logging, redaction, model rewriting) see every API call regardless of
+   * (logging, redaction, model rewriting) see every request regardless of
    * whether it came from `complete()`, `stream()`, or `streamYielding()`.
+   * The streaming paths run it once per round: a call membrane sends again
+   * after a failure goes out as the hook left it. `complete()` runs it on
+   * every pass.
    */
   private async applyBeforeRequestHook(
     normalizedRequest: NormalizedRequest,
@@ -2420,7 +2417,7 @@ export class Membrane {
         // the count again: membrane hasn't retried this failure.
         if (delivered) throw withAttempts(error, 1);
         const errorInfo = classifyError(error);
-        const plan = this.retryPlan(errorInfo, tries, { retryRateLimits, streaming: true });
+        const plan = isDeadlineExpiry(error) ? undefined : this.retryPlan(errorInfo, tries, { retryRateLimits });
         if (!plan) throw withAttempts(error, tries);
         // The same pre-retry hook contract as complete(): hosts use onError
         // for circuit-breaking, and its 'abort' decision ends the call here.
@@ -2435,11 +2432,11 @@ export class Membrane {
         if (!adapterOptions.signal?.aborted) {
           retryDelaysMs.push(delayMs);
           onBackoff?.({
-            reason: plan.overloaded ? 'overloaded' : 'rate_limit',
+            schedule: plan.overloaded ? 'overloaded' : 'base',
             attempt: tries,
             maxAttempts: plan.maxAttempts - 1,
             delayMs,
-            error: error instanceof Error ? error : new MembraneError(errorInfo),
+            error: error instanceof MembraneError ? error : new MembraneError(errorInfo),
           });
         }
         // The call's signal ends the wait: the caller's, or on streamYielding
@@ -3112,34 +3109,36 @@ export class Membrane {
   }
 
   /**
-   * One retry policy, read the same way by complete() and streamOnce():
-   * whether a request that failed with this error, after `attempt` tries, is
-   * sent again. Undefined when it isn't; otherwise the schedule it waits on
-   * (overloaded) and the most tries it gets in all (maxAttempts).
+   * One retry policy, read the same way by complete() and streamOnce() for
+   * every adapter: membrane is the one layer that retries (AnthropicAdapter
+   * turns its SDK client's own retries off). Whether a request that failed
+   * with this error, after `attempt` tries, is sent again: undefined when it
+   * isn't; otherwise the schedule it waits on (overloaded) and the most tries
+   * it gets in all (maxAttempts). The callers send again only what failed
+   * before delivering anything, and leave an adapter's own deadline
+   * (isDeadlineExpiry) to the caller.
    *
-   * The 429 floor exists because a transient rate limit with the default
-   * maxRetries of 0 would otherwise kill a turn outright — so it applies
-   * only where retrying can work. A 429 whose provider code says the account
-   * is out of quota is not a rate limit in that sense: it is classified
-   * non-retryable at the boundary, and gets no floor.
+   * A 529 takes the overloaded schedule, a 429 at least five attempts, and
+   * any other retryable error (a 5xx, a 408, a connection failure) the base
+   * schedule within maxRetries. The 429 floor exists so a transient rate
+   * limit doesn't end a turn whatever maxRetries says. A 429 whose provider
+   * code says the account is out of quota is not a rate limit in that sense:
+   * it is classified non-retryable at the boundary, and gets no floor.
    *
-   * A streaming call is sent again only for a 529 or a 429; complete() also
-   * retries any other retryable error within maxRetries. With
-   * `retryRateLimits: false` a 429 belongs to the caller: it isn't retried.
+   * With `retryRateLimits: false` a 429 belongs to the caller: it isn't retried.
    * Nor is an error whose stated wait is longer than its schedule's
    * maxRetryDelayMs.
    */
   private retryPlan(
     errorInfo: ErrorInfo,
     attempt: number,
-    options: { retryRateLimits?: boolean; streaming: boolean },
+    options: { retryRateLimits?: boolean },
   ): { overloaded: boolean; maxAttempts: number } | undefined {
     if (!errorInfo.retryable) return undefined;
     const isRateLimit = errorInfo.type === 'rate_limit';
     if (isRateLimit && options.retryRateLimits === false) return undefined;
     const overloaded =
       isOverloadedError(errorInfo) && this.retryConfig.overloaded.maxRetries > 0;
-    if (options.streaming && !overloaded && !isRateLimit) return undefined;
     const maxAttempts = isRateLimit
       ? Math.max(this.retryConfig.maxRetries, 5)
       : overloaded

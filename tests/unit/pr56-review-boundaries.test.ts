@@ -51,22 +51,21 @@ describe('fetch failures preserve transport retryability', () => {
       await expect(invokeAdapter(create(), entry)).rejects.toMatchObject({ type: 'network', retryable: true });
     });
   }
-  it.each(['complete', 'stream', 'yielding'])('%s retains its own retry policy', async entry => {
+  it.each(['complete', 'stream', 'yielding'])('%s retries a connection failure within maxRetries', async entry => {
     let sends = 0;
     vi.stubGlobal('fetch', vi.fn(async () => {
       if (++sends === 1) throw new TypeError('fetch failed');
-      return new Response(JSON.stringify({ choices: [{ message: { content: 'done' }, finish_reason: 'stop' }], usage: { prompt_tokens: 1, completion_tokens: 1 } }));
+      return entry === 'complete'
+        ? new Response(JSON.stringify({ choices: [{ message: { content: 'done' }, finish_reason: 'stop' }], usage: { prompt_tokens: 1, completion_tokens: 1 } }))
+        : sse([{ choices: [{ delta: { content: 'done' }, finish_reason: 'stop' }] }, '[DONE]']);
     }));
     const membrane = new Membrane(new OpenAIAdapter({ apiKey: 'zz-key' }), {
       formatter: new NativeFormatter(), retry: { maxRetries: 2, retryDelayMs: 1 },
     });
-    if (entry === 'complete') {
-      await invoke(membrane, entry);
-      expect(sends).toBe(2);
-    } else {
-      await expect(invoke(membrane, entry)).rejects.toMatchObject({ type: 'network', retryable: true });
-      expect(sends).toBe(1);
-    }
+    // One retry layer, the same on every entry point: the connection failed
+    // before anything was delivered, so the request is sent again.
+    await invoke(membrane, entry);
+    expect(sends).toBe(2);
   });
 });
 
