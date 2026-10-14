@@ -63,7 +63,9 @@ export interface CompleteEvent {
 }
 
 /**
- * Error event - something went wrong.
+ * Error event - something went wrong. When a provider call failed, the error
+ * is a MembraneError, whose `attempts` says how many times membrane sent the
+ * request.
  */
 export interface ErrorEvent {
   type: 'error';
@@ -104,7 +106,8 @@ export interface RetryingEvent {
  * an error membrane retries (a 529 overload, a 429 rate limit unless
  * `retryRateLimits` is false, a 5xx, a 408 or a connection failure), and
  * membrane waits `delayMs` before sending the call again. It can come in any
- * round of a tool loop.
+ * round of a tool loop, and each round's provider call counts its own
+ * retries.
  *
  * Unlike `retrying`, there is nothing to discard: the failed call emitted
  * nothing. The event lets a consumer show or log the wait. cancel(), or the
@@ -118,13 +121,13 @@ export interface BackoffEvent {
    * `error` (its `type`, `httpStatus` and `retryAfterMs`).
    */
   schedule: 'overloaded' | 'base';
-  /** 1-based index of the retry about to be issued. */
+  /** 1-based index of the retry about to be issued, in this round's call. */
   attempt: number;
-  /** The most retries membrane makes for this call. */
+  /** The most retries membrane makes for this round's call. */
   maxAttempts: number;
   /** How long membrane waits before sending the call again, in milliseconds. */
   delayMs: number;
-  /** The error the failed call ended with. */
+  /** The error this send failed with. Its `attempts` is the sends so far. */
   error: MembraneError;
 }
 

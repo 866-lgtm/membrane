@@ -92,8 +92,10 @@ export interface ErrorInfo {
    * (refusalRetries) starts the count again. Set on the error a failed
    * provider call ends with, from complete() and from each provider call of
    * stream() and streamYielding(); in a tool loop it counts the round that
-   * failed. A caller with its own retry policy reads it to tell whether
-   * membrane has already retried this failure.
+   * failed. A complete() cancelled after a send carries it too, and so does
+   * a `backoff` event's error: the sends so far. A caller with its own retry
+   * policy reads it to tell whether membrane has already retried this
+   * failure.
    */
   attempts?: number;
 }

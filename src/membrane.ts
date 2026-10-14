@@ -481,14 +481,16 @@ export class Membrane {
         // a refused build included, and never retried. The error stays on it
         // as evidence. stream()'s paths judge the signal first too.
         if (options.signal?.aborted) {
-          if (isTypedAbortError(error)) throw this.attachRawRequest(error, rawRequest);
-          throw new MembraneError({
-            type: 'abort',
-            message: 'Request was aborted',
-            retryable: false,
-            rawError: error,
-            rawRequest,
-          });
+          const cancelled = isTypedAbortError(error)
+            ? this.attachRawRequest(error, rawRequest)
+            : new MembraneError({
+                type: 'abort',
+                message: 'Request was aborted',
+                retryable: false,
+                rawError: error,
+                rawRequest,
+              });
+          throw sends > 0 ? withAttempts(cancelled, sends) : cancelled;
         }
         // A refused build never reached the provider, and its own type is
         // the answer. Rethrow it as it is instead of wrapping it as a
@@ -525,16 +527,16 @@ export class Membrane {
             // The caller's signal fired: that is a cancellation whatever it
             // was aborted with (a plain Error, a string), not an unknown
             // failure. The reason stays on the error as evidence.
-            if (options.signal?.aborted) {
-              throw new MembraneError({
-                type: 'abort',
-                message: 'Request was aborted',
-                retryable: false,
-                rawError: sleepError,
-                rawRequest,
-              });
-            }
-            throw this.attachRawRequest(sleepError, rawRequest);
+            const ended = options.signal?.aborted
+              ? new MembraneError({
+                  type: 'abort',
+                  message: 'Request was aborted',
+                  retryable: false,
+                  rawError: sleepError,
+                  rawRequest,
+                })
+              : this.attachRawRequest(sleepError, rawRequest);
+            throw sends > 0 ? withAttempts(ended, sends) : ended;
           }
           continue;
         }
@@ -2412,21 +2414,21 @@ export class Membrane {
       // Whether to send the call again is decided once the send is over, so
       // nothing that belongs to the send stays live through the wait.
       if (failure) {
-        const { error } = failure;
+        // Typed once, as every path's caller gets it: a failure that isn't a
+        // MembraneError yet is typed by errorFromThrown, so the retry is
+        // decided on that type and `attempts` stays on what is thrown.
+        const typed = failure.error instanceof MembraneError ? failure.error : errorFromThrown(failure.error);
         // A call that delivered anything can't be sent again, and it starts
         // the count again: membrane hasn't retried this failure.
-        if (delivered) throw withAttempts(error, 1);
-        // A failure that isn't a MembraneError yet is judged as the caller
-        // will get it: rethrown, it's typed by errorFromThrown.
-        const typed = error instanceof MembraneError ? error : errorFromThrown(error);
+        if (delivered) throw withAttempts(typed, 1);
         const errorInfo = classifyError(typed);
         const plan = isDeadlineExpiry(typed) ? undefined : this.retryPlan(errorInfo, tries, { retryRateLimits });
-        if (!plan) throw withAttempts(error, tries);
+        if (!plan) throw withAttempts(typed, tries);
         // The same pre-retry hook contract as complete(): hosts use onError
         // for circuit-breaking, and its 'abort' decision ends the call here.
         if (this.config.hooks?.onError) {
           const decision = await this.config.hooks.onError(errorInfo, tries);
-          if (decision === 'abort') throw withAttempts(error, tries);
+          if (decision === 'abort') throw withAttempts(typed, tries);
         }
         const delayMs = this.calculateRetryDelay(tries, plan.overloaded, errorInfo);
         // A cancellation can land while onError decides. Then the sleep below
@@ -2439,7 +2441,7 @@ export class Membrane {
             attempt: tries,
             maxAttempts: plan.maxAttempts - 1,
             delayMs,
-            error: typed,
+            error: withAttempts(typed, tries),
           });
         }
         // The call's signal ends the wait: the caller's, or on streamYielding
