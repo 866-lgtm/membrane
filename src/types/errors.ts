@@ -465,8 +465,9 @@ const SENT_REQUEST_DEADLINE_CODES = new Set(['und_err_headers_timeout', 'und_err
 /**
  * Whether a failure is a runtime's own deadline on a request it sent: one of
  * undici's above, or Bun's fetch timeout, a DOMException named TimeoutError
- * (Bun 1.4.3 threw it after 360 s at a server that never answered). Its code,
- * 23, is a number, which the code check doesn't read, so the name decides,
+ * (Bun 1.4.3 threw it after 360 s at a server that never answered). It
+ * doesn't say which stage ran out, so a stalled connect is marked too. Its
+ * code, 23, is a number, which the code check doesn't read, so the name decides,
  * anywhere down the cause chain: the Anthropic SDK's MessageStream wraps a
  * failed read once more. A caller's AbortSignal.timeout() rejects the same
  * way, but membrane reads the caller's signal before the error, so that one
@@ -994,7 +995,9 @@ export function errorFromThrown(error: unknown, rawRequest?: unknown): MembraneE
   const info = classifyError(error);
   info.rawRequest = rawRequest;
   const typed = new MembraneError(info);
-  return isSentRequestDeadline(error) ? deadlineExpired(typed) : typed;
+  // A mark the error already carries, as a second loaded copy of membrane
+  // sets one on its own MembraneError, stays on the new one.
+  return isSentRequestDeadline(error) || isDeadlineExpiry(error) ? deadlineExpired(typed) : typed;
 }
 
 export function classifyError(error: unknown): ErrorInfo {
@@ -1019,7 +1022,7 @@ export function classifyError(error: unknown): ErrorInfo {
     // A runtime's own timeout (Bun's fetch deadline) is named, whatever its
     // message says. A caller's AbortSignal.timeout() rejects the same way, and
     // membrane still ends that call as a cancellation, from the caller's signal.
-    if (error.name === 'TimeoutError') {
+    if (causeChain(error).some((link) => (link as { name?: unknown }).name === 'TimeoutError')) {
       return { type: 'timeout', message: error.message, retryable: true, rawError: serializedError };
     }
 

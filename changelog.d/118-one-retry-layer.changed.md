@@ -24,8 +24,10 @@
   `AnthropicAdapter`'s SDK client reports. The SDK reports a connect
   timeout the same way, without its cause, so on `AnthropicAdapter` a connect
   timeout now reaches the caller after one send, where the SDK sent it three
-  times. On the other adapters a connect timeout (`UND_ERR_CONNECT_TIMEOUT`,
-  `ETIMEDOUT`) is retried like any connection failure.
+  times. On the other adapters, on Node, a connect timeout
+  (`UND_ERR_CONNECT_TIMEOUT`, `ETIMEDOUT`) is retried like any connection
+  failure. Bun's fetch timeout doesn't say which stage ran out, so on Bun a
+  stalled connect is left to the caller too.
 - `AnthropicAdapter` reads the API's `x-should-retry` (it decides whether the
   error is retryable) and `retry-after-ms` (before `retry-after`), as the SDK
   did.

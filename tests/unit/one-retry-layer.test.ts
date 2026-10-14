@@ -233,6 +233,22 @@ describe('a deadline on a sent request is the caller’s; a connect timeout is s
     expect(isDeadlineExpiry(typed)).toBe(true);
   });
 
+  it('a TimeoutError under a wrapper is a retryable, marked timeout, whatever the wrapper says', () => {
+    // As the SDK's MessageStream wraps a failed read: a plain error whose
+    // cause is the runtime's TimeoutError.
+    const wrapped = new Error('zz stream read failed', { cause: new DOMException('zz', 'TimeoutError') });
+    const typed = errorFromThrown(wrapped);
+    expect(typed).toMatchObject({ type: 'timeout', retryable: true });
+    expect(isDeadlineExpiry(typed)).toBe(true);
+  });
+
+  it('a mark set by a second loaded copy of membrane survives the retyping', () => {
+    // Another copy's MembraneError isn't this copy's, so it's typed afresh,
+    // and the mark, keyed by Symbol.for, goes with it.
+    const foreign = Object.assign(new Error('zz watchdog'), { [Symbol.for('membrane.deadlineExpiry')]: true });
+    expect(isDeadlineExpiry(errorFromThrown(foreign))).toBe(true);
+  });
+
   it('errorFromThrown keeps an error that is already typed, and its mark', () => {
     const marked = deadlineExpired(timeoutError('zz watchdog'));
     expect(errorFromThrown(marked)).toBe(marked);
@@ -329,19 +345,26 @@ describe('a deadline on a sent request is the caller’s; a connect timeout is s
       expect(fetch).toHaveBeenCalledTimes(1);
     });
 
-    // A fetch that waits until the request's signal aborts, then rejects with
-    // `reason(signal)`.
-    const untilAborted = (reason: (signal: AbortSignal) => unknown) =>
+    // A fetch that, once the send is in flight, fires the caller's cancel,
+    // then rejects with `reason(signal)` when the request's signal aborts.
+    const untilAborted = (cancel: () => void, reason: (signal: AbortSignal) => unknown) =>
       vi.fn((_url: unknown, init?: { signal?: AbortSignal }) => new Promise((_resolve, reject) => {
         init?.signal?.addEventListener('abort', () => reject(reason(init.signal!)));
+        cancel();
       }));
 
     it.each(['complete', 'stream', 'yielding'] as const)('%s: a caller’s own AbortSignal.timeout() is still a cancellation', async (entry) => {
       // It rejects with the same TimeoutError, but the caller's signal decides.
-      const fetch = untilAborted((signal) => signal.reason);
+      // The caller's signal fires as AbortSignal.timeout()'s does, once the
+      // send is in flight.
+      const controller = new AbortController();
+      const fetch = untilAborted(
+        () => controller.abort(new DOMException('The operation was aborted due to timeout', 'TimeoutError')),
+        (signal) => signal.reason,
+      );
       vi.stubGlobal('fetch', fetch);
       const m = openai();
-      const signal = AbortSignal.timeout(5);
+      const signal = controller.signal;
       if (entry === 'complete') {
         expect(await m.complete(REQUEST, { signal }).catch((e) => e)).toMatchObject({ type: 'abort', retryable: false });
       } else if (entry === 'stream') {
@@ -355,13 +378,13 @@ describe('a deadline on a sent request is the caller’s; a connect timeout is s
     });
 
     it.each(['stream', 'yielding'] as const)('%s: a retryable failure after the caller cancelled asks onError nothing', async (entry) => {
-      // The send fails as a connection failure would, once the signal fired.
-      const fetch = untilAborted(() => new TypeError('fetch failed'));
+      // The caller cancels once the send is in flight, and the send then
+      // fails as a connection failure would.
+      const controller = new AbortController();
+      const fetch = untilAborted(() => controller.abort(), () => new TypeError('fetch failed'));
       vi.stubGlobal('fetch', fetch);
       const onError = vi.fn(async () => 'retry' as const);
       const m = new Membrane(new OpenAIAdapter({ apiKey: 'zz-key' }), { formatter: new NativeFormatter(), ...FAST, hooks: { onError } });
-      const controller = new AbortController();
-      setTimeout(() => controller.abort(), 5);
       if (entry === 'stream') {
         expect(await m.stream(REQUEST, { signal: controller.signal })).toMatchObject({ aborted: true });
       } else {

@@ -22,8 +22,10 @@ export interface RetryConfig {
    * the caller: AnthropicAdapter's idle and first-event watchdogs, undici's
    * headers and body timeouts, Bun's fetch timeout, and every timeout
    * AnthropicAdapter's SDK client reports, which include a connect timeout
-   * (the SDK reports both the same way). The other adapters' connect
-   * timeouts are sent again like any connection failure. A retryable rate
+   * (the SDK reports both the same way). On Node, the other adapters'
+   * connect timeouts are sent again like any connection failure. Bun's fetch
+   * timeout doesn't say which stage ran out, so on Bun a stalled connect is
+   * left to the caller too. A retryable rate
    * limit (429) gets at least 5 attempts whatever this says (unless the call
    * sets `retryRateLimits: false`), and a provider capacity error (529) gets
    * the larger of this and `overloaded.maxRetries`, on the `overloaded`

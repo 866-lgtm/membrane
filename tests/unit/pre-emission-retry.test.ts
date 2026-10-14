@@ -380,12 +380,15 @@ describe('the backoff wait ends when the stream is stopped', () => {
   it('cancel() while onError decides: no backoff event after aborted, and nothing sent again', async () => {
     const adapter = new ScriptedNativeAdapter([{ fail: overloaded529 }, { text: 'zz never' }]);
     let stream!: ReturnType<Membrane['streamYielding']>;
+    let returned!: () => void;
+    const onErrorReturned = new Promise<void>((resolve) => { returned = resolve; });
     const membrane = native(adapter, {
       ...SLOW,
       hooks: {
         onError: async () => {
           stream.cancel();
-          await new Promise((resolve) => setTimeout(resolve, 20));
+          await new Promise((resolve) => setTimeout(resolve, 0));
+          returned();
           return 'retry' as const;
         },
       },
@@ -394,7 +397,8 @@ describe('the backoff wait ends when the stream is stopped', () => {
     // Start the stream, and read it only once the runner is past onError: a
     // consumer that hasn't drained sees whatever was queued after `aborted`.
     const iterator = stream[Symbol.asyncIterator]();
-    await new Promise((resolve) => setTimeout(resolve, 60));
+    await onErrorReturned;
+    await new Promise((resolve) => setTimeout(resolve, 0));
     const events: StreamEvent[] = [];
     for (;;) {
       const { value, done } = await iterator.next();

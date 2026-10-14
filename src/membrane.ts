@@ -371,6 +371,9 @@ export class Membrane {
     while (true) {
       attempts++;
       tries++;
+      // This pass's receipt guard: a receipt consumer that threw ends the
+      // call with its own error, before anything is classified or retried.
+      let receiptGuard: ReturnType<Membrane['wireReceiptGuard']> | undefined;
 
       try {
         const { providerRequest, prefillResult, toolMode } = this.transformRequest(request, activeFormatter);
@@ -391,7 +394,7 @@ export class Membrane {
         const useWireReceipt = this.adapter.cacheReceiptBasis === 'wire-request';
         let receiptEmitted = false;
         if (!useWireReceipt) request.onCacheWireReceipt?.(computeCacheWireReceipt(finalRequest));
-        const receiptGuard = useWireReceipt && request.onCacheWireReceipt
+        receiptGuard = useWireReceipt && request.onCacheWireReceipt
           ? this.wireReceiptGuard(options.signal)
           : undefined;
 
@@ -492,6 +495,9 @@ export class Membrane {
               });
           throw sends > 0 ? withAttempts(cancelled, sends) : cancelled;
         }
+        // A receipt consumer that threw stopped the call before its request
+        // went out: its error, typed as before, is the answer, never retried.
+        if (receiptGuard?.failure) throw this.attachRawRequest(error, rawRequest);
         // A refused build never reached the provider, and its own type is
         // the answer. Rethrow it as it is instead of wrapping it as a
         // transport error.
@@ -2033,6 +2039,8 @@ export class Membrane {
     const state: { failure?: { error: unknown } } = {};
     return {
       signal: callerSignal ? AbortSignal.any([callerSignal, controller.signal]) : controller.signal,
+      /** The consumer's failure, once it has thrown: the call ends with it. */
+      get failure(): { error: unknown } | undefined { return state.failure; },
       emit(send: () => void): void {
         try {
           send();
@@ -2285,14 +2293,16 @@ export class Membrane {
        */
       refusalRetries?: number;
       /**
-       * REQUIRED to enable streaming retries. Called immediately before a
-       * re-issue so the caller can discard the abandoned attempt: reset its
-       * accumulators and tell its own consumer to drop what it emitted.
+       * REQUIRED for a refusal re-issue (refusalRetries) on this path.
+       * Called immediately before the re-issue so the caller can discard the
+       * abandoned attempt: reset its accumulators and tell its own consumer
+       * to drop what it emitted.
        *
-       * Without it a retry would silently concatenate two attempts, so a
-       * caller that does not pass this simply does not get retries — an
+       * Without it a re-issue would silently concatenate two attempts, so a
+       * caller that does not pass this simply does not get re-issues — an
        * unaware consumer can never be corrupted by enabling the option
-       * somewhere upstream.
+       * somewhere upstream. A call that failed before it delivered anything
+       * is sent again without it, since there is nothing to discard.
        */
       onRetrying?: (info: { attempt: number; maxAttempts: number; category?: string }) => void;
       /** See StreamOptions.retryRateLimits: false leaves a 429 to the caller. */
@@ -2419,6 +2429,9 @@ export class Membrane {
         // MembraneError yet is typed by errorFromThrown, so the retry is
         // decided on that type and `attempts` stays on what is thrown.
         const typed = errorFromThrown(failure.error);
+        // A receipt consumer that threw stopped the call before its request
+        // went out: its error is the answer, never retried.
+        if (receiptGuard?.failure) throw typed;
         // A call that delivered anything can't be sent again, and it starts
         // the count again: membrane hasn't retried this failure.
         if (delivered) throw withAttempts(typed, 1);
