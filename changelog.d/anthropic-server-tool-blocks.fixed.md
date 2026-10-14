@@ -1,17 +1,19 @@
 - Anthropic server-tool blocks (`server_tool_use`, `web_search_tool_result`
   and the other blocks the API returns for a tool it runs itself, and
   `container_upload` for a file it puts in the code-execution container) go
-  back to the Anthropic API in their place in the turn. The native tool loops and
-  `fromAnthropicContent` kept each on a zero-width `rawItem` carrier, but
-  NativeFormatter, the native tool loop's builder and the exported
-  `toAnthropicContent` dropped the carrier as empty text. So a replayed
-  web-search turn lost its search results, and with signed thinking in the
-  turn the API refused it: "`thinking` or `redacted_thinking` blocks in the
-  latest assistant message cannot be modified". Each now sends the block
-  itself, as a copy without any `cache_control` stored on it or its
-  carrier. NativeFormatter and the native builder send it only in the
-  assistant's own turns: another participant's message, sent as a user
-  turn, still leaves it out. `toAnthropicContent` sends it when given
+  back to the Anthropic API in their place in the turn. The native tool
+  loops and `fromAnthropicContent` kept each on a zero-width `rawItem`
+  carrier, but NativeFormatter, which the native tool loops build through,
+  and the exported `toAnthropicContent` dropped the carrier as empty text.
+  So a replayed web-search turn lost its search results, and with signed
+  thinking in the turn the API refused it: "`thinking` or
+  `redacted_thinking` blocks in the latest assistant message cannot be
+  modified". Each now sends the block itself, as a copy without any
+  `cache_control` stored on it or its carrier. A block stored as itself, as
+  a seeded history can hold it, goes back the same way. NativeFormatter
+  sends it only in the assistant's own turns, the native tool loops'
+  requests included: another participant's message, sent as a user turn,
+  still leaves it out. `toAnthropicContent` sends it when given
   `{ role: 'assistant' }`, and otherwise leaves it out, as it always left
   out a carrier.
 - Membrane sends these blocks back only through `AnthropicAdapter`: a live
@@ -47,7 +49,8 @@
   formatters, the OpenAI, OpenAI-compatible, OpenRouter and OpenAI
   completions adapters, and the exported `toOpenAIMessages`,
   `toOpenRouterMessages` and `toOpenAIContent`, no longer write a zero-width
-  carrier as an empty text part or line. `toOpenAIContent` now answers
+  carrier as an empty text part or line, and neither does the exported
+  `extractText`. `toOpenAIContent` now answers
   `null`, its answer for no text, for a turn whose only text blocks are
   carriers, where it gave `''`. In XML
   (prefill) mode the turn is text, so these blocks still aren't sent there.

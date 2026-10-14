@@ -19,6 +19,7 @@ import { OpenAICompletionsAdapter } from '../../src/providers/openai-completions
 import { OpenRouterAdapter, toOpenRouterMessages } from '../../src/providers/openrouter.js';
 import { normalizeResponsesInput } from '../../src/providers/responses-input.js';
 import { ANTHROPIC_SERVER_BLOCK_TYPES, anthropicServerBlockFor } from '../../src/utils/anthropic-server-blocks.js';
+import { extractText } from '../../src/types/message.js';
 import type { ContentBlock, NormalizedMessage, NormalizedRequest, ProviderAdapter, ProviderRequest } from '../../src/types/index.js';
 
 // A web-search turn in the order the API returned one: signed thinking, the
@@ -120,6 +121,13 @@ describe('NativeFormatter', () => {
     const built = new NativeFormatter().buildMessages(messages, options);
     expect(built.messages[1]).toEqual({ role: 'assistant', content: sentTurn });
     expect(messages).toEqual(before);
+  });
+
+  it('sends server blocks stored as themselves, not on carriers, back in place between signed thinking', () => {
+    // A seeded history can hold them so, as the field report's did.
+    const bare = [thinking1, serverUse, searchResult, thinking2, answer] as ContentBlock[];
+    const built = new NativeFormatter().buildMessages(history(bare), options);
+    expect(built.messages[1]).toEqual({ role: 'assistant', content: sentTurn });
   });
 
   it('still leaves out a carrier holding another wire\'s item', () => {
@@ -284,6 +292,14 @@ describe('the native tool loop', () => {
     expect(messages).toEqual(before);
   });
 
+  it('sends server blocks stored as themselves back in place between signed thinking', async () => {
+    const sent: any[] = [];
+    const membrane = new Membrane(recordingAdapter(sent));
+    const messages = history([thinking1, serverUse, searchResult, thinking2, answer] as ContentBlock[]);
+    await membrane.stream({ ...request(), messages }, { onToolCalls: async (calls) => results(calls) });
+    expect(sent[0].messages[1]).toEqual({ role: 'assistant', content: sentTurn });
+  });
+
   it.each([
     ['stream', 'declared false'], ['stream', 'not declared'], ['streamYielding', 'not declared'],
   ] as const)('%s sends none through an adapter whose capability is %s', async (method, how) => {
@@ -410,6 +426,20 @@ describe('the Anthropic adapter\'s stream', () => {
     expect(warn.mock.calls.map((c) => String(c[0]))).toContainEqual(
       expect.stringMatching(/server_tool_use srvtoolu_zz1 didn't parse \(17 characters\); it keeps the start's input$/),
     );
+  });
+});
+
+describe('extractText', () => {
+  it('leaves a carrier out, so a turn complete() returned gains no empty lines', () => {
+    const message: NormalizedMessage = {
+      participant: 'Claude',
+      content: [carrier(serverUse), carrier(searchResult), { type: 'text', text: 'zz one' }, { type: 'text', text: 'zz two' }],
+    };
+    expect(extractText(message)).toBe('zz one\nzz two');
+  });
+
+  it('still keeps an empty text block that carries nothing', () => {
+    expect(extractText({ participant: 'Claude', content: [{ type: 'text', text: '' }, { type: 'text', text: 'zz one' }] })).toBe('\nzz one');
   });
 });
 
