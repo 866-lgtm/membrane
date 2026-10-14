@@ -300,12 +300,14 @@ export interface YieldingStreamOptions {
   /**
    * Whether membrane retries a 429 rate limit itself. Default true: a 429
    * that ends a provider call before it delivered anything is retried, like a
-   * 529, with a `backoff` event before each wait. With `false`, a 429 is the
-   * caller's: membrane doesn't retry it, and the stream ends with an `error`
-   * event at once, carrying the provider's stated wait on `retryAfterMs`. For
-   * a caller that paces rate limits itself, such as an agent framework
-   * sharing one organization's limit across its agents. A 529 is still
-   * retried either way.
+   * 529, with a `backoff` event before each wait, unless its stated wait is
+   * longer than its schedule's `maxRetryDelayMs`: that one ends the stream
+   * with an `error` event at once. With `false`, a 429 is the caller's:
+   * membrane doesn't retry it, and the stream ends with an `error` event at
+   * once, carrying the provider's stated wait on `retryAfterMs`. For a caller
+   * that paces rate limits itself, such as an agent framework sharing one
+   * organization's limit across its agents. A 529 is still retried either
+   * way.
    */
   retryRateLimits?: boolean;
 

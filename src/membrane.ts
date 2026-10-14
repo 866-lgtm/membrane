@@ -3085,9 +3085,10 @@ export class Membrane {
   /**
    * The server's own `retry-after` outranks our backoff when it is longer:
    * retrying inside a window the provider has already told us to wait out
-   * burns the whole attempt budget on guaranteed failures. maxRetryDelayMs
-   * still caps Membrane's own sleep, so a hostile or absurd retry-after
-   * cannot park the call. The error a caller receives carries the provider's
+   * burns the whole attempt budget on guaranteed failures. A stated wait
+   * longer than maxRetryDelayMs isn't retried at all (see retryPlan), so a
+   * hostile or absurd retry-after cannot park the call; the min() below keeps
+   * that bound here too. The error a caller receives carries the provider's
    * stated wait as stated (retryAfterMs): pacing across calls is the
    * caller's.
    */
@@ -3125,6 +3126,8 @@ export class Membrane {
    * A streaming call is sent again only for a 529 or a 429; complete() also
    * retries any other retryable error within maxRetries. With
    * `retryRateLimits: false` a 429 belongs to the caller: it isn't retried.
+   * Nor is an error whose stated wait is longer than its schedule's
+   * maxRetryDelayMs.
    */
   private retryPlan(
     errorInfo: ErrorInfo,
@@ -3143,6 +3146,12 @@ export class Membrane {
         ? Math.max(this.retryConfig.maxRetries, this.retryConfig.overloaded.maxRetries)
         : this.retryConfig.maxRetries;
     if (attempt >= maxAttempts) return undefined;
+    // A stated wait longer than the schedule's ceiling can't be waited out
+    // here, and retrying at the ceiling would send the call back inside the
+    // window the provider named. The caller gets the error, with the stated
+    // wait on retryAfterMs.
+    const { maxRetryDelayMs } = overloaded ? this.retryConfig.overloaded : this.retryConfig;
+    if (errorInfo.retryAfterMs !== undefined && errorInfo.retryAfterMs > maxRetryDelayMs) return undefined;
     return { overloaded, maxAttempts };
   }
 

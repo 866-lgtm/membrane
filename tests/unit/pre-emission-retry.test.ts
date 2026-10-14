@@ -545,6 +545,48 @@ describe('retryRateLimits: false leaves a 429 to the caller', () => {
   });
 });
 
+describe('a stated wait longer than the ceiling is given to the caller, not retried inside', () => {
+  // SCHEDULES caps the base wait at 3 ms and the overloaded one at 40 ms.
+  it('streamYielding(): a 429 asking for longer ends the stream at once', async () => {
+    const adapter = new ScriptedNativeAdapter([{ fail: () => rateLimited429(5_000) }, { text: 'zz never' }]);
+    const events = await drive(native(adapter).streamYielding(NATIVE_REQUEST));
+
+    expect(adapter.sends).toBe(1);
+    expect(ofType(events, 'backoff')).toHaveLength(0);
+    expect(ofType(events, 'error')[0]!.error).toMatchObject({ retryAfterMs: 5_000, attempts: 1 });
+  });
+
+  it('stream(): the same', async () => {
+    const adapter = new ScriptedNativeAdapter([{ fail: () => rateLimited429(5_000) }, { text: 'zz never' }]);
+    await expect(native(adapter).stream(NATIVE_REQUEST)).rejects.toMatchObject({ retryAfterMs: 5_000, attempts: 1 });
+    expect(adapter.sends).toBe(1);
+  });
+
+  it('a 429 is held to the base ceiling, not the overloaded one', async () => {
+    // 20 ms is over the base ceiling and under the overloaded one.
+    const adapter = new ScriptedNativeAdapter([{ fail: () => rateLimited429(20) }, { text: 'zz never' }]);
+    const events = await drive(native(adapter).streamYielding(NATIVE_REQUEST));
+
+    expect(adapter.sends).toBe(1);
+    expect(ofType(events, 'backoff')).toHaveLength(0);
+    expect(ofType(events, 'error')[0]!.error).toMatchObject({ retryAfterMs: 20, attempts: 1 });
+  });
+
+  it('a 529 is held to the overloaded ceiling', async () => {
+    const overloadedFor = (retryAfterMs: number) => () =>
+      new MembraneError({ ...overloaded529().toErrorInfo(), retryAfterMs });
+    const over = new ScriptedNativeAdapter([{ fail: overloadedFor(41) }, { text: 'zz never' }]);
+    await expect(native(over).complete(NATIVE_REQUEST)).rejects.toMatchObject({ httpStatus: 529, attempts: 1 });
+    expect(over.sends).toBe(1);
+
+    // At the ceiling it is waited out: the wait is the stated one.
+    const at = new ScriptedNativeAdapter([{ fail: overloadedFor(40) }, { text: 'zz ok' }]);
+    const events = await drive(native(at).streamYielding(NATIVE_REQUEST));
+    expect(at.sends).toBe(2);
+    expect(ofType(events, 'backoff').map((e) => e.delayMs)).toEqual([40]);
+  });
+});
+
 // Keeps the BackoffEvent type import honest: the event's shape is public.
 const _shape: BackoffEvent = {
   type: 'backoff', reason: 'overloaded', attempt: 1, maxAttempts: 1, delayMs: 0, error: new Error('zz'),
