@@ -5,6 +5,7 @@
  */
 
 import { restoreToolName } from './utils/tool-names.js';
+import { toolUseInputFromValue } from './providers/utils.js';
 import { StreamedThinking } from './utils/streamed-thinking.js';
 import { LocalStopSequences, firstStop, membraneBlockType } from './utils/local-stop-sequences.js';
 
@@ -1882,9 +1883,12 @@ export class Membrane {
             type: 'tool_use',
             id: item.id,
             name: restoreToolName(item.name, tools),
-            input: item.input,
-            // Arguments that never parsed: carry the marker through so a
-            // consumer can refuse the block instead of trusting `input`.
+            // `input` reaches callers as the object ToolUseContent promises,
+            // whatever the adapter gave.
+            ...toolUseInputFromValue(item.input),
+            // Arguments that weren't a JSON object: the adapter's marker, with
+            // the text as it came, so a consumer can refuse the block instead
+            // of trusting `input`.
             ...(item.unparseableInput !== undefined ? { unparseableInput: item.unparseableInput } : {}),
             ...(item.rawItem ? { rawItem: item.rawItem } : {}),
           });
@@ -2647,16 +2651,20 @@ export class Membrane {
           rawAssistantText += block.text;
         } else if (block.type === 'tool_use') {
           const name = restoreToolName(block.name, request.tools);
+          // As in parseProviderContent: `input` is an object, and the
+          // adapter's marker comes through.
+          const toolInput = toolUseInputFromValue(block.input);
           content.push({
             type: 'tool_use',
             id: block.id,
             name,
-            input: block.input,
+            ...toolInput,
+            ...(block.unparseableInput !== undefined ? { unparseableInput: block.unparseableInput } : {}),
           });
           toolCalls.push({
             id: block.id,
             name,
-            input: block.input,
+            input: toolInput.input,
           });
         } else if (block.type === 'thinking') {
           content.push({

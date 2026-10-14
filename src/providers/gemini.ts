@@ -28,7 +28,7 @@ import {
   isTypedAbortError,
   withRawRequest,
 } from '../types/index.js';
-import { createCombinedSignal, textOnlyToolResultContent, isDeadlineAbort, deadlineTimeoutError, throwOnStreamErrorFrame, assertTerminalEventObserved } from './utils.js';
+import { createCombinedSignal, textOnlyToolResultContent, toolUseInputFromValue, isDeadlineAbort, deadlineTimeoutError, throwOnStreamErrorFrame, assertTerminalEventObserved } from './utils.js';
 
 // ============================================================================
 // Gemini API Types
@@ -682,7 +682,7 @@ export class GeminiAdapter implements ProviderAdapter {
         type: 'tool_use',
         id: `gemini-tc-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
         name: tc.name,
-        input: tc.args,
+        ...toolUseInputFromValue(tc.args),
       });
     }
 
@@ -791,7 +791,7 @@ export function fromGeminiParts(parts: GeminiPart[]): ContentBlock[] {
         type: 'tool_use',
         id: `gemini-tc-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
         name: part.functionCall.name,
-        input: part.functionCall.args,
+        ...toolUseInputFromValue(part.functionCall.args),
       });
     }
   }

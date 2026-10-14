@@ -179,17 +179,48 @@ export function assertTerminalEventObserved(
   );
 }
 
+/** A tool_use block's `input`, and its `unparseableInput` when it has one. */
+export type ToolUseInput = { input: Record<string, unknown>; unparseableInput?: string };
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function notAnObject(raw: string, value: unknown): ToolUseInput {
+  const kind = value === null ? 'null' : Array.isArray(value) ? 'an array' : `a ${typeof value}`;
+  console.warn(`[membrane] Tool arguments are ${kind}, not an object; input is {} and unparseableInput keeps them`);
+  return { input: {}, unparseableInput: raw };
+}
+
 /**
- * Safely parse a JSON string, returning an empty object on failure.
- * Used for tool call arguments which may be malformed from streaming.
+ * A tool call's `input` from the argument text a provider sent (OpenAI-family
+ * `function.arguments`, Anthropic and Bedrock `input_json_delta`
+ * accumulations). `input` is always a plain object, as ToolUseContent types
+ * it. Text that doesn't parse, or parses to anything but an object (null, a
+ * number, a string, a boolean or an array), isn't the model's arguments as an
+ * object: `input` is then `{}`, and `unparseableInput` keeps the text as it
+ * came. No text, or empty text, is a call with no arguments: `{}`, unmarked.
  */
-export function safeParseJson(str: string | undefined): Record<string, unknown> {
+export function toolUseInputFromText(text: string | undefined): ToolUseInput {
+  if (text === undefined || text === '') return { input: {} };
+  let parsed: unknown;
   try {
-    return JSON.parse(str || '{}');
+    parsed = JSON.parse(text);
   } catch (e) {
-    console.warn('[membrane] Failed to parse tool arguments JSON:', e);
-    return {};
+    console.warn('[membrane] Failed to parse tool arguments JSON; input is {} and unparseableInput keeps the text:', e);
+    return { input: {}, unparseableInput: text };
   }
+  return isPlainObject(parsed) ? { input: parsed } : notAnObject(text, parsed);
+}
+
+/**
+ * As toolUseInputFromText, for a provider that sends a call's arguments as a
+ * value (Gemini's `functionCall.args`). No value is a call with no arguments.
+ * A value that isn't an object is kept, as JSON, in `unparseableInput`.
+ */
+export function toolUseInputFromValue(value: unknown): ToolUseInput {
+  if (value === undefined) return { input: {} };
+  return isPlainObject(value) ? { input: value } : notAnObject(JSON.stringify(value), value);
 }
 
 /**

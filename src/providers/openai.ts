@@ -30,7 +30,7 @@ import {
   isTypedAbortError,
   withRawRequest,
 } from '../types/index.js';
-import { safeParseJson, textOnlyToolResultContent, createCombinedSignal, SSELineParser, isDeadlineAbort, deadlineTimeoutError, throwOnStreamErrorFrame, assertTerminalEventObserved } from './utils.js';
+import { toolUseInputFromText, textOnlyToolResultContent, createCombinedSignal, SSELineParser, isDeadlineAbort, deadlineTimeoutError, throwOnStreamErrorFrame, assertTerminalEventObserved } from './utils.js';
 
 // ============================================================================
 // Types
@@ -692,7 +692,7 @@ export class OpenAIAdapter implements ProviderAdapter {
           type: 'tool_use',
           id: tc.id,
           name: tc.function.name,
-          input: safeParseJson(tc.function.arguments),
+          ...toolUseInputFromText(tc.function.arguments),
         });
       }
     }
@@ -766,7 +766,7 @@ export function fromOpenAIContent(message: OpenAIMessage): ContentBlock[] {
         type: 'tool_use',
         id: tc.id,
         name: tc.function.name,
-        input: safeParseJson(tc.function.arguments),
+        ...toolUseInputFromText(tc.function.arguments),
       });
     }
   }

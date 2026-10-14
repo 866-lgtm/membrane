@@ -1,0 +1,284 @@
+/**
+ * A tool_use block's `input` is always a plain object, and arguments that
+ * weren't a JSON object are marked with `unparseableInput`.
+ *
+ * `ToolUseContent` types `input` as `Record<string, unknown>`, and stores and
+ * callers downstream rely on it. Every adapter but Anthropic's put what it got
+ * there unchecked: the OpenAI-family adapters stored whatever `JSON.parse`
+ * returned (`null`, a number, a string or an array when a model's arguments
+ * were one), Gemini copied `functionCall.args` as it came, and Anthropic's and
+ * Bedrock's stream assemblies kept a parse that wasn't an object. Where the
+ * text didn't parse, the OpenAI-family adapters and Bedrock kept `{}` with
+ * nothing to tell it from a real no-argument call, which Anthropic's adapter
+ * already marks (`unparseableInput`). Now every adapter gives `{}` for
+ * arguments that aren't an object and keeps what came in `unparseableInput`.
+ */
+import { describe, it, expect, afterEach, beforeEach, vi } from 'vitest';
+import { toolUseInputFromText, toolUseInputFromValue } from '../../src/providers/utils.js';
+import { OpenAIAdapter, fromOpenAIContent } from '../../src/providers/openai.js';
+import { OpenAICompatibleAdapter, fromOpenAIMessage } from '../../src/providers/openai-compatible.js';
+import { fromOpenRouterMessage } from '../../src/providers/openrouter.js';
+import { OpenAIResponsesAPIAdapter } from '../../src/providers/openai-responses-api.js';
+import { GeminiAdapter, fromGeminiParts } from '../../src/providers/gemini.js';
+import { AnthropicAdapter } from '../../src/providers/anthropic.js';
+import { BedrockAdapter } from '../../src/providers/bedrock.js';
+import { Membrane } from '../../src/membrane.js';
+import type { ProviderAdapter, ProviderResponse } from '../../src/types/provider.js';
+import { stubFetchWithSseLines } from '../helpers/sse-fixtures.js';
+import { chunkFrame, streamBody } from '../helpers/bedrock-event-stream.js';
+
+beforeEach(() => {
+  vi.spyOn(console, 'warn').mockImplementation(() => {});
+});
+afterEach(() => {
+  vi.restoreAllMocks();
+  vi.unstubAllGlobals();
+});
+
+/** Argument texts that parse, but not to an object. */
+const notObjects = ['null', '42', '"zz"', 'true', '[1,2]'];
+const malformed = '{"path":"/zz/fld1.ts","n';
+
+function stubFetchWithJson(body: unknown): void {
+  vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify(body), {
+    status: 200,
+    headers: { 'Content-Type': 'application/json' },
+  })));
+}
+
+const toolUseOf = (content: any[]) => content.find((b) => b.type === 'tool_use');
+const openAICall = (args: string) => ({
+  role: 'assistant' as const,
+  content: null,
+  tool_calls: [{ id: 'call_zz', type: 'function' as const, function: { name: 'zz_tool', arguments: args } }],
+});
+
+describe('toolUseInputFromText', () => {
+  it('keeps arguments that are a JSON object, unmarked', () => {
+    expect(toolUseInputFromText('{"a":1}')).toEqual({ input: { a: 1 } });
+  });
+
+  it('reads no text, or empty text, as a call with no arguments', () => {
+    expect(toolUseInputFromText(undefined)).toEqual({ input: {} });
+    expect(toolUseInputFromText('')).toEqual({ input: {} });
+  });
+
+  it.each(notObjects)('gives {} and keeps %s, which parses to something other than an object', (text) => {
+    expect(toolUseInputFromText(text)).toEqual({ input: {}, unparseableInput: text });
+  });
+
+  it('gives {} and keeps text that does not parse, whitespace alone included', () => {
+    expect(toolUseInputFromText(malformed)).toEqual({ input: {}, unparseableInput: malformed });
+    expect(toolUseInputFromText('  ')).toEqual({ input: {}, unparseableInput: '  ' });
+  });
+});
+
+describe('toolUseInputFromValue', () => {
+  it('keeps an object, and reads no value as no arguments', () => {
+    expect(toolUseInputFromValue({ a: 1 })).toEqual({ input: { a: 1 } });
+    expect(toolUseInputFromValue(undefined)).toEqual({ input: {} });
+  });
+
+  it.each([null, 42, 'zz', true, [1, 2]])('gives {} and keeps %j as JSON', (value) => {
+    expect(toolUseInputFromValue(value)).toEqual({ input: {}, unparseableInput: JSON.stringify(value) });
+  });
+});
+
+describe('OpenAI-family converters', () => {
+  const converters: Array<[string, (args: string) => any[]]> = [
+    ['openai fromOpenAIContent', (args) => fromOpenAIContent(openAICall(args) as any)],
+    ['openai-compatible fromOpenAIMessage', (args) => fromOpenAIMessage(openAICall(args) as any)],
+    ['openrouter fromOpenRouterMessage', (args) => fromOpenRouterMessage(openAICall(args) as any)],
+  ];
+
+  describe.each(converters)('%s', (_name, convert) => {
+    it.each([...notObjects, malformed])('marks arguments %s and gives {}', (args) => {
+      expect(toolUseOf(convert(args))).toMatchObject({ id: 'call_zz', name: 'zz_tool', input: {}, unparseableInput: args });
+    });
+
+    it('keeps an object unmarked, and empty arguments as {}', () => {
+      expect(toolUseOf(convert('{"a":1}'))).toEqual({ type: 'tool_use', id: 'call_zz', name: 'zz_tool', input: { a: 1 } });
+      expect(toolUseOf(convert(''))).toEqual({ type: 'tool_use', id: 'call_zz', name: 'zz_tool', input: {} });
+    });
+  });
+
+  it('marks a completion\'s call whose arguments are a number (openai-compatible)', async () => {
+    stubFetchWithJson({
+      id: 'zz-id',
+      model: 'zz-model-1',
+      choices: [{ index: 0, message: openAICall('42'), finish_reason: 'tool_calls' }],
+      usage: { prompt_tokens: 3, completion_tokens: 5, total_tokens: 8 },
+    });
+    const res: any = await new OpenAICompatibleAdapter({ baseURL: 'http://localhost:9/v1', apiKey: 'zz-key' }).complete(
+      { model: 'zz-model-1', maxTokens: 64, messages: [{ role: 'user', content: 'zz prompt' }] } as any,
+    );
+    expect(toolUseOf(res.content)).toMatchObject({ id: 'call_zz', input: {}, unparseableInput: '42' });
+  });
+
+  it('marks a streamed call whose arguments are null', async () => {
+    stubFetchWithSseLines([
+      '{"choices":[{"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_zz","type":"function","function":{"name":"zz_tool","arguments":""}}]}}]}',
+      '{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"null"}}]}}]}',
+      '{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}',
+      '[DONE]',
+    ]);
+    const res: any = await new OpenAIAdapter({ apiKey: 'zz-key' }).stream(
+      { model: 'zz-model-1', maxTokens: 64, messages: [{ role: 'user', content: 'zz prompt' }] } as any,
+      { onChunk: () => {} } as any,
+    );
+    expect(toolUseOf(res.content)).toMatchObject({ input: {}, unparseableInput: 'null' });
+  });
+});
+
+describe('OpenAI Responses API', () => {
+  it('marks a function call whose arguments are an array', async () => {
+    stubFetchWithJson({
+      status: 'completed',
+      output: [{ type: 'function_call', id: 'fc_zz', call_id: 'call_zz', name: 'zz_tool', arguments: '[1,2]' }],
+      usage: { input_tokens: 1, output_tokens: 1 },
+    });
+    const res: any = await new OpenAIResponsesAPIAdapter({ apiKey: 'zz-key' }).complete(
+      { model: 'gpt-zz', maxTokens: 64, messages: [{ role: 'user', content: 'zz prompt' }] } as any,
+    );
+    expect(toolUseOf(res.content)).toMatchObject({ id: 'call_zz', input: {}, unparseableInput: '[1,2]' });
+  });
+});
+
+describe('Gemini', () => {
+  it('gives a call without args {}, unmarked, in a completion', async () => {
+    stubFetchWithJson({
+      candidates: [{ content: { role: 'model', parts: [{ functionCall: { name: 'zz_tool' } }] }, finishReason: 'STOP' }],
+      usageMetadata: { promptTokenCount: 1, candidatesTokenCount: 1 },
+    });
+    const res: any = await new GeminiAdapter({ apiKey: 'zz-key' }).complete(
+      { model: 'gemini-zz', maxTokens: 64, messages: [{ role: 'user', parts: [{ text: 'zz prompt' }] }] } as any,
+    );
+    const toolUse = toolUseOf(res.content);
+    expect(toolUse.input).toEqual({});
+    expect(toolUse).not.toHaveProperty('unparseableInput');
+  });
+
+  it('fromGeminiParts marks args that are not an object', () => {
+    const toolUse = toolUseOf(fromGeminiParts([{ functionCall: { name: 'zz_tool', args: [1, 2] as any } }]));
+    expect(toolUse).toMatchObject({ name: 'zz_tool', input: {}, unparseableInput: '[1,2]' });
+  });
+});
+
+function fakeAnthropicStream(events: unknown[]) {
+  return {
+    controller: { abort() { /* noop */ } },
+    [Symbol.asyncIterator]() {
+      let i = 0;
+      return {
+        async next() {
+          return i < events.length ? { value: events[i++], done: false } : { value: undefined, done: true };
+        },
+      };
+    },
+  };
+}
+
+describe('Anthropic stream', () => {
+  it('marks a call whose accumulated arguments parse to null, keeping content_block_start\'s {}', async () => {
+    const adapter = new AnthropicAdapter({ apiKey: 'zz-key' });
+    (adapter as any).client = {
+      messages: {
+        stream: async () => fakeAnthropicStream([
+          { type: 'message_start', message: { model: 'claude-zz-1', usage: { input_tokens: 10 } } },
+          { type: 'content_block_start', index: 0, content_block: { type: 'tool_use', id: 'toolu_zz', name: 'zz_tool', input: {} } },
+          { type: 'content_block_delta', index: 0, delta: { type: 'input_json_delta', partial_json: 'null' } },
+          { type: 'content_block_stop', index: 0 },
+          { type: 'message_delta', delta: { stop_reason: 'tool_use' }, usage: { output_tokens: 5 } },
+        ]),
+      },
+    };
+    const res: any = await adapter.stream(
+      { model: 'claude-zz-1', maxTokens: 64, messages: [{ role: 'user', content: [{ type: 'text', text: 'zz prompt' }] }] } as any,
+      { onChunk: () => {} } as any,
+    );
+    expect(toolUseOf(res.content)).toMatchObject({ id: 'toolu_zz', input: {}, unparseableInput: 'null' });
+  });
+});
+
+describe('Bedrock stream', () => {
+  async function streamToolCall(partialJson: string, opts: { stop?: boolean } = {}): Promise<{ res: any; completed: any[] }> {
+    const frames = [
+      chunkFrame({ type: 'message_start', message: { usage: { input_tokens: 10 } } }),
+      chunkFrame({ type: 'content_block_start', index: 0, content_block: { type: 'tool_use', id: 'toolu_zz', name: 'zz_tool', input: {} } }),
+      chunkFrame({ type: 'content_block_delta', index: 0, delta: { type: 'input_json_delta', partial_json: partialJson } }),
+      ...(opts.stop === false ? [] : [chunkFrame({ type: 'content_block_stop', index: 0 })]),
+      chunkFrame({ type: 'message_delta', delta: { stop_reason: 'tool_use' }, usage: { output_tokens: 5 } }),
+      chunkFrame({ type: 'message_stop' }),
+    ];
+    vi.stubGlobal('fetch', vi.fn(async () => ({ ok: true, status: 200, body: streamBody(frames) })));
+    const completed: any[] = [];
+    const adapter = new BedrockAdapter({ accessKeyId: 'zz-key', secretAccessKey: 'zz-secret', region: 'us-west-2' });
+    const res: any = await adapter.stream(
+      { model: 'anthropic.claude-zz-v1:0', messages: [{ role: 'user', content: 'zz prompt' }], maxTokens: 64 } as any,
+      { onChunk: () => {}, onContentBlock: (_i: number, block: any) => { if (block?.type === 'tool_use') completed.push({ ...block }); } } as any,
+    );
+    return { res, completed };
+  }
+
+  it('keeps arguments that parse to an object', async () => {
+    const { res } = await streamToolCall('{"a":1}');
+    expect(toolUseOf(res.content)).toEqual({ type: 'tool_use', id: 'toolu_zz', name: 'zz_tool', input: { a: 1 } });
+  });
+
+  it.each(['null', malformed])('marks arguments %s, in the response and at content_block_stop', async (args) => {
+    const { res, completed } = await streamToolCall(args);
+    expect(toolUseOf(res.content)).toMatchObject({ input: {}, unparseableInput: args });
+    expect(completed.at(-1)).toMatchObject({ unparseableInput: args });
+  });
+
+  it('marks a block the stream left open whose arguments did not parse', async () => {
+    const { res } = await streamToolCall(malformed, { stop: false });
+    expect(toolUseOf(res.content)).toMatchObject({ input: {}, unparseableInput: malformed });
+  });
+});
+
+/** An adapter that answers with one tool_use block, as given. */
+function adapterAnswering(block: Record<string, unknown>): ProviderAdapter {
+  const response = (): ProviderResponse => ({
+    content: [{ type: 'tool_use', id: 'call_zz', name: 'zz_tool', ...block }],
+    stopReason: 'tool_use',
+    stopSequence: undefined,
+    usage: { inputTokens: 1, outputTokens: 1 },
+    model: 'zz-model-1',
+    raw: {},
+  } as unknown as ProviderResponse);
+  return {
+    name: 'zz-fake',
+    supportsModel: () => true,
+    async complete(): Promise<ProviderResponse> { return response(); },
+    async stream(_request: unknown, callbacks: { onChunk?: (c: string) => void }): Promise<ProviderResponse> {
+      callbacks.onChunk?.('');
+      return response();
+    },
+  } as unknown as ProviderAdapter;
+}
+
+const membraneRequest = {
+  messages: [{ participant: 'User', content: [{ type: 'text', text: 'zz prompt' }] }],
+  toolMode: 'native',
+  tools: [{ name: 'zz_tool', description: 'zz', inputSchema: { type: 'object', properties: {} } }],
+  config: { model: 'zz-model-1', maxTokens: 64 },
+} as any;
+
+describe('Membrane', () => {
+  it('complete carries the adapter\'s unparseableInput to the response', async () => {
+    const res = await new Membrane(adapterAnswering({ input: {}, unparseableInput: 'null' })).complete(membraneRequest);
+    expect(res.content.find((b) => b.type === 'tool_use')).toMatchObject({ input: {}, unparseableInput: 'null' });
+  });
+
+  it('complete gives an adapter\'s input that is not an object as {}, marked, in content and toolCalls', async () => {
+    const res: any = await new Membrane(adapterAnswering({ input: null })).complete(membraneRequest);
+    expect(res.content.find((b: any) => b.type === 'tool_use')).toMatchObject({ input: {}, unparseableInput: 'null' });
+    expect(res.toolCalls).toEqual([expect.objectContaining({ id: 'call_zz', input: {} })]);
+  });
+
+  it('stream gives an adapter\'s input that is not an object as {}, marked', async () => {
+    const res: any = await new Membrane(adapterAnswering({ input: [1] })).stream(membraneRequest, { onChunk: () => {} });
+    expect(res.content.find((b: any) => b.type === 'tool_use')).toMatchObject({ input: {}, unparseableInput: '[1]' });
+  });
+});

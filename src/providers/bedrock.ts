@@ -25,7 +25,7 @@ import {
   withRawRequest,
 } from '../types/index.js';
 import { stripEmptyTextRequest } from '../utils/empty-text.js';
-import { createCombinedSignal, isDeadlineAbort, deadlineTimeoutError, assertTerminalEventObserved } from './utils.js';
+import { createCombinedSignal, isDeadlineAbort, deadlineTimeoutError, assertTerminalEventObserved, toolUseInputFromText } from './utils.js';
 import {
   INTERLEAVED_THINKING_BETA,
   needsInterleavedThinkingBeta,
@@ -101,6 +101,8 @@ interface BedrockMessageResponse {
     id?: string;
     name?: string;
     input?: unknown;
+    /** Set by the stream assembly, never by Bedrock (ToolUseContent.unparseableInput). */
+    unparseableInput?: string;
   }>;
   model: string;
   stop_reason: 'end_turn' | 'max_tokens' | 'stop_sequence' | 'tool_use' | null;
@@ -815,9 +817,14 @@ export class BedrockAdapter implements ProviderAdapter {
                   // Finalize tool_use blocks: parse accumulated argument JSON
                   // into `input` before the block_complete fire, so consumers
                   // of the dual-fire convention see a complete tool call.
-                  const stoppedBlk = contentBlocks[blockIdx] as ((typeof contentBlocks)[number] & { partialJson?: string; input?: unknown }) | undefined;
+                  const stoppedBlk = contentBlocks[blockIdx] as ((typeof contentBlocks)[number] & { partialJson?: string; input?: unknown; unparseableInput?: string }) | undefined;
                   if (stoppedBlk?.type === 'tool_use' && stoppedBlk.partialJson !== undefined) {
-                    try { stoppedBlk.input = JSON.parse(stoppedBlk.partialJson || '{}'); } catch { /* keep prior input */ }
+                    // As in the Anthropic adapter: arguments that don't parse,
+                    // or parse to anything but an object, leave the input
+                    // content_block_start carried, and the raw text marks it.
+                    const parsed = toolUseInputFromText(stoppedBlk.partialJson);
+                    if (parsed.unparseableInput === undefined) stoppedBlk.input = parsed.input;
+                    else stoppedBlk.unparseableInput = parsed.unparseableInput;
                   }
                   callbacks.onContentBlock?.(blockIdx, contentBlocks[blockIdx]);
                 } else if (eventData.type === 'message_delta') {
@@ -895,12 +902,20 @@ export class BedrockAdapter implements ProviderAdapter {
           // Preserve id/name and the input accumulated from input_json_delta
           // fragments — the generic text mapping below would strip them and
           // parseResponse would then drop the block (requires id && name).
-          const tb = b as { type: string; id?: string; name?: string; input?: unknown; partialJson?: string };
+          const tb = b as { type: string; id?: string; name?: string; input?: unknown; partialJson?: string; unparseableInput?: string };
           let input: unknown = tb.input ?? {};
-          if (tb.partialJson) {
-            try { input = JSON.parse(tb.partialJson); } catch { /* keep prior input */ }
+          // A block content_block_stop marked keeps its marker. Any other is
+          // parsed here, one the stream left open included.
+          let unparseableInput = tb.unparseableInput;
+          if (tb.partialJson && unparseableInput === undefined) {
+            const parsed = toolUseInputFromText(tb.partialJson);
+            if (parsed.unparseableInput === undefined) input = parsed.input;
+            else unparseableInput = parsed.unparseableInput;
           }
-          return { type: 'tool_use', id: tb.id, name: tb.name, input } as unknown as { type: 'text'; text?: string };
+          return {
+            type: 'tool_use', id: tb.id, name: tb.name, input,
+            ...(unparseableInput !== undefined ? { unparseableInput } : {}),
+          } as unknown as { type: 'text'; text?: string };
         }
         return { type: b.type as 'text', text: b.text };
       }),
@@ -930,6 +945,7 @@ export class BedrockAdapter implements ProviderAdapter {
           id: block.id,
           name: block.name,
           input: block.input as Record<string, unknown>,
+          ...(block.unparseableInput !== undefined ? { unparseableInput: block.unparseableInput } : {}),
         });
       } else if (block.type === 'thinking') {
         // Signature-only thinking blocks (display:'omitted') have an empty

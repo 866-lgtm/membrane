@@ -30,7 +30,7 @@ import {
 } from '../types/index.js';
 import { statusForProviderCode } from '../types/errors.js';
 import { flattenRootSchemaUnion } from './anthropic-tool-schema.js';
-import { assertTerminalEventObserved } from './utils.js';
+import { assertTerminalEventObserved, toolUseInputFromText } from './utils.js';
 import { fetchWithCredentials, validateCredential, type CredentialContext, type CredentialResolver } from './credentials.js';
 import { CacheKeepalive, type CacheKeepaliveConfig } from '../cache-keepalive.js';
 
@@ -469,13 +469,13 @@ export class AnthropicAdapter implements ProviderAdapter {
               // call that nothing downstream can distinguish from a real one.
               block.unparseableInput = currentBlockInputJson;
             } else if (currentBlockInputJson) {
-              try {
-                block.input = JSON.parse(currentBlockInputJson);
-              } catch {
-                // Same fabrication, reached by a block that did stop: keep the
-                // raw accumulation and mark it so consumers can refuse.
-                block.unparseableInput = currentBlockInputJson;
-              }
+              // Arguments that don't parse, or parse to anything but an
+              // object, are the same fabrication reached by a block that did
+              // stop: keep the raw accumulation and mark it so consumers can
+              // refuse.
+              const parsed = toolUseInputFromText(currentBlockInputJson);
+              if (parsed.unparseableInput === undefined) block.input = parsed.input;
+              else block.unparseableInput = parsed.unparseableInput;
             }
           }
         }
