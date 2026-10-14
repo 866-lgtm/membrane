@@ -22,10 +22,10 @@ import type { ModelPricing } from '../types/provider.js';
  * A provider can publish a rate together with the date it changes, such as an
  * introductory price "through November 30, 2026" and the next "starting
  * December 1, 2026". Such a row lists each later rate in `changes`, from the
- * instant it takes effect, so the table stays right across the date with no
- * edit and no release, for a caller still running this version then. `asOf`
- * stays the date the rates were read: it says how old the reading is, not
- * which rate applies.
+ * instant it takes effect, so while the provider keeps the dates it published,
+ * the table stays right across them with no edit and no release, for a caller
+ * still running this version then. `asOf` stays the date the rates were read:
+ * it says how old the reading is, not which rate applies.
  *
  * A row whose `pricing` is null says the table has no rate for ids under its
  * prefix, though a shorter prefix matches them: an image model, for one, whose
@@ -253,11 +253,15 @@ export const PRICING_TABLE: readonly PricingRow[] = [
   // context-caching per-token price and exclude Google's separate per-hour
   // storage charge, which membrane does not model. Where a model has a
   // >200k-token tier the smaller-prompt rate is used, so a longer prompt is
-  // underpriced. Where input costs more for audio, the text rate is used.
+  // underpriced. Where input costs more for audio, the text rate is used. A
+  // row's prefix also matches every id that extends it, so a new row needs a
+  // no-price row for each listed image, speech or audio id it would match
+  // (see the end of this section).
   // --------------------------------------------------------------------------
   {
-    // Introductory through November 30, 2026, then double. Implicit caching
-    // only: the context-caching price is what a cached span costs.
+    // Introductory through November 30, 2026, then double. Google: "Implicit
+    // caching only (explicit caching is not supported)", so the
+    // context-caching price is what an implicitly cached span costs.
     prefix: 'gemini-4-argon',
     pricing: { inputPerMillion: 2, outputPerMillion: 10, cacheReadPerMillion: 0.10, currency: 'USD', asOf: GOOGLE_PRICING_LAST_VERIFIED },
     changes: [
@@ -272,7 +276,7 @@ export const PRICING_TABLE: readonly PricingRow[] = [
   {
     // Deprecated: Google routes every request for it to gemini-3.8-flash, so
     // its rate follows 3.8 Flash's. Whichever of the two ids the response
-    // names as the model that served it, the price is the same.
+    // names as the model that served it, this table prices it the same.
     prefix: 'gemini-3.7-flash',
     ...GEMINI_3_8_FLASH,
   },
@@ -338,14 +342,19 @@ export const PRICING_TABLE: readonly PricingRow[] = [
 ];
 
 /**
- * The table's rate for `modelId` at the instant `at`: the row with the longest
- * prefix of the id, then the last of its changes in effect by `at`, or else
- * the row's own rate. Undefined when no row matches, or when the row that
- * matches has no rate. `at` defaults to now, which in membrane is the moment a
- * call or round is priced, so a turn that crosses a change prices each round
- * at the rate of its own moment.
+ * The table's rate for `modelId` at the instant `at`, in epoch milliseconds:
+ * the row with the longest prefix of the id, then the last of its changes in
+ * effect by `at`, or else the row's own rate. Undefined when no row matches,
+ * or when the row that matches has no rate.
+ *
+ * `at` defaults to `Date.now()`, membrane's clock, read when membrane prices:
+ * once a call's response is in, or once a round of a turn ends. So each round
+ * of a turn that crosses a change is priced at the rate of its own end, a call
+ * in flight across a change takes the later rate, and a call's or turn's
+ * discarded attempts (refusals and retries), priced together when it ends,
+ * take the rate of that moment.
  */
-export function getDefaultPricing(modelId: string, at: Date = new Date()): ModelPricing | undefined {
+export function getDefaultPricing(modelId: string, at: number = Date.now()): ModelPricing | undefined {
   let best: PricingRow | undefined;
   for (const row of PRICING_TABLE) {
     if (modelId.startsWith(row.prefix) && row.prefix.length > (best?.prefix.length ?? 0)) {
@@ -356,7 +365,7 @@ export function getDefaultPricing(modelId: string, at: Date = new Date()): Model
 
   let pricing = best.pricing;
   for (const change of best.changes ?? []) {
-    if (Date.parse(change.from) <= at.getTime()) pricing = change.pricing;
+    if (Date.parse(change.from) <= at) pricing = change.pricing;
   }
   return pricing;
 }
