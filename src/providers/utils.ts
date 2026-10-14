@@ -363,17 +363,20 @@ export function createCombinedSignal(
  * through `ProviderRequestOptions.onProgress` once per parsed provider event.
  *
  * Expiry aborts with the same mark as `createCombinedSignal`'s deadline, so
- * every adapter's existing `isDeadlineAbort` → `deadlineTimeoutError` path
- * turns it into a TimeoutAbortError: a timeout by type, an abort by
- * provenance. Its message names this deadline and says when the call began,
- * how many provider events it had and when the last came, so a call log that
- * keeps only an error's message still tells a call that never produced an
- * event from one that stopped partway.
+ * every adapter's `isDeadlineAbort` → `deadlineTimeoutError` path turns it
+ * into a TimeoutAbortError: a timeout by type, an abort by provenance. Its
+ * message names this deadline and says when the call began, how many provider
+ * events it had and when the last came, so a call log that keeps only an
+ * error's message still tells a call that never produced an event from one
+ * that stopped partway.
  *
- * `renew` only records the time and counts the event, so calling it per event
- * costs nothing; the one timer re-arms itself for whatever is left when it
- * fires early. Without `timeoutMs` the caller's signal passes through and
- * there is no `renew`. `cleanup` MUST run in a `finally`.
+ * Silence is measured on the monotonic clock (`performance.now()`), as the
+ * timers run, so a step of the system clock moves no expiry; the message's
+ * times are wall-clock. `renew` only records the time and counts the event,
+ * so calling it per event costs nothing; the one timer re-arms itself for
+ * whatever is left when it fires early. Without a positive `timeoutMs`
+ * (unset, zero, negative or NaN) the caller's signal passes through and there
+ * is no `renew`. `cleanup` MUST run in a `finally`.
  */
 export function createProgressDeadline(
   signal: AbortSignal | undefined,
@@ -382,17 +385,18 @@ export function createProgressDeadline(
   if (!timeoutMs || timeoutMs <= 0) return { signal, cleanup: () => {} };
 
   const controller = new AbortController();
-  const began = Date.now();
-  let last = began;
+  const beganAt = Date.now();
+  let lastAt = beganAt;
+  let last = performance.now();
   let events = 0;
   let cancelTimer: (() => void) | undefined;
   const check = (): void => {
-    const quiet = Date.now() - last;
+    const quiet = performance.now() - last;
     if (quiet >= timeoutMs) {
       cancelTimer = undefined;
       controller.abort(deadlineAbortReason(
-        `No stream progress within ${timeoutMs}ms: the call began at ${new Date(began).toISOString()}, ` +
-        `provider events: ${events}${events > 0 ? `, the last at ${new Date(last).toISOString()}` : ''}`,
+        `No provider progress within ${timeoutMs}ms: the call began at ${new Date(beganAt).toISOString()}, ` +
+        `provider events: ${events}${events > 0 ? `, the last at ${new Date(lastAt).toISOString()}` : ''}`,
       ));
     } else {
       cancelTimer = setLongTimeout(check, timeoutMs - quiet);
@@ -412,7 +416,7 @@ export function createProgressDeadline(
 
   return {
     signal: controller.signal,
-    renew: () => { last = Date.now(); events++; },
+    renew: () => { last = performance.now(); lastAt = Date.now(); events++; },
     cleanup: () => {
       cancelTimer?.();
       cancelTimer = undefined;

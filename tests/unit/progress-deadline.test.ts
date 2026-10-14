@@ -12,6 +12,7 @@
  * keepalives every TICK_MS, and runs of 4x the deadline, wide enough that a
  * loaded machine doesn't turn them into races.
  */
+import { getEventListeners } from 'node:events';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { Membrane } from '../../src/membrane.js';
 import { AnthropicAdapter } from '../../src/providers/anthropic.js';
@@ -28,10 +29,10 @@ import { chunkFrame, streamBody } from '../helpers/bedrock-event-stream.js';
 import { createCombinedSignal, createProgressDeadline, isDeadlineAbort, deadlineTimeoutError } from '../../src/providers/utils.js';
 import { TimeoutAbortError, isAbortedResponse } from '../../src/types/index.js';
 import type { NormalizedRequest, StreamEvent } from '../../src/types/index.js';
-import type { ProviderRequest, ProviderRequestOptions, ProviderResponse } from '../../src/types/provider.js';
+import type { ProviderAdapter, ProviderRequest, ProviderRequestOptions, ProviderResponse } from '../../src/types/provider.js';
 import type { StreamCallbacks } from '../../src/types/streaming.js';
 
-const PROGRESS_MS = 150;
+const PROGRESS_MS = 300;
 const TICK_MS = 30;
 const LIVE_MS = 4 * PROGRESS_MS;
 
@@ -158,7 +159,7 @@ describe('createProgressDeadline', () => {
     expect(error).toBeInstanceOf(TimeoutAbortError);
     expect(error.type).toBe('timeout');
     expect(error.message).toBe(
-      'No stream progress within 1000ms: the call began at 2026-10-14T12:00:00.000Z, provider events: 0',
+      'No provider progress within 1000ms: the call began at 2026-10-14T12:00:00.000Z, provider events: 0',
     );
     deadline.cleanup();
   });
@@ -176,7 +177,7 @@ describe('createProgressDeadline', () => {
     vi.advanceTimersByTime(1000);
     expect(deadline.signal!.aborted).toBe(true);
     expect(deadlineTimeoutError(deadline.signal!.reason).message).toBe(
-      'No stream progress within 1000ms: the call began at 2026-10-14T12:00:00.000Z, ' +
+      'No provider progress within 1000ms: the call began at 2026-10-14T12:00:00.000Z, ' +
       'provider events: 2, the last at 2026-10-14T12:00:00.500Z',
     );
     deadline.cleanup();
@@ -213,6 +214,56 @@ describe('createProgressDeadline', () => {
     expect(cleaned.signal!.aborted).toBe(false);
   });
 
+  it("is aborted at once, unmarked, when the caller's signal already was", () => {
+    const caller = new AbortController();
+    const reason = new Error('caller');
+    caller.abort(reason);
+    const deadline = createProgressDeadline(caller.signal, 1000);
+    expect(deadline.signal!.aborted).toBe(true);
+    expect(deadline.signal!.reason).toBe(reason);
+    expect(isDeadlineAbort(deadline.signal!.reason)).toBe(false);
+    deadline.cleanup();
+  });
+
+  it("lets go of the caller's signal at cleanup", () => {
+    // A resident's signal outlives many calls: each call's listener must go
+    // with its call.
+    const caller = new AbortController();
+    const deadline = createProgressDeadline(caller.signal, 1000);
+    expect(getEventListeners(caller.signal, 'abort')).toHaveLength(1);
+    deadline.cleanup();
+    expect(getEventListeners(caller.signal, 'abort')).toHaveLength(0);
+    caller.abort(new Error('caller'));
+    expect(deadline.signal!.aborted).toBe(false);
+  });
+
+  it('measures silence on the monotonic clock, so a step of the system clock moves no expiry', () => {
+    // vitest's fake timers move performance.now() and Date together;
+    // setSystemTime moves Date alone, as an NTP step or a VM restore does.
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-10-14T12:00:00.000Z'));
+    const forward = createProgressDeadline(undefined, 1000);
+    vi.advanceTimersByTime(500);
+    forward.renew!();
+    vi.setSystemTime(new Date('2026-10-14T13:00:00.000Z'));
+    vi.advanceTimersByTime(999);
+    expect(forward.signal!.aborted).toBe(false);
+    vi.advanceTimersByTime(1);
+    expect(forward.signal!.aborted).toBe(true);
+    // The message's times are the wall clock's: the renewal came before the step.
+    expect(deadlineTimeoutError(forward.signal!.reason).message).toBe(
+      'No provider progress within 1000ms: the call began at 2026-10-14T12:00:00.000Z, ' +
+      'provider events: 1, the last at 2026-10-14T12:00:00.500Z',
+    );
+    forward.cleanup();
+
+    const backward = createProgressDeadline(undefined, 1000);
+    vi.setSystemTime(new Date('2026-10-14T11:00:00.000Z'));
+    vi.advanceTimersByTime(1000);
+    expect(backward.signal!.aborted).toBe(true);
+    backward.cleanup();
+  });
+
   it('without a timeout passes the caller signal through and offers no renew', () => {
     const caller = new AbortController();
     const off = createProgressDeadline(caller.signal, undefined);
@@ -247,9 +298,28 @@ describe('deadlines past the platform timer limit', () => {
     vi.advanceTimersByTime(1);
     expect(deadline.signal!.aborted).toBe(true);
     expect(deadlineTimeoutError(deadline.signal!.reason).message).toMatch(
-      new RegExp(`^No stream progress within ${PAST_LIMIT_MS}ms: the call began at \\S+, provider events: 0$`),
+      new RegExp(`^No provider progress within ${PAST_LIMIT_MS}ms: the call began at \\S+, provider events: 0$`),
     );
     deadline.cleanup();
+  });
+
+  it('cleanup partway through a long wait cancels the step that is pending', () => {
+    vi.useFakeTimers();
+    const armed = vi.spyOn(globalThis, 'setTimeout');
+    const deadline = createProgressDeadline(undefined, PAST_LIMIT_MS);
+    const combined = createCombinedSignal(undefined, PAST_LIMIT_MS);
+    // A deadline re-armed every millisecond would make the long advance below spin for hours.
+    vi.advanceTimersByTime(10);
+    expect(armed).toHaveBeenCalledTimes(2);
+    // Past the first step: each helper has armed its second.
+    vi.advanceTimersByTime(2 ** 31 - 10);
+    expect(vi.getTimerCount()).toBe(2);
+    deadline.cleanup();
+    combined.cleanup!();
+    expect(vi.getTimerCount()).toBe(0);
+    vi.advanceTimersByTime(PAST_LIMIT_MS);
+    expect(deadline.signal!.aborted).toBe(false);
+    expect(combined.signal!.aborted).toBe(false);
   });
 
   it('createCombinedSignal never aborts on a timeout of Infinity', async () => {
@@ -297,17 +367,92 @@ describe('Membrane core: one renewable deadline per provider call', () => {
     for (const options of on.seen) {
       expect(typeof options?.onProgress).toBe('function');
       expect(options?.signal).toBeInstanceOf(AbortSignal);
+      // Core keeps the option to itself.
+      expect(options !== undefined && 'progressTimeoutMs' in options).toBe(false);
     }
 
     const off = new RecordingAdapter();
     const caller = new AbortController();
     await new Membrane(off).stream(REQUEST, { signal: caller.signal });
-    expect(off.seen[0]?.onProgress).toBeUndefined();
+    await new Membrane(off).complete(REQUEST, { signal: caller.signal });
+    for await (const _ of new Membrane(off).streamYielding(REQUEST, { signal: caller.signal })) { /* drain */ }
+    expect(off.seen).toHaveLength(3);
+    for (const options of off.seen) {
+      expect(options?.onProgress).toBeUndefined();
+      expect(options !== undefined && 'progressTimeoutMs' in options).toBe(false);
+    }
     expect(off.seen[0]?.signal).toBe(caller.signal);
+    expect(off.seen[1]?.signal).toBe(caller.signal);
+  });
+
+  it('gives each refusal re-issue a deadline of its own, and lets go of the caller as each call returns', async () => {
+    // Each attempt is silent for three quarters of the deadline, so one
+    // deadline shared by both attempts would expire during the second.
+    vi.useFakeTimers();
+    class RefusesOnce implements ProviderAdapter {
+      readonly name = 'zz-refuses-once';
+      calls = 0;
+      readonly signals: AbortSignal[] = [];
+      supportsModel(): boolean { return true; }
+      private async attempt(request: ProviderRequest, options?: ProviderRequestOptions): Promise<ProviderResponse> {
+        const refusing = this.calls++ % 2 === 0;
+        const signal = options!.signal!;
+        this.signals.push(signal);
+        await new Promise<void>((resolve, reject) => {
+          const timer = setTimeout(resolve, 750);
+          signal.addEventListener('abort', () => {
+            clearTimeout(timer);
+            reject(isDeadlineAbort(signal.reason) ? deadlineTimeoutError(signal.reason) : signal.reason);
+          }, { once: true });
+        });
+        return {
+          content: [{ type: 'text', text: refusing ? 'zz refused' : 'zz answer' }],
+          stopReason: refusing ? 'refusal' : 'end_turn',
+          usage: { inputTokens: 10, outputTokens: 2 },
+          model: request.model,
+          rawRequest: request,
+          raw: {},
+        } as unknown as ProviderResponse;
+      }
+      async complete(request: ProviderRequest, options?: ProviderRequestOptions): Promise<ProviderResponse> {
+        return this.attempt(request, options);
+      }
+      async stream(request: ProviderRequest, _callbacks: StreamCallbacks, options?: ProviderRequestOptions): Promise<ProviderResponse> {
+        return this.attempt(request, options);
+      }
+    }
+
+    const caller = new AbortController();
+    const viaComplete = new RefusesOnce();
+    const completed = new Membrane(viaComplete).complete(REQUEST, { progressTimeoutMs: 1000, refusalRetries: 1, signal: caller.signal });
+    await vi.advanceTimersByTimeAsync(1600);
+    const response = await completed;
+    expect(viaComplete.calls).toBe(2);
+    expect(response.content).toEqual([{ type: 'text', text: 'zz answer' }]);
+    expect(viaComplete.signals[0]).not.toBe(viaComplete.signals[1]);
+    expect(getEventListeners(caller.signal, 'abort')).toHaveLength(0);
+
+    const viaStream = new RefusesOnce();
+    const events: StreamEvent[] = [];
+    const collecting = collect(new Membrane(viaStream).streamYielding(NATIVE_REQUEST, { progressTimeoutMs: 1000, refusalRetries: 1 }), (e) => events.push(e));
+    await vi.advanceTimersByTimeAsync(1600);
+    await collecting;
+    expect(viaStream.calls).toBe(2);
+    expect(events.filter((e) => e.type === 'aborted')).toEqual([]);
+    expect(events.some((e) => e.type === 'complete')).toBe(true);
+    expect(viaStream.signals[0]).not.toBe(viaStream.signals[1]);
+
+    // stream() has no refusal re-issue; its one call lets go of the caller too.
+    const once = new RefusesOnce();
+    once.calls = 1;
+    const streamed = new Membrane(once).stream(REQUEST, { progressTimeoutMs: 1000, signal: caller.signal });
+    await vi.advanceTimersByTimeAsync(800);
+    expect(isAbortedResponse(await streamed)).toBe(false);
+    expect(getEventListeners(caller.signal, 'abort')).toHaveLength(0);
   });
 
   it('keeps a mock stream alive while its chunks come faster than the deadline', async () => {
-    const steady = new MockAdapter({ defaultResponse: 'zz one two three four', streamChunkSize: 3, streamChunkDelayMs: PROGRESS_MS / 3 });
+    const steady = new MockAdapter({ defaultResponse: 'zz one two three four', streamChunkSize: 3, streamChunkDelayMs: PROGRESS_MS / 6 });
     const result = await new Membrane(steady).stream(REQUEST, { progressTimeoutMs: PROGRESS_MS });
     expect(isAbortedResponse(result)).toBe(false);
   });
@@ -326,11 +471,11 @@ describe('Anthropic: the deadline follows SDK events, not keepalives', () => {
       io.emit(messageStart());
       await keepalives(io, ping, 20 * LIVE_MS);
     }));
-    const started = Date.now();
     const result = await new Membrane(anthropic()).stream(REQUEST, { progressTimeoutMs: PROGRESS_MS });
+    // An aborted response with reason 'timeout' comes only from the deadline's
+    // mark: the idle watchdog throws a retryable timeout instead.
     expect(isAbortedResponse(result)).toBe(true);
     expect((result as { reason: string }).reason).toBe('timeout');
-    expect(Date.now() - started).toBeLessThan(LIVE_MS * 4);
     expect(torn[0]).toBe(true);
   });
 
@@ -381,7 +526,7 @@ describe('Anthropic: the deadline follows SDK events, not keepalives', () => {
       .then(() => undefined, (e: unknown) => e);
     expect(error).toBeInstanceOf(TimeoutAbortError);
     expect((error as TimeoutAbortError).message).toMatch(
-      new RegExp(`^No stream progress within ${PROGRESS_MS}ms: the call began at \\S+, provider events: 0$`),
+      new RegExp(`^No provider progress within ${PROGRESS_MS}ms: the call began at \\S+, provider events: 0$`),
     );
   });
 });

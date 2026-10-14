@@ -314,10 +314,11 @@ export interface ProviderRequestOptions {
    * Stream progress, for the progress deadline Membrane core keeps per
    * provider call (`progressTimeoutMs`). An adapter calls it once per parsed
    * provider event: each SDK event, each SSE data frame that parses, each
-   * decoded event-stream message. Never for keepalives (Anthropic `ping`), SSE
-   * comments or raw body bytes: those prove the connection is up, not that the
-   * model is making progress. Decorators must forward it with the other
-   * options; one that drops it turns the progress deadline into a total one.
+   * decoded event-stream message. Never for keepalives (Anthropic's and
+   * Bedrock's `ping`), SSE comments or raw body bytes: those prove the
+   * connection is up, not that the model is making progress. Decorators must
+   * forward it with the other options; one that drops it turns the progress
+   * deadline into a total one.
    */
   onProgress?: () => void;
   /** Report the final API request body immediately before sending it.
