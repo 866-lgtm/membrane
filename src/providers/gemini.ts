@@ -84,6 +84,14 @@ interface GeminiResponse {
      * prompt 35, candidates 2, thoughts 228, total 265 — 35+2+228 === 265.
      */
     thoughtsTokenCount?: number;
+    /**
+     * Tokens of the prompts Gemini's built-in tools add, such as code
+     * execution's intermediate tokens or URL context's retrieved pages.
+     * DISJOINT from promptTokenCount: Google defines totalTokenCount as
+     * "prompt + tool-use prompt + thoughts + response candidates"
+     * (UsageMetadata reference, read 2026-10-14).
+     */
+    toolUsePromptTokenCount?: number;
   };
   modelVersion?: string;
   promptFeedback?: { blockReason?: string; safetyRatings?: unknown[] };
@@ -111,20 +119,34 @@ interface GeminiStreamState {
  * reconciliation check makes the next such omission loud rather than silent:
  * Google's own total is the independent witness, and a mismatch means a
  * usageMetadata field membrane does not read is carrying tokens.
+ *
+ * `toolUsePromptTokenCount` is disjoint from `promptTokenCount` and is read
+ * into `inputTokens`: Google bills code execution's intermediate tokens, URL
+ * context's retrieved content and file search's retrieved documents as input.
+ * Grounding, with Google Search or Google Maps, is billed per query or per
+ * grounded prompt instead, which membrane doesn't price, and for text models
+ * Google doesn't say whether grounding's retrieved context is counted here or
+ * charged as input. If it is counted here and not charged, a grounded
+ * response's input is overstated. A grounded candidate carries
+ * `groundingMetadata`, but a response that used grounding and another tool
+ * reports one count, which can't be split. The adapter's `raw` keeps
+ * `usageMetadata` as Google sent it.
  */
 function geminiUsageToProviderUsage(
   usageMetadata: GeminiResponse['usageMetadata']
 ): ProviderResponse['usage'] {
   const promptTokens = usageMetadata?.promptTokenCount ?? 0;
+  const toolUsePromptTokens = usageMetadata?.toolUsePromptTokenCount ?? 0;
   const candidatesTokens = usageMetadata?.candidatesTokenCount ?? 0;
   const thoughtsTokens = usageMetadata?.thoughtsTokenCount;
   const totalTokens = usageMetadata?.totalTokenCount;
 
   if (usageMetadata && totalTokens != null) {
-    const accountedTokens = promptTokens + candidatesTokens + (thoughtsTokens ?? 0);
+    const accountedTokens = promptTokens + toolUsePromptTokens + candidatesTokens + (thoughtsTokens ?? 0);
     if (accountedTokens !== totalTokens) {
       console.warn(
         `[membrane:gemini] usageMetadata does not reconcile: promptTokenCount(${promptTokens})`
+        + ` + toolUsePromptTokenCount(${toolUsePromptTokens})`
         + ` + candidatesTokenCount(${candidatesTokens}) + thoughtsTokenCount(${thoughtsTokens ?? 0})`
         + ` = ${accountedTokens}, but totalTokenCount = ${totalTokens}.`
         + ' Some billed tokens are in a usageMetadata field membrane does not read.'
@@ -133,7 +155,7 @@ function geminiUsageToProviderUsage(
   }
 
   return {
-    inputTokens: promptTokens,
+    inputTokens: promptTokens + toolUsePromptTokens,
     outputTokens: candidatesTokens + (thoughtsTokens ?? 0),
     ...(thoughtsTokens != null ? { thinkingTokens: thoughtsTokens } : {}),
     cacheReadTokens: usageMetadata?.cachedContentTokenCount
