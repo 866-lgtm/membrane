@@ -910,7 +910,8 @@ export class BedrockAdapter implements ProviderAdapter {
           // A block content_block_stop finalized keeps what it set there. One
           // the stream left open keeps the input content_block_start carried,
           // and whatever argument text arrived marks it, none included, as in
-          // the Anthropic adapter: its arguments never finished arriving.
+          // the Anthropic adapter: the call never finished, so nothing says
+          // its arguments were complete, even text that parses.
           const unparseableInput = stoppedBlocks.has(blockIdx) ? tb.unparseableInput : (tb.partialJson ?? '');
           return {
             type: 'tool_use', id: tb.id, name: tb.name, input: tb.input ?? {},

@@ -199,15 +199,15 @@ function notAnObject(raw: string, value: unknown): ToolUseInput {
  * it. Text that doesn't parse, or parses to anything but an object (null, a
  * number, a string, a boolean or an array), isn't the model's arguments as an
  * object: `input` is then `{}`, and `unparseableInput` keeps the text as it
- * came. No text, or text that is empty or only whitespace, is a call with no
- * arguments: `{}`, unmarked. Arguments a server sent as something other than
- * text, outside its wire's spec, are read as toolUseInputFromValue reads a
- * value, so a null field is a call with no arguments and the marker is always
- * text.
+ * came. No text (the field absent or null), or text that is empty or only
+ * JSON whitespace, is a call with no arguments: `{}`, unmarked. An arguments
+ * field that isn't text at all, outside its wire's spec, is read as
+ * toolUseInputFromValue reads a value, so the marker is always text.
  */
 export function toolUseInputFromText(text: unknown): ToolUseInput {
+  if (text === undefined || text === null) return { input: {} };
   if (typeof text !== 'string') return toolUseInputFromValue(text);
-  if (text.trim() === '') return { input: {} };
+  if (/^[ \t\n\r]*$/.test(text)) return { input: {} };
   let parsed: unknown;
   try {
     parsed = JSON.parse(text);
@@ -222,12 +222,12 @@ export function toolUseInputFromText(text: unknown): ToolUseInput {
 /**
  * As toolUseInputFromText, for arguments sent as a value: Gemini's
  * `functionCall.args`, Anthropic's and Bedrock's `input`, and the `input` an
- * adapter hands Membrane. No value, absent or null, is a call with no
- * arguments (proto3's JSON mapping, Gemini's, reads a null field as unset). A
- * value that isn't an object is kept, as JSON, in `unparseableInput`.
+ * adapter hands Membrane. No value is a call with no arguments. A value that
+ * isn't an object, `null` included, is kept, as JSON, in `unparseableInput`;
+ * a wire that means "unset" by null says so where it calls this (Gemini).
  */
 export function toolUseInputFromValue(value: unknown): ToolUseInput {
-  if (value === undefined || value === null) return { input: {} };
+  if (value === undefined) return { input: {} };
   return isPlainObject(value) ? { input: value } : notAnObject(JSON.stringify(value), value);
 }
 

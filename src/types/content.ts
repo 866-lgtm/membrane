@@ -128,15 +128,17 @@ export interface ToolUseContent {
    * Present when the argument text a provider sent didn't parse, or parsed to
    * something other than an object (null, a number, a string, a boolean or an
    * array), and when an Anthropic or Bedrock stream ended before a call's
-   * arguments finished arriving. A call truncated mid-arguments (max_tokens)
-   * is the usual cause. Where arguments come as a value rather than text
-   * (Gemini's, or an `input` that isn't an object), it holds that value as
-   * JSON. `input` then holds whatever the provider's start event carried, or
-   * `{}`: a wire-valid tool call with empty arguments, indistinguishable from
-   * a genuine no-arg call once it is written to durable history. Presence of
-   * this field means `input` is NOT the model's arguments, so a consumer can
-   * refuse the block (or attempt its own repair) instead of trusting a
-   * plausible `{}`. The call's ToolCall carries it too.
+   * block finished (no content_block_stop), whatever had arrived of its
+   * arguments, even nothing: then it is the empty string. A call truncated by
+   * max_tokens is the usual cause. Where arguments come as a value rather
+   * than text (Gemini's, or an `input` that isn't an object), it holds that
+   * value as JSON. `input` is then `{}`, or for a streamed Anthropic or
+   * Bedrock call whatever its content_block_start carried: a wire-valid tool
+   * call with empty arguments, indistinguishable from a genuine no-arg call
+   * once it is written to durable history. Presence of this field, the empty
+   * string included, means `input` is NOT the model's arguments, so a
+   * consumer can refuse the block (or attempt its own repair) instead of
+   * trusting a plausible `{}`. The call's ToolCall carries it too.
    */
   unparseableInput?: string;
 

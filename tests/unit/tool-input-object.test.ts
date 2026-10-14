@@ -54,7 +54,8 @@ const openAICall = (args: string) => ({
   tool_calls: [{ id: 'call_zz', type: 'function' as const, function: { name: 'zz_tool', arguments: args } }],
 });
 
-// toStrictEqual throughout: a marker key set to undefined is a defect too.
+// The helper tests compare with toStrictEqual: a marker key set to undefined
+// is a defect too.
 describe('toolUseInputFromText', () => {
   it('keeps arguments that are a JSON object, unmarked', () => {
     expect(toolUseInputFromText('{"a":1}')).toStrictEqual({ input: { a: 1 } });
@@ -78,6 +79,10 @@ describe('toolUseInputFromText', () => {
     expect(logged).not.toContain('fld1');
   });
 
+  it('reads whitespace JSON does not allow as text that does not parse', () => {
+    expect(toolUseInputFromText('\u00a0')).toStrictEqual({ input: {}, unparseableInput: '\u00a0' });
+  });
+
   it('reads arguments that are not text as a value, and a null field as no arguments', () => {
     expect(toolUseInputFromText(null)).toStrictEqual({ input: {} });
     expect(toolUseInputFromText({ a: 1 })).toStrictEqual({ input: { a: 1 } });
@@ -87,14 +92,13 @@ describe('toolUseInputFromText', () => {
 });
 
 describe('toolUseInputFromValue', () => {
-  it('keeps an object, and reads no value, absent or null, as no arguments', () => {
+  it('keeps an object, and reads no value as no arguments', () => {
     expect(toolUseInputFromValue({ a: 1 })).toStrictEqual({ input: { a: 1 } });
     expect(toolUseInputFromValue(undefined)).toStrictEqual({ input: {} });
-    expect(toolUseInputFromValue(null)).toStrictEqual({ input: {} });
     expect(console.warn).not.toHaveBeenCalled();
   });
 
-  it.each([42, 'zz', true, [1, 2]])('gives {} and keeps %j as JSON', (value) => {
+  it.each([null, 42, 'zz', true, [1, 2]])('gives {} and keeps %j as JSON', (value) => {
     expect(toolUseInputFromValue(value)).toStrictEqual({ input: {}, unparseableInput: JSON.stringify(value) });
   });
 });
@@ -173,6 +177,24 @@ describe('OpenAI Responses API', () => {
     );
     expect(toolUseOf(res.content)).toMatchObject({ id: 'call_zz', input: {}, unparseableInput: '[1,2]' });
   });
+
+  it.each([
+    [{ a: 1 }, { a: 1 }, undefined],
+    [42, {}, '42'],
+  ])('reads a function call whose arguments field %j is not text as a value', async (args, input, marker) => {
+    stubFetchWithJson({
+      status: 'completed',
+      output: [{ type: 'function_call', id: 'fc_zz', call_id: 'call_zz', name: 'zz_tool', arguments: args }],
+      usage: { input_tokens: 1, output_tokens: 1 },
+    });
+    const res: any = await new OpenAIResponsesAPIAdapter({ apiKey: 'zz-key' }).complete(
+      { model: 'gpt-zz', maxTokens: 64, messages: [{ role: 'user', content: 'zz prompt' }] } as any,
+    );
+    const toolUse = toolUseOf(res.content);
+    expect(toolUse.input).toStrictEqual(input);
+    expect(toolUse.unparseableInput).toBe(marker);
+    expect('unparseableInput' in toolUse).toBe(marker !== undefined);
+  });
 });
 
 describe('Gemini', () => {
@@ -189,9 +211,12 @@ describe('Gemini', () => {
     expect(toolUse).not.toHaveProperty('unparseableInput');
   });
 
-  it('fromGeminiParts marks args that are not an object', () => {
+  it('fromGeminiParts marks args that are not an object, and reads null args as unset', () => {
     const toolUse = toolUseOf(fromGeminiParts([{ functionCall: { name: 'zz_tool', args: [1, 2] as any } }]));
     expect(toolUse).toMatchObject({ name: 'zz_tool', input: {}, unparseableInput: '[1,2]' });
+    const unset = toolUseOf(fromGeminiParts([{ functionCall: { name: 'zz_tool', args: null as any } }]));
+    expect(unset.input).toStrictEqual({});
+    expect(unset).not.toHaveProperty('unparseableInput');
   });
 
   it.each([
@@ -244,9 +269,12 @@ describe('Anthropic stream', () => {
     expect(toolUseOf(res.content)).toMatchObject({ id: 'toolu_zz', input: {}, unparseableInput: 'null' });
   });
 
-  it('fromAnthropicContent gives an input that is not an object as {}, marked', () => {
-    const toolUse = toolUseOf(fromAnthropicContent([{ type: 'tool_use', id: 'toolu_zz', name: 'zz_tool', input: 'zz' } as any]));
-    expect(toolUse).toStrictEqual({ type: 'tool_use', id: 'toolu_zz', name: 'zz_tool', input: {}, unparseableInput: '"zz"' });
+  it.each([
+    ['zz', '"zz"'],
+    [null, 'null'],
+  ])('fromAnthropicContent gives an input %j that is not an object as {}, marked', (input, marker) => {
+    const toolUse = toolUseOf(fromAnthropicContent([{ type: 'tool_use', id: 'toolu_zz', name: 'zz_tool', input } as any]));
+    expect(toolUse).toStrictEqual({ type: 'tool_use', id: 'toolu_zz', name: 'zz_tool', input: {}, unparseableInput: marker });
   });
 });
 
@@ -305,6 +333,32 @@ describe('Bedrock stream', () => {
     expect(toolUseOf(res.content)).toEqual({ type: 'tool_use', id: 'toolu_zz', name: 'zz_tool', input: {}, unparseableInput: '' });
   });
 
+  it('tells a stopped call from one the stream left open by its index, in one response', async () => {
+    const frames = [
+      chunkFrame({ type: 'message_start', message: { usage: { input_tokens: 10 } } }),
+      chunkFrame({ type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } }),
+      chunkFrame({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'zz text' } }),
+      chunkFrame({ type: 'content_block_stop', index: 0 }),
+      chunkFrame({ type: 'content_block_start', index: 1, content_block: { type: 'tool_use', id: 'toolu_zz1', name: 'zz_tool', input: {} } }),
+      chunkFrame({ type: 'content_block_delta', index: 1, delta: { type: 'input_json_delta', partial_json: '{"a":1}' } }),
+      chunkFrame({ type: 'content_block_stop', index: 1 }),
+      chunkFrame({ type: 'content_block_start', index: 2, content_block: { type: 'tool_use', id: 'toolu_zz2', name: 'zz_tool', input: {} } }),
+      chunkFrame({ type: 'content_block_delta', index: 2, delta: { type: 'input_json_delta', partial_json: '{"b":' } }),
+      chunkFrame({ type: 'message_delta', delta: { stop_reason: 'max_tokens' }, usage: { output_tokens: 5 } }),
+      chunkFrame({ type: 'message_stop' }),
+    ];
+    vi.stubGlobal('fetch', vi.fn(async () => ({ ok: true, status: 200, body: streamBody(frames) })));
+    const adapter = new BedrockAdapter({ accessKeyId: 'zz-key', secretAccessKey: 'zz-secret', region: 'us-west-2' });
+    const res: any = await adapter.stream(
+      { model: 'anthropic.claude-zz-v1:0', messages: [{ role: 'user', content: 'zz prompt' }], maxTokens: 64 } as any,
+      { onChunk: () => {} } as any,
+    );
+    expect(res.content.filter((b: any) => b.type === 'tool_use')).toStrictEqual([
+      { type: 'tool_use', id: 'toolu_zz1', name: 'zz_tool', input: { a: 1 } },
+      { type: 'tool_use', id: 'toolu_zz2', name: 'zz_tool', input: {}, unparseableInput: '{"b":' },
+    ]);
+  });
+
   it('gives a completion\'s input that is not an object as {}, marked', async () => {
     stubFetchWithJson({
       id: 'msg_zz', type: 'message', role: 'assistant', model: 'anthropic.claude-zz-v1:0', stop_reason: 'tool_use',
@@ -319,12 +373,13 @@ describe('Bedrock stream', () => {
   });
 });
 
-/** An adapter that answers with one tool_use block, as given, and then with text. */
-function adapterAnswering(block: Record<string, unknown>): ProviderAdapter {
+/** An adapter that answers with these tool_use blocks (id call_zz and name
+ *  zz_tool unless given), and then with text. */
+function adapterAnsweringAll(blocks: Record<string, unknown>[]): ProviderAdapter {
   let calls = 0;
   const response = (): ProviderResponse => ({
     ...(calls++ === 0
-      ? { content: [{ type: 'tool_use', id: 'call_zz', name: 'zz_tool', ...block }], stopReason: 'tool_use' }
+      ? { content: blocks.map((block) => ({ type: 'tool_use', id: 'call_zz', name: 'zz_tool', ...block })), stopReason: 'tool_use' }
       : { content: [{ type: 'text', text: 'zz done' }], stopReason: 'end_turn' }),
     stopSequence: undefined,
     usage: { inputTokens: 1, outputTokens: 1 },
@@ -342,6 +397,8 @@ function adapterAnswering(block: Record<string, unknown>): ProviderAdapter {
   } as unknown as ProviderAdapter;
 }
 
+const adapterAnswering = (block: Record<string, unknown>): ProviderAdapter => adapterAnsweringAll([block]);
+
 const membraneRequest = {
   messages: [{ participant: 'User', content: [{ type: 'text', text: 'zz prompt' }] }],
   toolMode: 'native',
@@ -355,10 +412,13 @@ describe('Membrane', () => {
     expect(res.content.find((b) => b.type === 'tool_use')).toMatchObject({ input: {}, unparseableInput: 'null' });
   });
 
-  it('complete gives an adapter\'s input that is not an object as {}, marked, in content and toolCalls', async () => {
-    const res: any = await new Membrane(adapterAnswering({ input: 'zz' })).complete(membraneRequest);
-    expect(res.content.find((b: any) => b.type === 'tool_use')).toMatchObject({ input: {}, unparseableInput: '"zz"' });
-    expect(res.toolCalls).toStrictEqual([{ id: 'call_zz', name: 'zz_tool', input: {}, unparseableInput: '"zz"' }]);
+  it.each([
+    ['zz', '"zz"'],
+    [null, 'null'],
+  ])('complete gives an adapter\'s input %j that is not an object as {}, marked, in content and toolCalls', async (input, marker) => {
+    const res: any = await new Membrane(adapterAnswering({ input })).complete(membraneRequest);
+    expect(res.content.find((b: any) => b.type === 'tool_use')).toMatchObject({ input: {}, unparseableInput: marker });
+    expect(res.toolCalls).toStrictEqual([{ id: 'call_zz', name: 'zz_tool', input: {}, unparseableInput: marker }]);
   });
 
   it('keeps the adapter\'s own marker over the JSON of an input that is not an object', async () => {
@@ -406,5 +466,38 @@ describe('ToolCall carries the marker to whoever runs the call', () => {
     expect((await new Membrane(adapterAnswering(marked)).complete(membraneRequest)).toolCalls).toEqual([markedCall]);
     expect((await new Membrane(adapterAnswering({ input: { a: 1 } })).complete(membraneRequest)).toolCalls)
       .toEqual([{ id: 'call_zz', name: 'zz_tool', input: { a: 1 } }]);
+  });
+
+  it('keeps the empty marker of a call cut before any arguments arrived', async () => {
+    const cut = { input: {}, unparseableInput: '' };
+    const cutCall = { id: 'call_zz', name: 'zz_tool', input: {}, unparseableInput: '' };
+    const seen: ToolCall[] = [];
+    await new Membrane(adapterAnswering(cut)).stream(membraneRequest, {
+      onToolCalls: async (calls) => { seen.push(...calls); return refuse(calls); },
+    });
+    expect(seen).toStrictEqual([cutCall]);
+    expect((await new Membrane(adapterAnswering(cut)).complete(membraneRequest)).toolCalls).toStrictEqual([cutCall]);
+  });
+
+  it('marks only the call whose block is marked, in a round of two', async () => {
+    const blocks = [{ id: 'call_zz1', input: { a: 1 } }, { id: 'call_zz2', input: {}, unparseableInput: '{"b":' }];
+    const expected = [
+      { id: 'call_zz1', name: 'zz_tool', input: { a: 1 } },
+      { id: 'call_zz2', name: 'zz_tool', input: {}, unparseableInput: '{"b":' },
+    ];
+    const seen: ToolCall[] = [];
+    await new Membrane(adapterAnsweringAll(blocks)).stream(membraneRequest, {
+      onToolCalls: async (calls) => { seen.push(...calls); return refuse(calls); },
+    });
+    expect(seen).toStrictEqual(expected);
+    const stream = new Membrane(adapterAnsweringAll(blocks)).streamYielding(membraneRequest);
+    const yielded: ToolCall[] = [];
+    for await (const event of stream) {
+      if (event.type === 'tool-calls') {
+        yielded.push(...event.calls);
+        stream.provideToolResults(refuse(event.calls));
+      }
+    }
+    expect(yielded).toStrictEqual(expected);
   });
 });
