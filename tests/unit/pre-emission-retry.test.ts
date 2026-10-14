@@ -1,0 +1,552 @@
+/**
+ * A provider call that fails with a 529 or a 429 before it delivers anything
+ * is sent again, by every streaming entry point and in every round of a tool
+ * loop: nothing from it reached the caller, so retrying replays nothing.
+ *
+ *  - streamYielding() retries on the native and XML paths, yielding one
+ *    `backoff` event per wait; cancel() and the caller's signal end the wait.
+ *  - stream() retries a later round's call too, where it used to end the turn.
+ *  - The error membrane ends with says how many times it sent the request
+ *    (`attempts`), on complete(), stream() and streamYielding().
+ *  - `retryRateLimits: false` leaves a 429 to the caller on all three.
+ */
+
+import { describe, it, expect } from 'vitest';
+import { Membrane } from '../../src/membrane.js';
+import { MockAdapter } from '../../src/providers/mock.js';
+import { NativeFormatter } from '../../src/formatters/native.js';
+import { MembraneError, serverError } from '../../src/types/errors.js';
+import type {
+  NormalizedRequest,
+  ProviderAdapter,
+  ProviderRequest,
+  ProviderRequestOptions,
+  ProviderResponse,
+  StreamCallbacks,
+  StreamEvent,
+  ToolDefinition,
+} from '../../src/types/index.js';
+import type { BackoffEvent } from '../../src/types/yielding-stream.js';
+
+const zzTool: ToolDefinition = {
+  name: 'zz_tool',
+  description: 'zz no-op',
+  inputSchema: { type: 'object', properties: {} },
+};
+
+const overloaded529 = () => serverError('zz overloaded', 529);
+const rateLimited429 = (retryAfterMs?: number) =>
+  new MembraneError({
+    type: 'rate_limit',
+    message: 'zz slow down',
+    retryable: true,
+    httpStatus: 429,
+    providerErrorCode: 'rate_limit_exceeded',
+    ...(retryAfterMs !== undefined ? { retryAfterMs } : {}),
+    rawError: undefined,
+  });
+
+/**
+ * One provider call each: a failure (after an optional chunk), or a response
+ * with optional text and an optional tool call.
+ */
+type Step =
+  | { fail: () => Error; emitFirst?: string }
+  | { refuse: string }
+  | { text?: string; toolCall?: string };
+
+/** Native-mode adapter that plays a script, one step per provider call. */
+class ScriptedNativeAdapter implements ProviderAdapter {
+  readonly name = 'zz-scripted';
+  sends = 0;
+  constructor(private steps: Step[]) {}
+
+  supportsModel(): boolean {
+    return true;
+  }
+
+  private next(): Step {
+    this.sends++;
+    const step = this.steps.shift();
+    if (!step) throw new Error('zz script ran out');
+    return step;
+  }
+
+  private respond(step: { text?: string; toolCall?: string } | { refuse: string }): ProviderResponse {
+    if ('refuse' in step) {
+      return {
+        content: [{ type: 'text', text: step.refuse }],
+        stopReason: 'refusal',
+        usage: { inputTokens: 1, outputTokens: 1 },
+        raw: { response: { stop_reason: 'refusal' } },
+      } as unknown as ProviderResponse;
+    }
+    const content: unknown[] = [];
+    if (step.text) content.push({ type: 'text', text: step.text });
+    if (step.toolCall) content.push({ type: 'tool_use', id: step.toolCall, name: 'zz_tool', input: {} });
+    return {
+      content,
+      stopReason: step.toolCall ? 'tool_use' : 'end_turn',
+      usage: { inputTokens: 1, outputTokens: 1 },
+      raw: {},
+    } as unknown as ProviderResponse;
+  }
+
+  async complete(_request: ProviderRequest, _options?: ProviderRequestOptions): Promise<ProviderResponse> {
+    const step = this.next();
+    if ('fail' in step) throw step.fail();
+    return this.respond(step);
+  }
+
+  async stream(
+    _request: ProviderRequest,
+    callbacks: StreamCallbacks,
+    _options?: ProviderRequestOptions,
+  ): Promise<ProviderResponse> {
+    const step = this.next();
+    if ('fail' in step) {
+      if (step.emitFirst) callbacks.onChunk(step.emitFirst);
+      throw step.fail();
+    }
+    if ('refuse' in step) callbacks.onChunk(step.refuse);
+    else if (step.text) callbacks.onChunk(step.text);
+    return this.respond(step);
+  }
+}
+
+/** XML-mode adapter: MockAdapter's text responses, with scripted failures first. */
+class FlakyXmlAdapter extends MockAdapter {
+  sends = 0;
+  constructor(private failAt: Map<number, () => Error>) {
+    super();
+  }
+
+  override async stream(
+    request: ProviderRequest,
+    callbacks: StreamCallbacks,
+    options?: ProviderRequestOptions,
+  ): Promise<ProviderResponse> {
+    this.sends++;
+    const fail = this.failAt.get(this.sends);
+    if (fail) throw fail();
+    return super.stream(request, callbacks, options);
+  }
+}
+
+const NATIVE_REQUEST: NormalizedRequest = {
+  messages: [{ participant: 'User', content: [{ type: 'text', text: 'zz go' }] }],
+  config: { model: 'zz-model', maxTokens: 100 },
+  tools: [zzTool],
+};
+
+const XML_REQUEST: NormalizedRequest = { ...NATIVE_REQUEST, toolMode: 'xml' };
+
+const XML_TOOL_CALL =
+  'zz before\n<function_calls><invoke name="zz_tool"><parameter name="i">1</parameter></invoke></function_calls>';
+
+/**
+ * Distinct schedules, so a wait shows which one it was drawn from: the
+ * overloaded one is jittered into [20, 40), the base one is exactly 3.
+ */
+const SCHEDULES = {
+  retry: {
+    retryDelayMs: 3,
+    maxRetryDelayMs: 3,
+    backoffMultiplier: 1,
+    overloaded: { maxRetries: 4, retryDelayMs: 40, maxRetryDelayMs: 40, backoffMultiplier: 1 },
+  },
+};
+
+const native = (adapter: ProviderAdapter, config: object = SCHEDULES) =>
+  new Membrane(adapter, { formatter: new NativeFormatter(), ...config });
+
+/** Drive a yielding stream to its end, answering every tool round. */
+async function drive(
+  stream: ReturnType<Membrane['streamYielding']>,
+  onEvent?: (event: StreamEvent) => void,
+): Promise<StreamEvent[]> {
+  const events: StreamEvent[] = [];
+  for await (const event of stream) {
+    events.push(event);
+    onEvent?.(event);
+    if (event.type === 'tool-calls') {
+      stream.provideToolResults(event.calls.map((c) => ({ toolUseId: c.id, content: 'zz ok' })));
+    }
+  }
+  return events;
+}
+
+const ofType = <T extends StreamEvent['type']>(events: StreamEvent[], type: T) =>
+  events.filter((e): e is Extract<StreamEvent, { type: T }> => e.type === type);
+
+/** The visible text the consumer received. */
+const tokensOf = (events: StreamEvent[]) =>
+  ofType(events, 'tokens').filter((e) => e.meta?.type === 'text').map((e) => e.content).join('');
+
+describe('streamYielding() retries a call that failed before it delivered anything', () => {
+  it('native: a 529 is retried on the overloaded schedule, one backoff event per wait', async () => {
+    const adapter = new ScriptedNativeAdapter([
+      { fail: overloaded529 },
+      { fail: overloaded529 },
+      { text: 'zz recovered' },
+    ]);
+    const events = await drive(native(adapter).streamYielding(NATIVE_REQUEST));
+
+    expect(adapter.sends).toBe(3);
+    const backoffs = ofType(events, 'backoff');
+    expect(backoffs.map((e) => [e.reason, e.attempt, e.maxAttempts])).toEqual([
+      ['overloaded', 1, 3],
+      ['overloaded', 2, 3],
+    ]);
+    for (const e of backoffs) {
+      expect(e.delayMs).toBeGreaterThanOrEqual(20);
+      expect(e.delayMs).toBeLessThan(40);
+      expect(e.error).toBeInstanceOf(MembraneError);
+      expect((e.error as MembraneError).httpStatus).toBe(529);
+    }
+    // The failed calls delivered nothing, so the text arrives once.
+    expect(tokensOf(events)).toBe('zz recovered');
+    const [complete] = ofType(events, 'complete');
+    expect(complete!.response.details.timing.attempts).toBe(3);
+    expect(complete!.response.details.timing.retryDelaysMs).toEqual(backoffs.map((e) => e.delayMs));
+  });
+
+  it('XML: a 529 is retried the same way', async () => {
+    const adapter = new FlakyXmlAdapter(new Map([[1, overloaded529]]));
+    adapter.queueResponse('zz recovered');
+    const events = await drive(new Membrane(adapter, SCHEDULES).streamYielding(XML_REQUEST));
+
+    expect(adapter.sends).toBe(2);
+    expect(ofType(events, 'backoff').map((e) => [e.reason, e.attempt])).toEqual([['overloaded', 1]]);
+    expect(tokensOf(events)).toBe('zz recovered');
+    const [complete] = ofType(events, 'complete');
+    expect(complete!.response.details.timing.attempts).toBe(2);
+    expect(complete!.response.details.timing.retryDelaysMs).toHaveLength(1);
+  });
+
+  it('a 429 is retried on the base schedule', async () => {
+    const adapter = new ScriptedNativeAdapter([{ fail: () => rateLimited429() }, { text: 'zz ok' }]);
+    const events = await drive(native(adapter).streamYielding(NATIVE_REQUEST));
+
+    expect(adapter.sends).toBe(2);
+    // The base schedule, unjittered, and the 429 floor of five attempts.
+    expect(ofType(events, 'backoff').map((e) => [e.reason, e.attempt, e.maxAttempts, e.delayMs])).toEqual([
+      ['rate_limit', 1, 4, 3],
+    ]);
+    expect(ofType(events, 'complete')).toHaveLength(1);
+  });
+
+  it('a call that has delivered something is not retried', async () => {
+    const adapter = new ScriptedNativeAdapter([{ fail: overloaded529, emitFirst: 'zz partial ' }, { text: 'zz never' }]);
+    const events = await drive(native(adapter).streamYielding(NATIVE_REQUEST));
+
+    expect(adapter.sends).toBe(1);
+    expect(ofType(events, 'backoff')).toHaveLength(0);
+    expect(tokensOf(events)).toBe('zz partial ');
+    const [error] = ofType(events, 'error');
+    expect(error!.error).toMatchObject({ httpStatus: 529, attempts: 1 });
+  });
+
+  it('native: a later round is retried too, and the earlier round stands', async () => {
+    const adapter = new ScriptedNativeAdapter([
+      { text: 'zz round one', toolCall: 'zz_call_1' },
+      { fail: overloaded529 },
+      { text: 'zz round two' },
+    ]);
+    const events = await drive(native(adapter).streamYielding(NATIVE_REQUEST));
+
+    expect(adapter.sends).toBe(3);
+    expect(ofType(events, 'tool-calls')).toHaveLength(1);
+    expect(ofType(events, 'backoff').map((e) => e.attempt)).toEqual([1]);
+    expect(tokensOf(events)).toBe('zz round onezz round two');
+    const [complete] = ofType(events, 'complete');
+    expect(complete!.response.details.timing).toMatchObject({ attempts: 3, rounds: 2 });
+  });
+
+  it('XML: a later round is retried too', async () => {
+    const adapter = new FlakyXmlAdapter(new Map([[2, overloaded529]]));
+    adapter.queueResponses([XML_TOOL_CALL, 'zz round two']);
+    const events = await drive(new Membrane(adapter, SCHEDULES).streamYielding(XML_REQUEST));
+
+    expect(adapter.sends).toBe(3);
+    expect(ofType(events, 'tool-calls')).toHaveLength(1);
+    expect(ofType(events, 'backoff')).toHaveLength(1);
+    expect(tokensOf(events)).toContain('zz round two');
+    expect(tokensOf(events).match(/zz round two/g)).toHaveLength(1);
+    expect(ofType(events, 'complete')).toHaveLength(1);
+  });
+
+  it('gives up after the schedule, and the error says how many times it sent the request', async () => {
+    const adapter = new ScriptedNativeAdapter(Array.from({ length: 10 }, () => ({ fail: overloaded529 })));
+    const events = await drive(native(adapter).streamYielding(NATIVE_REQUEST));
+
+    // overloaded.maxRetries bounds the attempts in all.
+    expect(adapter.sends).toBe(4);
+    expect(ofType(events, 'backoff')).toHaveLength(3);
+    const [error] = ofType(events, 'error');
+    expect(error!.error).toMatchObject({ httpStatus: 529, attempts: 4 });
+  });
+
+  it('consults hooks.onError before each wait, and its abort ends the stream', async () => {
+    const adapter = new ScriptedNativeAdapter([{ fail: overloaded529 }, { text: 'zz never' }]);
+    const seen: number[] = [];
+    const membrane = native(adapter, {
+      ...SCHEDULES,
+      hooks: { onError: (_info: unknown, attempt: number) => { seen.push(attempt); return 'abort' as const; } },
+    });
+    const events = await drive(membrane.streamYielding(NATIVE_REQUEST));
+
+    expect(seen).toEqual([1]);
+    expect(adapter.sends).toBe(1);
+    expect(ofType(events, 'backoff')).toHaveLength(0);
+    expect(ofType(events, 'error')[0]!.error).toMatchObject({ httpStatus: 529, attempts: 1 });
+  });
+});
+
+describe('the backoff wait ends when the stream is stopped', () => {
+  const SLOW = { retry: { overloaded: { maxRetries: 5, retryDelayMs: 400, maxRetryDelayMs: 400, backoffMultiplier: 1 } } };
+
+  it('cancel() during the wait ends the stream with aborted, and nothing is sent again', async () => {
+    const adapter = new ScriptedNativeAdapter([{ fail: overloaded529 }, { text: 'zz never' }]);
+    const stream = native(adapter, SLOW).streamYielding(NATIVE_REQUEST);
+    const started = Date.now();
+    const events = await drive(stream, (event) => { if (event.type === 'backoff') stream.cancel(); });
+
+    expect(Date.now() - started).toBeLessThan(200);
+    expect(events.map((e) => e.type)).toEqual(['backoff', 'aborted']);
+    expect(ofType(events, 'aborted')[0]!.reason).toBe('user');
+    // Give a stray timer the time it would have needed.
+    await new Promise((resolve) => setTimeout(resolve, 450));
+    expect(adapter.sends).toBe(1);
+  });
+
+  it('cancel() while onError decides: no backoff event after aborted, and nothing sent again', async () => {
+    const adapter = new ScriptedNativeAdapter([{ fail: overloaded529 }, { text: 'zz never' }]);
+    let stream!: ReturnType<Membrane['streamYielding']>;
+    const membrane = native(adapter, {
+      ...SLOW,
+      hooks: {
+        onError: async () => {
+          stream.cancel();
+          await new Promise((resolve) => setTimeout(resolve, 20));
+          return 'retry' as const;
+        },
+      },
+    });
+    stream = membrane.streamYielding(NATIVE_REQUEST);
+    // Start the stream, and read it only once the runner is past onError: a
+    // consumer that hasn't drained sees whatever was queued after `aborted`.
+    const iterator = stream[Symbol.asyncIterator]();
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    const events: StreamEvent[] = [];
+    for (;;) {
+      const { value, done } = await iterator.next();
+      if (done) break;
+      events.push(value);
+    }
+
+    expect(events.map((e) => e.type)).toEqual(['aborted']);
+    expect(adapter.sends).toBe(1);
+  });
+
+  it("the caller's signal during the wait does the same", async () => {
+    const adapter = new ScriptedNativeAdapter([{ fail: overloaded529 }, { text: 'zz never' }]);
+    const controller = new AbortController();
+    const stream = native(adapter, SLOW).streamYielding(NATIVE_REQUEST, { signal: controller.signal });
+    const events = await drive(stream, (event) => { if (event.type === 'backoff') controller.abort(); });
+
+    expect(events.map((e) => e.type)).toEqual(['backoff', 'aborted']);
+    await new Promise((resolve) => setTimeout(resolve, 450));
+    expect(adapter.sends).toBe(1);
+  });
+
+  it("stream(): the caller's signal in a later round's wait returns what the earlier round delivered", async () => {
+    const adapter = new ScriptedNativeAdapter([
+      { text: 'zz round one', toolCall: 'zz_call_1' },
+      { fail: overloaded529 },
+      { text: 'zz never' },
+    ]);
+    const controller = new AbortController();
+    const result = await native(adapter, SLOW).stream(NATIVE_REQUEST, {
+      signal: controller.signal,
+      onToolCalls: async (calls) => {
+        setTimeout(() => controller.abort(), 50);
+        return calls.map((c) => ({ toolUseId: c.id, content: 'zz ok' }));
+      },
+    });
+
+    expect(result).toMatchObject({ aborted: true, reason: 'user', rawAssistantText: 'zz round one' });
+    expect((result as { toolCalls?: unknown[] }).toolCalls).toHaveLength(1);
+    expect(adapter.sends).toBe(2);
+  });
+});
+
+describe('stream() retries a later round the same way', () => {
+  it('a 529 on the call after a tool round is retried, where it used to end the turn', async () => {
+    const adapter = new ScriptedNativeAdapter([
+      { text: 'zz round one', toolCall: 'zz_call_1' },
+      { fail: overloaded529 },
+      { text: 'zz round two' },
+    ]);
+    const chunks: string[] = [];
+    const result = await native(adapter).stream(NATIVE_REQUEST, {
+      onChunk: (text, meta) => { if (meta?.type === 'text') chunks.push(text); },
+      onToolCalls: async (calls) => calls.map((c) => ({ toolUseId: c.id, content: 'zz ok' })),
+    });
+
+    expect(adapter.sends).toBe(3);
+    expect(chunks.join('')).toBe('zz round onezz round two');
+    expect('details' in result && result.details.timing).toMatchObject({ attempts: 3, rounds: 2 });
+    expect('details' in result && result.details.timing.retryDelaysMs).toHaveLength(1);
+  });
+});
+
+describe('the error says how many times membrane sent the request', () => {
+  it('complete(): every send, retries included', async () => {
+    const adapter = new ScriptedNativeAdapter(Array.from({ length: 10 }, () => ({ fail: overloaded529 })));
+    await expect(native(adapter).complete(NATIVE_REQUEST)).rejects.toMatchObject({ httpStatus: 529, attempts: 4 });
+    expect(adapter.sends).toBe(4);
+  });
+
+  it('complete(): 1 for an error that is not retried', async () => {
+    const adapter = new ScriptedNativeAdapter([{ fail: () => serverError('zz internal', 500) }]);
+    await expect(native(adapter).complete(NATIVE_REQUEST)).rejects.toMatchObject({ httpStatus: 500, attempts: 1 });
+  });
+
+  it('stream(): the sends of the call that failed', async () => {
+    const adapter = new ScriptedNativeAdapter(Array.from({ length: 10 }, () => ({ fail: overloaded529 })));
+    await expect(native(adapter).stream(NATIVE_REQUEST)).rejects.toMatchObject({ httpStatus: 529, attempts: 4 });
+  });
+
+  it('stream(): a later round counts its own sends, not the earlier rounds', async () => {
+    const adapter = new ScriptedNativeAdapter([
+      { text: 'zz round one', toolCall: 'zz_call_1' },
+      { fail: () => serverError('zz internal', 500) },
+    ]);
+    await expect(
+      native(adapter).stream(NATIVE_REQUEST, {
+        onToolCalls: async (calls) => calls.map((c) => ({ toolUseId: c.id, content: 'zz ok' })),
+      }),
+    ).rejects.toMatchObject({ httpStatus: 500, attempts: 1 });
+    expect(adapter.sends).toBe(2);
+  });
+});
+
+describe('attempts counts the sends membrane retried for this failure', () => {
+  it('streamYielding(): a 529 after output on the re-issue reports attempts 1', async () => {
+    const adapter = new ScriptedNativeAdapter([
+      { refuse: 'zz refused' },
+      { fail: overloaded529, emitFirst: 'zz partial ' },
+      { text: 'zz never' },
+    ]);
+    const events = await drive(native(adapter).streamYielding(NATIVE_REQUEST, { refusalRetries: 1 }));
+
+    expect(adapter.sends).toBe(2);
+    expect(ofType(events, 'retrying')).toHaveLength(1);
+    // Membrane re-issued the refusal but never retried the 529.
+    expect(ofType(events, 'error')[0]!.error).toMatchObject({ httpStatus: 529, attempts: 1 });
+  });
+
+  it('streamYielding(): a 529 before output on the re-issue is the first retry, not the second', async () => {
+    const adapter = new ScriptedNativeAdapter([
+      { refuse: 'zz refused' },
+      { fail: overloaded529 },
+      { text: 'zz ok' },
+    ]);
+    const events = await drive(native(adapter).streamYielding(NATIVE_REQUEST, { refusalRetries: 1 }));
+
+    expect(adapter.sends).toBe(3);
+    expect(ofType(events, 'backoff').map((e) => [e.attempt, e.maxAttempts])).toEqual([[1, 3]]);
+    const [complete] = ofType(events, 'complete');
+    // The response still counts every provider call.
+    expect(complete!.response.details.timing.attempts).toBe(3);
+  });
+
+  it('a retried call that then fails after delivering reports attempts 1: membrane did not retry that failure', async () => {
+    const adapter = new ScriptedNativeAdapter([
+      { fail: overloaded529 },
+      { fail: overloaded529, emitFirst: 'zz partial ' },
+      { text: 'zz never' },
+    ]);
+    const events = await drive(native(adapter).streamYielding(NATIVE_REQUEST));
+
+    expect(adapter.sends).toBe(2);
+    expect(ofType(events, 'backoff')).toHaveLength(1);
+    expect(ofType(events, 'error')[0]!.error).toMatchObject({ httpStatus: 529, attempts: 1 });
+  });
+
+  it('complete(): the re-issue gets the whole transport budget again', async () => {
+    const adapter = new ScriptedNativeAdapter([
+      { refuse: 'zz refused' },
+      ...Array.from({ length: 10 }, () => ({ fail: overloaded529 })),
+    ]);
+    await expect(native(adapter).complete(NATIVE_REQUEST, { refusalRetries: 1 })).rejects.toMatchObject({
+      httpStatus: 529,
+      attempts: 4,
+    });
+    // One refused send, then overloaded.maxRetries (4) sends of the re-issue.
+    expect(adapter.sends).toBe(5);
+  });
+});
+
+describe('retryRateLimits: false leaves a 429 to the caller', () => {
+  it('streamYielding(): the stream ends with the 429 at once, with its stated wait', async () => {
+    const adapter = new ScriptedNativeAdapter([{ fail: () => rateLimited429(1500) }, { text: 'zz never' }]);
+    const events = await drive(native(adapter).streamYielding(NATIVE_REQUEST, { retryRateLimits: false }));
+
+    expect(adapter.sends).toBe(1);
+    expect(ofType(events, 'backoff')).toHaveLength(0);
+    expect(ofType(events, 'error')[0]!.error).toMatchObject({ type: 'rate_limit', retryAfterMs: 1500, attempts: 1 });
+  });
+
+  it('streamYielding(): a 529 is still retried', async () => {
+    const adapter = new ScriptedNativeAdapter([{ fail: overloaded529 }, { text: 'zz ok' }]);
+    const events = await drive(native(adapter).streamYielding(NATIVE_REQUEST, { retryRateLimits: false }));
+
+    expect(adapter.sends).toBe(2);
+    expect(ofType(events, 'backoff').map((e) => e.reason)).toEqual(['overloaded']);
+    expect(ofType(events, 'complete')).toHaveLength(1);
+  });
+
+  it('stream(): thrown at once, even with base retries configured', async () => {
+    const adapter = new ScriptedNativeAdapter([{ fail: () => rateLimited429() }, { text: 'zz never' }]);
+    const membrane = native(adapter, { retry: { ...SCHEDULES.retry, maxRetries: 3 } });
+    await expect(membrane.stream(NATIVE_REQUEST, { retryRateLimits: false })).rejects.toMatchObject({
+      type: 'rate_limit',
+      attempts: 1,
+    });
+    expect(adapter.sends).toBe(1);
+  });
+
+  it('complete(): thrown at once, even with base retries configured', async () => {
+    const adapter = new ScriptedNativeAdapter([{ fail: () => rateLimited429() }, { text: 'zz never' }]);
+    const membrane = native(adapter, { retry: { ...SCHEDULES.retry, maxRetries: 3 } });
+    await expect(membrane.complete(NATIVE_REQUEST, { retryRateLimits: false })).rejects.toMatchObject({
+      type: 'rate_limit',
+      attempts: 1,
+    });
+    expect(adapter.sends).toBe(1);
+  });
+
+  it('complete(): other retryable errors keep their retries', async () => {
+    const adapter = new ScriptedNativeAdapter([{ fail: () => serverError('zz internal', 500) }, { text: 'zz ok' }]);
+    const membrane = native(adapter, { retry: { ...SCHEDULES.retry, maxRetries: 3 } });
+    const response = await membrane.complete(NATIVE_REQUEST, { retryRateLimits: false });
+    expect(response.content[0]).toMatchObject({ type: 'text', text: 'zz ok' });
+    expect(adapter.sends).toBe(2);
+  });
+
+  it('stream() with streaming: false hands the option to complete()', async () => {
+    const adapter = new ScriptedNativeAdapter([{ fail: () => rateLimited429() }, { text: 'zz never' }]);
+    await expect(
+      native(adapter).stream({ ...NATIVE_REQUEST, streaming: false }, { retryRateLimits: false }),
+    ).rejects.toMatchObject({ type: 'rate_limit', attempts: 1 });
+    expect(adapter.sends).toBe(1);
+  });
+});
+
+// Keeps the BackoffEvent type import honest: the event's shape is public.
+const _shape: BackoffEvent = {
+  type: 'backoff', reason: 'overloaded', attempt: 1, maxAttempts: 1, delayMs: 0, error: new Error('zz'),
+};
+void _shape;

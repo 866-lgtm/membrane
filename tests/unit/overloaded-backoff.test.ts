@@ -1,7 +1,8 @@
 /**
  * Overloaded (529) backoff policy: capacity errors always retry on their own
  * long, jittered schedule — in complete() via the shared retry loop, and in
- * stream() via the pre-emission wrapper (Connectome issue #25).
+ * stream() for a provider call that failed before it delivered anything
+ * (Connectome issue #25; the streaming paths' retry is in streamOnce).
  */
 
 import { describe, it, expect } from 'vitest';

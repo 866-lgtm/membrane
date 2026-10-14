@@ -83,6 +83,19 @@ export interface ErrorInfo {
 
   /** Raw request that caused the error (for logging) */
   rawRequest?: unknown;
+
+  /**
+   * How many times membrane sent the request for this failure: 1 when it
+   * didn't retry it, more when it sent the request again after earlier sends
+   * failed before anything arrived. A send that delivered anything before it
+   * failed can't be retried, so its error says 1, and a refusal re-issue
+   * (refusalRetries) starts the count again. Set on the error a failed
+   * provider call ends with, from complete() and from each provider call of
+   * stream() and streamYielding(); in a tool loop it counts the round that
+   * failed. A caller with its own retry policy reads it to tell whether
+   * membrane has already retried this failure.
+   */
+  attempts?: number;
 }
 
 // ============================================================================
@@ -97,6 +110,8 @@ export class MembraneError extends Error {
   readonly providerErrorCode?: string;
   readonly rawError?: unknown;
   readonly rawRequest?: unknown;
+  /** See ErrorInfo.attempts. */
+  readonly attempts?: number;
 
   constructor(info: ErrorInfo) {
     super(info.message);
@@ -109,6 +124,7 @@ export class MembraneError extends Error {
     // Serialize error objects so they don't become {} when JSON.stringify'd
     this.rawError = serializeError(info.rawError);
     this.rawRequest = info.rawRequest;
+    if (info.attempts !== undefined) this.attempts = info.attempts;
   }
 
   toErrorInfo(): ErrorInfo {
@@ -121,6 +137,7 @@ export class MembraneError extends Error {
       providerErrorCode: this.providerErrorCode,
       rawError: this.rawError,
       rawRequest: this.rawRequest,
+      ...(this.attempts !== undefined ? { attempts: this.attempts } : {}),
     };
   }
 }
@@ -743,6 +760,19 @@ export function withRawRequest(error: MembraneError, rawRequest: unknown): Membr
   // An immutable caller-owned error remains authoritative even without this hint.
   try {
     Object.defineProperty(error, 'rawRequest', { value: rawRequest, enumerable: true, configurable: true });
+  } catch { /* A frozen error still propagates unchanged. */ }
+  return error;
+}
+
+/**
+ * Record on a failed provider call's error how many times membrane sent the
+ * request (ErrorInfo.attempts). Keeps the error's identity, as withRawRequest
+ * does; anything other than a MembraneError passes through unchanged.
+ */
+export function withAttempts<E>(error: E, attempts: number): E {
+  if (!(error instanceof MembraneError)) return error;
+  try {
+    Object.defineProperty(error, 'attempts', { value: attempts, enumerable: true, configurable: true });
   } catch { /* A frozen error still propagates unchanged. */ }
   return error;
 }

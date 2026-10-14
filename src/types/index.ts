@@ -133,6 +133,7 @@ export type {
   UsageEvent,
   CompleteEvent,
   ErrorEvent,
+  BackoffEvent,
   AbortedEvent,
   StreamEvent,
   YieldingStream,

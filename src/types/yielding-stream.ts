@@ -99,6 +99,30 @@ export interface RetryingEvent {
 }
 
 /**
+ * Backoff event — a provider call failed before it delivered anything, with
+ * an error membrane retries (a 529 overload, or a 429 rate limit unless
+ * `retryRateLimits` is false), and membrane waits `delayMs` before sending
+ * the call again. It can come in any round of a tool loop.
+ *
+ * Unlike `retrying`, there is nothing to discard: the failed call emitted
+ * nothing. The event lets a consumer show or log the wait. cancel(), or the
+ * caller's signal, ends the wait, and the stream then ends with `aborted`.
+ */
+export interface BackoffEvent {
+  type: 'backoff';
+  /** The schedule the wait is on: `overloaded` for a 529, `rate_limit` for a 429. */
+  reason: 'overloaded' | 'rate_limit';
+  /** 1-based index of the retry about to be issued. */
+  attempt: number;
+  /** The most retries membrane makes for this call. */
+  maxAttempts: number;
+  /** How long membrane waits before sending the call again, in milliseconds. */
+  delayMs: number;
+  /** The error the failed call ended with. */
+  error: Error;
+}
+
+/**
  * Aborted event - stream was cancelled.
  */
 export interface AbortedEvent {
@@ -117,6 +141,7 @@ export type StreamEvent =
   | TokensEvent
   | StreamBlockEvent
   | RetryingEvent
+  | BackoffEvent
   | ToolCallsEvent
   | UsageEvent
   | CompleteEvent
@@ -271,6 +296,18 @@ export interface YieldingStreamOptions {
    * tokens are real spend.
    */
   refusalRetries?: number;
+
+  /**
+   * Whether membrane retries a 429 rate limit itself. Default true: a 429
+   * that ends a provider call before it delivered anything is retried, like a
+   * 529, with a `backoff` event before each wait. With `false`, a 429 is the
+   * caller's: membrane doesn't retry it, and the stream ends with an `error`
+   * event at once, carrying the provider's stated wait on `retryAfterMs`. For
+   * a caller that paces rate limits itself, such as an agent framework
+   * sharing one organization's limit across its agents. A 529 is still
+   * retried either way.
+   */
+  retryRateLimits?: boolean;
 
   /**
    * Maximum tool execution depth. Default: unlimited.
