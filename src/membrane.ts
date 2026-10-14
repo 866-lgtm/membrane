@@ -502,7 +502,8 @@ export class Membrane {
         // The one retry policy (retryPlan): a 529 on the overloaded schedule,
         // a 429 with its floor of five, any other retryable error within
         // maxRetries. Terminal billing/quota codes are excluded by
-        // classification, and a deadline on a sent request is the caller's.
+        // classification (on AnthropicAdapter the API's x-should-retry has
+        // the last word), and a deadline on a sent request is the caller's.
         const plan = isDeadlineExpiry(classifiedError)
           ? undefined
           : this.retryPlan(errorInfo, tries, { retryRateLimits: options.retryRateLimits });
@@ -2417,10 +2418,14 @@ export class Membrane {
         // Typed once, as every path's caller gets it: a failure that isn't a
         // MembraneError yet is typed by errorFromThrown, so the retry is
         // decided on that type and `attempts` stays on what is thrown.
-        const typed = failure.error instanceof MembraneError ? failure.error : errorFromThrown(failure.error);
+        const typed = errorFromThrown(failure.error);
         // A call that delivered anything can't be sent again, and it starts
         // the count again: membrane hasn't retried this failure.
         if (delivered) throw withAttempts(typed, 1);
+        // The call's signal first, as complete() reads the caller's: a
+        // cancellation plans no retry and asks onError nothing, and each path
+        // reports it as the cancellation it is.
+        if (adapterOptions.signal?.aborted) throw withAttempts(typed, tries);
         const errorInfo = classifyError(typed);
         const plan = isDeadlineExpiry(typed) ? undefined : this.retryPlan(errorInfo, tries, { retryRateLimits });
         if (!plan) throw withAttempts(typed, tries);
@@ -3115,13 +3120,13 @@ export class Membrane {
 
   /**
    * One retry policy, read the same way by complete() and streamOnce() for
-   * every adapter: membrane is the one layer that retries (AnthropicAdapter
-   * turns its SDK client's own retries off). Whether a request that failed
-   * with this error, after `attempt` tries, is sent again: undefined when it
-   * isn't; otherwise the schedule it waits on (overloaded) and the most tries
-   * it gets in all (maxAttempts). The callers send again only what failed
-   * before delivering anything, and leave a deadline that ran out on a sent
-   * request (isDeadlineExpiry) to the caller.
+   * every adapter: membrane is the one layer that retries a call's requests
+   * (AnthropicAdapter turns its SDK client's own retries off for them).
+   * Whether a request that failed with this error, after `attempt` tries, is
+   * sent again: undefined when it isn't; otherwise the schedule it waits on
+   * (overloaded) and the most tries it gets in all (maxAttempts). The callers
+   * send again only what failed before delivering anything, and leave a
+   * deadline that ran out on a sent request (isDeadlineExpiry) to the caller.
    *
    * A 529 takes the overloaded schedule, a 429 at least five attempts, and
    * any other retryable error (a 5xx, a 408, a connection failure) the base

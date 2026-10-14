@@ -24,13 +24,15 @@ export interface RetryConfig {
    * AnthropicAdapter's SDK client reports, which include a connect timeout
    * (the SDK reports both the same way). The other adapters' connect
    * timeouts are sent again like any connection failure. A retryable rate
-   * limit (429) gets at least 5
-   * attempts whatever this says (unless the call sets `retryRateLimits:
-   * false`), and a provider capacity error (529) gets the larger of this and
-   * `overloaded.maxRetries`, on the `overloaded` schedule. Membrane is the
-   * only layer that retries: AnthropicAdapter turns its SDK client's own
-   * retries off. A host with a retry layer of its own can set 1 here, and
-   * read `MembraneError.attempts`.
+   * limit (429) gets at least 5 attempts whatever this says (unless the call
+   * sets `retryRateLimits: false`), and a provider capacity error (529) gets
+   * the larger of this and `overloaded.maxRetries`, on the `overloaded`
+   * schedule. Membrane is the only layer that retries a call's requests:
+   * AnthropicAdapter turns its SDK client's own retries off for them, and
+   * only the cache keepalive's background replays keep the SDK's. A host
+   * whose own retry layer should be the only one sets 1 here, 0 for
+   * `overloaded.maxRetries`, and `retryRateLimits: false` on each call, and
+   * reads `MembraneError.attempts`.
    */
   maxRetries: number;
 

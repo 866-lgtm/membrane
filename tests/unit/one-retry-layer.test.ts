@@ -1,10 +1,11 @@
 /**
  * Membrane is the one layer that retries.
  *
- *  - AnthropicAdapter's SDK client sends each request once: its own retries
- *    (two by default, invisible to membrane) are off on the requests membrane
- *    makes, so a 429 reaches a caller that asked for it at once, and
- *    `attempts`, `backoff` and `retryDelaysMs` count every send.
+ *  - AnthropicAdapter's SDK client sends each request a call makes once: its
+ *    own retries (two by default, invisible to membrane) are off on them, so
+ *    a 429 reaches a caller that asked for it at once, and `attempts`,
+ *    `backoff` and `retryDelaysMs` count every send. The cache keepalive's
+ *    background replays keep the SDK's retries.
  *  - What the SDK used to retry before delivery, membrane retries: a 5xx, a
  *    provider's 408 and a connection failure get the base schedule, five
  *    attempts by default, on every entry point. `maxRetries` still sets it.
@@ -158,6 +159,19 @@ describe('AnthropicAdapter sends each request once', () => {
     expect(fetch).toHaveBeenCalledTimes(1);
   });
 
+  it('the cache keepalive’s replays keep the SDK’s own retries', async () => {
+    // A replay refreshes an idle cache in the background, with no caller
+    // waiting, so it keeps the SDK's default of two retries.
+    const fetch = vi.fn(async () => new Response(
+      JSON.stringify({ type: 'error', error: { type: 'api_error', message: 'zz internal' } }),
+      { status: 500, headers: { 'content-type': 'application/json', 'retry-after-ms': '1' } },
+    ));
+    vi.stubGlobal('fetch', fetch);
+    const keepalive = (new AnthropicAdapter({ apiKey: 'zz-key' }).cacheKeepalive as any);
+    await keepalive.send({ model: 'zz-model', max_tokens: 0, messages: [{ role: 'user', content: 'zz go' }] }, {}).catch(() => {});
+    expect(fetch).toHaveBeenCalledTimes(3);
+  });
+
   it('through membrane, a 429 left to the caller arrives after one send', async () => {
     const fetch = vi.fn(async () => new Response(
       JSON.stringify({ type: 'error', error: { type: 'rate_limit_error', message: 'zz slow down' } }),
@@ -173,7 +187,7 @@ describe('AnthropicAdapter sends each request once', () => {
 });
 
 describe("AnthropicAdapter's watchdog expiry is a deadline", () => {
-  it('a stream with no first event ends with a timeout membrane leaves to the caller', async () => {
+  it('a stream with no first event ends with a timeout that carries the deadline mark', async () => {
     // Headers arrive, then nothing: the body stays open until the request is aborted.
     vi.stubGlobal('fetch', vi.fn(async (_url: unknown, init?: { signal?: AbortSignal }) => new Response(
       new ReadableStream({
@@ -212,6 +226,27 @@ describe('a deadline on a sent request is the caller’s; a connect timeout is s
     const last = (await yielding(m)).at(-1) as StreamEvent;
     return last.type === 'error' ? last.error : last;
   }
+
+  it('a TimeoutError is a retryable timeout by its name, whatever its message', () => {
+    const typed = errorFromThrown(new DOMException('zz no keyword here', 'TimeoutError'));
+    expect(typed).toMatchObject({ type: 'timeout', retryable: true });
+    expect(isDeadlineExpiry(typed)).toBe(true);
+  });
+
+  it('errorFromThrown keeps an error that is already typed, and its mark', () => {
+    const marked = deadlineExpired(timeoutError('zz watchdog'));
+    expect(errorFromThrown(marked)).toBe(marked);
+    expect(isDeadlineExpiry(errorFromThrown(marked))).toBe(true);
+  });
+
+  it('the API’s x-should-retry advice keeps a deadline’s mark', () => {
+    const sdkTimeout = Object.assign(new Anthropic.APIConnectionTimeoutError(), {
+      headers: new Headers({ 'x-should-retry': 'false' }),
+    });
+    const typed = (new AnthropicAdapter({ apiKey: 'zz-key', cacheKeepalive: { enabled: false } }) as any).handleError(sdkTimeout, {});
+    expect(typed).toMatchObject({ type: 'timeout', retryable: false });
+    expect(isDeadlineExpiry(typed)).toBe(true);
+  });
 
   it.each([
     ['headers timeout', true, headersTimeout],
@@ -294,13 +329,48 @@ describe('a deadline on a sent request is the caller’s; a connect timeout is s
       expect(fetch).toHaveBeenCalledTimes(1);
     });
 
-    it('a caller’s own AbortSignal.timeout() is still a cancellation', async () => {
+    // A fetch that waits until the request's signal aborts, then rejects with
+    // `reason(signal)`.
+    const untilAborted = (reason: (signal: AbortSignal) => unknown) =>
+      vi.fn((_url: unknown, init?: { signal?: AbortSignal }) => new Promise((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => reject(reason(init.signal!)));
+      }));
+
+    it.each(['complete', 'stream', 'yielding'] as const)('%s: a caller’s own AbortSignal.timeout() is still a cancellation', async (entry) => {
       // It rejects with the same TimeoutError, but the caller's signal decides.
-      vi.stubGlobal('fetch', vi.fn((_url: unknown, init?: { signal?: AbortSignal }) => new Promise((_resolve, reject) => {
-        init?.signal?.addEventListener('abort', () => reject(init.signal!.reason));
-      })));
-      const thrown = await openai().complete(REQUEST, { signal: AbortSignal.timeout(5) }).catch((e) => e);
-      expect(thrown).toMatchObject({ type: 'abort', retryable: false });
+      const fetch = untilAborted((signal) => signal.reason);
+      vi.stubGlobal('fetch', fetch);
+      const m = openai();
+      const signal = AbortSignal.timeout(5);
+      if (entry === 'complete') {
+        expect(await m.complete(REQUEST, { signal }).catch((e) => e)).toMatchObject({ type: 'abort', retryable: false });
+      } else if (entry === 'stream') {
+        expect(await m.stream(REQUEST, { signal })).toMatchObject({ aborted: true });
+      } else {
+        const events: StreamEvent[] = [];
+        for await (const event of m.streamYielding(REQUEST, { signal })) events.push(event);
+        expect(events.map((e) => e.type)).toEqual(['aborted']);
+      }
+      expect(fetch).toHaveBeenCalledTimes(1);
+    });
+
+    it.each(['stream', 'yielding'] as const)('%s: a retryable failure after the caller cancelled asks onError nothing', async (entry) => {
+      // The send fails as a connection failure would, once the signal fired.
+      const fetch = untilAborted(() => new TypeError('fetch failed'));
+      vi.stubGlobal('fetch', fetch);
+      const onError = vi.fn(async () => 'retry' as const);
+      const m = new Membrane(new OpenAIAdapter({ apiKey: 'zz-key' }), { formatter: new NativeFormatter(), ...FAST, hooks: { onError } });
+      const controller = new AbortController();
+      setTimeout(() => controller.abort(), 5);
+      if (entry === 'stream') {
+        expect(await m.stream(REQUEST, { signal: controller.signal })).toMatchObject({ aborted: true });
+      } else {
+        const events: StreamEvent[] = [];
+        for await (const event of m.streamYielding(REQUEST, { signal: controller.signal })) events.push(event);
+        expect(events.map((e) => e.type)).toEqual(['aborted']);
+      }
+      expect(onError).not.toHaveBeenCalled();
+      expect(fetch).toHaveBeenCalledTimes(1);
     });
   });
 
@@ -346,6 +416,15 @@ describe('a deadline on a sent request is the caller’s; a connect timeout is s
       expect(fetch).toHaveBeenCalledTimes(1);
     });
 
+    it.each(['stream', 'yielding'] as const)('%s: Bun’s fetch timeout before any event, wrapped by MessageStream, is sent once', async (entry) => {
+      const fetch = failedRead(bunTimeout);
+      vi.stubGlobal('fetch', fetch);
+      const thrown = await run(anthropic(), entry);
+      expect(thrown).toMatchObject({ type: 'timeout', retryable: true, attempts: 1 });
+      expect(isDeadlineExpiry(thrown)).toBe(true);
+      expect(fetch).toHaveBeenCalledTimes(1);
+    });
+
     it.each(['stream', 'yielding'] as const)('%s: a socket closed before any event gets the base schedule', async (entry) => {
       const fetch = failedRead(() => undici('other side closed', 'SocketError', 'UND_ERR_SOCKET', 'terminated'));
       vi.stubGlobal('fetch', fetch);
@@ -357,13 +436,13 @@ describe('a deadline on a sent request is the caller’s; a connect timeout is s
   it.each(['complete', 'stream', 'yielding'] as const)(
     '%s: an adapter that throws what fetch threw gets the same rule',
     async (entry) => {
-      // Not every adapter types its own failures. Membrane decides the retry
-      // on the error as errorFromThrown types it, which is how complete() and
-      // stream() rethrow it (streamYielding's error event carries it as thrown).
+      // Not every adapter types its own failures. Membrane types one with
+      // errorFromThrown, decides the retry on that, and every entry point
+      // ends with it, streamYielding's error event included.
       const adapter = new FailingAdapter(Infinity, headersTimeout);
       const thrown = await run(membrane(adapter), entry);
       expect(adapter.sends).toBe(1);
-      if (entry !== 'yielding') expect(isDeadlineExpiry(thrown)).toBe(true);
+      expect(isDeadlineExpiry(thrown)).toBe(true);
     },
   );
 });

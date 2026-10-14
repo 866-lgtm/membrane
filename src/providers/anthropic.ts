@@ -27,7 +27,7 @@ import {
   withRawRequest,
   unsupportedError,
 } from '../types/index.js';
-import { statusForProviderCode, deadlineExpired, errorFromThrown } from '../types/errors.js';
+import { statusForProviderCode, deadlineExpired, isDeadlineExpiry, errorFromThrown } from '../types/errors.js';
 import { flattenRootSchemaUnion } from './anthropic-tool-schema.js';
 import { assertTerminalEventObserved } from './utils.js';
 import { fetchWithCredentials, validateCredential, type CredentialContext, type CredentialResolver } from './credentials.js';
@@ -869,7 +869,9 @@ export class AnthropicAdapter implements ProviderAdapter {
     // `retryable` here.
     const advice = error instanceof Anthropic.APIError ? error.headers?.get?.('x-should-retry') : undefined;
     if ((advice === 'true' || advice === 'false') && typed.retryable !== (advice === 'true')) {
-      return new MembraneError({ ...typed.toErrorInfo(), retryable: advice === 'true' });
+      const advised = new MembraneError({ ...typed.toErrorInfo(), retryable: advice === 'true' });
+      // A spent deadline stays one: the mark isn't part of the error's info.
+      return isDeadlineExpiry(typed) ? deadlineExpired(advised) : advised;
     }
     return typed;
   }

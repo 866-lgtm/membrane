@@ -465,14 +465,16 @@ const SENT_REQUEST_DEADLINE_CODES = new Set(['und_err_headers_timeout', 'und_err
 /**
  * Whether a failure is a runtime's own deadline on a request it sent: one of
  * undici's above, or Bun's fetch timeout, a DOMException named TimeoutError
- * with no code to read (Bun 1.4.3 threw it after 360 s at a server that never
- * answered). A caller's AbortSignal.timeout() rejects the same way, but
- * membrane reads the caller's signal before the error, so that one stays a
- * cancellation.
+ * (Bun 1.4.3 threw it after 360 s at a server that never answered). Its code,
+ * 23, is a number, which the code check doesn't read, so the name decides,
+ * anywhere down the cause chain: the Anthropic SDK's MessageStream wraps a
+ * failed read once more. A caller's AbortSignal.timeout() rejects the same
+ * way, but membrane reads the caller's signal before the error, so that one
+ * stays a cancellation.
  */
 function isSentRequestDeadline(error: unknown): boolean {
   if (socketCodes(error).some((code) => SENT_REQUEST_DEADLINE_CODES.has(code))) return true;
-  return typeof error === 'object' && error !== null && (error as { name?: unknown }).name === 'TimeoutError';
+  return causeChain(error).some((link) => (link as { name?: unknown }).name === 'TimeoutError');
 }
 
 function firstString(...candidates: unknown[]): string | undefined {
@@ -787,7 +789,9 @@ export function withRawRequest(error: MembraneError, rawRequest: unknown): Membr
   return error;
 }
 
-const DEADLINE_EXPIRY = Symbol('membrane.deadlineExpiry');
+// Symbol.for, like the adapters' deadline-abort mark, so a second loaded copy
+// of membrane reads the same mark.
+const DEADLINE_EXPIRY = Symbol.for('membrane.deadlineExpiry');
 
 /**
  * Mark an error as a deadline running out on a call that was under way:
@@ -960,16 +964,21 @@ function classifySocketCode(error: Error): { type: MembraneErrorType; retryable:
  * sit two causes down.
  */
 function socketCodes(error: unknown): string[] {
-  const codes: string[] = [];
-  const seen = new Set<unknown>();
+  return causeChain(error)
+    .map((link) => (link as { code?: unknown }).code)
+    .filter((code): code is string => typeof code === 'string')
+    .map((code) => code.toLowerCase());
+}
+
+/** An error and its causes, outermost first, at most four deep. */
+function causeChain(error: unknown): object[] {
+  const chain: object[] = [];
   let current = error;
-  while (typeof current === 'object' && current !== null && !seen.has(current) && seen.size < 4) {
-    seen.add(current);
-    const code = (current as { code?: unknown }).code;
-    if (typeof code === 'string') codes.push(code.toLowerCase());
+  while (typeof current === 'object' && current !== null && !chain.includes(current) && chain.length < 4) {
+    chain.push(current);
     current = (current as { cause?: unknown }).cause;
   }
-  return codes;
+  return chain;
 }
 
 /**
@@ -980,6 +989,8 @@ function socketCodes(error: unknown): string[] {
  * adapter's own watchdog is, so membrane leaves it to the caller.
  */
 export function errorFromThrown(error: unknown, rawRequest?: unknown): MembraneError {
+  // Already typed: keep it, and its marks, as it is.
+  if (error instanceof MembraneError) return withRawRequest(error, rawRequest);
   const info = classifyError(error);
   info.rawRequest = rawRequest;
   const typed = new MembraneError(info);
@@ -1004,6 +1015,12 @@ export function classifyError(error: unknown): ErrorInfo {
         retryable: false,
         rawError: serializedError,
       };
+    }
+    // A runtime's own timeout (Bun's fetch deadline) is named, whatever its
+    // message says. A caller's AbortSignal.timeout() rejects the same way, and
+    // membrane still ends that call as a cancellation, from the caller's signal.
+    if (error.name === 'TimeoutError') {
+      return { type: 'timeout', message: error.message, retryable: true, rawError: serializedError };
     }
 
     const classification = classifySocketCode(error) ?? classifyMessage(error.message);
