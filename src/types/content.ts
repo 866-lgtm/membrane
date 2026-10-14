@@ -129,14 +129,14 @@ export interface ToolUseContent {
    * something other than an object (null, a number, a string, a boolean or an
    * array), and when an Anthropic or Bedrock stream ended before a call's
    * arguments finished arriving. A call truncated mid-arguments (max_tokens)
-   * is the usual cause. From a provider that sends arguments as a value
-   * rather than text (Gemini), it holds that value as JSON. `input` then
-   * holds whatever the provider's start event carried, or `{}`: a wire-valid
-   * tool call with empty arguments, indistinguishable from a genuine no-arg
-   * call once it is written to durable history. Presence of this field means
-   * `input` is NOT the model's arguments, so a consumer can refuse the block
-   * (or attempt its own repair) instead of trusting a plausible `{}`. The
-   * call's ToolCall carries it too.
+   * is the usual cause. Where arguments come as a value rather than text
+   * (Gemini's, or an `input` that isn't an object), it holds that value as
+   * JSON. `input` then holds whatever the provider's start event carried, or
+   * `{}`: a wire-valid tool call with empty arguments, indistinguishable from
+   * a genuine no-arg call once it is written to durable history. Presence of
+   * this field means `input` is NOT the model's arguments, so a consumer can
+   * refuse the block (or attempt its own repair) instead of trusting a
+   * plausible `{}`. The call's ToolCall carries it too.
    */
   unparseableInput?: string;
 

@@ -25,7 +25,7 @@ import {
   withRawRequest,
 } from '../types/index.js';
 import { stripEmptyTextRequest } from '../utils/empty-text.js';
-import { createCombinedSignal, isDeadlineAbort, deadlineTimeoutError, assertTerminalEventObserved, toolUseInputFromText } from './utils.js';
+import { createCombinedSignal, isDeadlineAbort, deadlineTimeoutError, assertTerminalEventObserved, toolUseInputFromText, toolUseInputFromValue } from './utils.js';
 import {
   INTERLEAVED_THINKING_BETA,
   needsInterleavedThinkingBeta,
@@ -940,11 +940,13 @@ export class BedrockAdapter implements ProviderAdapter {
       if (block.type === 'text' && block.text) {
         content.push({ type: 'text', text: block.text });
       } else if (block.type === 'tool_use' && block.id && block.name) {
+        // The stream assembly's marker, which keeps the text as it came, wins
+        // over the value's JSON.
         content.push({
           type: 'tool_use',
           id: block.id,
           name: block.name,
-          input: block.input as Record<string, unknown>,
+          ...toolUseInputFromValue(block.input),
           ...(block.unparseableInput !== undefined ? { unparseableInput: block.unparseableInput } : {}),
         });
       } else if (block.type === 'thinking') {

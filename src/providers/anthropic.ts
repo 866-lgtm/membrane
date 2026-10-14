@@ -30,7 +30,7 @@ import {
 } from '../types/index.js';
 import { statusForProviderCode } from '../types/errors.js';
 import { flattenRootSchemaUnion } from './anthropic-tool-schema.js';
-import { assertTerminalEventObserved, toolUseInputFromText } from './utils.js';
+import { assertTerminalEventObserved, toolUseInputFromText, toolUseInputFromValue } from './utils.js';
 import { fetchWithCredentials, validateCredential, type CredentialContext, type CredentialResolver } from './credentials.js';
 import { CacheKeepalive, type CacheKeepaliveConfig } from '../cache-keepalive.js';
 
@@ -1181,7 +1181,7 @@ export function fromAnthropicContent(blocks: Anthropic.ContentBlock[]): ContentB
           type: 'tool_use',
           id: block.id,
           name: block.name,
-          input: block.input as Record<string, unknown>,
+          ...toolUseInputFromValue(block.input),
         });
         break;
         

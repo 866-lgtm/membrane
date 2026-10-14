@@ -199,31 +199,35 @@ function notAnObject(raw: string, value: unknown): ToolUseInput {
  * it. Text that doesn't parse, or parses to anything but an object (null, a
  * number, a string, a boolean or an array), isn't the model's arguments as an
  * object: `input` is then `{}`, and `unparseableInput` keeps the text as it
- * came. No text (the field absent or null), or empty text, is a call with no
+ * came. No text, or text that is empty or only whitespace, is a call with no
  * arguments: `{}`, unmarked. Arguments a server sent as something other than
  * text, outside its wire's spec, are read as toolUseInputFromValue reads a
- * value, so the marker is always text.
+ * value, so a null field is a call with no arguments and the marker is always
+ * text.
  */
 export function toolUseInputFromText(text: unknown): ToolUseInput {
-  if (text === undefined || text === null || text === '') return { input: {} };
   if (typeof text !== 'string') return toolUseInputFromValue(text);
+  if (text.trim() === '') return { input: {} };
   let parsed: unknown;
   try {
     parsed = JSON.parse(text);
-  } catch (e) {
-    console.warn('[membrane] Failed to parse tool arguments JSON; input is {} and unparseableInput keeps the text:', e);
+  } catch {
+    // Not the SyntaxError: its message quotes the text.
+    console.warn("[membrane] Tool arguments aren't valid JSON; input is {} and unparseableInput keeps them (not logged: tool arguments can carry secrets)");
     return { input: {}, unparseableInput: text };
   }
   return isPlainObject(parsed) ? { input: parsed } : notAnObject(text, parsed);
 }
 
 /**
- * As toolUseInputFromText, for a provider that sends a call's arguments as a
- * value (Gemini's `functionCall.args`). No value is a call with no arguments.
- * A value that isn't an object is kept, as JSON, in `unparseableInput`.
+ * As toolUseInputFromText, for arguments sent as a value: Gemini's
+ * `functionCall.args`, Anthropic's and Bedrock's `input`, and the `input` an
+ * adapter hands Membrane. No value, absent or null, is a call with no
+ * arguments (proto3's JSON mapping, Gemini's, reads a null field as unset). A
+ * value that isn't an object is kept, as JSON, in `unparseableInput`.
  */
 export function toolUseInputFromValue(value: unknown): ToolUseInput {
-  if (value === undefined) return { input: {} };
+  if (value === undefined || value === null) return { input: {} };
   return isPlainObject(value) ? { input: value } : notAnObject(JSON.stringify(value), value);
 }
 

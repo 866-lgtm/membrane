@@ -19,10 +19,12 @@
     Before, it parsed what had arrived, and kept `{}` unmarked when that
     didn't parse or nothing had arrived.
   - Gemini copied `functionCall.args` into `input` unchecked. `input` is now
-    `{}` when the call carries no args, and a value that isn't an object is
-    kept, as JSON, in `unparseableInput`.
-  - `Membrane.complete` and `Membrane.stream` hand on every `tool_use` with
-    an object `input`, whatever an adapter gave: an `input` that isn't an
+    `{}` when the call carries no args, or `null` ones, and a value that
+    isn't an object is kept, as JSON, in `unparseableInput`. The exported
+    `fromAnthropicContent` and Bedrock's non-streamed response follow the
+    same rule for the `input` the provider sent.
+  - `Membrane.complete` and `Membrane.stream` give every `tool_use` they hand
+    on an object `input`, whatever an adapter gave: an `input` that isn't an
     object reaches the caller as `{}`, with `unparseableInput` holding it as
     JSON unless the adapter marked the block already. `Membrane.complete` now
     carries an adapter's `unparseableInput`, as streamed responses already
@@ -31,4 +33,8 @@
     executor can answer a marked call with an error result instead of
     running it with `{}`. It's on the calls `stream()` hands `onToolCalls`,
     the yielding stream's `tool-calls` event and `complete()`'s `toolCalls`.
-  - A call with empty arguments is still `{}`, unmarked.
+  - A call with empty arguments, or arguments that are only whitespace, is
+    `{}`, unmarked.
+  - The warning for arguments that aren't an object, which the Anthropic
+    and Bedrock stream assemblies now log too, no longer includes the parse
+    error, whose message quotes the arguments.
