@@ -1,1 +1,0 @@
-- Add an optional Anthropic response-progress watchdog. Nonempty response deltas renew its inactivity window; keepalives do not. A stream with ongoing generation has no total-duration cap. Expiry aborts the request with a nonretryable timeout and payload-free diagnostic timestamps. Unconfigured callers retain their existing first-event policy.
