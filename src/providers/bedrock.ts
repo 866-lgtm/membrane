@@ -18,12 +18,12 @@ import {
   MembraneError,
   invalidRequestError,
   abortError,
-  classifyError,
   errorFromHttpResponse,
   errorFromProviderStatus,
   isTypedAbortError,
   withRawRequest,
 } from '../types/index.js';
+import { errorFromThrown } from '../types/errors.js';
 import { stripEmptyTextRequest } from '../utils/empty-text.js';
 import { createCombinedSignal, isDeadlineAbort, deadlineTimeoutError, assertTerminalEventObserved } from './utils.js';
 import {
@@ -986,9 +986,7 @@ export class BedrockAdapter implements ProviderAdapter {
       });
     }
 
-    const info = classifyError(error);
-    info.rawRequest = rawRequest;
-    return new MembraneError(info);
+    return errorFromThrown(error, rawRequest);
   }
 }
 

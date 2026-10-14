@@ -8,7 +8,8 @@
  *  - What the SDK used to retry before delivery, membrane retries: a 5xx, a
  *    provider's 408 and a connection failure get the base schedule, five
  *    attempts by default, on every entry point. `maxRetries` still sets it.
- *  - An adapter's own deadline is the caller's: it isn't sent again.
+ *  - A deadline that ran out on a sent request is the caller's: it isn't sent
+ *    again. A connect timeout is, where the adapter can tell it apart.
  *  - The API's `x-should-retry` and `retry-after-ms`, which the SDK obeyed,
  *    are read where the adapter types the error.
  */
@@ -17,10 +18,19 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import Anthropic from '@anthropic-ai/sdk';
 import { Membrane } from '../../src/membrane.js';
 import { AnthropicAdapter } from '../../src/providers/anthropic.js';
+import { OpenAIAdapter } from '../../src/providers/openai.js';
+import { OpenAICompatibleAdapter } from '../../src/providers/openai-compatible.js';
+import { OpenAICompletionsAdapter } from '../../src/providers/openai-completions.js';
+import { OpenAIResponsesAPIAdapter } from '../../src/providers/openai-responses-api.js';
+import { OpenAIResponsesAdapter } from '../../src/providers/openai-responses.js';
+import { OpenRouterAdapter } from '../../src/providers/openrouter.js';
+import { GeminiAdapter } from '../../src/providers/gemini.js';
+import { BedrockAdapter } from '../../src/providers/bedrock.js';
 import { NativeFormatter } from '../../src/formatters/native.js';
 import {
   MembraneError,
   deadlineExpired,
+  errorFromThrown,
   isDeadlineExpiry,
   networkError,
   serverError,
@@ -180,6 +190,182 @@ describe("AnthropicAdapter's watchdog expiry is a deadline", () => {
     expect(thrown).toMatchObject({ type: 'timeout', retryable: true });
     expect(isDeadlineExpiry(thrown)).toBe(true);
   });
+});
+
+describe('a deadline on a sent request is the caller’s; a connect timeout is sent again', () => {
+  // The shapes Node's fetch (undici) rejects with: `TypeError: fetch failed`
+  // before response headers, `TypeError: terminated` while reading the body,
+  // each with the undici error as its cause.
+  const undici = (message: string, name: string, code: string, outer = 'fetch failed') =>
+    new TypeError(outer, { cause: Object.assign(new Error(message), { name, code }) });
+  const connectTimeout = () => undici('Connect Timeout Error', 'ConnectTimeoutError', 'UND_ERR_CONNECT_TIMEOUT');
+  const headersTimeout = () => undici('Headers Timeout Error', 'HeadersTimeoutError', 'UND_ERR_HEADERS_TIMEOUT');
+  const bodyTimeout = () => undici('Body Timeout Error', 'BodyTimeoutError', 'UND_ERR_BODY_TIMEOUT', 'terminated');
+  const systemTimeout = () => undici('connect ETIMEDOUT 192.0.2.1:443', 'Error', 'ETIMEDOUT');
+  const reset = () => undici('read ECONNRESET', 'Error', 'ECONNRESET');
+  // What Bun's fetch rejects with when its own timeout ends a request.
+  const bunTimeout = () => new DOMException('The operation timed out.', 'TimeoutError');
+
+  async function run(m: Membrane, entry: 'complete' | 'stream' | 'yielding'): Promise<unknown> {
+    if (entry === 'complete') return m.complete(REQUEST).catch((e) => e);
+    if (entry === 'stream') return m.stream(REQUEST).catch((e) => e);
+    const last = (await yielding(m)).at(-1) as StreamEvent;
+    return last.type === 'error' ? last.error : last;
+  }
+
+  it.each([
+    ['headers timeout', true, headersTimeout],
+    ['body timeout', true, bodyTimeout],
+    ['Bun fetch timeout', true, bunTimeout],
+    ['connect timeout', false, connectTimeout],
+    ['ETIMEDOUT', false, systemTimeout],
+    ['reset', false, reset],
+  ] as const)('errorFromThrown: a %s is a deadline: %s', (_name, deadline, make) => {
+    const typed = errorFromThrown(make(), { zz: 'request' });
+    expect(typed).toMatchObject({ retryable: true, rawRequest: { zz: 'request' } });
+    expect(isDeadlineExpiry(typed)).toBe(deadline);
+  });
+
+  describe('every fetch adapter marks undici’s headers timeout', () => {
+    const wire: ProviderRequest = { model: 'zz-model', messages: [{ role: 'user', content: 'zz go' }], maxTokens: 16 };
+    const adapters = [
+      ['OpenAI', () => new OpenAIAdapter({ apiKey: 'zz-key' })],
+      ['compatible', () => new OpenAICompatibleAdapter({ apiKey: 'zz-key', baseURL: 'https://zz.invalid/v1' })],
+      ['completions', () => new OpenAICompletionsAdapter({ apiKey: 'zz-key', baseURL: 'https://zz.invalid/v1' })],
+      ['Responses API', () => new OpenAIResponsesAPIAdapter({ apiKey: 'zz-key' })],
+      ['Responses', () => new OpenAIResponsesAdapter({ apiKey: 'zz-key' })],
+      ['OpenRouter', () => new OpenRouterAdapter({ apiKey: 'zz-key' })],
+      ['Gemini', () => new GeminiAdapter({ apiKey: 'zz-key' })],
+      ['Bedrock', () => new BedrockAdapter({ accessKeyId: 'zz-access', secretAccessKey: 'zz-secret', region: 'us-east-1' })],
+    ] as const;
+    for (const [name, create] of adapters) {
+      it.each(['complete', 'stream'] as const)(`${name} %s`, async (entry) => {
+        vi.stubGlobal('fetch', vi.fn(async () => { throw headersTimeout(); }));
+        const adapter = create();
+        const thrown = entry === 'complete'
+          ? await adapter.complete(wire).catch((e) => e)
+          : await adapter.stream(wire, { onChunk() {} }).catch((e) => e);
+        expect(thrown).toMatchObject({ type: 'timeout', retryable: true });
+        expect(isDeadlineExpiry(thrown)).toBe(true);
+      });
+    }
+  });
+
+  describe('a fetch adapter (OpenAIAdapter)', () => {
+    const openai = () => membrane(new OpenAIAdapter({ apiKey: 'zz-key' }));
+
+    it.each(['complete', 'stream', 'yielding'] as const)('%s: undici’s headers timeout is sent once', async (entry) => {
+      const fetch = vi.fn(async () => { throw headersTimeout(); });
+      vi.stubGlobal('fetch', fetch);
+      expect(await run(openai(), entry)).toMatchObject({ type: 'timeout', retryable: true, attempts: 1 });
+      expect(fetch).toHaveBeenCalledTimes(1);
+    });
+
+    it.each(['complete', 'stream', 'yielding'] as const)('%s: undici’s body timeout is sent once', async (entry) => {
+      // Headers arrive; the body then fails before any data, as undici's
+      // bodyTimeout fails it.
+      const fetch = vi.fn(async () => new Response(
+        new ReadableStream({ start(controller) { controller.error(bodyTimeout()); } }),
+        { status: 200, headers: { 'content-type': entry === 'complete' ? 'application/json' : 'text/event-stream' } },
+      ));
+      vi.stubGlobal('fetch', fetch);
+      expect(await run(openai(), entry)).toMatchObject({ type: 'timeout', retryable: true, attempts: 1 });
+      expect(fetch).toHaveBeenCalledTimes(1);
+    });
+
+    it.each(['complete', 'stream', 'yielding'] as const)('%s: a connect timeout gets the base schedule', async (entry) => {
+      const fetch = vi.fn(async () => { throw connectTimeout(); });
+      vi.stubGlobal('fetch', fetch);
+      expect(await run(openai(), entry)).toMatchObject({ type: 'timeout', retryable: true, attempts: 5 });
+      expect(fetch).toHaveBeenCalledTimes(5);
+    });
+
+    it('ETIMEDOUT gets the base schedule', async () => {
+      const fetch = vi.fn(async () => { throw systemTimeout(); });
+      vi.stubGlobal('fetch', fetch);
+      expect(await run(openai(), 'stream')).toMatchObject({ type: 'timeout', attempts: 5 });
+      expect(fetch).toHaveBeenCalledTimes(5);
+    });
+
+    it.each(['complete', 'stream', 'yielding'] as const)('%s: Bun’s fetch timeout is sent once', async (entry) => {
+      const fetch = vi.fn(async () => { throw bunTimeout(); });
+      vi.stubGlobal('fetch', fetch);
+      expect(await run(openai(), entry)).toMatchObject({ type: 'timeout', retryable: true, attempts: 1 });
+      expect(fetch).toHaveBeenCalledTimes(1);
+    });
+
+    it('a caller’s own AbortSignal.timeout() is still a cancellation', async () => {
+      // It rejects with the same TimeoutError, but the caller's signal decides.
+      vi.stubGlobal('fetch', vi.fn((_url: unknown, init?: { signal?: AbortSignal }) => new Promise((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => reject(init.signal!.reason));
+      })));
+      const thrown = await openai().complete(REQUEST, { signal: AbortSignal.timeout(5) }).catch((e) => e);
+      expect(thrown).toMatchObject({ type: 'abort', retryable: false });
+    });
+  });
+
+  describe('AnthropicAdapter, whose SDK reports every timeout the same way', () => {
+    const anthropic = () => membrane(new AnthropicAdapter({ apiKey: 'zz-key', cacheKeepalive: { enabled: false } }));
+
+    it.each(['complete', 'stream', 'yielding'] as const)('%s: a connect timeout is sent once', async (entry) => {
+      const fetch = vi.fn(async () => { throw connectTimeout(); });
+      vi.stubGlobal('fetch', fetch);
+      const thrown = await run(anthropic(), entry);
+      expect(thrown).toMatchObject({ type: 'timeout', retryable: true, attempts: 1 });
+      expect(isDeadlineExpiry(thrown)).toBe(true);
+      expect(fetch).toHaveBeenCalledTimes(1);
+    });
+
+    it.each(['complete', 'stream', 'yielding'] as const)('%s: undici’s headers timeout is sent once', async (entry) => {
+      const fetch = vi.fn(async () => { throw headersTimeout(); });
+      vi.stubGlobal('fetch', fetch);
+      expect(await run(anthropic(), entry)).toMatchObject({ type: 'timeout', retryable: true, attempts: 1 });
+      expect(fetch).toHaveBeenCalledTimes(1);
+    });
+
+    it.each(['complete', 'stream', 'yielding'] as const)('%s: a reset connection gets the base schedule', async (entry) => {
+      const fetch = vi.fn(async () => { throw reset(); });
+      vi.stubGlobal('fetch', fetch);
+      expect(await run(anthropic(), entry)).toMatchObject({ type: 'network', retryable: true, attempts: 5 });
+      expect(fetch).toHaveBeenCalledTimes(5);
+    });
+
+    // A read that fails after the headers reaches the stream paths wrapped
+    // once more, by the SDK's MessageStream, so its code is two causes down.
+    const failedRead = (failure: () => Error) => vi.fn(async () => new Response(
+      new ReadableStream({ start(controller) { controller.error(failure()); } }),
+      { status: 200, headers: { 'content-type': 'text/event-stream' } },
+    ));
+
+    it.each(['stream', 'yielding'] as const)('%s: undici’s body timeout before any event is sent once', async (entry) => {
+      const fetch = failedRead(bodyTimeout);
+      vi.stubGlobal('fetch', fetch);
+      const thrown = await run(anthropic(), entry);
+      expect(thrown).toMatchObject({ type: 'timeout', retryable: true, attempts: 1 });
+      expect(isDeadlineExpiry(thrown)).toBe(true);
+      expect(fetch).toHaveBeenCalledTimes(1);
+    });
+
+    it.each(['stream', 'yielding'] as const)('%s: a socket closed before any event gets the base schedule', async (entry) => {
+      const fetch = failedRead(() => undici('other side closed', 'SocketError', 'UND_ERR_SOCKET', 'terminated'));
+      vi.stubGlobal('fetch', fetch);
+      expect(await run(anthropic(), entry)).toMatchObject({ type: 'network', retryable: true, attempts: 5 });
+      expect(fetch).toHaveBeenCalledTimes(5);
+    });
+  });
+
+  it.each(['complete', 'stream', 'yielding'] as const)(
+    '%s: an adapter that throws what fetch threw gets the same rule',
+    async (entry) => {
+      // Not every adapter types its own failures. Membrane decides the retry
+      // on the error as errorFromThrown types it, which is how complete() and
+      // stream() rethrow it (streamYielding's error event carries it as thrown).
+      const adapter = new FailingAdapter(Infinity, headersTimeout);
+      const thrown = await run(membrane(adapter), entry);
+      expect(adapter.sends).toBe(1);
+      if (entry !== 'yielding') expect(isDeadlineExpiry(thrown)).toBe(true);
+    },
+  );
 });
 
 describe("AnthropicAdapter reads the API's retry advice, as the SDK did", () => {

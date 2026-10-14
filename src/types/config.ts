@@ -18,13 +18,19 @@ export interface RetryConfig {
    * before it delivered anything, the first included: 5 means one try and up
    * to four retries; 0 or 1 means no retries (default: 5). It covers a 5xx,
    * a provider's 408 and a connection failure, on every entry point and
-   * adapter; an adapter's own idle or first-event deadline is left to the
-   * caller. A retryable rate limit (429) gets at least 5 attempts whatever
-   * this says (unless the call sets `retryRateLimits: false`), and a provider
-   * capacity error (529) gets the larger of this and `overloaded.maxRetries`,
-   * on the `overloaded` schedule. Membrane is the only layer that retries:
-   * AnthropicAdapter turns its SDK client's own retries off. A host with a
-   * retry layer of its own can set 1 here, and read `MembraneError.attempts`.
+   * adapter. A deadline that runs out on a request already sent is left to
+   * the caller: AnthropicAdapter's idle and first-event watchdogs, undici's
+   * headers and body timeouts, Bun's fetch timeout, and every timeout
+   * AnthropicAdapter's SDK client reports, which include a connect timeout
+   * (the SDK reports both the same way). The other adapters' connect
+   * timeouts are sent again like any connection failure. A retryable rate
+   * limit (429) gets at least 5
+   * attempts whatever this says (unless the call sets `retryRateLimits:
+   * false`), and a provider capacity error (529) gets the larger of this and
+   * `overloaded.maxRetries`, on the `overloaded` schedule. Membrane is the
+   * only layer that retries: AnthropicAdapter turns its SDK client's own
+   * retries off. A host with a retry layer of its own can set 1 here, and
+   * read `MembraneError.attempts`.
    */
   maxRetries: number;
 

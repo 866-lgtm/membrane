@@ -61,7 +61,7 @@ import {
   isAbortedResponse,
   unsupportedError,
 } from './types/index.js';
-import { withAttempts, isDeadlineExpiry } from './types/errors.js';
+import { withAttempts, isDeadlineExpiry, errorFromThrown } from './types/errors.js';
 import type { BuildResult } from './formatters/types.js';
 import { computeCacheWireReceipt } from './cache-wire-receipt.js';
 import {
@@ -500,7 +500,7 @@ export class Membrane {
         // The one retry policy (retryPlan): a 529 on the overloaded schedule,
         // a 429 with its floor of five, any other retryable error within
         // maxRetries. Terminal billing/quota codes are excluded by
-        // classification, and an adapter's own deadline is the caller's.
+        // classification, and a deadline on a sent request is the caller's.
         const plan = isDeadlineExpiry(classifiedError)
           ? undefined
           : this.retryPlan(errorInfo, tries, { retryRateLimits: options.retryRateLimits });
@@ -2416,8 +2416,11 @@ export class Membrane {
         // A call that delivered anything can't be sent again, and it starts
         // the count again: membrane hasn't retried this failure.
         if (delivered) throw withAttempts(error, 1);
-        const errorInfo = classifyError(error);
-        const plan = isDeadlineExpiry(error) ? undefined : this.retryPlan(errorInfo, tries, { retryRateLimits });
+        // A failure that isn't a MembraneError yet is judged as the caller
+        // will get it: rethrown, it's typed by errorFromThrown.
+        const typed = error instanceof MembraneError ? error : errorFromThrown(error);
+        const errorInfo = classifyError(typed);
+        const plan = isDeadlineExpiry(typed) ? undefined : this.retryPlan(errorInfo, tries, { retryRateLimits });
         if (!plan) throw withAttempts(error, tries);
         // The same pre-retry hook contract as complete(): hosts use onError
         // for circuit-breaking, and its 'abort' decision ends the call here.
@@ -2436,7 +2439,7 @@ export class Membrane {
             attempt: tries,
             maxAttempts: plan.maxAttempts - 1,
             delayMs,
-            error: error instanceof MembraneError ? error : new MembraneError(errorInfo),
+            error: typed,
           });
         }
         // The call's signal ends the wait: the caller's, or on streamYielding
@@ -3115,8 +3118,8 @@ export class Membrane {
    * with this error, after `attempt` tries, is sent again: undefined when it
    * isn't; otherwise the schedule it waits on (overloaded) and the most tries
    * it gets in all (maxAttempts). The callers send again only what failed
-   * before delivering anything, and leave an adapter's own deadline
-   * (isDeadlineExpiry) to the caller.
+   * before delivering anything, and leave a deadline that ran out on a sent
+   * request (isDeadlineExpiry) to the caller.
    *
    * A 529 takes the overloaded schedule, a 429 at least five attempts, and
    * any other retryable error (a 5xx, a 408, a connection failure) the base
@@ -3161,9 +3164,7 @@ export class Membrane {
     // through as it is.
     if (isBuildRefusal(error)) return error;
     if (error instanceof MembraneError) return withRawRequest(error, rawRequest);
-    const errorInfo = classifyError(error);
-    errorInfo.rawRequest = rawRequest;
-    return new MembraneError(errorInfo);
+    return errorFromThrown(error, rawRequest);
   }
 
   private sleep(ms: number, signal?: AbortSignal): Promise<void> {

@@ -19,7 +19,6 @@ import {
   MembraneError,
   abortError,
   authError,
-  classifyError,
   errorFromProviderStatus,
   isTypedAbortError,
   networkError,
@@ -28,7 +27,7 @@ import {
   withRawRequest,
   unsupportedError,
 } from '../types/index.js';
-import { statusForProviderCode, deadlineExpired } from '../types/errors.js';
+import { statusForProviderCode, deadlineExpired, errorFromThrown } from '../types/errors.js';
 import { flattenRootSchemaUnion } from './anthropic-tool-schema.js';
 import { assertTerminalEventObserved } from './utils.js';
 import { fetchWithCredentials, validateCredential, type CredentialContext, type CredentialResolver } from './credentials.js';
@@ -893,8 +892,14 @@ export class AnthropicAdapter implements ProviderAdapter {
     // The SDK's transport failures carry no status ("Connection error.",
     // `cause: TypeError: fetch failed`), so the status path below can't type
     // them. They are the SDK's own types: the timeout subclass first.
+    //
+    // A timeout is a deadline membrane leaves to the caller. The SDK reports
+    // its own request timeout, undici's headers timeout and a connect timeout
+    // as this same error, with no cause (SDK 0.52 makeRequest), so a connect
+    // timeout, which membrane would otherwise send again, can't be told
+    // apart here and goes to the caller too.
     if (error instanceof Anthropic.APIConnectionTimeoutError) {
-      return timeoutError(error.message, error, rawRequest);
+      return deadlineExpired(timeoutError(error.message, error, rawRequest));
     }
     if (error instanceof Anthropic.APIConnectionError) {
       return networkError(error.message, error, rawRequest);
@@ -960,9 +965,7 @@ export class AnthropicAdapter implements ProviderAdapter {
       }
     }
 
-    const info = classifyError(error);
-    info.rawRequest = rawRequest;
-    return new MembraneError(info);
+    return errorFromThrown(error, rawRequest);
   }
 
   /**

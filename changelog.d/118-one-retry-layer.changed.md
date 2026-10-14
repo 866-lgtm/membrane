@@ -12,9 +12,17 @@
   also retried, stays non-retryable: Anthropic's Messages API doesn't document
   it. With `overloaded.maxRetries: 0`, a 529 follows this base policy on every
   path; before, it wasn't retried on the streaming paths.
-- An adapter's own deadline isn't retried: `AnthropicAdapter`'s idle and
-  first-event watchdogs still end the call with a retryable `timeout`, which
-  the caller may retry, but membrane doesn't spend another full deadline on it.
+- A deadline that runs out on a request already sent isn't retried. The call
+  still ends with a retryable `timeout`, which the caller may retry, but
+  membrane doesn't spend another full deadline on it. That covers
+  `AnthropicAdapter`'s idle and first-event watchdogs, the runtime's own
+  fetch deadlines on the other adapters (undici's headers and body timeouts,
+  300 s each by default; Bun's fetch timeout), and every timeout
+  `AnthropicAdapter`'s SDK client reports. The SDK reports a connect
+  timeout the same way, without its cause, so on `AnthropicAdapter` a connect
+  timeout now reaches the caller after one send, where the SDK sent it three
+  times. On the other adapters a connect timeout (`UND_ERR_CONNECT_TIMEOUT`,
+  `ETIMEDOUT`) is retried like any connection failure.
 - `AnthropicAdapter` reads the API's `x-should-retry` (it decides whether the
   error is retryable) and `retry-after-ms` (before `retry-after`), as the SDK
   did.
