@@ -102,7 +102,6 @@ import {
   strippedImagePlaceholder,
   shedImagesToFitByteBudget, assertWithinByteBudget,
 } from './utils/image-media.js';
-import { anthropicServerBlockFor } from './utils/anthropic-server-blocks.js';
 import { getDefaultPricing } from './registry/default-pricing.js';
 
 // ============================================================================

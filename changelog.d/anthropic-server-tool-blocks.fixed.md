@@ -5,10 +5,11 @@
   loops and `fromAnthropicContent` kept each on a zero-width `rawItem`
   carrier, but NativeFormatter, which the native tool loops build through,
   and the exported `toAnthropicContent` dropped the carrier as empty text.
-  So a replayed web-search turn lost its search results, and with signed
-  thinking in the turn the API refused it: "`thinking` or
-  `redacted_thinking` blocks in the latest assistant message cannot be
-  modified". Each now sends the block itself, as a copy without any
+  So a replayed web-search turn lost its search results. With signed
+  thinking in the turn, claude-sonnet-4-6 refused it in a live check:
+  "`thinking` or `redacted_thinking` blocks in the latest assistant message
+  cannot be modified". claude-haiku-5-5 accepted it and ran the search
+  again. Each now sends the block itself, as a copy without any
   `cache_control` stored on it or its carrier. A block stored as itself, as
   a seeded history can hold it, goes back the same way. NativeFormatter
   sends it only in the assistant's own turns, the native tool loops'
@@ -30,8 +31,8 @@
   that turn on: a prompt-cache prefix written before upgrading that reaches
   past the turn no longer matches, and the search results are input tokens on
   every later request. A turn stored through `complete()` before this release
-  has no carrier to send, so replaying it with signed thinking is still
-  refused: an upgrade can't restore what was never kept.
+  has no carrier to send, so a model that refuses it with signed thinking
+  still refuses it: an upgrade can't restore what was never kept.
 - Streaming: a server tool's call (`server_tool_use`, `mcp_tool_use`) kept
   the empty `input` of its `content_block_start`, because only a `tool_use`
   assembled its `input_json_delta` fragments. It now holds the input the
