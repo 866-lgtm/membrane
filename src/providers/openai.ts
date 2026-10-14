@@ -154,7 +154,7 @@ const COMPLETION_TOKENS_MODELS = [
 /**
  * Check if a model requires max_completion_tokens parameter
  */
-function requiresCompletionTokens(model: string): boolean {
+export function requiresCompletionTokens(model: string): boolean {
   return isReasoningGenerationGpt(model) || COMPLETION_TOKENS_MODELS.some(prefix => model.startsWith(prefix));
 }
 
@@ -174,7 +174,7 @@ const NO_TEMPERATURE_MODELS = [
 /**
  * Check if a model doesn't support custom temperature
  */
-function noTemperatureSupport(model: string): boolean {
+export function noTemperatureSupport(model: string): boolean {
   return isReasoningGenerationGpt(model) || NO_TEMPERATURE_MODELS.some(prefix => model.startsWith(prefix));
 }
 
@@ -197,7 +197,7 @@ const NO_STOP_MODELS = [
 /**
  * Check if a model doesn't support stop sequences
  */
-function noStopSupport(model: string): boolean {
+export function noStopSupport(model: string): boolean {
   return isReasoningGenerationGpt(model) || NO_STOP_MODELS.some(prefix => model.startsWith(prefix));
 }
 
