@@ -24,6 +24,7 @@ import { AnthropicAdapter } from '../../src/providers/anthropic.js';
 import { BedrockAdapter } from '../../src/providers/bedrock.js';
 import { Membrane } from '../../src/membrane.js';
 import type { ProviderAdapter, ProviderResponse } from '../../src/types/provider.js';
+import type { ToolCall, ToolResult } from '../../src/types/tools.js';
 import { stubFetchWithSseLines } from '../helpers/sse-fixtures.js';
 import { chunkFrame, streamBody } from '../helpers/bedrock-event-stream.js';
 
@@ -71,6 +72,13 @@ describe('toolUseInputFromText', () => {
     expect(toolUseInputFromText(malformed)).toEqual({ input: {}, unparseableInput: malformed });
     expect(toolUseInputFromText('  ')).toEqual({ input: {}, unparseableInput: '  ' });
   });
+
+  it('reads arguments that are not text as a value, and a null field as no arguments', () => {
+    expect(toolUseInputFromText(null)).toEqual({ input: {} });
+    expect(toolUseInputFromText({ a: 1 })).toEqual({ input: { a: 1 } });
+    expect(toolUseInputFromText(42)).toEqual({ input: {}, unparseableInput: '42' });
+    expect(toolUseInputFromText([1, 2])).toEqual({ input: {}, unparseableInput: '[1,2]' });
+  });
 });
 
 describe('toolUseInputFromValue', () => {
@@ -113,6 +121,22 @@ describe('OpenAI-family converters', () => {
       { model: 'zz-model-1', maxTokens: 64, messages: [{ role: 'user', content: 'zz prompt' }] } as any,
     );
     expect(toolUseOf(res.content)).toMatchObject({ id: 'call_zz', input: {}, unparseableInput: '42' });
+  });
+
+  it.each([
+    [null, {}],
+    [{ a: 1 }, { a: 1 }],
+  ])('reads a completion\'s arguments field %j, which is not text, as a value (openai-compatible)', async (args, input) => {
+    stubFetchWithJson({
+      id: 'zz-id',
+      model: 'zz-model-1',
+      choices: [{ index: 0, message: openAICall(args as any), finish_reason: 'tool_calls' }],
+      usage: { prompt_tokens: 3, completion_tokens: 5, total_tokens: 8 },
+    });
+    const res: any = await new OpenAICompatibleAdapter({ baseURL: 'http://localhost:9/v1', apiKey: 'zz-key' }).complete(
+      { model: 'zz-model-1', maxTokens: 64, messages: [{ role: 'user', content: 'zz prompt' }] } as any,
+    );
+    expect(toolUseOf(res.content)).toEqual({ type: 'tool_use', id: 'call_zz', name: 'zz_tool', input });
   });
 
   it('marks a streamed call whose arguments are null', async () => {
@@ -201,13 +225,17 @@ describe('Anthropic stream', () => {
 });
 
 describe('Bedrock stream', () => {
-  async function streamToolCall(partialJson: string, opts: { stop?: boolean } = {}): Promise<{ res: any; completed: any[] }> {
+  /** One tool call: `partialJson` undefined sends no input_json_delta at all. */
+  async function streamToolCall(partialJson: string | undefined, opts: { stop?: boolean } = {}): Promise<{ res: any; completed: any[] }> {
     const frames = [
       chunkFrame({ type: 'message_start', message: { usage: { input_tokens: 10 } } }),
       chunkFrame({ type: 'content_block_start', index: 0, content_block: { type: 'tool_use', id: 'toolu_zz', name: 'zz_tool', input: {} } }),
-      chunkFrame({ type: 'content_block_delta', index: 0, delta: { type: 'input_json_delta', partial_json: partialJson } }),
+      ...(partialJson === undefined ? [] : [
+        chunkFrame({ type: 'content_block_delta', index: 0, delta: { type: 'input_json_delta', partial_json: partialJson } }),
+      ]),
       ...(opts.stop === false ? [] : [chunkFrame({ type: 'content_block_stop', index: 0 })]),
-      chunkFrame({ type: 'message_delta', delta: { stop_reason: 'tool_use' }, usage: { output_tokens: 5 } }),
+      // A call max_tokens cuts gets no content_block_stop.
+      chunkFrame({ type: 'message_delta', delta: { stop_reason: opts.stop === false ? 'max_tokens' : 'tool_use' }, usage: { output_tokens: 5 } }),
       chunkFrame({ type: 'message_stop' }),
     ];
     vi.stubGlobal('fetch', vi.fn(async () => ({ ok: true, status: 200, body: streamBody(frames) })));
@@ -231,17 +259,34 @@ describe('Bedrock stream', () => {
     expect(completed.at(-1)).toMatchObject({ unparseableInput: args });
   });
 
-  it('marks a block the stream left open whose arguments did not parse', async () => {
-    const { res } = await streamToolCall(malformed, { stop: false });
-    expect(toolUseOf(res.content)).toMatchObject({ input: {}, unparseableInput: malformed });
+  it('keeps a stopped call with no arguments as {}, unmarked', async () => {
+    const { res } = await streamToolCall(undefined);
+    expect(toolUseOf(res.content)).toEqual({ type: 'tool_use', id: 'toolu_zz', name: 'zz_tool', input: {} });
+  });
+
+  // As in the Anthropic adapter: a block the stream left open keeps
+  // content_block_start's input, and whatever arguments arrived mark it.
+  it.each([
+    ['did not parse', malformed],
+    ['parse to an object', '{"a":1}'],
+  ])('marks a block the stream left open whose arguments %s', async (_kind, args) => {
+    const { res } = await streamToolCall(args, { stop: false });
+    expect(toolUseOf(res.content)).toEqual({ type: 'tool_use', id: 'toolu_zz', name: 'zz_tool', input: {}, unparseableInput: args });
+  });
+
+  it('marks a block the stream left open before any arguments arrived with ""', async () => {
+    const { res } = await streamToolCall(undefined, { stop: false });
+    expect(toolUseOf(res.content)).toEqual({ type: 'tool_use', id: 'toolu_zz', name: 'zz_tool', input: {}, unparseableInput: '' });
   });
 });
 
-/** An adapter that answers with one tool_use block, as given. */
+/** An adapter that answers with one tool_use block, as given, and then with text. */
 function adapterAnswering(block: Record<string, unknown>): ProviderAdapter {
+  let calls = 0;
   const response = (): ProviderResponse => ({
-    content: [{ type: 'tool_use', id: 'call_zz', name: 'zz_tool', ...block }],
-    stopReason: 'tool_use',
+    ...(calls++ === 0
+      ? { content: [{ type: 'tool_use', id: 'call_zz', name: 'zz_tool', ...block }], stopReason: 'tool_use' }
+      : { content: [{ type: 'text', text: 'zz done' }], stopReason: 'end_turn' }),
     stopSequence: undefined,
     usage: { inputTokens: 1, outputTokens: 1 },
     model: 'zz-model-1',
@@ -280,5 +325,38 @@ describe('Membrane', () => {
   it('stream gives an adapter\'s input that is not an object as {}, marked', async () => {
     const res: any = await new Membrane(adapterAnswering({ input: [1] })).stream(membraneRequest, { onChunk: () => {} });
     expect(res.content.find((b: any) => b.type === 'tool_use')).toMatchObject({ input: {}, unparseableInput: '[1]' });
+  });
+});
+
+describe('ToolCall carries the marker to whoever runs the call', () => {
+  const marked = { input: {}, unparseableInput: '{"path":' };
+  const markedCall: ToolCall = { id: 'call_zz', name: 'zz_tool', input: {}, unparseableInput: '{"path":' };
+  const refuse = (calls: ToolCall[]): ToolResult[] =>
+    calls.map((c) => ({ toolUseId: c.id, content: 'zz arguments did not parse', isError: true }));
+
+  it('in the calls stream() hands onToolCalls', async () => {
+    const seen: ToolCall[] = [];
+    await new Membrane(adapterAnswering(marked)).stream(membraneRequest, {
+      onToolCalls: async (calls) => { seen.push(...calls); return refuse(calls); },
+    });
+    expect(seen).toEqual([markedCall]);
+  });
+
+  it('in the yielding stream\'s tool-calls event', async () => {
+    const stream = new Membrane(adapterAnswering(marked)).streamYielding(membraneRequest);
+    const seen: ToolCall[] = [];
+    for await (const event of stream) {
+      if (event.type === 'tool-calls') {
+        seen.push(...event.calls);
+        stream.provideToolResults(refuse(event.calls));
+      }
+    }
+    expect(seen).toEqual([markedCall]);
+  });
+
+  it('in complete()\'s toolCalls, and not on a call whose arguments were an object', async () => {
+    expect((await new Membrane(adapterAnswering(marked)).complete(membraneRequest)).toolCalls).toEqual([markedCall]);
+    expect((await new Membrane(adapterAnswering({ input: { a: 1 } })).complete(membraneRequest)).toolCalls)
+      .toEqual([{ id: 'call_zz', name: 'zz_tool', input: { a: 1 } }]);
   });
 });

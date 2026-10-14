@@ -31,6 +31,7 @@ import type {
   ToolCall,
   ToolResult,
   ToolContext,
+  ToolUseContent,
   RetryConfig,
   ToolDefinition,
   ErrorInfo,
@@ -288,6 +289,19 @@ class NativeBlockTracker {
     this.emit?.({ event: 'block_complete', index, block: mb });
     if (this.blockIndex === index) this.currentType = 'text';
   }
+}
+
+/**
+ * The call a caller runs, from its tool_use block, with the block's marker
+ * when `input` isn't the model's arguments.
+ */
+function toolCallOf(block: ToolUseContent): ToolCall {
+  return {
+    id: block.id,
+    name: block.name,
+    input: block.input,
+    ...(block.unparseableInput !== undefined ? { unparseableInput: block.unparseableInput } : {}),
+  };
 }
 
 /**
@@ -1612,11 +1626,7 @@ export class Membrane {
           }
 
           // Convert to normalized ToolCall[]
-          const toolCalls: ToolCall[] = toolUseBlocks.map(block => ({
-            id: block.id,
-            name: block.name,
-            input: block.input as Record<string, unknown>,
-          }));
+          const toolCalls: ToolCall[] = toolUseBlocks.map(toolCallOf);
 
           // Track tool calls
           executedToolCalls.push(...toolCalls);
@@ -2653,19 +2663,15 @@ export class Membrane {
           const name = restoreToolName(block.name, request.tools);
           // As in parseProviderContent: `input` is an object, and the
           // adapter's marker comes through.
-          const toolInput = toolUseInputFromValue(block.input);
-          content.push({
+          const toolUse: ToolUseContent = {
             type: 'tool_use',
             id: block.id,
             name,
-            ...toolInput,
+            ...toolUseInputFromValue(block.input),
             ...(block.unparseableInput !== undefined ? { unparseableInput: block.unparseableInput } : {}),
-          });
-          toolCalls.push({
-            id: block.id,
-            name,
-            input: toolInput.input,
-          });
+          };
+          content.push(toolUse);
+          toolCalls.push(toolCallOf(toolUse));
         } else if (block.type === 'thinking') {
           content.push({
             type: 'thinking',
@@ -4132,11 +4138,7 @@ export class Membrane {
 
         if (toolUseBlocks.length > 0 && lastStopReason === 'tool_use') {
           // Convert to normalized ToolCall[]
-          const toolCalls: ToolCall[] = toolUseBlocks.map(block => ({
-            id: block.id,
-            name: block.name,
-            input: block.input as Record<string, unknown>,
-          }));
+          const toolCalls: ToolCall[] = toolUseBlocks.map(toolCallOf);
 
           // Track tool calls
           executedToolCalls.push(...toolCalls);

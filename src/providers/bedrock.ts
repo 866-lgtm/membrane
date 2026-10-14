@@ -633,6 +633,9 @@ export class BedrockAdapter implements ProviderAdapter {
 
     // Parse the binary event stream
     const contentBlocks: Array<{ type: string; text?: string; thinking?: string; signature?: string }> = [];
+    // Indices of blocks content_block_stop finalized. A tool call truncated by
+    // max_tokens never gets one, as in the Anthropic adapter.
+    const stoppedBlocks = new Set<number>();
     let currentBlockIndex = -1;
     let finalMessage: BedrockMessageResponse | undefined;
     let inputTokens = 0;
@@ -814,6 +817,7 @@ export class BedrockAdapter implements ProviderAdapter {
                   // on the dual-fire convention (e.g. membrane's native
                   // yielding path) silently drops block_complete on Bedrock.
                   const blockIdx = (eventData as { index?: number }).index ?? currentBlockIndex;
+                  stoppedBlocks.add(blockIdx);
                   // Finalize tool_use blocks: parse accumulated argument JSON
                   // into `input` before the block_complete fire, so consumers
                   // of the dual-fire convention see a complete tool call.
@@ -890,7 +894,7 @@ export class BedrockAdapter implements ProviderAdapter {
       id: 'msg_stream',
       type: 'message',
       role: 'assistant',
-      content: contentBlocks.map(b => {
+      content: contentBlocks.map((b, blockIdx) => {
         if (b.type === 'thinking') {
           return { type: 'thinking' as const, thinking: b.thinking ?? '', signature: b.signature };
         }
@@ -903,17 +907,13 @@ export class BedrockAdapter implements ProviderAdapter {
           // fragments — the generic text mapping below would strip them and
           // parseResponse would then drop the block (requires id && name).
           const tb = b as { type: string; id?: string; name?: string; input?: unknown; partialJson?: string; unparseableInput?: string };
-          let input: unknown = tb.input ?? {};
-          // A block content_block_stop marked keeps its marker. Any other is
-          // parsed here, one the stream left open included.
-          let unparseableInput = tb.unparseableInput;
-          if (tb.partialJson && unparseableInput === undefined) {
-            const parsed = toolUseInputFromText(tb.partialJson);
-            if (parsed.unparseableInput === undefined) input = parsed.input;
-            else unparseableInput = parsed.unparseableInput;
-          }
+          // A block content_block_stop finalized keeps what it set there. One
+          // the stream left open keeps the input content_block_start carried,
+          // and whatever argument text arrived marks it, none included, as in
+          // the Anthropic adapter: its arguments never finished arriving.
+          const unparseableInput = stoppedBlocks.has(blockIdx) ? tb.unparseableInput : (tb.partialJson ?? '');
           return {
-            type: 'tool_use', id: tb.id, name: tb.name, input,
+            type: 'tool_use', id: tb.id, name: tb.name, input: tb.input ?? {},
             ...(unparseableInput !== undefined ? { unparseableInput } : {}),
           } as unknown as { type: 'text'; text?: string };
         }

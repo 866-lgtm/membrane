@@ -199,10 +199,14 @@ function notAnObject(raw: string, value: unknown): ToolUseInput {
  * it. Text that doesn't parse, or parses to anything but an object (null, a
  * number, a string, a boolean or an array), isn't the model's arguments as an
  * object: `input` is then `{}`, and `unparseableInput` keeps the text as it
- * came. No text, or empty text, is a call with no arguments: `{}`, unmarked.
+ * came. No text (the field absent or null), or empty text, is a call with no
+ * arguments: `{}`, unmarked. Arguments a server sent as something other than
+ * text, outside its wire's spec, are read as toolUseInputFromValue reads a
+ * value, so the marker is always text.
  */
-export function toolUseInputFromText(text: string | undefined): ToolUseInput {
-  if (text === undefined || text === '') return { input: {} };
+export function toolUseInputFromText(text: unknown): ToolUseInput {
+  if (text === undefined || text === null || text === '') return { input: {} };
+  if (typeof text !== 'string') return toolUseInputFromValue(text);
   let parsed: unknown;
   try {
     parsed = JSON.parse(text);

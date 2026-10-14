@@ -605,7 +605,7 @@ export class OpenAIResponsesAPIAdapter implements ProviderAdapter {
           type: 'tool_use',
           id: callId,
           name: typeof item.name === 'string' ? item.name : '',
-          ...toolUseInputFromText(typeof item.arguments === 'string' ? item.arguments : undefined),
+          ...toolUseInputFromText(item.arguments),
           itemId: item.id,
           outputIndex,
           rawItem: item,
