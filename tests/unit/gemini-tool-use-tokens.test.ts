@@ -9,7 +9,7 @@
  * input (#120).
  */
 import { describe, it, expect, afterEach, vi } from 'vitest';
-import { GeminiAdapter } from '../../src/providers/gemini.js';
+import { GeminiAdapter, resetPromptExcludesCacheWarning } from '../../src/providers/gemini.js';
 import { Membrane } from '../../src/membrane.js';
 import type { NormalizedRequest, NormalizedResponse } from '../../src/types/index.js';
 
@@ -147,5 +147,35 @@ describe('tool-use prompt tokens through Membrane', () => {
     expect(response.usage.estimatedCost?.input).toBeGreaterThan(0);
     expect(response.usage.estimatedCost?.input).toBe(promptOnly.usage.estimatedCost?.input);
     expect(response.details.model.perRound?.[0]?.usage.estimatedCost?.input).toBe(promptOnly.usage.estimatedCost?.input);
+  });
+});
+
+/**
+ * Beside the cache-inclusive reading: the cached span is inside
+ * `promptTokenCount` and the tool-use prompt is beside it, so a hit's fresh
+ * input is the prompt less the cached span, plus the tool-use prompt, and the
+ * cached span is compared with the prompt count alone.
+ */
+describe('tool-use prompt tokens beside a cache hit', () => {
+  it('a hit subtracts the cached span from the prompt and keeps the tool-use prompt', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => { /* silence */ });
+    stubCompleteResponse({ promptTokenCount: 10_000, cachedContentTokenCount: 8_000, toolUsePromptTokenCount: 300, candidatesTokenCount: 50, totalTokenCount: 10_350 });
+    const response = await new Membrane(new GeminiAdapter({ apiKey: 'zz-key-not-used' })).complete(MEMBRANE_REQUEST);
+
+    expect(response.usage.inputTokens).toBe(2_300);
+    expect(response.details.usage.cacheReadTokens).toBe(8_000);
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it('a cached span above the prompt count is read as cache-excluded, though prompt plus tool-use prompt would hold it', async () => {
+    resetPromptExcludesCacheWarning();
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => { /* silence */ });
+    stubCompleteResponse({ promptTokenCount: 1_000, cachedContentTokenCount: 1_200, toolUsePromptTokenCount: 500, candidatesTokenCount: 50, totalTokenCount: 1_550 });
+    const response = await new Membrane(new GeminiAdapter({ apiKey: 'zz-key-not-used' })).complete(MEMBRANE_REQUEST);
+
+    expect(response.usage.inputTokens).toBe(1_500);
+    expect(response.details.usage.cacheReadTokens).toBe(1_200);
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(String(warn.mock.calls[0]?.[0])).toContain('cachedContentTokenCount(1200) exceeds promptTokenCount(1000)');
   });
 });
