@@ -169,17 +169,21 @@ function geminiUsageToProviderUsage(
     // count, so a total that counts it is the same arithmetic as an
     // inclusive one: prompt + tool-use prompt + cached + candidates +
     // thoughts.
-    const reconciles = accountedTokens === totalTokens
-      || (promptExcludesCache && accountedTokens + cachedTokens === totalTokens);
+    const largestSum = promptExcludesCache ? accountedTokens + cachedTokens : accountedTokens;
+    const reconciles = accountedTokens === totalTokens || largestSum === totalTokens;
     if (!reconciles) {
+      // Only a total above every accepted sum says where the rest is.
+      const fields = promptExcludesCache
+        ? 'prompt, tool-use prompt, cached, candidates and thoughts'
+        : 'prompt, tool-use prompt, candidates and thoughts';
       console.warn(
         `[membrane:gemini] usageMetadata does not reconcile: promptTokenCount(${promptTokens})`
         + ` + toolUsePromptTokenCount(${toolUsePromptTokens})`
         + ` + candidatesTokenCount(${candidatesTokens}) + thoughtsTokenCount(${thoughtsTokens ?? 0})`
         + ` = ${accountedTokens}`
-        + (promptExcludesCache ? ` (${accountedTokens + cachedTokens} with cachedContentTokenCount(${cachedTokens}))` : '')
+        + (promptExcludesCache ? ` (${largestSum} with cachedContentTokenCount(${cachedTokens}))` : '')
         + `, but totalTokenCount = ${totalTokens}.`
-        + ' Some billed tokens are in a usageMetadata field outside prompt, tool-use prompt, candidates and thoughts.'
+        + (totalTokens > largestSum ? ` Some billed tokens are in a usageMetadata field outside ${fields}.` : '')
       );
     }
   }
@@ -253,20 +257,21 @@ export class GeminiAdapter implements ProviderAdapter {
    * "When cachedContent is set" sentence is about explicit caching
    * (`cachedContent`), which membrane never sets itself: a hit through
    * membrane is implicit unless a caller passes `cachedContent` through
-   * `providerParams`. Published figures fit the inclusive reading for both
-   * kinds of hit (each read 2026-10-15):
+   * `providerParams`. Published figures (each read 2026-10-15):
    *   - explicit: Google's caching cookbook (google-gemini/cookbook,
    *     quickstarts/Caching.ipynb) prints a response with promptTokenCount
    *     322,707, of which 322,698 cached, 282 candidates, 4,049 thoughts and
-   *     a totalTokenCount of 327,038, which is prompt + thoughts + candidates;
+   *     a totalTokenCount of 327,038, which is prompt + thoughts + candidates,
+   *     the cached span inside the prompt;
    *   - implicit: googleapis/python-genai#2064 (gemini-3-flash-preview, a
    *     chat growing about 1,000 tokens a turn) shows promptTokenCount rising
    *     steadily (7,996, 8,986, ... 17,972) while cachedContentTokenCount
    *     goes from 6,134 to 0 and later from 0 to 16,391, so the prompt count
    *     is the whole prompt whether the cache hit or not;
    *   - implicit: Simon Willison's note of 2025-05-09 on Gemini 2.5 Flash
-   *     shows a 204,082-token prompt (promptTokensDetails) with 200,658
-   *     cached.
+   *     shows a cached count on an implicit hit, 200,658 beside a
+   *     204,082-token prompt (promptTokensDetails). With no promptTokenCount
+   *     or total shown, these figures fit either reading.
    * Membrane's own probe hasn't measured a hit: on 2026-08-25, three
    * identical 10,893-token calls to gemini-3.5-flash-lite never reported the
    * field (implicit caching did not trigger), and explicit `cachedContents`

@@ -2,4 +2,6 @@
   read as cache-excluded, may have a `totalTokenCount` that counts the cached
   span too. The usage check now accepts that total, so such a response no
   longer logs "usageMetadata does not reconcile" on every call; a total that
-  matches neither sum still does, and names both.
+  matches neither sum still does, and names both. The warning's closing
+  sentence, that some billed tokens are in another usageMetadata field, now
+  appears only when the total exceeds every sum it names.
