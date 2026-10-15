@@ -4,6 +4,7 @@
  * Handles OpenAI-compatible API with tool_calls format
  */
 
+import { unreportedUsage } from '../utils/usage.js';
 import { assertMessagePrefillSupported } from './request-capabilities.js';
 
 import type {
@@ -696,6 +697,7 @@ export class OpenRouterAdapter implements ProviderAdapter {
         cacheReadTokens: cacheReadTokens ?? undefined,
         cacheConvention,
       },
+      ...unreportedUsage(response.usage?.prompt_tokens, response.usage?.completion_tokens),
       model: response.model ?? requestedModel,
       rawRequest,
       raw: response,
@@ -728,6 +730,7 @@ export class OpenRouterAdapter implements ProviderAdapter {
         cacheReadTokens: cacheReadTokens ?? undefined,
         cacheConvention,
       },
+      ...unreportedUsage(streamUsage?.prompt_tokens, streamUsage?.completion_tokens),
       model: requestedModel,
       rawRequest,
       raw: { message, finish_reason: finishReason ?? 'stop', usage: streamUsage },

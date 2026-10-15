@@ -104,6 +104,7 @@ export type {
   ProviderRequestOptions,
   ProviderRequestContext,
   ProviderResponse,
+  ProviderInputTransformation,
   StreamCallbacks,
   UsageCacheConvention,
 } from './provider.js';
@@ -131,6 +132,9 @@ export type {
   StreamBlockEvent,
   ToolCallsEvent,
   UsageEvent,
+  RoundReport,
+  RoundUsage,
+  ThinkingBindingEntry,
   CompleteEvent,
   ErrorEvent,
   BackoffEvent,
