@@ -13,7 +13,7 @@
 import { describe, it, expect, afterEach, vi } from 'vitest';
 import { GeminiAdapter, resetPromptExcludesCacheWarning } from '../../src/providers/gemini.js';
 import { Membrane } from '../../src/membrane.js';
-import type { NormalizedRequest, NormalizedResponse } from '../../src/types/index.js';
+import type { NormalizedRequest, NormalizedResponse, ProviderRequest } from '../../src/types/index.js';
 
 const HIT = { promptTokenCount: 10_000, cachedContentTokenCount: 8_000, candidatesTokenCount: 5, totalTokenCount: 10_005 };
 
@@ -121,12 +121,17 @@ describe('a pricing row without a cache-read rate', () => {
 });
 
 describe('a response the inclusive reading cannot explain', () => {
-  it('a cached span equal to the whole prompt is still inside it: no fresh input', async () => {
+  it('a cached span equal to the whole prompt is still inside it: no fresh input, on complete() and stream()', async () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
-    stubComplete({ promptTokenCount: 8_000, cachedContentTokenCount: 8_000, candidatesTokenCount: 5, totalTokenCount: 8_005 });
-    const response = await new Membrane(new GeminiAdapter({ apiKey: 'zz-key-not-used' })).complete(REQUEST);
-    expect(response.usage.inputTokens).toBe(0);
-    expect(response.details.usage.cacheReadTokens).toBe(8_000);
+    const usage = { promptTokenCount: 8_000, cachedContentTokenCount: 8_000, candidatesTokenCount: 5, totalTokenCount: 8_005 };
+    stubComplete(usage);
+    const completed = await new Membrane(new GeminiAdapter({ apiKey: 'zz-key-not-used' })).complete(REQUEST);
+    expect(completed.usage.inputTokens).toBe(0);
+    expect(completed.details.usage.cacheReadTokens).toBe(8_000);
+    stubStream(usage);
+    const streamed = await new Membrane(new GeminiAdapter({ apiKey: 'zz-key-not-used' })).stream(REQUEST) as NormalizedResponse;
+    expect(streamed.usage.inputTokens).toBe(0);
+    expect(streamed.details.usage.cacheReadTokens).toBe(8_000);
     expect(warn).not.toHaveBeenCalled();
   });
 
@@ -134,17 +139,74 @@ describe('a response the inclusive reading cannot explain', () => {
     resetPromptExcludesCacheWarning(); // the latch is process-wide: this test doesn't depend on order
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     const usage = { promptTokenCount: 2_000, cachedContentTokenCount: 8_000, candidatesTokenCount: 5, totalTokenCount: 2_005 };
-    const exceeding = (): string[] =>
-      warn.mock.calls.map((call) => String(call[0])).filter((line) => line.includes('exceeds promptTokenCount'));
+    const warning = '[membrane:gemini] cachedContentTokenCount(8000) exceeds promptTokenCount(2000),'
+      + ' so this prompt count cannot include the cached span. The response is read as cache-excluded'
+      + ' (promptTokenCount is the fresh input); the adapter declares cache-inclusive from Google\'s'
+      + ' definition of the field.';
     stubComplete(usage);
     const completed = await new Membrane(new GeminiAdapter({ apiKey: 'zz-key-not-used' })).complete(REQUEST);
     expect(completed.usage.inputTokens).toBe(2_000);
     expect(completed.details.usage.cacheReadTokens).toBe(8_000);
-    expect(exceeding()).toHaveLength(1);
+    // This warning and no other: the counts reconcile, and the convention is declared.
+    expect(warn.mock.calls).toEqual([[warning]]);
     stubStream(usage);
     const streamed = await new Membrane(new GeminiAdapter({ apiKey: 'zz-key-not-used' })).stream(REQUEST) as NormalizedResponse;
     expect(streamed.usage.inputTokens).toBe(2_000);
+    expect(streamed.details.usage.cacheReadTokens).toBe(8_000);
     // Once per process, though two responses exceeded.
-    expect(exceeding()).toHaveLength(1);
+    expect(warn.mock.calls).toEqual([[warning]]);
   });
+
+  it('one cached token above the prompt count is enough', async () => {
+    resetPromptExcludesCacheWarning();
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    stubComplete({ promptTokenCount: 10_000, cachedContentTokenCount: 10_001, candidatesTokenCount: 5, totalTokenCount: 10_005 });
+    const response = await new Membrane(new GeminiAdapter({ apiKey: 'zz-key-not-used' })).complete(REQUEST);
+    expect(response.usage.inputTokens).toBe(10_000);
+    expect(response.details.usage.cacheReadTokens).toBe(10_001);
+  });
+});
+
+/**
+ * What a direct GeminiAdapter caller gets, which the changelog says is
+ * unchanged. Membrane's restated usage can't hold this: it reads the same
+ * whether the adapter or membrane subtracts the cached span.
+ */
+describe('a direct GeminiAdapter caller', () => {
+  const DIRECT = {
+    messages: [{ role: 'user', parts: [{ text: 'zz-prompt' }] }],
+    model: 'gemini-3.5-flash-lite',
+    maxTokens: 64,
+  } as unknown as ProviderRequest;
+  const call = async (run: 'complete' | 'stream', usageMetadata: unknown) => {
+    if (run === 'complete') stubComplete(usageMetadata); else stubStream(usageMetadata);
+    const adapter = new GeminiAdapter({ apiKey: 'zz-key-not-used' });
+    return run === 'complete' ? adapter.complete(DIRECT) : adapter.stream(DIRECT, { onChunk: () => {} });
+  };
+
+  for (const run of ['complete', 'stream'] as const) {
+    it(`gets promptTokenCount as inputTokens and the cached span as cacheReadTokens, on ${run}()`, async () => {
+      const hit = await call(run, HIT);
+      expect(hit.usage.inputTokens).toBe(10_000);
+      expect(hit.usage.cacheReadTokens).toBe(8_000);
+      expect(hit.usage.cacheConvention).toBeUndefined();
+      const equal = await call(run, { promptTokenCount: 10_000, cachedContentTokenCount: 10_000, candidatesTokenCount: 5, totalTokenCount: 10_005 });
+      expect(equal.usage.cacheConvention).toBeUndefined();
+    });
+
+    it(`marks a response with more cached tokens than prompt tokens cache-excluded, on ${run}()`, async () => {
+      resetPromptExcludesCacheWarning();
+      vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const above = await call(run, { promptTokenCount: 10_000, cachedContentTokenCount: 10_001, candidatesTokenCount: 5, totalTokenCount: 10_005 });
+      expect(above.usage.inputTokens).toBe(10_000);
+      expect(above.usage.cacheReadTokens).toBe(10_001);
+      expect(above.usage.cacheConvention).toBe('cache-excluded');
+    });
+
+    it(`leaves the counts unreported when the response has no usageMetadata, on ${run}()`, async () => {
+      const none = await call(run, undefined);
+      expect(none.usage.cacheReadTokens).toBeUndefined();
+      expect(none.unreportedUsage).toEqual(['inputTokens', 'outputTokens']);
+    });
+  }
 });
