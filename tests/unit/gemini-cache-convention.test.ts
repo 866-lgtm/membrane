@@ -141,7 +141,8 @@ describe('a response the inclusive reading cannot explain', () => {
     const usage = { promptTokenCount: 2_000, cachedContentTokenCount: 8_000, candidatesTokenCount: 5, totalTokenCount: 2_005 };
     const warning = '[membrane:gemini] cachedContentTokenCount(8000) exceeds promptTokenCount(2000),'
       + ' so this prompt count cannot include the cached span. The response is read as cache-excluded'
-      + ' (promptTokenCount is the fresh input); the adapter declares cache-inclusive from Google\'s'
+      + ' (promptTokenCount, with any tool-use prompt, is the fresh input); the adapter declares'
+      + ' cache-inclusive from Google\'s'
       + ' definition of the field.';
     stubComplete(usage);
     const completed = await new Membrane(new GeminiAdapter({ apiKey: 'zz-key-not-used' })).complete(REQUEST);
