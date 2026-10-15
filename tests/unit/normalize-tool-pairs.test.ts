@@ -864,8 +864,7 @@ describe('normalizeToolPairs', () => {
 
       const text = orphanText(out);
       expect(text).toContain('zz-screenshot of the failing chart');
-      expect(text).toContain('[Image:');
-      expect(text).toContain('image/png');
+      expect(text).toContain('[Image: image/png, ~2KB, not shown to you]');
     });
 
     it('reports the recovered length on the event so a drop can never be silent', () => {
@@ -963,7 +962,7 @@ describe('normalizeToolPairs', () => {
         {
           part: 'a base64 document',
           content: [{ type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: 'zzzz'.repeat(1024) } }],
-          expected: '[Document: application/pdf, ~3KB]',
+          expected: '[Document: application/pdf, ~3KB, not shown to you]',
         },
         {
           part: 'a text document',
@@ -973,17 +972,22 @@ describe('normalizeToolPairs', () => {
         {
           part: 'an MCP-style image',
           content: [{ type: 'image', data: 'zzzz'.repeat(1024), mimeType: 'image/jpeg' }],
-          expected: '[Image: image/jpeg, ~3KB]',
+          expected: '[Image: image/jpeg, ~3KB, not shown to you]',
+        },
+        {
+          part: 'a generated image',
+          content: [{ type: 'generated_image', data: 'zzzz'.repeat(1024), mimeType: 'image/png' }],
+          expected: '[Image: image/png, ~3KB, not shown to you]',
         },
         {
           part: 'base64 audio',
           content: [{ type: 'audio', source: { type: 'base64', mediaType: 'audio/mpeg', data: 'zzzz'.repeat(1024) } }],
-          expected: '[Audio: audio/mpeg, ~3KB]',
+          expected: '[Audio: audio/mpeg, ~3KB, not shown to you]',
         },
         {
           part: 'base64 video',
           content: [{ type: 'video', source: { type: 'base64', mediaType: 'video/mp4', data: 'zzzz'.repeat(1024) } }],
-          expected: '[Video: video/mp4, ~3KB]',
+          expected: '[Video: video/mp4, ~3KB, not shown to you]',
         },
         {
           part: 'a part type the module does not know',

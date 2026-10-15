@@ -71,9 +71,18 @@ describe('tool results carrying images (Responses)', () => {
       { type: 'image', source: png },
       { type: 'other', value: 1 },
     ])).toEqual([
-      { type: 'input_text', text: '[image omitted: unsupported image source]' },
+      { type: 'input_text', text: "[system: an image in this tool result was NOT shown to you. This request couldn't carry it, so you are not seeing it.]" },
       { type: 'input_image', image_url: 'data:image/png;base64,iVBORw0KGgo=' },
       { type: 'input_text', text: '{"type":"other","value":1}' },
     ]);
+  });
+
+  it('helper: the same stand-in, which names no cause, for an empty source and for base64 outside the source', () => {
+    const standIn = { type: 'input_text', text: "[system: an image in this tool result was NOT shown to you. This request couldn't carry it, so you are not seeing it.]" };
+    expect(responsesToolOutputParts([
+      { type: 'image', source: { type: 'base64', data: '', mediaType: 'image/png' } },
+      { type: 'image', source: { type: 'url', url: '' } },
+      { type: 'image', data: 'iVBORw0KGgo=', mimeType: 'image/png' },
+    ])).toEqual([standIn, standIn, standIn]);
   });
 });
