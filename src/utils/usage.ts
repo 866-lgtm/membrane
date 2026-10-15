@@ -85,6 +85,18 @@ export function resetUnconvertibleProviderItemWarnings(): void {
 }
 
 /**
+ * `ProviderResponse.unreportedUsage` for a provider's raw input and output
+ * counts: each that is not a number is unreported (its usage value is a 0
+ * default). Spread into a ProviderResponse.
+ */
+export function unreportedUsage(input: unknown, output: unknown): { unreportedUsage?: Array<'inputTokens' | 'outputTokens'> } {
+  const missing: Array<'inputTokens' | 'outputTokens'> = [];
+  if (typeof input !== 'number') missing.push('inputTokens');
+  if (typeof output !== 'number') missing.push('outputTokens');
+  return missing.length > 0 ? { unreportedUsage: missing } : {};
+}
+
+/**
  * Accumulates one turn's usage ACROSS ROUNDS, pricing each round under the
  * model that actually served it.
  *
@@ -121,15 +133,17 @@ export class TurnUsageAccumulator {
 
     this.tokens.inputTokens += usage.inputTokens;
     this.tokens.outputTokens += usage.outputTokens;
-    if (usage.cacheCreationTokens) {
+    // An optional count is in the total once any round reported it, a 0
+    // included, and absent while none has, as in each round's own entry.
+    if (usage.cacheCreationTokens != null) {
       this.tokens.cacheCreationTokens = (this.tokens.cacheCreationTokens ?? 0) + usage.cacheCreationTokens;
     }
-    if (usage.cacheReadTokens) {
+    if (usage.cacheReadTokens != null) {
       this.tokens.cacheReadTokens = (this.tokens.cacheReadTokens ?? 0) + usage.cacheReadTokens;
     }
     // Already inside outputTokens (billed at the output rate) — summed for
     // attribution, never added to the output total.
-    if (usage.thinkingTokens) {
+    if (usage.thinkingTokens != null) {
       this.tokens.thinkingTokens = (this.tokens.thinkingTokens ?? 0) + usage.thinkingTokens;
     }
 
@@ -175,6 +189,12 @@ export class TurnUsageAccumulator {
   /** The model that served the LAST round, or undefined if no round named one. */
   get lastServedModel(): string | undefined {
     return this.lastServed;
+  }
+
+  /** The latest round's own usage (a copy), or undefined before any round. */
+  get lastRound(): TurnRoundUsage | undefined {
+    const round = this.rounds[this.rounds.length - 1];
+    return round ? { model: round.model, usage: { ...round.usage } } : undefined;
   }
 
   /** One entry per provider round, in order — the audit trail behind the summed total. */

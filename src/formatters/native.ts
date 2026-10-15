@@ -9,6 +9,7 @@
  * - 'multiuser': Multiple participants, names prefixed to content
  */
 
+import { followNormalizedBlocks, isRawItemCarrier, ownBlocks } from '../utils/fidelity.js';
 import { sanitizeToolName } from '../utils/tool-names.js';
 import { unsupportedError } from '../types/errors.js';
 
@@ -165,6 +166,8 @@ class PassthroughParser implements StreamParser {
 // ============================================================================
 
 export class NativeFormatter implements PrefillFormatter {
+  /** buildMessages records every consumer message it doesn't carry verbatim (utils/fidelity.ts). */
+  readonly reportsAlterations = true;
   readonly name = 'native';
   readonly usesPrefill = false;
   readonly supportsNativeTools = true;
@@ -243,11 +246,12 @@ export class NativeFormatter implements PrefillFormatter {
 
       const role: 'user' | 'assistant' = isAssistant ? 'assistant' : 'user';
 
-      // Convert content
+      // Convert content (recording alterations against this message's index)
       const content = this.convertContent(message.content, message.participant, {
         includeNames: participantMode === 'multiuser' && !isAssistant,
         isAssistant,
         serverBlocks: options.anthropicServerBlocks !== false,
+        ...(options.fidelity ? { onAltered: () => options.fidelity!.alter(i) } : {}),
       });
 
       if (
@@ -260,6 +264,8 @@ export class NativeFormatter implements PrefillFormatter {
       if (content.length === 0) {
         continue; // Skip empty messages
       }
+      // An adapter's report about one of these blocks names this message.
+      ownBlocks(options.fidelity, content, i);
 
       // hasCacheMarker: cache boundary is BEFORE this message — tag previous message's last block
       if (hasCacheMarker && hasCacheMarker(message, i) && cacheControl && providerMessages.length > 0) {
@@ -289,6 +295,9 @@ export class NativeFormatter implements PrefillFormatter {
     const normalized = normalizeToolPairs(providerMessages, {
       pendingToolCallIds: options.pendingToolCallIds,
       onEvent: options.onNormalize,
+      // A tool_result textified as an orphan or a duplicate alters the
+      // message that occurrence came from, and its replacement keeps the owner.
+      ...followNormalizedBlocks(options.fidelity),
       // The caller's synthetic user text, used where the normalizer decides a
       // leading user turn is needed: after a contextPrefix, before
       // assistant-first history, or after role repair moved a block forward.
@@ -397,8 +406,9 @@ export class NativeFormatter implements PrefillFormatter {
   // ==========================================================================
 
   /** Replace API-unacceptable image blocks nested in tool_result content with
-   *  text placeholders. Non-array content passes through untouched. */
-  private static sanitizeToolResultContent(content: unknown): unknown {
+   *  text placeholders. Non-array content passes through untouched.
+   *  `onAltered` hears each placeholder substitution. */
+  private static sanitizeToolResultContent(content: unknown, onAltered?: () => void): unknown {
     if (!Array.isArray(content)) return content;
     return content.map((item) => {
       if (
@@ -407,26 +417,30 @@ export class NativeFormatter implements PrefillFormatter {
         (item as { type?: string }).type === 'image'
       ) {
         const src = (item as { source?: { type?: string; data?: string; mediaType?: string; media_type?: string } }).source;
-        if (src?.type === 'url') return item;
+        if (src?.type === 'url') return { ...item };
         const mediaType = resolveImageMediaType(src?.data, src?.mediaType ?? src?.media_type);
         if (!isAcceptedImageMediaType(mediaType)) {
+          onAltered?.();
           return strippedImagePlaceholder(mediaType);
         }
         const { mediaType: _declared, ...source } = src ?? {};
         return { ...item, source: { ...source, media_type: mediaType } };
       }
-      return item;
+      // Its own object per occurrence, so an adapter's report names one.
+      return item !== null && typeof item === 'object' ? { ...item } : item;
     });
   }
 
   private convertContent(
     content: ContentBlock[],
     participant: string,
-    options: { includeNames: boolean; isAssistant: boolean; serverBlocks: boolean }
+    options: { includeNames: boolean; isAssistant: boolean; serverBlocks: boolean; onAltered?: () => void }
   ): unknown[] {
     const result: unknown[] = [];
     let hasUnsupportedMedia = false;
     let hasText = false;
+    // Any non-empty block not carried verbatim alters the consumer message.
+    const altered = () => options.onAltered?.();
 
     for (const block of content) {
       // An Anthropic server-tool block (web search and the like), kept on a
@@ -436,17 +450,24 @@ export class NativeFormatter implements PrefillFormatter {
       // message sent as a user turn, such as another participant's, it has
       // no place and is left out. An adapter for another wire leaves out a
       // block type it has no form for.
+      // Sent, it is carried: the block is the carrier's item, its content.
+      // Left out, the message loses it.
       const serverBlock = anthropicServerBlockFor(block);
       if (serverBlock) {
         if (options.isAssistant && options.serverBlocks) result.push(serverBlock);
+        else altered();
         continue;
       }
       if (block.type === 'text') {
         // Empty text blocks are rejected by the Anthropic API. Any other
         // zero-width rawItem carrier (an opaque provider-native item from
         // another wire) has no form here and must not leak. Filter BEFORE
-        // the name prefix below would make it non-empty.
-        if (block.text === '') continue;
+        // the name prefix below would make it non-empty. A carrier's item is
+        // its content, and it is not sent here.
+        if (block.text === '') {
+          if (isRawItemCarrier(block)) altered();
+          continue;
+        }
         let text = block.text;
         if (options.includeNames && !hasText) {
           const prefix = this.nameFormat.replace('{name}', () => participant);
@@ -465,6 +486,7 @@ export class NativeFormatter implements PrefillFormatter {
             // Unacceptable media type (e.g. image/svg): degrade to a text
             // placeholder instead of poisoning the whole request.
             result.push(strippedImagePlaceholder(mediaType));
+            altered();
           } else {
             const imageBlock: Record<string, unknown> = {
               type: 'image',
@@ -480,6 +502,8 @@ export class NativeFormatter implements PrefillFormatter {
             }
             result.push(imageBlock);
           }
+        } else {
+          altered(); // a non-base64 image source has no branch here
         }
       } else if (block.type === 'audio') {
         // Pass audio through in the same shape as images — the provider
@@ -494,6 +518,8 @@ export class NativeFormatter implements PrefillFormatter {
               data: block.source.data,
             },
           });
+        } else {
+          altered();
         }
       } else if (block.type === 'tool_use') {
         result.push({
@@ -506,7 +532,7 @@ export class NativeFormatter implements PrefillFormatter {
         result.push({
           type: 'tool_result',
           tool_use_id: block.toolUseId,
-          content: NativeFormatter.sanitizeToolResultContent(block.content),
+          content: NativeFormatter.sanitizeToolResultContent(block.content, options.onAltered),
           is_error: block.isError,
         });
       } else if (block.type === 'thinking') {
@@ -526,6 +552,10 @@ export class NativeFormatter implements PrefillFormatter {
         result.push({ ...(block as unknown as Record<string, unknown>) });
       } else if (block.type === 'document') {
         hasUnsupportedMedia = true;
+        altered();
+      } else {
+        // A block type this formatter does not convert is left out.
+        altered();
       }
     }
 

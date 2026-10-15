@@ -12,7 +12,16 @@ type JsonObject = Record<string, unknown>;
  * final transport boundary so every call shape accepted by ProviderAdapter is
  * valid on the Codex Responses endpoint.
  */
-export function normalizeResponsesInput(messages: ProviderRequest['messages']): OpenAIResponsesInputItem[] {
+export function normalizeResponsesInput(
+  messages: ProviderRequest['messages'],
+  /**
+   * Hears each content block this normalization leaves out or changes, and
+   * each tool result whose nested content or error flag it can't carry as it
+   * was: given the request's own block, so membrane can name the message it
+   * came from (nothing, for a block that isn't an object).
+   */
+  onDropped?: (block?: unknown) => void,
+): OpenAIResponsesInputItem[] {
   const output: unknown[] = [];
 
   for (const rawMessage of messages as unknown[]) {
@@ -21,7 +30,7 @@ export function normalizeResponsesInput(messages: ProviderRequest['messages']): 
       continue;
     }
     if (rawMessage.type !== 'message' && rawMessage.role === undefined) {
-      output.push(normalizeStandaloneItem(rawMessage));
+      output.push(normalizeStandaloneItem(rawMessage, onDropped));
       continue;
     }
 
@@ -56,22 +65,29 @@ export function normalizeResponsesInput(messages: ProviderRequest['messages']): 
     };
 
     for (const rawBlock of blocks) {
-      if (!isObject(rawBlock)) continue;
+      if (!isObject(rawBlock)) {
+        onDropped?.();
+        continue;
+      }
       // An Anthropic server-tool block, bare or on its zero-width carrier (an
       // Anthropic-shaped builder sends one back for its own wire), has no
-      // form on this one.
-      if (carriesAnthropicServerBlock(rawBlock)) continue;
+      // form on this one, so the message loses it.
+      if (carriesAnthropicServerBlock(rawBlock)) {
+        onDropped?.(rawBlock);
+        continue;
+      }
       if (rawBlock.type === 'text') {
         parts.push({ type: role === 'assistant' ? 'output_text' : 'input_text', text: asString(rawBlock.text) });
       } else if (rawBlock.type === 'image') {
         const imageUrl = responsesImageUrl(rawBlock);
         if (imageUrl && role !== 'assistant') parts.push({ type: 'input_image', image_url: imageUrl });
+        else onDropped?.(rawBlock);
       } else if (rawBlock.type === 'tool_use') {
         flush();
-        output.push(normalizeStandaloneItem(rawBlock));
+        output.push(normalizeStandaloneItem(rawBlock, onDropped));
       } else if (rawBlock.type === 'tool_result') {
         flush();
-        output.push(normalizeStandaloneItem(rawBlock));
+        output.push(normalizeStandaloneItem(rawBlock, onDropped));
       } else if (rawBlock.type === 'redacted_thinking') {
         flush();
         output.push(reasoningInputItem(rawBlock));
@@ -86,8 +102,10 @@ export function normalizeResponsesInput(messages: ProviderRequest['messages']): 
   return output as OpenAIResponsesInputItem[];
 }
 
-function normalizeStandaloneItem(item: JsonObject): unknown {
+function normalizeStandaloneItem(item: JsonObject, onDropped?: (block?: unknown) => void): unknown {
   if (item.type === 'tool_use') {
+    // Arguments are an object; anything else goes out as {}.
+    if (item.input !== undefined && !isObject(item.input)) onDropped?.(item);
     return {
       type: 'function_call',
       call_id: asString(item.id),
@@ -97,6 +115,10 @@ function normalizeStandaloneItem(item: JsonObject): unknown {
   }
   if (item.type === 'tool_result') {
     const content = item.content;
+    // A nested value the output can't carry is stringified or replaced by a
+    // note, and a function_call_output has no error flag, so a failed result
+    // reads as a plain one.
+    if (responsesToolOutputLoses(content) || item.isError === true || item.is_error === true) onDropped?.(item);
     return {
       type: 'function_call_output',
       call_id: asString(item.toolUseId) || asString(item.tool_use_id),
@@ -122,6 +144,22 @@ function reasoningInputItem(block: JsonObject): unknown {
   const raw = block.rawItem;
   if (isObject(raw) && raw.type === 'reasoning') return raw;
   return { type: 'reasoning', summary: [], encrypted_content: asString(block.data) };
+}
+
+/**
+ * Whether a tool result's content loses something on its way to a Responses
+ * `function_call_output`: a nested block that is neither text nor an image
+ * the output can carry (it is JSON-stringified or replaced by a note).
+ */
+export function responsesToolOutputLoses(content: unknown): boolean {
+  if (!Array.isArray(content)) return false;
+  return content.some((block) => {
+    if (typeof block === 'string') return false;
+    if (!isObject(block)) return true;
+    if (block.type === 'text' || block.type === 'input_text' || block.type === 'input_image') return false;
+    if (block.type === 'image') return !responsesImageUrl(block);
+    return true;
+  });
 }
 
 /**

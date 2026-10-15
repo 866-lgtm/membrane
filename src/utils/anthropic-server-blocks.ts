@@ -83,12 +83,3 @@ export function anthropicServerBlockFor(block: unknown): AnthropicServerBlock | 
   const { cache_control: _stored, ...sent } = item;
   return sent as AnthropicServerBlock;
 }
-
-/**
- * A zero-width carrier: empty text holding an object `rawItem`, a provider
- * item with no normalized form. It has no text, so a text serialization of a
- * turn leaves it out rather than writing an empty part.
- */
-export function isZeroWidthCarrier(block: { type?: unknown; text?: unknown; rawItem?: unknown }): boolean {
-  return block.type === 'text' && block.text === '' && block.rawItem !== null && typeof block.rawItem === 'object';
-}

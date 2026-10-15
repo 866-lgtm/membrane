@@ -12,6 +12,7 @@
  * - Direct API integration with proper error handling
  */
 
+import { unreportedUsage } from '../utils/usage.js';
 import { assertMessagePrefillSupported } from './request-capabilities.js';
 
 import type {
@@ -30,7 +31,7 @@ import {
   isTypedAbortError,
   withRawRequest,
 } from '../types/index.js';
-import { isZeroWidthCarrier } from '../utils/anthropic-server-blocks.js';
+import { isRawItemCarrier } from '../utils/fidelity.js';
 import { safeParseJson, textOnlyToolResultContent, createCombinedSignal, SSELineParser, isDeadlineAbort, deadlineTimeoutError, throwOnStreamErrorFrame, assertTerminalEventObserved } from './utils.js';
 
 // ============================================================================
@@ -155,7 +156,7 @@ const COMPLETION_TOKENS_MODELS = [
 /**
  * Check if a model requires max_completion_tokens parameter
  */
-function requiresCompletionTokens(model: string): boolean {
+export function requiresCompletionTokens(model: string): boolean {
   return isReasoningGenerationGpt(model) || COMPLETION_TOKENS_MODELS.some(prefix => model.startsWith(prefix));
 }
 
@@ -175,7 +176,7 @@ const NO_TEMPERATURE_MODELS = [
 /**
  * Check if a model doesn't support custom temperature
  */
-function noTemperatureSupport(model: string): boolean {
+export function noTemperatureSupport(model: string): boolean {
   return isReasoningGenerationGpt(model) || NO_TEMPERATURE_MODELS.some(prefix => model.startsWith(prefix));
 }
 
@@ -198,7 +199,7 @@ const NO_STOP_MODELS = [
 /**
  * Check if a model doesn't support stop sequences
  */
-function noStopSupport(model: string): boolean {
+export function noStopSupport(model: string): boolean {
   return isReasoningGenerationGpt(model) || NO_STOP_MODELS.some(prefix => model.startsWith(prefix));
 }
 
@@ -507,7 +508,7 @@ export class OpenAIAdapter implements ProviderAdapter {
             // A zero-width carrier (a provider item with no normalized form,
             // such as an Anthropic server-tool block) has no text and no form
             // on this wire: an empty part would only add a blank line.
-            if (isZeroWidthCarrier(block)) continue;
+            if (isRawItemCarrier(block)) continue;
             contentParts.push({ type: 'text', text: block.text });
           } else if (block.type === 'image') {
             // Convert Anthropic-style image to OpenAI image_url with data URI
@@ -634,7 +635,8 @@ export class OpenAIAdapter implements ProviderAdapter {
     const message = choice?.message;
 
     // Extract prompt caching details (OpenAI automatic caching for prompts ≥1024 tokens)
-    const cachedTokens = response.usage?.prompt_tokens_details?.cached_tokens ?? 0;
+    // A reported 0 is a fact (no cache read); only an unreported count is absent.
+    const cachedTokens = response.usage?.prompt_tokens_details?.cached_tokens;
 
     return {
       content: this.messageToContent(message),
@@ -646,8 +648,9 @@ export class OpenAIAdapter implements ProviderAdapter {
         outputTokens: response.usage?.completion_tokens ?? 0,
         // OpenAI's automatic prompt caching - cached tokens are read from cache
         // Note: OpenAI doesn't have separate "creation" tokens - it's automatic
-        cacheReadTokens: cachedTokens > 0 ? cachedTokens : undefined,
+        ...(typeof cachedTokens === 'number' ? { cacheReadTokens: cachedTokens } : {}),
       },
+      ...unreportedUsage(response.usage?.prompt_tokens, response.usage?.completion_tokens),
       model: response.model ?? requestedModel,
       rawRequest,
       raw: response,
@@ -662,7 +665,7 @@ export class OpenAIAdapter implements ProviderAdapter {
     rawRequest?: unknown
   ): ProviderResponse {
     // Extract cached tokens from stream usage if available
-    const cachedTokens = streamUsage?.prompt_tokens_details?.cached_tokens ?? 0;
+    const cachedTokens = streamUsage?.prompt_tokens_details?.cached_tokens;
 
     return {
       content: this.messageToContent(message),
@@ -672,8 +675,9 @@ export class OpenAIAdapter implements ProviderAdapter {
       usage: {
         inputTokens: streamUsage?.prompt_tokens ?? 0,
         outputTokens: streamUsage?.completion_tokens ?? 0,
-        cacheReadTokens: cachedTokens > 0 ? cachedTokens : undefined,
+        ...(typeof cachedTokens === 'number' ? { cacheReadTokens: cachedTokens } : {}),
       },
+      ...unreportedUsage(streamUsage?.prompt_tokens, streamUsage?.completion_tokens),
       model: requestedModel,
       rawRequest,
       raw: { message, finish_reason: finishReason ?? 'stop', usage: streamUsage },
@@ -750,7 +754,7 @@ export class OpenAIAdapter implements ProviderAdapter {
  */
 export function toOpenAIContent(blocks: ContentBlock[]): string | null {
   // A zero-width carrier holds a block this wire has no form for.
-  const textBlocks = blocks.filter(b => b.type === 'text' && !isZeroWidthCarrier(b)) as Array<{ type: 'text'; text: string }>;
+  const textBlocks = blocks.filter(b => b.type === 'text' && !isRawItemCarrier(b)) as Array<{ type: 'text'; text: string }>;
   if (textBlocks.length === 0) return null;
   return textBlocks.map(b => b.text).join('\n');
 }

@@ -32,7 +32,7 @@ import type {
   BlockEvent,
   StreamEmission,
 } from './types.js';
-import { isZeroWidthCarrier } from '../utils/anthropic-server-blocks.js';
+import { holdsContent, isRawItemCarrier } from '../utils/fidelity.js';
 
 // ============================================================================
 // Configuration
@@ -183,6 +183,8 @@ class CompletionsStreamParser implements StreamParser {
 // ============================================================================
 
 export class CompletionsFormatter implements PrefillFormatter {
+  /** buildMessages records every consumer message it doesn't carry verbatim (utils/fidelity.ts). */
+  readonly reportsAlterations = true;
   readonly name = 'completions';
   readonly usesPrefill = true;
   /** This formatter does not encode provider-native tool definitions. */
@@ -247,16 +249,24 @@ export class CompletionsFormatter implements PrefillFormatter {
     }
 
     // Serialize each message
-    for (const message of messages) {
+    for (let index = 0; index < messages.length; index++) {
+      const message = messages[index]!;
       participants.add(message.participant);
 
-      const { text, hadImages } = this.extractTextContent(message.content);
+      const { text, hadImages, leftOut } = this.extractTextContent(message.content);
       if (hadImages) {
         hasStrippedImages = true;
       }
+      // Base models carry text only: every image, tool carrier and thinking
+      // block is left out, which alters the consumer message.
+      if (leftOut) options.fidelity?.alter(index);
 
-      // Skip empty messages (except if it's the final completion target)
+      // Skip empty messages.
+      // Whitespace-only text is content: skipping it is an alteration. Only
+      // exactly empty '' blocks with no raw form carry nothing (joined, two
+      // of them read '\n').
       if (!text.trim()) {
+        if (holdsContent(message.content)) options.fidelity?.alter(index);
         continue;
       }
 
@@ -344,26 +354,33 @@ export class CompletionsFormatter implements PrefillFormatter {
   // PRIVATE HELPERS
   // ==========================================================================
 
-  private extractTextContent(content: ContentBlock[]): { text: string; hadImages: boolean } {
+  private extractTextContent(content: ContentBlock[]): { text: string; hadImages: boolean; leftOut: boolean } {
     const textParts: string[] = [];
     let hadImages = false;
+    let leftOut = false;
 
     for (const block of content) {
       if (block.type === 'text') {
         // A zero-width carrier (a provider item with no normalized form, such
         // as an Anthropic server-tool block) has no text: an empty part would
-        // only add a line to the prompt.
-        if (isZeroWidthCarrier(block)) continue;
+        // only add a line to the prompt. Its item is its content, and the
+        // prompt can't carry it.
+        if (isRawItemCarrier(block)) {
+          leftOut = true;
+          continue;
+        }
         textParts.push(block.text);
-      } else if (block.type === 'image') {
-        hadImages = true;
+      } else {
+        if (block.type === 'image') hadImages = true;
+        // Skip tool_use, tool_result, thinking and media blocks for base models
+        leftOut = true;
       }
-      // Skip tool_use, tool_result, thinking blocks for base models
     }
 
     return {
       text: textParts.join('\n'),
       hadImages,
+      leftOut,
     };
   }
 

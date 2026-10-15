@@ -10,6 +10,7 @@
  * Serializes conversations to Human:/Assistant: format.
  */
 
+import { unreportedUsage } from '../utils/usage.js';
 import { assertPromptToolSupport } from './request-capabilities.js';
 
 import type {
@@ -29,7 +30,7 @@ import {
   withRawRequest,
 } from '../types/index.js';
 import { createCombinedSignal, SSELineParser, isDeadlineAbort, deadlineTimeoutError, throwOnStreamErrorFrame, assertTerminalEventObserved } from './utils.js';
-import { isZeroWidthCarrier } from '../utils/anthropic-server-blocks.js';
+import { isRawItemCarrier } from '../utils/fidelity.js';
 
 // ============================================================================
 // Types
@@ -406,7 +407,7 @@ export class OpenAICompletionsAdapter implements ProviderAdapter {
       for (const block of content) {
         if (block.type === 'text') {
           // A zero-width carrier holds a block this wire has no form for.
-          if (isZeroWidthCarrier(block)) continue;
+          if (isRawItemCarrier(block)) continue;
           textParts.push(block.text);
         } else if (block.type === 'image' || block.type === 'image_url') {
           hadImages = true;
@@ -548,6 +549,7 @@ export class OpenAICompletionsAdapter implements ProviderAdapter {
         inputTokens: response.usage?.prompt_tokens ?? 0,
         outputTokens: response.usage?.completion_tokens ?? 0,
       },
+      ...unreportedUsage(response.usage?.prompt_tokens, response.usage?.completion_tokens),
       model: response.model ?? requestedModel,
       rawRequest,
       raw: response,
@@ -575,6 +577,7 @@ export class OpenAICompletionsAdapter implements ProviderAdapter {
         inputTokens: streamUsage?.prompt_tokens ?? 0,
         outputTokens: streamUsage?.completion_tokens ?? 0,
       },
+      ...unreportedUsage(streamUsage?.prompt_tokens, streamUsage?.completion_tokens),
       model: requestedModel,
       rawRequest,
       raw: { text: accumulated, finish_reason: finishReason ?? 'stop', usage: streamUsage },

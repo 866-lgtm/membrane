@@ -4,6 +4,7 @@
  * Handles OpenAI-compatible API with tool_calls format
  */
 
+import { unreportedUsage } from '../utils/usage.js';
 import { assertMessagePrefillSupported } from './request-capabilities.js';
 
 import type {
@@ -24,7 +25,7 @@ import {
   isTypedAbortError,
   withRawRequest,
 } from '../types/index.js';
-import { isZeroWidthCarrier } from '../utils/anthropic-server-blocks.js';
+import { isRawItemCarrier } from '../utils/fidelity.js';
 import { safeParseJson, textOnlyToolResultContent, createCombinedSignal, SSELineParser, isDeadlineAbort, deadlineTimeoutError, throwOnStreamErrorFrame, assertTerminalEventObserved } from './utils.js';
 
 // ============================================================================
@@ -513,7 +514,7 @@ export class OpenRouterAdapter implements ProviderAdapter {
             // A zero-width carrier (a provider item with no normalized form,
             // such as an Anthropic server-tool block) has no text and no form
             // on this wire: an empty part would only add a blank line.
-            if (isZeroWidthCarrier(block)) continue;
+            if (isRawItemCarrier(block)) continue;
             if (hasCache || hasImages || hasAudio) {
               const contentBlock: OpenRouterContentBlock = {
                 type: 'text',
@@ -701,6 +702,7 @@ export class OpenRouterAdapter implements ProviderAdapter {
         cacheReadTokens: cacheReadTokens ?? undefined,
         cacheConvention,
       },
+      ...unreportedUsage(response.usage?.prompt_tokens, response.usage?.completion_tokens),
       model: response.model ?? requestedModel,
       rawRequest,
       raw: response,
@@ -733,6 +735,7 @@ export class OpenRouterAdapter implements ProviderAdapter {
         cacheReadTokens: cacheReadTokens ?? undefined,
         cacheConvention,
       },
+      ...unreportedUsage(streamUsage?.prompt_tokens, streamUsage?.completion_tokens),
       model: requestedModel,
       rawRequest,
       raw: { message, finish_reason: finishReason ?? 'stop', usage: streamUsage },
@@ -799,7 +802,7 @@ export function toOpenRouterMessages(
     for (const block of msg.content) {
       if (block.type === 'text') {
         // A zero-width carrier holds a block this wire has no form for.
-        if (isZeroWidthCarrier(block)) continue;
+        if (isRawItemCarrier(block)) continue;
         textParts.push(block.text);
       } else if (block.type === 'tool_use') {
         toolCalls.push({

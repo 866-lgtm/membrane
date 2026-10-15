@@ -3,7 +3,7 @@
  */
 
 import type { ContentBlock, CacheControl } from './content.js';
-import { isZeroWidthCarrier } from '../utils/anthropic-server-blocks.js';
+import { isRawItemCarrier } from '../utils/fidelity.js';
 
 // Re-export CacheControl for consumers
 export type { CacheControl } from './content.js';
@@ -76,7 +76,7 @@ export function textMessage(participant: string, text: string, metadata?: Messag
  */
 export function extractText(message: NormalizedMessage): string {
   return message.content
-    .filter((block): block is { type: 'text'; text: string } => block.type === 'text' && !isZeroWidthCarrier(block))
+    .filter((block): block is { type: 'text'; text: string } => block.type === 'text' && !isRawItemCarrier(block))
     .map((block) => block.text)
     .join('\n');
 }
