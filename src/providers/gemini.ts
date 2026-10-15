@@ -103,6 +103,17 @@ interface GeminiStreamState {
 }
 
 /**
+ * Gemini's usageMetadata follows proto3 JSON, which omits zero-valued counts:
+ * when the object is present, a missing prompt, candidates or cache-read
+ * count is a reported 0. Only a response with no usageMetadata at all leaves
+ * the counts unreported. A turn without thinking keeps `thinkingTokens`
+ * absent, as it always has.
+ */
+function geminiUnreportedUsage(usageMetadata: GeminiResponse['usageMetadata']): { unreportedUsage?: Array<'inputTokens' | 'outputTokens'> } {
+  return usageMetadata ? {} : { unreportedUsage: ['inputTokens', 'outputTokens'] };
+}
+
+/**
  * Map Gemini's `usageMetadata` onto membrane's usage shape.
  *
  * `thoughtsTokenCount` is disjoint from `candidatesTokenCount` and billed at
@@ -136,9 +147,13 @@ function geminiUsageToProviderUsage(
     inputTokens: promptTokens,
     outputTokens: candidatesTokens + (thoughtsTokens ?? 0),
     ...(thoughtsTokens != null ? { thinkingTokens: thoughtsTokens } : {}),
-    cacheReadTokens: usageMetadata?.cachedContentTokenCount
-      ? usageMetadata.cachedContentTokenCount
-      : undefined,
+    // A reported 0 is a fact (no cache read); only an unreported count is
+    // absent. By the proto3 rule above, a present usageMetadata reports the
+    // cache-read count even when it omits it: real calls without a cache hit
+    // never send the field (see usageCacheConvention's note), and that is a 0.
+    ...(usageMetadata
+      ? { cacheReadTokens: typeof usageMetadata.cachedContentTokenCount === 'number' ? usageMetadata.cachedContentTokenCount : 0 }
+      : {}),
   };
 }
 
@@ -318,6 +333,7 @@ export class GeminiAdapter implements ProviderAdapter {
         providerStopReason: streamState.candidateFinishReason ?? (!streamState.sawCandidateData ? streamState.promptFeedback?.blockReason : undefined),
         stopSequence: undefined,
         usage: geminiUsageToProviderUsage(streamState.lastUsage),
+        ...geminiUnreportedUsage(streamState.lastUsage),
         model: streamState.lastModelVersion ?? request.model,
         rawRequest: geminiRequest,
         raw: {
@@ -652,6 +668,7 @@ export class GeminiAdapter implements ProviderAdapter {
       providerStopReason: candidate?.finishReason ?? (candidate === undefined ? response.promptFeedback?.blockReason : undefined),
       stopSequence: undefined,
       usage: geminiUsageToProviderUsage(response.usageMetadata),
+      ...geminiUnreportedUsage(response.usageMetadata),
       model: response.modelVersion ?? requestedModel,
       rawRequest,
       raw: response,

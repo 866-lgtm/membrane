@@ -130,6 +130,15 @@ export interface NormalizeOptions {
   /** See `BuildOptions.onNormalize`. */
   onEvent?: (event: NormalizeEvent) => void;
   /**
+   * Hears each input block the normalizer rewrote as a new object with
+   * different content: a tool_result textified because it was an orphan or
+   * a duplicate. For a caller that follows its blocks by object identity
+   * (request fidelity). Phase 1 also copies a tool_result spelled
+   * `toolUseId` to rename the key, without calling this; NativeFormatter,
+   * which passes it, writes `tool_use_id` before the normalizer runs.
+   */
+  onBlockRewritten?: (original: ProviderBlock, replacement: ProviderBlock) => void;
+  /**
    * Text of the synthetic user envelope prepended when the first envelope is
    * assistant (phase 7). `[continuing]` when absent, empty or only
    * whitespace. NativeFormatter passes `BuildOptions.prefillUserMessage`, so
@@ -225,13 +234,13 @@ export function normalizeToolPairs(
   // 3 itself creates one such shape by hoisting a matching result into an
   // envelope that already holds a non-matching one.
   // ---------------------------------------------------------------------
-  envelopes = repairStrayResults(envelopes, onEvent);
+  envelopes = repairStrayResults(envelopes, onEvent, options.onBlockRewritten);
 
   // ---------------------------------------------------------------------
   // Phase 4: resolve orphans. Textification can create new non-result
   // blocks before or between results, so ordering repair must follow it.
   // ---------------------------------------------------------------------
-  const orphanRes = resolveOrphans(envelopes, pending, onEvent);
+  const orphanRes = resolveOrphans(envelopes, pending, onEvent, options.onBlockRewritten);
   envelopes = orphanRes.envelopes;
   const ready = orphanRes.ready;
 
@@ -764,6 +773,7 @@ function hoistMatchingResults(
 function repairStrayResults(
   envelopes: Envelope[],
   onEvent: (e: NormalizeEvent) => void,
+  onBlockRewritten?: NormalizeOptions['onBlockRewritten'],
 ): Envelope[] {
   // Each id's call envelopes, in order.
   const callEnvelopesOfId = new Map<string, number[]>();
@@ -804,7 +814,7 @@ function repairStrayResults(
           kept.push(block);
           continue;
         }
-        kept.push(textifyDuplicateResult(block, id, i, 'duplicate_in_cycle', onEvent));
+        kept.push(textifyDuplicateResult(block, id, i, 'duplicate_in_cycle', onEvent, onBlockRewritten));
         continue;
       }
       const calls = callEnvelopesOfId.get(id);
@@ -843,7 +853,7 @@ function repairStrayResults(
         continue;
       }
 
-      kept.push(textifyDuplicateResult(block, id, i, 'cycle_closed', onEvent));
+      kept.push(textifyDuplicateResult(block, id, i, 'cycle_closed', onEvent, onBlockRewritten));
     }
     env.content = kept;
   }
@@ -863,6 +873,7 @@ function textifyDuplicateResult(
   fromEnvelope: number,
   reason: 'cycle_closed' | 'duplicate_in_cycle',
   onEvent: (e: NormalizeEvent) => void,
+  onBlockRewritten?: NormalizeOptions['onBlockRewritten'],
 ): ProviderBlock {
   const textified = textifyResult(block, `duplicate tool_result for ${toolUseId}`);
   onEvent({
@@ -872,6 +883,7 @@ function textifyDuplicateResult(
     recoveredChars: textified.recoveredChars,
     reason,
   });
+  onBlockRewritten?.(block, textified.block);
   return textified.block;
 }
 
@@ -956,6 +968,7 @@ function resolveOrphans(
   envelopes: Envelope[],
   pending: ReadonlySet<string>,
   onEvent: (e: NormalizeEvent) => void,
+  onBlockRewritten?: NormalizeOptions['onBlockRewritten'],
 ): OrphanResolution {
   let ready = true;
 
@@ -982,6 +995,7 @@ function resolveOrphans(
           toolUseId: id ?? '<missing>',
           recoveredChars: textified.recoveredChars,
         });
+        onBlockRewritten?.(block, textified.block);
         return textified.block;
       }
       return block;

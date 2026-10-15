@@ -2,6 +2,7 @@
  * Anthropic provider adapter
  */
 
+import { unreportedUsage } from '../utils/usage.js';
 import { assertMessagePrefillSupported } from './request-capabilities.js';
 
 import Anthropic, { type ClientOptions } from '@anthropic-ai/sdk';
@@ -203,6 +204,8 @@ export interface AnthropicAdapterConfig {
 
 export class AnthropicAdapter implements ProviderAdapter {
   readonly name = 'anthropic';
+  /** Carries message content verbatim, and reports the nested tool-result blocks it can't carry. */
+  readonly reportsContentAlterations = true;
   readonly cacheReceiptBasis = 'wire-request' as const;
 
   /**
@@ -324,7 +327,7 @@ export class AnthropicAdapter implements ProviderAdapter {
     request: ProviderRequest,
     options?: ProviderRequestOptions
   ): Promise<ProviderResponse> {
-    const anthropicRequest = this.buildRequest(request);
+    const anthropicRequest = this.buildRequest(request, options?.onContentAltered);
     const fullRequest = { ...anthropicRequest, stream: false as const };
     assertMessagePrefillSupported(fullRequest.model, fullRequest.messages, options, this.name, fullRequest);
     options?.onRequest?.(fullRequest);
@@ -350,7 +353,7 @@ export class AnthropicAdapter implements ProviderAdapter {
     callbacks: StreamCallbacks,
     options?: ProviderRequestOptions
   ): Promise<ProviderResponse> {
-    const anthropicRequest = this.buildRequest(request);
+    const anthropicRequest = this.buildRequest(request, options?.onContentAltered);
     // Note: stream is implicitly true when using .stream()
     const fullRequest = { ...anthropicRequest, stream: true };
     assertMessagePrefillSupported(fullRequest.model, fullRequest.messages, options, this.name, fullRequest);
@@ -419,6 +422,9 @@ export class AnthropicAdapter implements ProviderAdapter {
       let model = '';
       let inputTokens = 0;
       let outputTokens = 0;
+      // Whether the stream reported each count (an unreported one stays a 0 default).
+      let inputReported = false;
+      let outputReported = false;
       let cacheCreationTokens: number | undefined;
       let cacheReadTokens: number | undefined;
       let cacheCreation5mTokens: number | undefined;
@@ -489,6 +495,7 @@ export class AnthropicAdapter implements ProviderAdapter {
           model = event.message.model;
           const usage = event.message.usage as unknown as Record<string, unknown>;
           inputTokens = typeof usage.input_tokens === 'number' ? usage.input_tokens : 0;
+          inputReported = typeof usage.input_tokens === 'number';
           cacheCreationTokens = typeof usage.cache_creation_input_tokens === 'number'
             ? usage.cache_creation_input_tokens : undefined;
           cacheReadTokens = typeof usage.cache_read_input_tokens === 'number'
@@ -567,6 +574,7 @@ export class AnthropicAdapter implements ProviderAdapter {
             cache_read_input_tokens?: number | null;
           };
           outputTokens = deltaUsage.output_tokens ?? 0;
+          if (typeof deltaUsage.output_tokens === 'number') outputReported = true;
           // message_delta carries cumulative cache metrics — use as authoritative
           if (deltaUsage.cache_creation_input_tokens != null) {
             cacheCreationTokens = deltaUsage.cache_creation_input_tokens;
@@ -609,6 +617,7 @@ export class AnthropicAdapter implements ProviderAdapter {
           cacheCreationTokens,
           cacheReadTokens,
         },
+        ...unreportedUsage(inputReported ? inputTokens : undefined, outputReported ? outputTokens : undefined),
         model,
         rawRequest: fullRequest,
         raw: {
@@ -690,7 +699,7 @@ export class AnthropicAdapter implements ProviderAdapter {
     return { 'anthropic-beta': [...betas].join(',') };
   }
 
-  private buildRequest(request: ProviderRequest): Anthropic.MessageCreateParams {
+  private buildRequest(request: ProviderRequest, onContentAltered?: (block?: unknown) => void): Anthropic.MessageCreateParams {
     // Strip provider-specific fields (e.g., sourceUrl for Gemini) from image blocks
     // before sending to Anthropic, which rejects extra inputs.
     // Also normalize nested tool_result content blocks: Membrane uses camelCase
@@ -718,10 +727,15 @@ export class AnthropicAdapter implements ProviderAdapter {
             };
           }
           if (block.type === 'tool_result' && Array.isArray(block.content)) {
-            return {
-              ...block,
-              content: toAnthropicToolResultContent(block.content as ContentBlock[]),
-            };
+            const content = toAnthropicToolResultContent(block.content as ContentBlock[]);
+            // Nested blocks other than text and base64/URL images have no
+            // Anthropic tool_result form and are left out, and whitespace-only
+            // nested text is cleaned away. Only an exactly empty '' text block
+            // carried nothing.
+            const carried = (block.content as Array<{ type?: string; text?: unknown }>)
+              .filter((b) => !(b?.type === 'text' && (typeof b.text !== 'string' || b.text === ''))).length;
+            if (content.length !== carried) onContentAltered?.(block);
+            return { ...block, content };
           }
           return block;
         }),
@@ -830,10 +844,12 @@ export class AnthropicAdapter implements ProviderAdapter {
           delete rest.top_p;
         }
       }
+      // A passthrough `messages` replaces the built messages wholesale.
+      if (rest.messages !== undefined) onContentAltered?.();
       Object.assign(params, rest);
     }
 
-    stripEmptyTextRequest(params);
+    stripEmptyTextRequest(params, onContentAltered);
     return params;
   }
 
@@ -849,6 +865,7 @@ export class AnthropicAdapter implements ProviderAdapter {
         cacheCreationTokens: (response.usage as any).cache_creation_input_tokens,
         cacheReadTokens: (response.usage as any).cache_read_input_tokens,
       },
+      ...unreportedUsage(response.usage?.input_tokens, response.usage?.output_tokens),
       model: response.model,
       rawRequest,
       raw: response,
