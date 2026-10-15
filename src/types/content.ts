@@ -151,7 +151,9 @@ export interface ToolUseContent {
    * once it is written to durable history. Presence of this field, the empty
    * string included, means `input` is NOT the model's arguments, so a
    * consumer can refuse the block (or attempt its own repair) instead of
-   * trusting a plausible `{}`. The call's ToolCall carries it too.
+   * trusting a plausible `{}`. The call's ToolCall carries it too. A
+   * request sends `input` as stored, so round reports don't count a marked
+   * call as altered: this field records the replacement.
    */
   unparseableInput?: string;
 
