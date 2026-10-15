@@ -12,6 +12,9 @@
  * Uses the standard OpenAI chat completions format with tool_calls support.
  */
 
+import { unreportedUsage } from '../utils/usage.js';
+import { assertMessagePrefillSupported } from './request-capabilities.js';
+
 import type {
   ProviderAdapter,
   ProviderRequest,
@@ -23,14 +26,14 @@ import type {
 } from '../types/index.js';
 import {
   MembraneError,
-  rateLimitError,
-  contextLengthError,
-  authError,
-  serverError,
   abortError,
-  networkError,
+  classifyError,
+  errorFromHttpResponse,
+  isTypedAbortError,
+  withRawRequest,
 } from '../types/index.js';
 import { safeParseJson, textOnlyToolResultContent, createCombinedSignal, SSELineParser, isDeadlineAbort, deadlineTimeoutError, throwOnStreamErrorFrame, assertTerminalEventObserved } from './utils.js';
+import { requiresCompletionTokens, noTemperatureSupport, noStopSupport } from './openai.js';
 
 // ============================================================================
 // Types
@@ -182,6 +185,7 @@ export class OpenAICompatibleAdapter implements ProviderAdapter {
     options?: ProviderRequestOptions
   ): Promise<ProviderResponse> {
     const openAIRequest = this.buildRequest(request);
+    assertMessagePrefillSupported(openAIRequest.model, openAIRequest.messages, options, this.name, openAIRequest);
     options?.onRequest?.(openAIRequest);
 
     try {
@@ -202,6 +206,7 @@ export class OpenAICompatibleAdapter implements ProviderAdapter {
     // Ask for usage in the stream — without this the endpoint sends no usage
     // frame at all and every streamed call reports 0/0 tokens.
     openAIRequest.stream_options = { include_usage: true };
+    assertMessagePrefillSupported(openAIRequest.model, openAIRequest.messages, options, this.name, openAIRequest);
     options?.onRequest?.(openAIRequest);
 
     const { signal: combinedSignal, cleanup } = createCombinedSignal(options?.signal, options?.timeoutMs);
@@ -214,8 +219,7 @@ export class OpenAICompatibleAdapter implements ProviderAdapter {
       });
 
       if (!response.ok) {
-        const errorText = await response.text();
-        throw new Error(`API error: ${response.status} ${errorText}`);
+        throw errorFromHttpResponse(this.name, response, await response.text(), openAIRequest);
       }
 
       const reader = response.body?.getReader();
@@ -227,7 +231,7 @@ export class OpenAICompatibleAdapter implements ProviderAdapter {
       const sseParser = new SSELineParser();
       let accumulated = '';
       let reasoning = '';
-      let finishReason = 'stop';
+      let finishReason: string | undefined;
       let sawTerminalEvent = false;
       let toolCalls: OpenAIToolCall[] = [];
       let streamUsage: OpenAIResponse['usage'] | undefined;
@@ -372,17 +376,27 @@ export class OpenAICompatibleAdapter implements ProviderAdapter {
       }
     }
     
+    // OpenAI's own models keep their parameter surface when reached through
+    // this adapter (e.g. baseURL https://api.openai.com/v1): GPT-5+ and the
+    // o-series reject `max_tokens` ("Use 'max_completion_tokens' instead") and
+    // custom temperature/top_p, and some reject `stop`. Same model detection
+    // as OpenAIAdapter; every other model id keeps the legacy parameters that
+    // generic OpenAI-compatible servers expect.
+    const model = request.model;
+    const maxTokens = request.maxTokens || this.defaultMaxTokens;
     const params: any = {
-      model: request.model,
+      model,
       messages,
-      max_tokens: request.maxTokens || this.defaultMaxTokens,
+      ...(requiresCompletionTokens(model)
+        ? { max_completion_tokens: maxTokens }
+        : { max_tokens: maxTokens }),
     };
     
-    if (request.temperature !== undefined) {
+    if (request.temperature !== undefined && !noTemperatureSupport(model)) {
       params.temperature = request.temperature;
     }
 
-    if (request.topP !== undefined) {
+    if (request.topP !== undefined && !noTemperatureSupport(model)) {
       params.top_p = request.topP;
     }
 
@@ -399,7 +413,7 @@ export class OpenAICompatibleAdapter implements ProviderAdapter {
     }
 
     // OpenAI-compatible APIs may limit stop sequences (OpenAI: 4) — truncate to be safe
-    if (request.stopSequences && request.stopSequences.length > 0) {
+    if (request.stopSequences && request.stopSequences.length > 0 && !noStopSupport(model)) {
       params.stop = request.stopSequences.slice(0, 4);
     }
     
@@ -555,8 +569,7 @@ export class OpenAICompatibleAdapter implements ProviderAdapter {
       });
 
       if (!response.ok) {
-        const errorText = await response.text();
-        throw new Error(`API error: ${response.status} ${errorText}`);
+        throw errorFromHttpResponse(this.name, response, await response.text(), request);
       }
 
       return await response.json() as OpenAIResponse;
@@ -572,11 +585,13 @@ export class OpenAICompatibleAdapter implements ProviderAdapter {
     return {
       content: this.messageToContent(message),
       stopReason: this.mapFinishReason(choice?.finish_reason),
+      providerStopReason: choice?.finish_reason ?? undefined,
       stopSequence: undefined,
       usage: {
         inputTokens: response.usage?.prompt_tokens ?? 0,
         outputTokens: response.usage?.completion_tokens ?? 0,
       },
+      ...unreportedUsage(response.usage?.prompt_tokens, response.usage?.completion_tokens),
       model: response.model ?? requestedModel,
       rawRequest,
       raw: response,
@@ -585,7 +600,7 @@ export class OpenAICompatibleAdapter implements ProviderAdapter {
 
   private parseStreamedResponse(
     message: OpenAIMessage,
-    finishReason: string,
+    finishReason: string | undefined,
     requestedModel: string,
     streamUsage?: OpenAIResponse['usage'],
     rawRequest?: unknown
@@ -593,6 +608,7 @@ export class OpenAICompatibleAdapter implements ProviderAdapter {
     return {
       content: this.messageToContent(message),
       stopReason: this.mapFinishReason(finishReason),
+      providerStopReason: finishReason,
       stopSequence: undefined,
       usage: {
         // Zeros only as the genuinely-absent fallback: an endpoint that
@@ -600,9 +616,10 @@ export class OpenAICompatibleAdapter implements ProviderAdapter {
         inputTokens: streamUsage?.prompt_tokens ?? 0,
         outputTokens: streamUsage?.completion_tokens ?? 0,
       },
+      ...unreportedUsage(streamUsage?.prompt_tokens, streamUsage?.completion_tokens),
       model: requestedModel,
       rawRequest,
-      raw: { message, finish_reason: finishReason, usage: streamUsage },
+      raw: { message, finish_reason: finishReason ?? 'stop', usage: streamUsage },
     };
   }
 
@@ -638,6 +655,8 @@ export class OpenAICompatibleAdapter implements ProviderAdapter {
   }
 
   private mapFinishReason(reason: string | undefined): string {
+    // No reason (or a server's null) is a plain end of turn.
+    if (reason == null) return 'end_turn';
     switch (reason) {
       case 'stop':
         return 'end_turn';
@@ -648,54 +667,26 @@ export class OpenAICompatibleAdapter implements ProviderAdapter {
       case 'content_filter':
         return 'refusal';
       default:
-        return 'end_turn';
+        // Unrecognized reasons ('error', a compatible server's own token)
+        // travel as the provider's own token, so membrane's mapper discloses
+        // and logs them instead of reading a clean end_turn.
+        return reason;
     }
   }
 
+  /**
+   * HTTP failures are classified at the fetch boundary, where status,
+   * headers and body are still live; this handles what is left — typed
+   * aborts and non-HTTP throwables — through the shared last-resort table.
+   */
   private handleError(error: unknown, rawRequest?: unknown): MembraneError {
-    // A deadline abort is a timeout and stays one. Collapsing it into a bare
-    // abortError() here is what erased the identity before Membrane's
-    // caller-signal > timeout > error ladder could read it.
     if (isDeadlineAbort(error)) return deadlineTimeoutError(error, rawRequest);
-    // Already-classified failures (e.g. the stream-integrity guards) keep
-    // their type and retryability instead of being re-derived from a string.
-    if (error instanceof MembraneError) return error;
+    if (error instanceof MembraneError) return withRawRequest(error, rawRequest);
+    if (isTypedAbortError(error)) return abortError(undefined, rawRequest);
 
-    if (error instanceof Error) {
-      const message = error.message;
-
-      if (message.includes('429') || message.includes('rate')) {
-        return rateLimitError(message, undefined, error, rawRequest);
-      }
-
-      if (message.includes('401') || message.includes('auth') || message.includes('Unauthorized')) {
-        return authError(message, error, rawRequest);
-      }
-
-      if (message.includes('context') || message.includes('too long') || message.includes('maximum context')) {
-        return contextLengthError(message, error, rawRequest);
-      }
-
-      if (message.includes('500') || message.includes('502') || message.includes('503')) {
-        return serverError(message, undefined, error, rawRequest);
-      }
-
-      if (error.name === 'AbortError') {
-        return abortError(undefined, rawRequest);
-      }
-
-      if (message.includes('network') || message.includes('fetch') || message.includes('ECONNREFUSED')) {
-        return networkError(message, error, rawRequest);
-      }
-    }
-
-    return new MembraneError({
-      type: 'unknown',
-      message: error instanceof Error ? error.message : String(error),
-      retryable: false,
-      rawError: error,
-      rawRequest,
-    });
+    const info = classifyError(error);
+    info.rawRequest = rawRequest;
+    return new MembraneError(info);
   }
 }
 

@@ -12,6 +12,9 @@
  * - Direct API integration with proper error handling
  */
 
+import { unreportedUsage } from '../utils/usage.js';
+import { assertMessagePrefillSupported } from './request-capabilities.js';
+
 import type {
   ProviderAdapter,
   ProviderRequest,
@@ -22,12 +25,11 @@ import type {
 } from '../types/index.js';
 import {
   MembraneError,
-  rateLimitError,
-  contextLengthError,
-  authError,
-  serverError,
   abortError,
-  networkError,
+  classifyError,
+  errorFromHttpResponse,
+  isTypedAbortError,
+  withRawRequest,
 } from '../types/index.js';
 import { safeParseJson, textOnlyToolResultContent, createCombinedSignal, SSELineParser, isDeadlineAbort, deadlineTimeoutError, throwOnStreamErrorFrame, assertTerminalEventObserved } from './utils.js';
 
@@ -153,7 +155,7 @@ const COMPLETION_TOKENS_MODELS = [
 /**
  * Check if a model requires max_completion_tokens parameter
  */
-function requiresCompletionTokens(model: string): boolean {
+export function requiresCompletionTokens(model: string): boolean {
   return isReasoningGenerationGpt(model) || COMPLETION_TOKENS_MODELS.some(prefix => model.startsWith(prefix));
 }
 
@@ -173,7 +175,7 @@ const NO_TEMPERATURE_MODELS = [
 /**
  * Check if a model doesn't support custom temperature
  */
-function noTemperatureSupport(model: string): boolean {
+export function noTemperatureSupport(model: string): boolean {
   return isReasoningGenerationGpt(model) || NO_TEMPERATURE_MODELS.some(prefix => model.startsWith(prefix));
 }
 
@@ -196,7 +198,7 @@ const NO_STOP_MODELS = [
 /**
  * Check if a model doesn't support stop sequences
  */
-function noStopSupport(model: string): boolean {
+export function noStopSupport(model: string): boolean {
   return isReasoningGenerationGpt(model) || NO_STOP_MODELS.some(prefix => model.startsWith(prefix));
 }
 
@@ -245,6 +247,7 @@ export class OpenAIAdapter implements ProviderAdapter {
     options?: ProviderRequestOptions
   ): Promise<ProviderResponse> {
     const openAIRequest = this.buildRequest(request);
+    assertMessagePrefillSupported(openAIRequest.model, openAIRequest.messages, options, this.name, openAIRequest);
     options?.onRequest?.(openAIRequest);
 
     try {
@@ -264,6 +267,7 @@ export class OpenAIAdapter implements ProviderAdapter {
     openAIRequest.stream = true;
     // Request usage data in stream for cache metrics
     openAIRequest.stream_options = { include_usage: true };
+    assertMessagePrefillSupported(openAIRequest.model, openAIRequest.messages, options, this.name, openAIRequest);
     options?.onRequest?.(openAIRequest);
 
     const { signal: combinedSignal, cleanup } = createCombinedSignal(options?.signal, options?.timeoutMs);
@@ -276,8 +280,7 @@ export class OpenAIAdapter implements ProviderAdapter {
       });
 
       if (!response.ok) {
-        const errorText = await response.text();
-        throw new Error(`OpenAI API error: ${response.status} ${errorText}`);
+        throw errorFromHttpResponse(this.name, response, await response.text(), openAIRequest);
       }
 
       const reader = response.body?.getReader();
@@ -288,7 +291,7 @@ export class OpenAIAdapter implements ProviderAdapter {
       const decoder = new TextDecoder();
       const sseParser = new SSELineParser();
       let accumulated = '';
-      let finishReason = 'stop';
+      let finishReason: string | undefined;
       let sawTerminalEvent = false;
       let toolCalls: OpenAIToolCall[] = [];
       let streamUsage: OpenAIResponse['usage'] | undefined;
@@ -613,8 +616,7 @@ export class OpenAIAdapter implements ProviderAdapter {
       });
 
       if (!response.ok) {
-        const errorText = await response.text();
-        throw new Error(`OpenAI API error: ${response.status} ${errorText}`);
+        throw errorFromHttpResponse(this.name, response, await response.text(), request);
       }
 
       return await response.json() as OpenAIResponse;
@@ -628,19 +630,22 @@ export class OpenAIAdapter implements ProviderAdapter {
     const message = choice?.message;
 
     // Extract prompt caching details (OpenAI automatic caching for prompts ≥1024 tokens)
-    const cachedTokens = response.usage?.prompt_tokens_details?.cached_tokens ?? 0;
+    // A reported 0 is a fact (no cache read); only an unreported count is absent.
+    const cachedTokens = response.usage?.prompt_tokens_details?.cached_tokens;
 
     return {
       content: this.messageToContent(message),
       stopReason: this.mapFinishReason(choice?.finish_reason),
+      providerStopReason: choice?.finish_reason ?? undefined,
       stopSequence: undefined,
       usage: {
         inputTokens: response.usage?.prompt_tokens ?? 0,
         outputTokens: response.usage?.completion_tokens ?? 0,
         // OpenAI's automatic prompt caching - cached tokens are read from cache
         // Note: OpenAI doesn't have separate "creation" tokens - it's automatic
-        cacheReadTokens: cachedTokens > 0 ? cachedTokens : undefined,
+        ...(typeof cachedTokens === 'number' ? { cacheReadTokens: cachedTokens } : {}),
       },
+      ...unreportedUsage(response.usage?.prompt_tokens, response.usage?.completion_tokens),
       model: response.model ?? requestedModel,
       rawRequest,
       raw: response,
@@ -649,26 +654,28 @@ export class OpenAIAdapter implements ProviderAdapter {
 
   private parseStreamedResponse(
     message: OpenAIMessage,
-    finishReason: string,
+    finishReason: string | undefined,
     requestedModel: string,
     streamUsage?: OpenAIResponse['usage'],
     rawRequest?: unknown
   ): ProviderResponse {
     // Extract cached tokens from stream usage if available
-    const cachedTokens = streamUsage?.prompt_tokens_details?.cached_tokens ?? 0;
+    const cachedTokens = streamUsage?.prompt_tokens_details?.cached_tokens;
 
     return {
       content: this.messageToContent(message),
       stopReason: this.mapFinishReason(finishReason),
+      providerStopReason: finishReason,
       stopSequence: undefined,
       usage: {
         inputTokens: streamUsage?.prompt_tokens ?? 0,
         outputTokens: streamUsage?.completion_tokens ?? 0,
-        cacheReadTokens: cachedTokens > 0 ? cachedTokens : undefined,
+        ...(typeof cachedTokens === 'number' ? { cacheReadTokens: cachedTokens } : {}),
       },
+      ...unreportedUsage(streamUsage?.prompt_tokens, streamUsage?.completion_tokens),
       model: requestedModel,
       rawRequest,
-      raw: { message, finish_reason: finishReason, usage: streamUsage },
+      raw: { message, finish_reason: finishReason ?? 'stop', usage: streamUsage },
     };
   }
 
@@ -698,6 +705,8 @@ export class OpenAIAdapter implements ProviderAdapter {
   }
 
   private mapFinishReason(reason: string | undefined): string {
+    // No reason (or a server's null) is a plain end of turn.
+    if (reason == null) return 'end_turn';
     switch (reason) {
       case 'stop':
         return 'end_turn';
@@ -708,58 +717,26 @@ export class OpenAIAdapter implements ProviderAdapter {
       case 'content_filter':
         return 'refusal';
       default:
-        return 'end_turn';
+        // Unrecognized reasons ('error', a compatible server's own token)
+        // travel as the provider's own token, so membrane's mapper discloses
+        // and logs them instead of reading a clean end_turn.
+        return reason;
     }
   }
 
+  /**
+   * HTTP failures are classified at the fetch boundary, where status,
+   * headers and body are still live; this handles what is left — typed
+   * aborts and non-HTTP throwables — through the shared last-resort table.
+   */
   private handleError(error: unknown, rawRequest?: unknown): MembraneError {
-    // A deadline abort is a timeout and stays one. Collapsing it into a bare
-    // abortError() here is what erased the identity before Membrane's
-    // caller-signal > timeout > error ladder could read it.
     if (isDeadlineAbort(error)) return deadlineTimeoutError(error, rawRequest);
-    // Already-classified failures (e.g. the stream-integrity guards) keep
-    // their type and retryability instead of being re-derived from a string.
-    if (error instanceof MembraneError) return error;
+    if (error instanceof MembraneError) return withRawRequest(error, rawRequest);
+    if (isTypedAbortError(error)) return abortError(undefined, rawRequest);
 
-    if (error instanceof Error) {
-      const message = error.message;
-
-      // OpenAI specific error patterns
-      if (message.includes('429') || message.includes('rate_limit')) {
-        // Try to extract retry-after
-        const retryMatch = message.match(/retry after (\d+)/i);
-        const retryAfter = retryMatch?.[1] ? parseInt(retryMatch[1], 10) * 1000 : undefined;
-        return rateLimitError(message, retryAfter, error, rawRequest);
-      }
-
-      if (message.includes('401') || message.includes('invalid_api_key') || message.includes('Incorrect API key')) {
-        return authError(message, error, rawRequest);
-      }
-
-      if (message.includes('context_length') || message.includes('maximum context') || message.includes('too long')) {
-        return contextLengthError(message, error, rawRequest);
-      }
-
-      if (message.includes('500') || message.includes('502') || message.includes('503') || message.includes('server_error')) {
-        return serverError(message, undefined, error, rawRequest);
-      }
-
-      if (error.name === 'AbortError') {
-        return abortError(undefined, rawRequest);
-      }
-
-      if (message.includes('network') || message.includes('fetch') || message.includes('ECONNREFUSED')) {
-        return networkError(message, error, rawRequest);
-      }
-    }
-
-    return new MembraneError({
-      type: 'unknown',
-      message: error instanceof Error ? error.message : String(error),
-      retryable: false,
-      rawError: error,
-      rawRequest,
-    });
+    const info = classifyError(error);
+    info.rawRequest = rawRequest;
+    return new MembraneError(info);
   }
 }
 

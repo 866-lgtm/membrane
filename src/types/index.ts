@@ -102,7 +102,9 @@ export type {
   ProviderAdapter,
   ProviderRequest,
   ProviderRequestOptions,
+  ProviderRequestContext,
   ProviderResponse,
+  ProviderInputTransformation,
   StreamCallbacks,
   UsageCacheConvention,
 } from './provider.js';
@@ -130,6 +132,9 @@ export type {
   StreamBlockEvent,
   ToolCallsEvent,
   UsageEvent,
+  RoundReport,
+  RoundUsage,
+  ThinkingBindingEntry,
   CompleteEvent,
   ErrorEvent,
   AbortedEvent,
@@ -153,10 +158,12 @@ export {
 export type {
   MembraneErrorType,
   ErrorInfo,
+  HttpErrorResponseLike,
 } from './errors.js';
 
 export {
   MembraneError,
+  MembraneNotReadyError,
   serializeError,
   rateLimitError,
   contextLengthError,
@@ -172,6 +179,11 @@ export {
   unsupportedError,
   classifyError,
   isOverloadedError,
+  isTypedAbortError,
+  errorFromHttpResponse,
+  errorFromProviderStatus,
+  extractProviderErrorFields,
+  withRawRequest,
 } from './errors.js';
 
 // Config
