@@ -29,7 +29,10 @@ import { stripEmptyTextRequest } from '../utils/empty-text.js';
 import { createCombinedSignal, isDeadlineAbort, deadlineTimeoutError, assertTerminalEventObserved } from './utils.js';
 import {
   INTERLEAVED_THINKING_BETA,
+  THINKING_BINDING_BETA,
   needsInterleavedThinkingBeta,
+  readInputTransformations,
+  sendsBlockBinding,
   thinkingEnabled,
   detectImageMediaType,
 } from './anthropic.js';
@@ -85,7 +88,11 @@ interface BedrockMessageRequest {
   top_k?: number;
   stop_sequences?: string[];
   tools?: unknown[];
-  thinking?: { type: 'enabled'; budget_tokens: number };
+  /** As membrane builds it: enabled with a budget, or adaptive, either with
+   *  `display` and binding controls when they're set. */
+  thinking?:
+    | { type: 'enabled'; budget_tokens: number; display?: 'summarized' | 'omitted'; block_binding?: { prefix_mismatch_behavior: 'error' | 'drop_block' } }
+    | { type: 'adaptive'; display?: 'summarized' | 'omitted'; block_binding?: { prefix_mismatch_behavior: 'error' | 'drop_block' } };
   /** Beta flags. On bedrock-runtime these ride in the body, not a header. */
   anthropic_beta?: string[];
 }
@@ -112,6 +119,8 @@ interface BedrockMessageResponse {
     cache_creation_input_tokens?: number;
     cache_read_input_tokens?: number;
   };
+  /** The thinking-binding report (with THINKING_BINDING_BETA). */
+  input_transformations?: unknown;
 }
 
 interface BedrockStreamEvent {
@@ -140,6 +149,8 @@ interface BedrockStreamEvent {
     cache_creation_input_tokens?: number | null;
     cache_read_input_tokens?: number | null;
   };
+  /** On message_delta, after a server-side model fallback: the serving model's report. */
+  input_transformations?: unknown;
 }
 
 /**
@@ -559,6 +570,11 @@ export class BedrockAdapter implements ProviderAdapter {
       const existing = params.anthropic_beta ?? [];
       params.anthropic_beta = [...new Set([...existing, INTERLEAVED_THINKING_BETA])];
     }
+    // Thinking-binding controls need their beta, the same way.
+    if (sendsBlockBinding(params)) {
+      const existing = params.anthropic_beta ?? [];
+      params.anthropic_beta = [...new Set([...existing, THINKING_BINDING_BETA])];
+    }
 
     stripEmptyTextRequest(params, onContentAltered
       ? (dropped) => onContentAltered(dropped !== null && typeof dropped === 'object' ? originals.get(dropped) ?? dropped : dropped)
@@ -663,6 +679,8 @@ export class BedrockAdapter implements ProviderAdapter {
     let sawTerminalEvent = false;
     let stopSequence: string | undefined;
     let fullText = '';
+    // Final in message_start, replaced by a message_delta's after a fallback.
+    let inputTransformations: unknown;
 
     const reader = response.body?.getReader();
     if (!reader) {
@@ -786,6 +804,7 @@ export class BedrockAdapter implements ProviderAdapter {
                   // permanently inert on Bedrock streams: complete() surfaced
                   // them, stream() zeroed them, and every ledger/pricing
                   // consumer downstream saw zeros. (Connectome issue #35.)
+                  inputTransformations = eventData.message.input_transformations;
                   const startUsage = eventData.message.usage;
                   inputTokens = startUsage?.input_tokens ?? 0;
                   inputReported = typeof startUsage?.input_tokens === 'number';
@@ -845,6 +864,7 @@ export class BedrockAdapter implements ProviderAdapter {
                   callbacks.onContentBlock?.(blockIdx, contentBlocks[blockIdx]);
                 } else if (eventData.type === 'message_delta') {
                   sawTerminalEvent = true;
+                  if (Array.isArray(eventData.input_transformations)) inputTransformations = eventData.input_transformations;
                   if (eventData.usage) {
                     outputTokens = eventData.usage.output_tokens;
                     if (typeof eventData.usage.output_tokens === 'number') outputReported = true;
@@ -937,6 +957,7 @@ export class BedrockAdapter implements ProviderAdapter {
         ...(cacheCreationTokens != null ? { cache_creation_input_tokens: cacheCreationTokens } : {}),
         ...(cacheReadTokens != null ? { cache_read_input_tokens: cacheReadTokens } : {}),
       },
+      ...(Array.isArray(inputTransformations) ? { input_transformations: inputTransformations } : {}),
     };
 
     const parsed = this.parseResponse(finalMessage, rawRequest);
@@ -987,6 +1008,7 @@ export class BedrockAdapter implements ProviderAdapter {
         cacheReadTokens: response.usage.cache_read_input_tokens,
       },
       ...unreportedUsage(response.usage?.input_tokens, response.usage?.output_tokens),
+      ...readInputTransformations(response.input_transformations, (rawRequest as { messages?: unknown } | undefined)?.messages),
       model: response.model,
       rawRequest,
       raw: response,
