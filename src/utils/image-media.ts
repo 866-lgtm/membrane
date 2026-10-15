@@ -65,6 +65,14 @@ function formatOf(data: unknown): ImageMediaType | undefined {
   return undefined;
 }
 
+/** Whether `data` holds an image of an `accepted` format: the test
+ *  `imageForRequest` applies, without its placeholder or its warning, for a
+ *  caller that only needs to know whether an image will be sent. */
+export function isAcceptedImage(data: unknown, accepted: ReadonlySet<ImageMediaType> = RASTER_IMAGE_TYPES): boolean {
+  const format = formatOf(data);
+  return format !== undefined && accepted.has(format);
+}
+
 export type ImageForRequest<T extends ImageMediaType = RasterImageMediaType> =
   | { mediaType: T; placeholder?: undefined }
   | { mediaType?: undefined; placeholder: { type: 'text'; text: string } };

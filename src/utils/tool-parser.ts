@@ -19,7 +19,7 @@ import type {
   ToolDefinition,
 } from '../types/index.js';
 import { createHash } from 'node:crypto';
-import { imageForRequest } from './image-media.js';
+import { imageForRequest, isAcceptedImage } from './image-media.js';
 import { readToolSchema, type ParameterDeclaration, type ToolSchemaReading } from './tool-schema.js';
 
 // ============================================================================
@@ -1301,17 +1301,13 @@ export interface ProviderImageBlock {
 }
 
 /**
- * Check if any tool result contains image content
+ * Whether any tool result holds an image the request will send as an image:
+ * one whose data is an accepted format. It asks without deciding, so the
+ * placeholder's warning prints once, where the chosen path decides the image.
  */
 export function hasImageInToolResults(results: ToolResult[]): boolean {
-  for (const result of results) {
-    if (Array.isArray(result.content)) {
-      if (result.content.some(block => block.type === 'image')) {
-        return true;
-      }
-    }
-  }
-  return false;
+  return results.some((result) => Array.isArray(result.content)
+    && result.content.some((block) => block.type === 'image' && isAcceptedImage(toolResultImage(block).data)));
 }
 
 /**

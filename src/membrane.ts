@@ -1213,8 +1213,10 @@ export class Membrane {
 
             // Check if results contain images (requires split-turn injection).
             // The split is for images that will be sent: when every image
-            // became a placeholder, there is nothing to put in the user turn,
-            // and the standard path carries the placeholders as text.
+            // would become a placeholder, there is nothing to put in the user
+            // turn, and the standard path carries the placeholders as text.
+            // The check doesn't decide, so each image is decided once, on
+            // whichever path carries it.
             const splitContent = hasImageInToolResults(results) ? formatToolResultsForSplitTurn(results) : null;
             if (splitContent?.hasImages) {
               // Emit block events for tool results (image path)
@@ -3904,7 +3906,8 @@ export class Membrane {
             executedToolResults.push(...results);
 
             // Check if results contain images that will be sent (see the
-            // streaming path: an all-placeholder result takes the standard path)
+            // streaming path: an all-placeholder result takes the standard
+            // path, and each image is decided once)
             const splitContent = hasImageInToolResults(results) ? formatToolResultsForSplitTurn(results) : null;
             if (splitContent?.hasImages) {
               // Emit block events for tool results

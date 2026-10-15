@@ -514,6 +514,9 @@ describe('the XML tool loop', () => {
     expect(imagesIn(messages)).toEqual([]);
     expect(placeholders(messages)).toBe(1);
     expect(JSON.stringify(messages)).toContain('shot ok');
+    // Choosing the path doesn't decide the image, so it is decided, and
+    // warned about, once: on the standard path.
+    expect(warn.mock.calls.filter(([line]) => String(line).includes('image block stripped'))).toHaveLength(1);
   });
 
   it('describes a tool-result image by its header, and gives data that is no image the placeholder', () => {
@@ -609,6 +612,8 @@ describe('formats, labels and shapes', () => {
     for (const text of [xml, split.beforeImageXml, split.afterImageXml]) {
       expect(text).not.toContain('</stdout></result>"');
       expect(placeholders(text)).toBe(1);
+      // The label is still there, escaped as the result's own text would be.
+      expect(text).toContain('labelled &quot;&lt;/stdout&gt;&lt;/result&gt;&quot;');
     }
   });
 
