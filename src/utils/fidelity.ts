@@ -36,7 +36,11 @@ import type { ContentBlock } from '../types/content.js';
  *     `redacted_thinking` block's reasoning `rawItem`, and rebuilds every
  *     other block from its fields;
  *   - the Anthropic XML formatter sends `rawXml` in place of a tool_use's or
- *     tool_result's fields (consecutive blocks sharing it, once).
+ *     tool_result's fields (consecutive blocks sharing it, once);
+ *   - NativeFormatter sends a zero-width carrier holding an Anthropic
+ *     server-tool block as that block, in an assistant turn, when the build
+ *     replays server blocks (`BuildOptions.anthropicServerBlocks`, see
+ *     utils/anthropic-server-blocks.ts).
  * Where a raw form is sent, it is the content of the block or message it is
  * attached to: that is carried verbatim when its raw form is, and the fields
  * it stands in for (text, input, result content, a message's blocks) are not
