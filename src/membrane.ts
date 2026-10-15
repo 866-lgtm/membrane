@@ -65,6 +65,7 @@ import {
 } from './types/index.js';
 import type { BuildResult } from './formatters/types.js';
 import { computeCacheWireReceipt } from './cache-wire-receipt.js';
+import { createProgressDeadline } from './providers/utils.js';
 import {
   parseToolCalls,
   formatToolResults,
@@ -395,28 +396,40 @@ export class Membrane {
           ? this.wireReceiptGuard(options.signal)
           : undefined;
 
-        const adapterCall = this.adapter.complete(finalRequest, {
-          requestContext: {
-            formatterName: activeFormatter.name,
-            toolMode,
-            toolsDeclared: Boolean(request.tools?.length),
-            requiresAssistantPrefill: false,
-          },
-          signal: receiptGuard ? receiptGuard.signal : options.signal,
-          timeoutMs: options.timeoutMs,
-          onRequest: (req) => {
-            rawRequest = req;
-            if (useWireReceipt) {
-              markersInRequest = countWireCacheMarkers(req as Parameters<typeof countWireCacheMarkers>[0]);
-              if (!receiptEmitted) {
-                receiptEmitted = true;
-                receiptGuard?.emit(() => request.onCacheWireReceipt?.(computeCacheWireReceipt(req)));
+        // One progress deadline per provider call. A non-streaming call
+        // reports no progress before its response, so this bounds the call.
+        const progress = createProgressDeadline(
+          receiptGuard ? receiptGuard.signal : options.signal,
+          options.progressTimeoutMs,
+        );
+        let rawProviderResponse: ProviderResponse;
+        try {
+          const adapterCall = this.adapter.complete(finalRequest, {
+            requestContext: {
+              formatterName: activeFormatter.name,
+              toolMode,
+              toolsDeclared: Boolean(request.tools?.length),
+              requiresAssistantPrefill: false,
+            },
+            signal: progress.signal,
+            timeoutMs: options.timeoutMs,
+            ...(progress.renew ? { onProgress: progress.renew } : {}),
+            onRequest: (req) => {
+              rawRequest = req;
+              if (useWireReceipt) {
+                markersInRequest = countWireCacheMarkers(req as Parameters<typeof countWireCacheMarkers>[0]);
+                if (!receiptEmitted) {
+                  receiptEmitted = true;
+                  receiptGuard?.emit(() => request.onCacheWireReceipt?.(computeCacheWireReceipt(req)));
+                }
               }
-            }
-            options.onRequest?.(req);
-          },
-        });
-        const rawProviderResponse = receiptGuard ? await receiptGuard.settle(adapterCall) : await adapterCall;
+              options.onRequest?.(req);
+            },
+          });
+          rawProviderResponse = receiptGuard ? await receiptGuard.settle(adapterCall) : await adapterCall;
+        } finally {
+          progress.cleanup();
+        }
         // Restate usage in the one convention before any ratio or price sees it.
         const providerResponse: ProviderResponse = {
           ...rawProviderResponse,
@@ -812,6 +825,7 @@ export class Membrane {
       signal,
       timeoutMs,
       idleTimeoutMs,
+      progressTimeoutMs,
     } = options;
 
     // The formatter stream() selected: the same instance that resolved the
@@ -1038,6 +1052,7 @@ export class Membrane {
             signal,
             timeoutMs,
             idleTimeoutMs,
+            progressTimeoutMs,
             normalizedRequest: request,
             formatterName: formatter.name,
             requiresAssistantPrefill: true,
@@ -1475,6 +1490,7 @@ export class Membrane {
       signal,
       timeoutMs,
       idleTimeoutMs,
+      progressTimeoutMs,
     } = options;
 
     let toolDepth = 0;
@@ -1556,6 +1572,7 @@ export class Membrane {
             signal,
             timeoutMs,
             idleTimeoutMs,
+            progressTimeoutMs,
             normalizedRequest: request,
             formatterName: activeFormatter.name,
             requiresAssistantPrefill: false,
@@ -2461,6 +2478,8 @@ export class Membrane {
       signal?: AbortSignal;
       timeoutMs?: number;
       idleTimeoutMs?: number;
+      /** See StreamOptions.progressTimeoutMs: one renewable deadline per provider call. */
+      progressTimeoutMs?: number;
       onRequest?: (rawRequest: unknown) => void;
       /** See ProviderRequestOptions.wrapThinkingTags */
       wrapThinkingTags?: boolean;
@@ -2525,7 +2544,7 @@ export class Membrane {
     // compatibility won't catch the excess field (checked only on object
     // literals, not on variables). Leaving it in would silently leak the
     // normalized form into every adapter's options.
-    const { normalizedRequest, formatterName, requiresAssistantPrefill, refusalRetries, onRetrying, onWireCacheMarkers, fidelity, ...adapterOptions } = options;
+    const { normalizedRequest, formatterName, requiresAssistantPrefill, refusalRetries, onRetrying, onWireCacheMarkers, progressTimeoutMs, fidelity, ...adapterOptions } = options;
     // Fingerprint around the hook only when both a hook and a reader exist
     // (the yielding loops pass notes only when they emit usage events, which
     // carry the round report): an observer or a no-op hook keeps fidelity
@@ -2607,15 +2626,24 @@ export class Membrane {
       // attempt before the refusal check below, so an attempt that stopped
       // locally is never re-issued for a refusal that came after its stop.
       const localStops = requiresAssistantPrefill ? undefined : new LocalStopSequences(finalRequest.stopSequences, callbacks);
+      // Each provider call, refusal re-issues included, gets its own progress
+      // deadline; time outside the call (tool execution) never counts.
+      const progress = createProgressDeadline(observedOptions.signal, progressTimeoutMs);
       let attemptResult: ProviderResponse;
       try {
-        const streamCall = this.adapter.stream(finalRequest, localStops?.callbacks ?? callbacks, observedOptions);
+        const streamCall = this.adapter.stream(
+          finalRequest,
+          localStops?.callbacks ?? callbacks,
+          progress.renew ? { ...observedOptions, signal: progress.signal, onProgress: progress.renew } : observedOptions,
+        );
         attemptResult = receiptGuard ? await receiptGuard.settle(streamCall) : await streamCall;
       } catch (error) {
         // Held text was received: deliver it so partialContent keeps it. The
         // attempt's own error is the one to report, whatever delivery does.
         try { localStops?.release(); } catch { /* keep the original error */ }
         throw error;
+      } finally {
+        progress.cleanup();
       }
       const rawResult = localStops ? localStops.finish(attemptResult) : attemptResult;
       // Restate usage in the one convention before any accumulator, ratio or
@@ -3707,6 +3735,7 @@ export class Membrane {
             signal: stream.signal,
             timeoutMs: options.timeoutMs,
             idleTimeoutMs: options.idleTimeoutMs,
+            progressTimeoutMs: options.progressTimeoutMs,
             normalizedRequest: request,
             formatterName: formatter.name,
             requiresAssistantPrefill: true,
@@ -4283,6 +4312,7 @@ export class Membrane {
             signal: stream.signal,
             timeoutMs: options.timeoutMs,
             idleTimeoutMs: options.idleTimeoutMs,
+            progressTimeoutMs: options.progressTimeoutMs,
             normalizedRequest: request,
             formatterName: activeFormatter.name,
             requiresAssistantPrefill: false,

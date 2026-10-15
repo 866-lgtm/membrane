@@ -423,7 +423,7 @@ export class BedrockAdapter implements ProviderAdapter {
 
     const { signal: combinedSignal, cleanup } = createCombinedSignal(options?.signal, options?.timeoutMs);
     try {
-      return await this.invokeModelWithStream(bedrockModelId, bedrockRequest, callbacks, combinedSignal, fullRequest);
+      return await this.invokeModelWithStream(bedrockModelId, bedrockRequest, callbacks, combinedSignal, fullRequest, options?.onProgress);
     } catch (error) {
       throw this.handleError(error, fullRequest);
     } finally {
@@ -629,7 +629,8 @@ export class BedrockAdapter implements ProviderAdapter {
     request: BedrockMessageRequest,
     callbacks: StreamCallbacks,
     signal: AbortSignal | undefined,
-    rawRequest: unknown
+    rawRequest: unknown,
+    onProgress?: () => void,
   ): Promise<ProviderResponse> {
     const url = new URL(
       `${this.baseURL ?? `https://bedrock-runtime.${this.region}.amazonaws.com`}/model/${encodeURIComponent(modelId)}/invoke-with-response-stream`
@@ -783,6 +784,8 @@ export class BedrockAdapter implements ProviderAdapter {
                   bytes[i] = binaryStr.charCodeAt(i);
                 }
                 const eventData = JSON.parse(new TextDecoder().decode(bytes)) as BedrockStreamEvent;
+                // A decoded model event is progress; a ping only proves the connection.
+                if ((eventData as { type?: string }).type !== 'ping') onProgress?.();
 
                 // Check for error events within the stream
                 if (eventData.type === 'error') {
