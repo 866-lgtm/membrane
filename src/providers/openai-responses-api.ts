@@ -28,6 +28,8 @@ import {
   contextLengthError,
   networkError,
   rateLimitError,
+  creditExhaustionError,
+  isCreditExhaustion,
   serverError,
 } from '../types/index.js';
 import { createCombinedSignal, SSELineParser, safeParseJson, isDeadlineAbort, deadlineTimeoutError, throwOnStreamErrorFrame } from './utils.js';
@@ -719,6 +721,7 @@ export class OpenAIResponsesAPIAdapter implements ProviderAdapter {
         : Number.isFinite(date) ? Math.max(0, date - Date.now()) : undefined;
       throw rateLimitError(message, delay, detail, rawRequest);
     }
+    if (isCreditExhaustion(detail, status)) throw creditExhaustionError(message, detail, rawRequest);
     if (status >= 500) throw serverError(message, status, detail, rawRequest);
     if (status === 400 && /context_length|maximum context|token limit|too long/i.test(detail)) {
       throw contextLengthError(message, detail, rawRequest);
@@ -750,6 +753,11 @@ export class OpenAIResponsesAPIAdapter implements ProviderAdapter {
     if (error instanceof MembraneError) return error;
     if (error instanceof Error) {
       const message = error.message;
+      // 402 / insufficient credits: transient at account scale, never a
+      // property of the request (see isCreditExhaustion).
+      if (isCreditExhaustion(message)) {
+        return creditExhaustionError(message, error, rawRequest);
+      }
       if (message.includes('429') || message.includes('rate_limit')) {
         const retryMatch = message.match(/retry after (\d+)/i);
         const retryAfter = retryMatch?.[1] ? Number(retryMatch[1]) * 1000 : undefined;

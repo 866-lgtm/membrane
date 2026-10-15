@@ -172,6 +172,8 @@ export {
   unsupportedError,
   classifyError,
   isOverloadedError,
+  isCreditExhaustion,
+  creditExhaustionError,
 } from './errors.js';
 
 // Config

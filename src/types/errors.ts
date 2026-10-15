@@ -285,6 +285,73 @@ export function isOverloadedError(info: ErrorInfo): boolean {
   return m.includes('529') || m.includes('overloaded_error');
 }
 
+const CREDIT_EXHAUSTION_TOKENS = [
+  'insufficient_credits',
+  'insufficient credits',
+  'insufficient_quota',
+  'insufficient quota',
+  'payment_required',
+  'payment required',
+  'credit balance is too low',
+];
+
+/**
+ * An HTTP status as error messages spell it: the adapters' `API error: 402`,
+ * `OpenRouter error: 402`, the OpenAI SDK's leading `402 …`, `HTTP 402`,
+ * `status: 402`, or a JSON body's `"code": 402`.
+ */
+const statusPattern = (status: number): RegExp =>
+  new RegExp(`(?:^|error:\\s*|http\\s+|status\\s*:?\\s*|"code"\\s*:\\s*)${status}\\b`);
+
+/**
+ * Account-level credit/quota exhaustion: HTTP 402 Payment Required, or a
+ * provider's own insufficient-credits/quota code (VoidAI and OpenRouter answer
+ * 402 `insufficient_credits`; OpenAI answers 429 `insufficient_quota`).
+ *
+ * A fact about the ACCOUNT, not the request — the identical request succeeds
+ * once credits refill or are topped up — so it must not surface as
+ * `unknown, retryable: false`. Callers read retryable:false as "this request
+ * fails identically forever" and spend bounded attempt budgets on it (a
+ * context-manager merge burned all five attempts in one second and went to
+ * quarantine on a credit dip that cleared minutes later). The status is
+ * matched only where messages spell a status (see statusPattern), never as a
+ * bare number in prose.
+ */
+export function isCreditExhaustion(message: string, httpStatus?: number): boolean {
+  if (httpStatus === 402) return true;
+  const m = message.toLowerCase();
+  if (CREDIT_EXHAUSTION_TOKENS.some((token) => m.includes(token))) return true;
+  return statusPattern(402).test(m);
+}
+
+/** 429 when the provider sent one (OpenAI's insufficient_quota), else 402. */
+function creditExhaustionStatus(message: string): number {
+  return statusPattern(429).test(message.toLowerCase()) ? 429 : 402;
+}
+
+/**
+ * Credit exhaustion as a retryable `rate_limit` — the bucket OpenAI's own
+ * insufficient_quota 429 already lands in — keeping the provider's status
+ * (402 unless it said 429) so the cause stays legible in receipts.
+ */
+export function creditExhaustionError(message: string, raw?: unknown, rawRequest?: unknown): MembraneError {
+  const m = message.toLowerCase();
+  const providerErrorCode = m.includes('insufficient_quota')
+    ? 'insufficient_quota'
+    : m.includes('insufficient_credits')
+      ? 'insufficient_credits'
+      : undefined;
+  return new MembraneError({
+    type: 'rate_limit',
+    message,
+    retryable: true,
+    httpStatus: creditExhaustionStatus(message),
+    ...(providerErrorCode ? { providerErrorCode } : {}),
+    rawError: raw,
+    rawRequest,
+  });
+}
+
 export function classifyError(error: unknown): ErrorInfo {
   if (error instanceof MembraneError) {
     return error.toErrorInfo();
@@ -295,7 +362,18 @@ export function classifyError(error: unknown): ErrorInfo {
 
   if (error instanceof Error) {
     const message = error.message.toLowerCase();
-    
+
+    // Credit/quota exhaustion (402): transient at account scale.
+    if (isCreditExhaustion(error.message)) {
+      return {
+        type: 'rate_limit',
+        message: error.message,
+        retryable: true,
+        httpStatus: creditExhaustionStatus(error.message),
+        rawError: serializedError,
+      };
+    }
+
     // Rate limit
     if (message.includes('rate') || message.includes('429') || message.includes('too many')) {
       return {

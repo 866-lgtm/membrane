@@ -23,6 +23,8 @@ import type {
 import {
   MembraneError,
   rateLimitError,
+  creditExhaustionError,
+  isCreditExhaustion,
   contextLengthError,
   authError,
   serverError,
@@ -776,6 +778,12 @@ export class OpenAIAdapter implements ProviderAdapter {
 
     if (error instanceof Error) {
       const message = error.message;
+
+      // 402 / insufficient credits: transient at account scale, never a
+      // property of the request (see isCreditExhaustion).
+      if (isCreditExhaustion(message)) {
+        return creditExhaustionError(message, error, rawRequest);
+      }
 
       // OpenAI specific error patterns
       if (message.includes('429') || message.includes('rate_limit')) {

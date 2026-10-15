@@ -1,4 +1,4 @@
-import { TimeoutAbortError, authError, networkError, rateLimitError, serverError } from '../types/errors.js';
+import { TimeoutAbortError, authError, creditExhaustionError, networkError, rateLimitError, serverError } from '../types/errors.js';
 
 interface StreamErrorFrameFields {
   code?: unknown;
@@ -14,6 +14,7 @@ interface StreamErrorFrameFields {
 }
 
 const RATE_LIMIT_FRAME_TOKENS = ['rate_limit', 'rate-limit', 'ratelimit', 'too_many_requests', 'resource_exhausted'];
+const CREDIT_FRAME_TOKENS = ['insufficient_credits', 'insufficient_quota', 'payment_required'];
 const OVERLOADED_FRAME_TOKENS = ['overloaded'];
 const SERVER_FRAME_TOKENS = ['server_error', 'internal', 'unavailable'];
 const AUTH_FRAME_TOKENS = [
@@ -96,6 +97,8 @@ function frameTokensMatch(tokens: string[], needles: string[]): boolean {
  * unchanged. Mapping, using the structured fields only:
  *   - 429, or a rate-limit-shaped token  -> rate_limit (retryable), carrying
  *     the frame's retry hint when it has one
+ *   - 402, or a credit/quota-shaped token -> rate_limit (retryable, 402):
+ *     account credit exhaustion, transient by nature (isCreditExhaustion)
  *   - 5xx, or an overloaded/server-shaped token -> server (retryable);
  *     overloaded-without-a-status takes 529 so it lands on the capacity
  *     backoff schedule, matching how anthropic.ts recovers the same shape
@@ -137,6 +140,10 @@ export function throwOnStreamErrorFrame(
 
   if (httpStatus === 429 || frameTokensMatch(tokens, RATE_LIMIT_FRAME_TOKENS)) {
     throw rateLimitError(description, readFrameRetryAfterMs(fields), parsed, rawRequest);
+  }
+
+  if (httpStatus === 402 || frameTokensMatch(tokens, CREDIT_FRAME_TOKENS)) {
+    throw creditExhaustionError(description, parsed, rawRequest);
   }
 
   if (httpStatus === 401 || httpStatus === 403 || frameTokensMatch(tokens, AUTH_FRAME_TOKENS)) {
