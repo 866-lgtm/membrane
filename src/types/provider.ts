@@ -409,7 +409,9 @@ export interface ProviderResponse {
      * reads `cache_read_input_tokens` (Anthropic, cache-excluded) OR
      * `prompt_tokens_details.cached_tokens` (OpenAI, cache-inclusive) depending
      * on which provider it routed to, so the convention is a per-response fact
-     * there rather than a per-adapter one.
+     * there rather than a per-adapter one. Gemini sets it too, for a response
+     * whose cached count exceeds its prompt count: the inclusive reading it
+     * declares can't hold there, so that response is read as cache-excluded.
      */
     cacheConvention?: UsageCacheConvention;
   };
