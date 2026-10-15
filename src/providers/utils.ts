@@ -292,8 +292,8 @@ export function textOnlyToolResultContent(content: unknown): string {
  */
 const DEADLINE_ABORT = Symbol.for('membrane.deadlineAbort');
 
-function deadlineAbortReason(): DOMException {
-  const reason = new DOMException('Request timed out', 'AbortError');
+function deadlineAbortReason(message = 'Request timed out'): DOMException {
+  const reason = new DOMException(message, 'AbortError');
   Object.defineProperty(reason, DEADLINE_ABORT, { value: true, enumerable: false });
   return reason;
 }
@@ -321,7 +321,35 @@ export function isDeadlineAbort(error: unknown): boolean {
  * caller-signal > timeout > error ladder could read it.
  */
 export function deadlineTimeoutError(error: unknown, rawRequest?: unknown): TimeoutAbortError {
-  return new TimeoutAbortError('Request timed out', error, rawRequest);
+  // The marked reason names its deadline (see createProgressDeadline).
+  const message = isDeadlineAbort(error) ? (error as { message?: unknown }).message : undefined;
+  return new TimeoutAbortError(
+    typeof message === 'string' && message ? message : 'Request timed out',
+    error,
+    rawRequest,
+  );
+}
+
+/**
+ * The longest delay a platform timer holds. Node and browsers run a timer
+ * whose delay is longer, Infinity included, after 1 ms.
+ */
+const MAX_TIMER_DELAY_MS = 2_147_483_647;
+
+/**
+ * `setTimeout` for any delay: one past the platform's limit (about 24.8
+ * days) is armed in steps no longer than it, so it fires on time, and
+ * Infinity never fires. Returns its cancel.
+ */
+function setLongTimeout(fire: () => void, delayMs: number): () => void {
+  let timer: ReturnType<typeof setTimeout>;
+  const arm = (left: number): void => {
+    timer = left > MAX_TIMER_DELAY_MS
+      ? setTimeout(() => arm(left - MAX_TIMER_DELAY_MS), MAX_TIMER_DELAY_MS)
+      : setTimeout(fire, left);
+  };
+  arm(delayMs);
+  return () => clearTimeout(timer);
 }
 
 /**
@@ -343,10 +371,10 @@ export function createCombinedSignal(
   if (signal && !timeoutMs) return { signal };
 
   const controller = new AbortController();
-  let timeoutId: ReturnType<typeof setTimeout> | undefined;
+  let cancelTimeout: (() => void) | undefined;
 
   if (timeoutMs) {
-    timeoutId = setTimeout(() => controller.abort(deadlineAbortReason()), timeoutMs);
+    cancelTimeout = setLongTimeout(() => controller.abort(deadlineAbortReason()), timeoutMs);
   }
 
   const onAbort = () => controller.abort(signal!.reason);
@@ -361,8 +389,77 @@ export function createCombinedSignal(
   return {
     signal: controller.signal,
     cleanup: () => {
-      if (timeoutId) clearTimeout(timeoutId);
+      cancelTimeout?.();
       if (signal) signal.removeEventListener('abort', onAbort);
+    },
+  };
+}
+
+/**
+ * A deadline that stream progress renews, for one provider call: it aborts
+ * when `timeoutMs` passes with no call to `renew`, combined with the caller's
+ * signal. Membrane core owns it (`progressTimeoutMs`); adapters renew it
+ * through `ProviderRequestOptions.onProgress` once per parsed provider event.
+ *
+ * Expiry aborts with the same mark as `createCombinedSignal`'s deadline, so
+ * every adapter's `isDeadlineAbort` → `deadlineTimeoutError` path turns it
+ * into a TimeoutAbortError: a timeout by type, an abort by provenance. Its
+ * message names this deadline and says when the call began, how many provider
+ * events it had and when the last came, so a call log that keeps only an
+ * error's message still tells a call that never produced an event from one
+ * that stopped partway.
+ *
+ * Silence is measured on the monotonic clock (`performance.now()`), as the
+ * timers run, so a step of the system clock moves no expiry; the message's
+ * times are wall-clock. `renew` only records the time and counts the event,
+ * so calling it per event costs nothing; the one timer re-arms itself for
+ * whatever is left when it fires early. Without a positive `timeoutMs`
+ * (unset, zero, negative or NaN) the caller's signal passes through and there
+ * is no `renew`. `cleanup` MUST run in a `finally`.
+ */
+export function createProgressDeadline(
+  signal: AbortSignal | undefined,
+  timeoutMs: number | undefined,
+): { signal?: AbortSignal; renew?: () => void; cleanup: () => void } {
+  if (!timeoutMs || timeoutMs <= 0) return { signal, cleanup: () => {} };
+
+  const controller = new AbortController();
+  const beganAt = Date.now();
+  let lastAt = beganAt;
+  let last = performance.now();
+  let events = 0;
+  let cancelTimer: (() => void) | undefined;
+  const check = (): void => {
+    const quiet = performance.now() - last;
+    if (quiet >= timeoutMs) {
+      cancelTimer = undefined;
+      controller.abort(deadlineAbortReason(
+        `No provider progress within ${timeoutMs}ms: the call began at ${new Date(beganAt).toISOString()}, ` +
+        `provider events: ${events}${events > 0 ? `, the last at ${new Date(lastAt).toISOString()}` : ''}`,
+      ));
+    } else {
+      cancelTimer = setLongTimeout(check, timeoutMs - quiet);
+    }
+  };
+  cancelTimer = setLongTimeout(check, timeoutMs);
+
+  const onAbort = (): void => {
+    cancelTimer?.();
+    cancelTimer = undefined;
+    controller.abort(signal!.reason);
+  };
+  if (signal) {
+    if (signal.aborted) onAbort();
+    else signal.addEventListener('abort', onAbort, { once: true });
+  }
+
+  return {
+    signal: controller.signal,
+    renew: () => { last = performance.now(); lastAt = Date.now(); events++; },
+    cleanup: () => {
+      cancelTimer?.();
+      cancelTimer = undefined;
+      signal?.removeEventListener('abort', onAbort);
     },
   };
 }

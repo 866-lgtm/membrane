@@ -4,6 +4,7 @@
  * Handles OpenAI-compatible API with tool_calls format
  */
 
+import { unreportedUsage } from '../utils/usage.js';
 import { assertMessagePrefillSupported } from './request-capabilities.js';
 
 import type {
@@ -273,6 +274,8 @@ export class OpenRouterAdapter implements ProviderAdapter {
         } catch {
           return; // Ignore parse errors (partial/keep-alive lines)
         }
+        // A parsed provider event is progress (comments never reach here).
+        options?.onProgress?.();
 
         // OpenRouter delivers mid-stream failures (e.g. upstream 429s) as an
         // SSE data line with an `error` payload. Silently ignoring it would
@@ -696,6 +699,7 @@ export class OpenRouterAdapter implements ProviderAdapter {
         cacheReadTokens: cacheReadTokens ?? undefined,
         cacheConvention,
       },
+      ...unreportedUsage(response.usage?.prompt_tokens, response.usage?.completion_tokens),
       model: response.model ?? requestedModel,
       rawRequest,
       raw: response,
@@ -728,6 +732,7 @@ export class OpenRouterAdapter implements ProviderAdapter {
         cacheReadTokens: cacheReadTokens ?? undefined,
         cacheConvention,
       },
+      ...unreportedUsage(streamUsage?.prompt_tokens, streamUsage?.completion_tokens),
       model: requestedModel,
       rawRequest,
       raw: { message, finish_reason: finishReason ?? 'stop', usage: streamUsage },
