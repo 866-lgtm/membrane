@@ -171,9 +171,26 @@ export interface ToolResultContent {
    * consumer that changes the result (truncating it, say) must drop or
    * replace `rawXml` too, or the change won't reach the provider, and round
    * reports count the block as carried when its raw text is
-   * (utils/fidelity.ts).
+   * (utils/fidelity.ts). Where `rawXmlImagesAt` is set, the replay can also
+   * send the images the turn sent, from `content`, at that place (see there).
    */
   rawXml?: string;
+  /**
+   * Set on the result whose images an XML tool loop sent in a user turn of
+   * their own, splitting its results block: the offset in `rawXml` where the
+   * split fell. Its `content` then holds what the tool returned, images
+   * included. The prefill path replays `rawXml` split at that offset, with
+   * the images from `content` that an XML split sends (the accepted image
+   * formats) between the two parts, as the turn sent it, and the images are
+   * carried with the raw text. It sends `rawXml` whole instead when the
+   * offset no longer falls where a result or error in the block closes, or when
+   * `content` holds no image a split sends. A message that also carries
+   * images of its own goes to the provider as one user turn, with these
+   * images where the split fell. What the turn added after the block, such
+   * as the thinking opener a thinking turn writes there, replays as it did
+   * before. A consumer that changes the result drops this with `rawXml`.
+   */
+  rawXmlImagesAt?: number;
   /** See {@link TextContent.rawItem}. */
   rawItem?: unknown;
 }

@@ -72,7 +72,9 @@ import {
   endsWithPartialToolBlock,
   hasImageInToolResults,
   formatToolResultsForSplitTurn,
+  attachSplitResults,
   type ProviderImageBlock,
+  type SplitResultsRound,
 } from './utils/tool-parser.js';
 import { IncrementalXmlParser, type ProcessChunkResult } from './utils/stream-parser.js';
 import type { ChunkMeta, BlockEvent, MembraneBlockType, MembraneBlock } from './types/streaming.js';
@@ -846,6 +848,9 @@ export class Membrane {
     // Track executed tool calls and results
     const executedToolCalls: ToolCall[] = [];
     const executedToolResults: ToolResult[] = [];
+    // Rounds split to send their images, so the final parse can give each
+    // results block what its tools returned (attachSplitResults).
+    const splitRounds: SplitResultsRound[] = [];
 
     // Track non-text content blocks from provider (e.g., generated_image from Gemini)
     // These can't be handled by the text-based XML parser, so we capture and append them
@@ -1218,6 +1223,16 @@ export class Membrane {
             if (hasImageInToolResults(results)) {
               // Use split-turn injection for images
               const splitContent = formatToolResultsForSplitTurn(results);
+              if (splitContent.hasImages) {
+                splitRounds.push({
+                  xml: splitContent.beforeImageXml + splitContent.afterImageXml,
+                  // The block goes into the document next, so it starts here.
+                  docAt: parser.getAccumulated().length - initialPrefillLength,
+                  at: splitContent.beforeImageXml.length,
+                  imageResult: splitContent.imageResult,
+                  results,
+                });
+              }
 
               // Emit block events for tool results (image path)
               const toolResultBlockIndex = parser.getBlockIndex();
@@ -1416,7 +1431,8 @@ export class Membrane {
         executedToolResults,
         initialBlockType,
         lastStopSequence,
-        lastProviderStopReason
+        lastProviderStopReason,
+        splitRounds
       );
 
       // Append non-text content blocks (e.g., generated_image) that the XML parser can't handle
@@ -1444,7 +1460,7 @@ export class Membrane {
           executedToolResults,
           this.abortReason(error, signal),
           xmlToolProtocol
-            ? parseAccumulatedIntoBlocks(newContent, { tools: request.tools, ...(initialBlockType ? { startInsideBlock: initialBlockType } : {}) }).blocks
+            ? attachSplitResults(parseAccumulatedIntoBlocks(newContent, { tools: request.tools, ...(initialBlockType ? { startInsideBlock: initialBlockType } : {}) }), splitRounds).blocks
             : streamedThinking.content(newContent, (value, context) => formatter.parseContentBlocks(value, request.tools, context))
         );
       }
@@ -3009,7 +3025,8 @@ export class Membrane {
     executedToolResults: ToolResult[] = [],
     startInsideBlock: 'thinking' | 'tool_call' | 'tool_result' | null = null,
     triggeredSequence?: string,
-    providerStopReason?: string
+    providerStopReason?: string,
+    splitRounds: readonly SplitResultsRound[] = [],
   ): NormalizedResponse {
     const usage = turnUsage.total;
     // Parse accumulated text into structured content blocks
@@ -3034,9 +3051,12 @@ export class Membrane {
         ...(startInsideBlock ? { startInsideBlock } : {}),
       };
       const parsed = parseAccumulatedIntoBlocks(accumulated, parseOptions);
-      finalContent = parsed.blocks;
+      // A round split to send images wrote only its results' text into the
+      // document; its blocks and tool results take what the tools returned.
+      const attached = attachSplitResults(parsed, splitRounds);
+      finalContent = attached.blocks;
       toolCalls = parsed.toolCalls.length > 0 ? parsed.toolCalls : executedToolCalls;
-      toolResults = parsed.toolResults.length > 0 ? parsed.toolResults : executedToolResults;
+      toolResults = attached.toolResults.length > 0 ? attached.toolResults : executedToolResults;
       unclosedToolBlock = parsed.unclosedToolBlock;
       this.reportToolParseDiagnostics(parsed, stopReason);
     }
@@ -3547,6 +3567,9 @@ export class Membrane {
     // Track executed tool calls and results
     const executedToolCalls: ToolCall[] = [];
     const executedToolResults: ToolResult[] = [];
+    // Rounds split to send their images, so the final parse can give each
+    // results block what its tools returned (attachSplitResults).
+    const splitRounds: SplitResultsRound[] = [];
 
     // Transform initial request using the formatter. Its fidelity notes hold
     // for every round: continuations carry the same converted messages.
@@ -3908,6 +3931,16 @@ export class Membrane {
             // Check if results contain images
             if (hasImageInToolResults(results)) {
               const splitContent = formatToolResultsForSplitTurn(results);
+              if (splitContent.hasImages) {
+                splitRounds.push({
+                  xml: splitContent.beforeImageXml + splitContent.afterImageXml,
+                  // The block goes into the document next, so it starts here.
+                  docAt: parser.getAccumulated().length - initialPrefillLength,
+                  at: splitContent.beforeImageXml.length,
+                  imageResult: splitContent.imageResult,
+                  results,
+                });
+              }
 
               // Emit block events for tool results
               if (emitBlocks) {
@@ -4112,7 +4145,8 @@ export class Membrane {
         executedToolResults,
         initialBlockType,
         lastStopSequence,
-        lastProviderStopReason
+        lastProviderStopReason,
+        splitRounds
       );
 
       // Merge provider thinking signatures into parser-derived thinking blocks
@@ -4135,7 +4169,7 @@ export class Membrane {
           type: 'aborted',
           reason: this.abortReason(error, stream.signal),
           partialContent: xmlToolProtocol
-              ? parseAccumulatedIntoBlocks(newContent, { tools: request.tools, ...(initialBlockType ? { startInsideBlock: initialBlockType } : {}) }).blocks
+              ? attachSplitResults(parseAccumulatedIntoBlocks(newContent, { tools: request.tools, ...(initialBlockType ? { startInsideBlock: initialBlockType } : {}) }), splitRounds).blocks
               : streamedThinking.content(newContent, (value, context) => formatter.parseContentBlocks(value, request.tools, context)),
           rawAssistantText: newContent,
           toolCalls: executedToolCalls,

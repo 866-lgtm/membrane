@@ -30,6 +30,7 @@ import type {
 import {
   parseToolCalls as parseToolCallsXml,
   formatToolResults as formatToolResultsXml,
+  formatToolResultsForSplitTurn,
   parseAccumulatedIntoBlocks,
   formatToolDefinitions,
   toolDefinitionForPrompt,
@@ -112,6 +113,36 @@ function toToolResult(block: ToolResultContent): ToolResult {
     content,
     isError: block.isError ?? false,
   };
+}
+
+/** A results block's text split where the turn sent a result's images, with those images. */
+interface SentSplit {
+  before: string;
+  images: unknown[];
+  after: string;
+}
+
+/**
+ * The split a turn sent a results block with: the result marked with
+ * `rawXmlImagesAt` holds the images it sent, and the raw text splits there,
+ * where the live split's second part began with a result's closing text.
+ * The stored offset has to fall where a result or error closes, as this
+ * version renders the close, and the images are decided again by today's
+ * rules for what an XML split sends (formatToolResultsForSplitTurn), so a
+ * block whose mark falls elsewhere, or whose images the split wouldn't send,
+ * goes out as its raw text whole. Null when no result is marked, the mark doesn't
+ * fall where a result or error closes, or no image it holds can be sent.
+ */
+function sentSplit(group: readonly ToolResultContent[]): SentSplit | null {
+  const rawXml = group[0]!.rawXml!;
+  const marked = group.find((b) => typeof b.rawXmlImagesAt === 'number');
+  // An offset counts from the start: slice() would read a negative one from the end.
+  const at = marked?.rawXmlImagesAt ?? 0;
+  if (at <= 0) return null;
+  const after = rawXml.slice(at);
+  if (!after.startsWith('\n</stdout>') && !after.startsWith('\n</error>')) return null;
+  const { images } = formatToolResultsForSplitTurn([toToolResult(marked!)]);
+  return images.length > 0 ? { before: rawXml.slice(0, at), images, after } : null;
 }
 
 // ============================================================================
@@ -276,7 +307,7 @@ export class AnthropicXmlFormatter implements PrefillFormatter {
 
       // Extract content (recording alterations against this message's index)
       const onAltered = options.fidelity ? () => options.fidelity!.alter(i) : undefined;
-      const { text, images, hasUnsupportedMedia } = this.extractContent(message.content, message.participant, onAltered);
+      const { text, images, hasUnsupportedMedia, segments, splitImages } = this.extractContent(message.content, message.participant, onAltered);
       const hasImages = images.length > 0;
       const isEmpty = !text.trim() && !hasImages;
 
@@ -302,9 +333,17 @@ export class AnthropicXmlFormatter implements PrefillFormatter {
           currentConversation = [];
         }
 
+        // One user turn: the text, with a split results block's images where
+        // the turn split it, then the message's own images.
         const userContent: unknown[] = [];
-        if (text) {
-          userContent.push({ type: 'text', text: `${message.participant}: ${text}` });
+        let prefix = `${message.participant}: `;
+        for (let k = 0; k < segments.length; k++) {
+          const piece = segments[k]!;
+          if (prefix ? piece : piece.trim()) {
+            userContent.push({ type: 'text', text: `${prefix}${piece}` });
+            prefix = '';
+          }
+          if (k < splitImages.length) userContent.push(...splitImages[k]!);
         }
         userContent.push(...images);
 
@@ -312,6 +351,21 @@ export class AnthropicXmlFormatter implements PrefillFormatter {
         lastNonEmptyParticipant = message.participant;
         continue;
       }
+
+      // A results block the turn split to send images replays the same way:
+      // the assistant text through the result, a user turn with its images,
+      // then the rest. Without a split, this is the message's text whole.
+      const pushText = (prefix: string): void => {
+        for (let k = 0; k < segments.length; k++) {
+          const last = k === segments.length - 1;
+          currentConversation.push(`${k === 0 ? prefix : ''}${segments[k]}${last ? this.config.messageDelimiter : ''}`);
+          if (last) break;
+          // Assistant content can't end in whitespace, as the live split trims it.
+          providerMessages.push({ role: 'assistant', content: currentConversation.join(joiner).trimEnd() });
+          providerMessages.push({ role: 'user', content: splitImages[k]! });
+          currentConversation = [];
+        }
+      };
 
       // Every branch below that leaves a message's content out of the
       // transcript alters it, unless it held nothing: whitespace-only text is
@@ -378,7 +432,7 @@ export class AnthropicXmlFormatter implements PrefillFormatter {
           // harness's injection as someone's utterance, and the model then
           // reads the same result in two attributions across compiles
           // (D2 of the Evander 2026-08-08 scaffold-leak analysis).
-          currentConversation.push(`${text}${this.config.messageDelimiter}`);
+          pushText('');
           lastWasToolResults = true;
         } else if (isBotMessage && lastWasToolResults) {
           // The round after injected results continues the same assistant
@@ -386,11 +440,11 @@ export class AnthropicXmlFormatter implements PrefillFormatter {
           // (If a turn ended exactly on a results injection, the next
           // assistant turn glues here unlabeled — a minor cost the message
           // model can't distinguish; a turn id would be needed.)
-          currentConversation.push(`${text}${this.config.messageDelimiter}`);
+          pushText('');
           lastWasToolResults = false;
           lastNonEmptyParticipant = message.participant;
         } else {
-          currentConversation.push(`${message.participant}: ${text}${this.config.messageDelimiter}`);
+          pushText(`${message.participant}: `);
           lastWasToolResults = false;
           if (!hasToolResult) {
             lastNonEmptyParticipant = message.participant;
@@ -545,10 +599,15 @@ export class AnthropicXmlFormatter implements PrefillFormatter {
     content: ContentBlock[],
     participant: string,
     onAltered?: () => void,
-  ): { text: string; images: unknown[]; hasUnsupportedMedia: boolean } {
-    const parts: string[] = [];
+  ): { text: string; images: unknown[]; hasUnsupportedMedia: boolean; segments: string[]; splitImages: unknown[][] } {
+    let parts: string[] = [];
     const images: unknown[] = [];
     let hasUnsupportedMedia = false;
+    // A results block the turn split to send images ends a segment: the text
+    // through the result goes before its images, the rest after. Joined
+    // without a separator, the segments are the text unsplit.
+    const segments: string[] = [];
+    const splitImages: unknown[][] = [];
 
     for (let i = 0; i < content.length; i++) {
       const block = content[i]!;
@@ -592,11 +651,16 @@ export class AnthropicXmlFormatter implements PrefillFormatter {
           i++;
         }
         i--;
-        // The transcript renders a result's text; nested media becomes a
-        // note ([Image: …]) and other nested blocks have no rendering. A
-        // result with rawXml goes out as that text, which is its content.
-        if (run.some((r) => !r.rawXml && Array.isArray(r.content) && r.content.some((sub) => sub.type !== 'text'))) onAltered?.();
-        parts.push(...this.renderToolResultRun(run));
+        for (const piece of this.renderToolResultRun(run, onAltered)) {
+          if (typeof piece === 'string') {
+            parts.push(piece);
+          } else {
+            parts.push(piece.before);
+            segments.push(parts.join('\n'));
+            splitImages.push(piece.images);
+            parts = [piece.after];
+          }
+        }
       } else if (block.type === 'document' || block.type === 'audio') {
         hasUnsupportedMedia = true;
         onAltered?.();
@@ -607,7 +671,8 @@ export class AnthropicXmlFormatter implements PrefillFormatter {
       }
     }
 
-    return { text: parts.join('\n'), images, hasUnsupportedMedia };
+    segments.push(parts.join('\n'));
+    return { text: segments.join(''), images, hasUnsupportedMedia, segments, splitImages };
   }
 
   /**
@@ -650,30 +715,41 @@ export class AnthropicXmlFormatter implements PrefillFormatter {
     return out;
   }
 
-  /** See {@link renderToolUseRun} — same contract for tool results. */
-  private renderToolResultRun(run: ToolResultContent[]): string[] {
-    const out: string[] = [];
+  /**
+   * See {@link renderToolUseRun}: the same contract for tool results, with
+   * one addition. A results block the turn split to send a result's images
+   * (that result carries `rawXmlImagesAt`) comes back as that split, so the
+   * transcript shows the images where the turn showed them. A block without
+   * rawXml renders its text, with nested media as a note ([Image: …]) and no
+   * rendering for other nested blocks, which alters its message.
+   */
+  private renderToolResultRun(run: ToolResultContent[], onAltered?: () => void): Array<string | SentSplit> {
+    const out: Array<string | SentSplit> = [];
     let legacy: ToolResultContent[] = [];
-    let lastRaw: string | undefined;
 
     const flushLegacy = () => {
       if (legacy.length > 0) {
+        if (legacy.some((r) => Array.isArray(r.content) && r.content.some((sub) => sub.type !== 'text'))) onAltered?.();
         out.push(formatToolResultsXml(legacy.map(toToolResult)));
         legacy = [];
       }
     };
 
-    for (const block of run) {
-      if (block.rawXml) {
-        flushLegacy();
-        if (block.rawXml !== lastRaw) {
-          out.push(block.rawXml);
-        }
-        lastRaw = block.rawXml;
-      } else {
-        lastRaw = undefined;
+    for (let i = 0; i < run.length;) {
+      const block = run[i]!;
+      if (!block.rawXml) {
         legacy.push(block);
+        i++;
+        continue;
       }
+      flushLegacy();
+      // Every result parsed from one <function_results> block carries its
+      // text, which goes out once.
+      let end = i + 1;
+      while (end < run.length && run[end]!.rawXml === block.rawXml) end++;
+      const group = run.slice(i, end);
+      i = end;
+      out.push(sentSplit(group) ?? block.rawXml);
     }
     flushLegacy();
     return out;
