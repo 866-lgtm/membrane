@@ -181,7 +181,8 @@ function geminiUsageToProviderUsage(
     console.warn(
       `[membrane:gemini] cachedContentTokenCount(${cachedTokens}) exceeds promptTokenCount(${promptTokens}),`
       + ' so this prompt count cannot include the cached span. The response is read as cache-excluded'
-      + ' (promptTokenCount is the fresh input); the adapter declares cache-inclusive from Google\'s'
+      + ' (promptTokenCount, with any tool-use prompt, is the fresh input); the adapter declares'
+      + ' cache-inclusive from Google\'s'
       + ' definition of the field.'
     );
   }
@@ -230,9 +231,10 @@ export class GeminiAdapter implements ProviderAdapter {
   readonly name = 'gemini';
 
   /**
-   * Cache-inclusive: `promptTokenCount` (read as `inputTokens`) counts the
-   * cached span `cachedContentTokenCount` (read as `cacheReadTokens`)
-   * reports, so membrane subtracts it to reach the fresh input.
+   * Cache-inclusive: `promptTokenCount` (read into `inputTokens`, beside the
+   * tool-use prompt) counts the cached span `cachedContentTokenCount` (read
+   * as `cacheReadTokens`) reports, so membrane subtracts it to reach the
+   * fresh input.
    *
    * The basis is Google's definition, not a measured hit. The UsageMetadata
    * reference (https://ai.google.dev/api/generate-content, read 2026-10-10)
