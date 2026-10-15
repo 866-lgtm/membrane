@@ -11,7 +11,16 @@ type JsonObject = Record<string, unknown>;
  * final transport boundary so every call shape accepted by ProviderAdapter is
  * valid on the Codex Responses endpoint.
  */
-export function normalizeResponsesInput(messages: ProviderRequest['messages']): OpenAIResponsesInputItem[] {
+export function normalizeResponsesInput(
+  messages: ProviderRequest['messages'],
+  /**
+   * Hears each content block this normalization leaves out or changes, and
+   * each tool result whose nested content or error flag it can't carry as it
+   * was: given the request's own block, so membrane can name the message it
+   * came from (nothing, for a block that isn't an object).
+   */
+  onDropped?: (block?: unknown) => void,
+): OpenAIResponsesInputItem[] {
   const output: unknown[] = [];
 
   for (const rawMessage of messages as unknown[]) {
@@ -20,7 +29,7 @@ export function normalizeResponsesInput(messages: ProviderRequest['messages']): 
       continue;
     }
     if (rawMessage.type !== 'message' && rawMessage.role === undefined) {
-      output.push(normalizeStandaloneItem(rawMessage));
+      output.push(normalizeStandaloneItem(rawMessage, onDropped));
       continue;
     }
 
@@ -30,7 +39,7 @@ export function normalizeResponsesInput(messages: ProviderRequest['messages']): 
     if (Array.isArray(rawMessage.content) && !rawMessage.content.some((block) =>
       isObject(block) && ['text', 'image', 'tool_use', 'tool_result', 'redacted_thinking'].includes(asString(block.type))
     )) {
-      const content = nativeParts(rawMessage.content);
+      const content = nativeParts(rawMessage.content, onDropped);
       output.push(content === rawMessage.content ? rawMessage : { ...rawMessage, content });
       continue;
     }
@@ -53,24 +62,33 @@ export function normalizeResponsesInput(messages: ProviderRequest['messages']): 
     };
 
     for (const rawBlock of blocks) {
-      if (!isObject(rawBlock)) continue;
+      if (!isObject(rawBlock)) {
+        onDropped?.();
+        continue;
+      }
       if (rawBlock.type === 'text') {
         parts.push({ type: role === 'assistant' ? 'output_text' : 'input_text', text: asString(rawBlock.text) });
       } else if (rawBlock.type === 'image') {
         const part = responsesImagePart(rawBlock);
-        if (part && role !== 'assistant') parts.push(part);
+        if (part && role !== 'assistant') {
+          parts.push(part);
+          // The placeholder stands where the image was.
+          if (part.type !== 'input_image') onDropped?.(rawBlock);
+        } else onDropped?.(rawBlock);
       } else if (rawBlock.type === 'tool_use') {
         flush();
-        output.push(normalizeStandaloneItem(rawBlock));
+        output.push(normalizeStandaloneItem(rawBlock, onDropped));
       } else if (rawBlock.type === 'tool_result') {
         flush();
-        output.push(normalizeStandaloneItem(rawBlock));
+        output.push(normalizeStandaloneItem(rawBlock, onDropped));
       } else if (rawBlock.type === 'redacted_thinking') {
         flush();
         output.push(reasoningInputItem(rawBlock));
       } else {
         // Already-native input_text/output_text/input_image/refusal parts.
-        parts.push(nativePart(rawBlock));
+        const part = nativePart(rawBlock);
+        if (part !== rawBlock) onDropped?.(rawBlock);
+        parts.push(part);
       }
     }
     flush();
@@ -79,8 +97,10 @@ export function normalizeResponsesInput(messages: ProviderRequest['messages']): 
   return output as OpenAIResponsesInputItem[];
 }
 
-function normalizeStandaloneItem(item: JsonObject): unknown {
+function normalizeStandaloneItem(item: JsonObject, onDropped?: (block?: unknown) => void): unknown {
   if (item.type === 'tool_use') {
+    // Arguments are an object; anything else goes out as {}.
+    if (item.input !== undefined && !isObject(item.input)) onDropped?.(item);
     return {
       type: 'function_call',
       call_id: asString(item.id),
@@ -89,20 +109,22 @@ function normalizeStandaloneItem(item: JsonObject): unknown {
     };
   }
   if (item.type === 'tool_result') {
-    const content = item.content;
+    const { output, loses } = responsesToolOutput(item.content);
+    // A nested value the output can't carry is stringified or replaced by a
+    // note or the placeholder, and a function_call_output has no error flag,
+    // so a failed result reads as a plain one.
+    if (loses || item.isError === true || item.is_error === true) onDropped?.(item);
     return {
       type: 'function_call_output',
       call_id: asString(item.toolUseId) || asString(item.tool_use_id),
-      output: typeof content === 'string'
-        ? content
-        : responsesToolOutputParts(content) ?? JSON.stringify(content ?? null),
+      output,
     };
   }
   if (item.type === 'redacted_thinking') {
     return reasoningInputItem(item);
   }
   if (item.type === 'function_call_output' && Array.isArray(item.output)) {
-    const output = nativeParts(item.output);
+    const output = nativeParts(item.output, onDropped);
     return output === item.output ? item : { ...item, output };
   }
   return item;
@@ -122,37 +144,58 @@ function reasoningInputItem(block: JsonObject): unknown {
 }
 
 /**
- * `function_call_output.output` as a native content-part array, for tool
- * results that carry images. Responses accepts `output` as a string OR an
- * array of input_text / input_image parts; stringifying an image-bearing
- * result hands the model its base64 as TEXT — no vision, and ~1 token per
- * 2 base64 chars (a 760 KB snapshot ≈ 500k input tokens; probed live on the
- * Codex backend 2026-10-02: array form = 526 tokens and the model describes
- * the image). Returns null for image-free content so callers keep their
- * legacy string form and existing replay bytes don't change.
+ * A tool result's content as a Responses `function_call_output` carries it,
+ * and whether that loses something on the way.
+ *
+ * A string goes as it is. Content with an image goes as an array of native
+ * input_text / input_image parts: Responses accepts `output` as a string OR
+ * an array of those parts, and stringifying an image-bearing result hands
+ * the model its base64 as TEXT — no vision, and ~1 token per 2 base64 chars
+ * (a 760 KB snapshot ≈ 500k input tokens; probed live on the Codex backend
+ * 2026-10-02: array form = 526 tokens and the model describes the image).
+ * Any other content keeps the legacy JSON string form, which carries its
+ * text, so existing replay bytes don't change.
+ *
+ * It loses something when a nested block is neither text nor an image the
+ * output can carry (it is JSON-stringified, replaced by a note or left out),
+ * or when an image's data is none the API accepts (it becomes the
+ * placeholder). Each image is decided once, so its warning prints once.
  */
-export function responsesToolOutputParts(content: unknown): unknown[] | null {
-  if (!Array.isArray(content)) return null;
+export function responsesToolOutput(content: unknown): { output: unknown; loses: boolean } {
+  if (typeof content === 'string') return { output: content, loses: false };
+  if (!Array.isArray(content)) return { output: JSON.stringify(content ?? null), loses: false };
   if (!content.some((block) => isObject(block) && (block.type === 'image' || block.type === 'input_image'))) {
-    return null;
+    return {
+      output: JSON.stringify(content),
+      loses: content.some((block) =>
+        typeof block !== 'string' && !(isObject(block) && (block.type === 'text' || block.type === 'input_text'))),
+    };
   }
+  let loses = false;
   const parts: unknown[] = [];
   for (const block of content) {
     if (typeof block === 'string') {
       parts.push({ type: 'input_text', text: block });
     } else if (!isObject(block)) {
-      continue;
+      loses = true;
     } else if (block.type === 'text') {
       parts.push({ type: 'input_text', text: asString(block.text) });
     } else if (block.type === 'image') {
-      parts.push(responsesImagePart(block) ?? { type: 'input_text', text: '[image omitted: unsupported image source]' });
-    } else if (block.type === 'input_text' || block.type === 'input_image') {
-      parts.push(nativePart(block));
+      const part = responsesImagePart(block);
+      if (part?.type !== 'input_image') loses = true;
+      parts.push(part ?? { type: 'input_text', text: '[image omitted: unsupported image source]' });
+    } else if (block.type === 'input_text') {
+      parts.push(block);
+    } else if (block.type === 'input_image') {
+      const part = nativePart(block);
+      if (part !== block) loses = true;
+      parts.push(part);
     } else {
+      loses = true;
       parts.push({ type: 'input_text', text: JSON.stringify(block) });
     }
   }
-  return parts;
+  return { output: parts, loses };
 }
 
 type ResponsesImagePart = { type: 'input_image'; image_url: string } | { type: 'input_text'; text: string };
@@ -197,15 +240,19 @@ function nativePart(part: JsonObject): JsonObject {
  *  verbatim, except an input_image, in a message's content or a
  *  function_call_output's output, whose data: URL holds no accepted image,
  *  which becomes the placeholder. The same array, and the same items, when
- *  nothing changes, so valid items replay byte for byte. */
-export function nativeInputForRequest(items: ProviderRequest['messages']): OpenAIResponsesInputItem[] {
+ *  nothing changes, so valid items replay byte for byte. `onAltered` hears
+ *  each part that becomes the placeholder, the request's own block. */
+export function nativeInputForRequest(
+  items: ProviderRequest['messages'],
+  onAltered?: (block?: unknown) => void,
+): OpenAIResponsesInputItem[] {
   let changed = false;
   const out = (items as unknown[]).map((item) => {
     if (!isObject(item)) return item;
     const key = Array.isArray(item.content) ? 'content'
       : item.type === 'function_call_output' && Array.isArray(item.output) ? 'output' : null;
     if (!key) return item;
-    const parts = nativeParts(item[key] as unknown[]);
+    const parts = nativeParts(item[key] as unknown[], onAltered);
     if (parts === item[key]) return item;
     changed = true;
     return { ...item, [key]: parts };
@@ -214,13 +261,17 @@ export function nativeInputForRequest(items: ProviderRequest['messages']): OpenA
 }
 
 /** nativePart over a native content or output array: the same array when no
- *  part changes, so a valid native item replays verbatim. */
-function nativeParts(parts: unknown[]): unknown[] {
+ *  part changes, so a valid native item replays verbatim. `onAltered` hears
+ *  each part that becomes the placeholder. */
+function nativeParts(parts: unknown[], onAltered?: (part: unknown) => void): unknown[] {
   let changed = false;
   const decided = parts.map((part) => {
     if (!isObject(part)) return part;
     const next = nativePart(part);
-    if (next !== part) changed = true;
+    if (next !== part) {
+      changed = true;
+      onAltered?.(part);
+    }
     return next;
   });
   return changed ? decided : parts;

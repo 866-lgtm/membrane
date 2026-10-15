@@ -24,7 +24,8 @@ import { OpenAIResponsesAdapter } from '../../src/providers/openai-responses.js'
 import { OpenAIResponsesAPIAdapter } from '../../src/providers/openai-responses-api.js';
 import { formatToolResults, formatToolResultsForSplitTurn } from '../../src/utils/tool-parser.js';
 import { GEMINI_IMAGE_TYPES, OPENAI_IMAGE_EDIT_TYPES, imageForRequest, toolResultContentForRequest, urlImageForRequest } from '../../src/utils/image-media.js';
-import { normalizeResponsesInput } from '../../src/providers/responses-input.js';
+import { nativeInputForRequest, normalizeResponsesInput, responsesToolOutput } from '../../src/providers/responses-input.js';
+import { FidelityNotes } from '../../src/utils/fidelity.js';
 import { stubFetchWithSseLines } from '../helpers/sse-fixtures.js';
 import type { ContentBlock, NormalizedMessage, NormalizedRequest, ProviderAdapter, ProviderRequest } from '../../src/types/index.js';
 
@@ -619,5 +620,183 @@ describe('formats, labels and shapes', () => {
     expect(split.images).toEqual([{ type: 'image', source: { type: 'base64', media_type: 'image/png', data: PNG } }]);
     expect(placeholders(split)).toBe(1);
     expect(placeholders(formatToolResults([{ toolUseId: 't', toolName: 'shot', content: [{ type: 'image', data: NOTES, mimeType: 'image/png' } as any] }]))).toBe(1);
+  });
+});
+
+describe('round reports name a message whose image became the placeholder', () => {
+  const build = (fidelity: FidelityNotes) => ({ ...options, fidelity }) as any;
+  const shot = (id: string): ContentBlock => ({ type: 'tool_use', id, name: 'shot', input: {} });
+
+  it.each([
+    ['native', () => new NativeFormatter()],
+    ['XML', () => new AnthropicXmlFormatter()],
+    ['Responses', () => new OpenAIResponsesFormatter()],
+  ] as const)('the %s formatter names the message, and a PNG beside it is carried', (_name, create) => {
+    const fidelity = new FidelityNotes();
+    create().buildMessages([
+      { participant: 'User', content: [{ type: 'text', text: 'a PNG' }, png()] },
+      { participant: 'User', content: [{ type: 'text', text: 'renamed notes' }, notes()] },
+    ], build(fidelity));
+    expect([...fidelity.altered]).toEqual([1]);
+    expect(fidelity.established).toBe(true);
+  });
+
+  it('the Responses formatter names a message whose data: URL holds no image; a remote URL is carried', () => {
+    const fidelity = new FidelityNotes();
+    new OpenAIResponsesFormatter().buildMessages([
+      { participant: 'User', content: [urlImage(REMOTE)] },
+      { participant: 'User', content: [urlImage(NOTES_URL)] },
+    ], build(fidelity));
+    expect([...fidelity.altered]).toEqual([1]);
+  });
+
+  // An MCP-shaped image (data and mimeType, no source) is decided by its data
+  // in the native builder, so a PNG is carried. The Responses tool output
+  // gives an image with no source a note, as on main, so there it alters its
+  // message too.
+  it.each([
+    ['native', () => new NativeFormatter(), [3]],
+    ['Responses', () => new OpenAIResponsesFormatter(), [3, 4]],
+  ] as const)('the %s formatter names a tool result whose image became the placeholder, and not one whose image is a PNG', (_name, create, altered) => {
+    const fidelity = new FidelityNotes();
+    create().buildMessages([
+      { participant: 'User', content: [{ type: 'text', text: 'look' }] },
+      { participant: 'Claude', content: [shot('a'), shot('b'), shot('c')] },
+      { participant: 'User', content: [{ type: 'tool_result', toolUseId: 'a', content: [png()] }] },
+      { participant: 'User', content: [{ type: 'tool_result', toolUseId: 'b', content: [notes()] }] },
+      { participant: 'User', content: [{ type: 'tool_result', toolUseId: 'c', content: [{ type: 'image', data: PNG, mimeType: 'image/png' } as any] }] },
+    ], build(fidelity));
+    expect([...fidelity.altered]).toEqual(altered);
+    expect(fidelity.established).toBe(true);
+  });
+
+  it('through a yielding round: the report names the message in the consumer\'s coordinates, and stays established', async () => {
+    const adapter = {
+      name: 'reporting-capture', reportsContentAlterations: true, supportsModel: () => true,
+      complete: async () => { throw new Error('Unexpected complete'); },
+      stream: async (_request: ProviderRequest, callbacks: { onChunk: (text: string) => void }) => {
+        callbacks.onChunk('Done');
+        return { content: [{ type: 'text', text: 'Done' }], stopReason: 'end_turn', usage: { inputTokens: 1, outputTokens: 1 }, raw: {} };
+      },
+    } as unknown as ProviderAdapter;
+    const stream = new Membrane(adapter).streamYielding({
+      messages: [
+        { participant: 'User', content: [{ type: 'text', text: 'a PNG' }, png()] },
+        { participant: 'User', content: [{ type: 'text', text: 'renamed notes' }, notes()] },
+      ],
+      config: { model: 'test-model', maxTokens: 100 },
+      tools: [{ name: 'shot', description: 'Take a screenshot.', inputSchema: { type: 'object', properties: {} } }],
+      toolMode: 'native',
+    } as NormalizedRequest);
+    const rounds: Array<{ altered: { messages: number[] }; fidelity: string }> = [];
+    for await (const event of stream) if (event.type === 'usage' && event.round) rounds.push(event.round);
+    expect(rounds.map((round) => [round.altered.messages, round.fidelity])).toEqual([[[1], 'established']]);
+  });
+
+  it.each([
+    ['Anthropic', (heard: unknown[]) => (request: unknown) => (anthropic() as any).buildRequest(request, (block: unknown) => heard.push(block))],
+    ['Bedrock', (heard: unknown[]) => (request: unknown) => (bedrock() as any).buildRequest(request, undefined, (block: unknown) => heard.push(block))],
+  ] as const)('the %s adapter reports each image it sends as the placeholder, as the block it was handed', (_name, builder) => {
+    const heard: unknown[] = [];
+    const kept = png();
+    const image = notes();
+    const dataUrl = urlImage(NOTES_URL);
+    // A Gemini-sourced image carries the URL it came from.
+    const sourced = { ...notes(), sourceUrl: 'https://example.com/notes.png' };
+    const result = { type: 'tool_result', tool_use_id: 'shot_1', content: [notes()] };
+    const fine = { type: 'tool_result', tool_use_id: 'shot_2', content: [png()] };
+    builder(heard)({
+      model: 'claude-sonnet-4-5', maxTokens: 64,
+      messages: [
+        { role: 'user', content: [kept, image, dataUrl, sourced] },
+        { role: 'assistant', content: [shot('shot_1'), shot('shot_2')] },
+        { role: 'user', content: [result, fine] },
+      ],
+    });
+    expect(heard).toHaveLength(4);
+    expect(heard[0]).toBe(image);
+    expect(heard[1]).toBe(dataUrl);
+    expect(heard[2]).toBe(sourced);
+    expect(heard[3]).toBe(result);
+  });
+
+  it('Responses input normalization reports the block it sent as the placeholder: a normalized image, a native part, a tool output part', () => {
+    const image = notes();
+    const mixed = { type: 'input_image', image_url: NOTES_URL };
+    const part = { type: 'input_image', image_url: NOTES_URL };
+    const nested = { type: 'input_image', image_url: NOTES_URL };
+    const result = { type: 'tool_result', toolUseId: 'c2', content: [notes()] };
+    const nativeResult = { type: 'tool_result', toolUseId: 'c3', content: [{ type: 'input_image', image_url: NOTES_URL }] };
+    const heard: unknown[] = [];
+    normalizeResponsesInput([
+      { role: 'user', content: [{ type: 'text', text: 'see' }, png(), image] },
+      // A native part among normalized blocks, and in an all-native message.
+      { role: 'user', content: [{ type: 'text', text: 'mixed' }, mixed] },
+      { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'native' }, { type: 'input_image', image_url: PNG_URL }, part] },
+      { type: 'function_call_output', call_id: 'c1', output: [nested, { type: 'input_image', image_url: REMOTE }] },
+      { role: 'user', content: [result] },
+      { role: 'user', content: [nativeResult] },
+    ] as any, (block) => heard.push(block));
+    expect(heard).toHaveLength(6);
+    expect(heard[0]).toBe(image);
+    expect(heard[1]).toBe(mixed);
+    expect(heard[2]).toBe(part);
+    expect(heard[3]).toBe(nested);
+    expect(heard[4]).toBe(result);
+    expect(heard[5]).toBe(nativeResult);
+  });
+
+  it('the Responses API adapter in api mode reports each native part it sends as the placeholder', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(
+      JSON.stringify({ id: 'resp_1', status: 'completed', output: [], usage: { input_tokens: 1, output_tokens: 1 } }),
+      { status: 200, headers: { 'Content-Type': 'application/json' } },
+    )));
+    const part = { type: 'input_image', image_url: NOTES_URL };
+    const nested = { type: 'input_image', image_url: NOTES_URL };
+    const heard: unknown[] = [];
+    await new OpenAIResponsesAPIAdapter({ apiKey: 'sk-test' }).complete({
+      model: 'gpt-5.4', maxTokens: 32,
+      messages: [
+        { type: 'message', role: 'user', content: [{ type: 'input_image', image_url: PNG_URL }, part] },
+        { type: 'function_call', call_id: 'c1', name: 'shot', arguments: '{}' },
+        { type: 'function_call_output', call_id: 'c1', output: [nested] },
+      ],
+    } as any, { onContentAltered: (block) => heard.push(block) }).catch(() => undefined);
+    expect(heard).toHaveLength(2);
+    expect(heard[0]).toBe(part);
+    expect(heard[1]).toBe(nested);
+    const items = [{ type: 'message', role: 'user', content: [{ type: 'input_image', image_url: PNG_URL }] }];
+    expect(nativeInputForRequest(items as any, () => heard.push('none expected'))).toBe(items);
+    expect(heard).toHaveLength(2);
+  });
+
+  it('a native part a raw form carried, replaced in api mode, leaves the round unknown: the Responses formatter registers no blocks', () => {
+    const fidelity = new FidelityNotes();
+    const raw = { type: 'message', role: 'user', content: [{ type: 'input_image', image_url: NOTES_URL }] };
+    const built = new OpenAIResponsesFormatter().buildMessages([
+      { participant: 'User', content: [{ type: 'text', text: '', rawItem: raw } as any] },
+    ], build(fidelity));
+    // The formatter sends the raw form, so it carried the message verbatim.
+    expect(built.messages).toEqual([raw]);
+    expect([...fidelity.altered]).toEqual([]);
+    const heard: unknown[] = [];
+    nativeInputForRequest(built.messages as any, (block) => { heard.push(block); fidelity.alterBlock(block); });
+    expect(heard).toHaveLength(1);
+    expect(heard[0]).toBe(raw.content[0]);
+    expect(fidelity.unattributed).toBe(true);
+    expect(fidelity.established).toBe(false);
+  });
+
+  it('a Responses tool output that sends the placeholder loses something, and decides each image once', () => {
+    warn.mockClear();
+    expect(responsesToolOutput([png(), notes()])).toEqual({
+      output: [
+        { type: 'input_image', image_url: PNG_URL },
+        { type: 'input_text', text: expect.stringContaining(SAID) },
+      ],
+      loses: true,
+    });
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(responsesToolOutput([png()]).loses).toBe(false);
   });
 });

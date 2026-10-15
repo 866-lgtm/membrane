@@ -38,6 +38,7 @@ import { IncrementalXmlParser } from '../utils/stream-parser.js';
 import { assertCacheMarkersWithinLimit, clampCacheMarkers } from '../utils/cache-marker-budget.js';
 import { lastCacheableBlockIndex } from './native.js';
 import { imageForRequest } from '../utils/image-media.js';
+import { holdsContent, isRawItemCarrier } from '../utils/fidelity.js';
 
 // ============================================================================
 // Configuration
@@ -118,6 +119,8 @@ function toToolResult(block: ToolResultContent): ToolResult {
 // ============================================================================
 
 export class AnthropicXmlFormatter implements PrefillFormatter {
+  /** buildMessages records every consumer message it doesn't carry verbatim (utils/fidelity.ts). */
+  readonly reportsAlterations = true;
   readonly name = 'anthropic-xml';
   readonly usesPrefill = true;
   readonly supportsNativeTools = true;
@@ -271,8 +274,9 @@ export class AnthropicXmlFormatter implements PrefillFormatter {
       const isLastMessage = i === messages.length - 1;
       const isAssistant = message.participant === assistantParticipant;
 
-      // Extract content
-      const { text, images, hasUnsupportedMedia } = this.extractContent(message.content, message.participant);
+      // Extract content (recording alterations against this message's index)
+      const onAltered = options.fidelity ? () => options.fidelity!.alter(i) : undefined;
+      const { text, images, hasUnsupportedMedia } = this.extractContent(message.content, message.participant, onAltered);
       const hasImages = images.length > 0;
       const isEmpty = !text.trim() && !hasImages;
 
@@ -309,8 +313,17 @@ export class AnthropicXmlFormatter implements PrefillFormatter {
         continue;
       }
 
-      // Skip empty messages except last
+      // Every branch below that leaves a message's content out of the
+      // transcript alters it, unless it held nothing: whitespace-only text is
+      // content, and only an exactly empty '' block with no raw form (not a
+      // zero-width carrier) carries nothing.
+      const omitted = () => {
+        if (holdsContent(message.content)) onAltered?.();
+      };
+
+      // Skip empty messages except last.
       if (isEmpty && !isLastMessage) {
+        omitted();
         continue;
       }
 
@@ -350,10 +363,13 @@ export class AnthropicXmlFormatter implements PrefillFormatter {
         hasToolResult && message.content.every((c) => c.type === 'tool_result');
 
       if (isContinuation && isLastMessage) {
-        // Bot continuation - don't add prefix
+        // Bot continuation - don't add prefix. Its content is not carried:
+        // the transcript ends on the turn prefix alone.
+        omitted();
         continue;
       } else if (isLastMessage && isEmpty) {
-        // Completion target - prefix added below
+        // Completion target - prefix added below; whitespace it held is not carried
+        omitted();
       } else if (text) {
         if (isPureToolResults) {
           // Tool results are not speech: replay them exactly as they were
@@ -527,7 +543,8 @@ export class AnthropicXmlFormatter implements PrefillFormatter {
 
   private extractContent(
     content: ContentBlock[],
-    participant: string
+    participant: string,
+    onAltered?: () => void,
   ): { text: string; images: unknown[]; hasUnsupportedMedia: boolean } {
     const parts: string[] = [];
     const images: unknown[] = [];
@@ -537,11 +554,14 @@ export class AnthropicXmlFormatter implements PrefillFormatter {
       const block = content[i]!;
       if (block.type === 'text') {
         parts.push(block.text);
+        // A zero-width carrier's item is its content; the transcript can't carry it.
+        if (isRawItemCarrier(block)) onAltered?.();
       } else if (block.type === 'image') {
         if (block.source.type === 'base64') {
           const { mediaType, placeholder } = imageForRequest(block.source.data, block.source.mediaType);
           if (placeholder) {
             parts.push(placeholder.text);
+            onAltered?.();
           } else {
             images.push({
               type: 'image',
@@ -552,6 +572,8 @@ export class AnthropicXmlFormatter implements PrefillFormatter {
               },
             });
           }
+        } else {
+          onAltered?.(); // a non-base64 image source has no branch here
         }
       } else if (block.type === 'tool_use') {
         // Collect the run of consecutive tool_use blocks so calls parsed
@@ -570,9 +592,18 @@ export class AnthropicXmlFormatter implements PrefillFormatter {
           i++;
         }
         i--;
+        // The transcript renders a result's text; nested media becomes a
+        // note ([Image: …]) and other nested blocks have no rendering. A
+        // result with rawXml goes out as that text, which is its content.
+        if (run.some((r) => !r.rawXml && Array.isArray(r.content) && r.content.some((sub) => sub.type !== 'text'))) onAltered?.();
         parts.push(...this.renderToolResultRun(run));
       } else if (block.type === 'document' || block.type === 'audio') {
         hasUnsupportedMedia = true;
+        onAltered?.();
+      } else {
+        // Thinking carriers and any other block type have no rendering in the
+        // prefill transcript: left out.
+        onAltered?.();
       }
     }
 

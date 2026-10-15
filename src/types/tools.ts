@@ -131,6 +131,15 @@ export interface ToolContext {
    * only shape that is right everywhere", not as current API law.
    */
   roundContent?: import('./content.js').ContentBlock[];
+
+  /**
+   * Yielding paths: whether this path can carry `injectedMessages` supplied
+   * in reply to this event, if another round starts. A capability, not a
+   * promise of a next request: the round report (`UsageEvent.round`) says
+   * what a round actually carried. True on the native path, false on the XML
+   * prefill path.
+   */
+  supportsInjectedMessages?: boolean;
 }
 
 // ============================================================================

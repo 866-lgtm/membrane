@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { OpenAIResponsesFormatter } from '../../src/formatters/openai-responses.js';
-import { normalizeResponsesInput, responsesToolOutputParts } from '../../src/providers/responses-input.js';
+import { normalizeResponsesInput, responsesToolOutput } from '../../src/providers/responses-input.js';
 
 const options = {
   participantMode: 'multiuser' as const,
@@ -63,17 +63,20 @@ describe('tool results carrying images (Responses)', () => {
     }]);
   });
 
-  it('helper: null for strings and image-free arrays; placeholder for unusable image sources', () => {
-    expect(responsesToolOutputParts('plain')).toBeNull();
-    expect(responsesToolOutputParts([{ type: 'text', text: 'x' }])).toBeNull();
-    expect(responsesToolOutputParts([
+  it('helper: the string form for strings and image-free arrays; placeholder for unusable image sources', () => {
+    expect(responsesToolOutput('plain')).toEqual({ output: 'plain', loses: false });
+    expect(responsesToolOutput([{ type: 'text', text: 'x' }])).toEqual({ output: '[{"type":"text","text":"x"}]', loses: false });
+    expect(responsesToolOutput([
       { type: 'image', source: { type: 'file', path: '/tmp/x.png' } },
       { type: 'image', source: png },
       { type: 'other', value: 1 },
-    ])).toEqual([
-      { type: 'input_text', text: '[image omitted: unsupported image source]' },
-      { type: 'input_image', image_url: 'data:image/png;base64,iVBORw0KGgo=' },
-      { type: 'input_text', text: '{"type":"other","value":1}' },
-    ]);
+    ])).toEqual({
+      output: [
+        { type: 'input_text', text: '[image omitted: unsupported image source]' },
+        { type: 'input_image', image_url: 'data:image/png;base64,iVBORw0KGgo=' },
+        { type: 'input_text', text: '{"type":"other","value":1}' },
+      ],
+      loses: true,
+    });
   });
 });

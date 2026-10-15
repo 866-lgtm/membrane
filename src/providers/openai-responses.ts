@@ -44,6 +44,7 @@
  * - Support `size`, `quality`, `n`, `background`, `output_format`
  */
 
+import { unreportedUsage } from '../utils/usage.js';
 import { assertPromptToolSupport } from './request-capabilities.js';
 
 import { imageForRequest, OPENAI_IMAGE_EDIT_TYPES } from '../utils/image-media.js';
@@ -569,6 +570,7 @@ export class OpenAIResponsesAdapter implements ProviderAdapter {
         inputTokens: response.usage?.input_tokens ?? 0,
         outputTokens: response.usage?.output_tokens ?? 0,
       },
+      ...unreportedUsage(response.usage?.input_tokens, response.usage?.output_tokens),
       model: requestedModel,
       rawRequest,
       raw: response,

@@ -9,6 +9,7 @@
  * exposes the response's ordered output array verbatim for the next turn.
  */
 
+import { unreportedUsage } from '../utils/usage.js';
 import { createHash, randomUUID } from 'node:crypto';
 import { nativeInputForRequest, normalizeResponsesInput } from './responses-input.js';
 import { fetchWithCredentials, type CredentialResolver } from './credentials.js';
@@ -164,6 +165,13 @@ function headerSafeSessionId(key: string): string {
 
 export class OpenAIResponsesAPIAdapter implements ProviderAdapter {
   readonly name: string = 'openai-responses-api';
+  /**
+   * Carries native input items verbatim, and reports what it can't: what
+   * subscription-mode normalization leaves out or changes, and, in either
+   * mode, a native input_image whose data: URL holds no image the API
+   * accepts, which goes as the placeholder.
+   */
+  readonly reportsContentAlterations = true;
 
   /**
    * Reads `usage.input_tokens_details.cached_tokens` from OpenAI's account-wide
@@ -228,7 +236,7 @@ export class OpenAIResponsesAPIAdapter implements ProviderAdapter {
     options?: ProviderRequestOptions
   ): Promise<OpenAIResponsesAPIProviderResponse> {
     if (this.subscription) return this.stream(request, { onChunk: () => {} }, options);
-    const responsesRequest = this.buildRequest(request);
+    const responsesRequest = this.buildRequest(request, options?.onContentAltered);
     // A gateway's Responses endpoint can serve a Claude model, which refuses
     // an input ending in an assistant turn: refuse it here, typed, before HTTP.
     assertMessagePrefillSupported(responsesRequest.model, responsesRequest.input, options, this.name, responsesRequest);
@@ -254,7 +262,7 @@ export class OpenAIResponsesAPIAdapter implements ProviderAdapter {
     callbacks: StreamCallbacks,
     options?: ProviderRequestOptions
   ): Promise<OpenAIResponsesAPIProviderResponse> {
-    const responsesRequest = this.buildRequest(request);
+    const responsesRequest = this.buildRequest(request, options?.onContentAltered);
     responsesRequest.stream = true;
     assertMessagePrefillSupported(responsesRequest.model, responsesRequest.input, options, this.name, responsesRequest);
     options?.onRequest?.(responsesRequest);
@@ -410,7 +418,7 @@ export class OpenAIResponsesAPIAdapter implements ProviderAdapter {
     }, this.credentials ?? { token: this.apiKey });
   }
 
-  private buildRequest(request: ProviderRequest): OpenAIResponsesAPIRequest {
+  private buildRequest(request: ProviderRequest, onContentAltered?: (block?: unknown) => void): OpenAIResponsesAPIRequest {
     if (!Array.isArray(request.messages)) {
       throw new Error('OpenAI Responses API input must be a provider-native input-item array');
     }
@@ -456,8 +464,8 @@ export class OpenAIResponsesAPIAdapter implements ProviderAdapter {
     // URL holds no image would be refused on every request, so it goes as the
     // placeholder in either mode.
     responsesRequest.input = this.subscription
-      ? normalizeResponsesInput(request.messages)
-      : nativeInputForRequest(request.messages);
+      ? normalizeResponsesInput(request.messages, onContentAltered)
+      : nativeInputForRequest(request.messages, onContentAltered);
     responsesRequest.store = false;
     responsesRequest.include = this.mergeEncryptedReasoningInclude(responsesRequest.include);
     if (this.subscription) {
@@ -534,7 +542,8 @@ export class OpenAIResponsesAPIAdapter implements ProviderAdapter {
   ): OpenAIResponsesAPIProviderResponse {
     const outputItems = Array.isArray(response.output) ? response.output : [];
     const content = this.outputToContent(outputItems);
-    const cachedTokens = response.usage?.input_tokens_details?.cached_tokens ?? 0;
+    // A reported 0 is a fact (no cache read); only an unreported count is absent.
+    const cachedTokens = response.usage?.input_tokens_details?.cached_tokens;
 
     return {
       content,
@@ -545,8 +554,9 @@ export class OpenAIResponsesAPIAdapter implements ProviderAdapter {
       usage: {
         inputTokens: response.usage?.input_tokens ?? 0,
         outputTokens: response.usage?.output_tokens ?? 0,
-        cacheReadTokens: cachedTokens > 0 ? cachedTokens : undefined,
+        ...(typeof cachedTokens === 'number' ? { cacheReadTokens: cachedTokens } : {}),
       },
+      ...unreportedUsage(response.usage?.input_tokens, response.usage?.output_tokens),
       model: response.model ?? requestedModel,
       rawRequest,
       raw: response,

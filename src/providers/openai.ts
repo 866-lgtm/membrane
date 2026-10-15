@@ -12,6 +12,7 @@
  * - Direct API integration with proper error handling
  */
 
+import { unreportedUsage } from '../utils/usage.js';
 import { assertMessagePrefillSupported } from './request-capabilities.js';
 
 import type {
@@ -154,7 +155,7 @@ const COMPLETION_TOKENS_MODELS = [
 /**
  * Check if a model requires max_completion_tokens parameter
  */
-function requiresCompletionTokens(model: string): boolean {
+export function requiresCompletionTokens(model: string): boolean {
   return isReasoningGenerationGpt(model) || COMPLETION_TOKENS_MODELS.some(prefix => model.startsWith(prefix));
 }
 
@@ -174,7 +175,7 @@ const NO_TEMPERATURE_MODELS = [
 /**
  * Check if a model doesn't support custom temperature
  */
-function noTemperatureSupport(model: string): boolean {
+export function noTemperatureSupport(model: string): boolean {
   return isReasoningGenerationGpt(model) || NO_TEMPERATURE_MODELS.some(prefix => model.startsWith(prefix));
 }
 
@@ -197,7 +198,7 @@ const NO_STOP_MODELS = [
 /**
  * Check if a model doesn't support stop sequences
  */
-function noStopSupport(model: string): boolean {
+export function noStopSupport(model: string): boolean {
   return isReasoningGenerationGpt(model) || NO_STOP_MODELS.some(prefix => model.startsWith(prefix));
 }
 
@@ -620,7 +621,8 @@ export class OpenAIAdapter implements ProviderAdapter {
     const message = choice?.message;
 
     // Extract prompt caching details (OpenAI automatic caching for prompts ≥1024 tokens)
-    const cachedTokens = response.usage?.prompt_tokens_details?.cached_tokens ?? 0;
+    // A reported 0 is a fact (no cache read); only an unreported count is absent.
+    const cachedTokens = response.usage?.prompt_tokens_details?.cached_tokens;
 
     return {
       content: this.messageToContent(message),
@@ -632,8 +634,9 @@ export class OpenAIAdapter implements ProviderAdapter {
         outputTokens: response.usage?.completion_tokens ?? 0,
         // OpenAI's automatic prompt caching - cached tokens are read from cache
         // Note: OpenAI doesn't have separate "creation" tokens - it's automatic
-        cacheReadTokens: cachedTokens > 0 ? cachedTokens : undefined,
+        ...(typeof cachedTokens === 'number' ? { cacheReadTokens: cachedTokens } : {}),
       },
+      ...unreportedUsage(response.usage?.prompt_tokens, response.usage?.completion_tokens),
       model: response.model ?? requestedModel,
       rawRequest,
       raw: response,
@@ -648,7 +651,7 @@ export class OpenAIAdapter implements ProviderAdapter {
     rawRequest?: unknown
   ): ProviderResponse {
     // Extract cached tokens from stream usage if available
-    const cachedTokens = streamUsage?.prompt_tokens_details?.cached_tokens ?? 0;
+    const cachedTokens = streamUsage?.prompt_tokens_details?.cached_tokens;
 
     return {
       content: this.messageToContent(message),
@@ -658,8 +661,9 @@ export class OpenAIAdapter implements ProviderAdapter {
       usage: {
         inputTokens: streamUsage?.prompt_tokens ?? 0,
         outputTokens: streamUsage?.completion_tokens ?? 0,
-        cacheReadTokens: cachedTokens > 0 ? cachedTokens : undefined,
+        ...(typeof cachedTokens === 'number' ? { cacheReadTokens: cachedTokens } : {}),
       },
+      ...unreportedUsage(streamUsage?.prompt_tokens, streamUsage?.completion_tokens),
       model: requestedModel,
       rawRequest,
       raw: { message, finish_reason: finishReason ?? 'stop', usage: streamUsage },

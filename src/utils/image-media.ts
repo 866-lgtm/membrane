@@ -157,30 +157,38 @@ export function urlImageForRequest(url: string): UrlImageForRequest {
  *  image may carry its data in a `source`, or MCP-style as `data` and
  *  `mimeType`; either way an accepted one comes back with a base64 `source`.
  *  Remote URL images and other blocks pass through, non-array content is
- *  returned as it is, and the content itself is not mutated. */
-export function toolResultContentForRequest(content: unknown): unknown {
+ *  returned as it is, and the content itself is not mutated. Each block
+ *  comes back as its own object, so an adapter's report about one names
+ *  exactly one occurrence, and `onAltered` hears each placeholder
+ *  substitution. */
+export function toolResultContentForRequest(content: unknown, onAltered?: () => void): unknown {
   if (!Array.isArray(content)) return content;
+  const placeholder = (note: { type: 'text'; text: string }) => {
+    onAltered?.();
+    return note;
+  };
   return content.map((item) => {
-    if (!item || typeof item !== 'object' || (item as { type?: unknown }).type !== 'image') return item;
+    if (!item || typeof item !== 'object') return item;
+    if ((item as { type?: unknown }).type !== 'image') return { ...item };
     const block = item as { source?: { type?: string; url?: unknown; data?: unknown; mediaType?: unknown; media_type?: unknown }; data?: unknown; mimeType?: unknown };
     const src = block.source;
     if (src?.type === 'url') {
       const image = urlImageForRequest(src.url as string);
-      if (image.placeholder) return image.placeholder;
-      if (!image.data) return item;
+      if (image.placeholder) return placeholder(image.placeholder);
+      if (!image.data) return { ...item };
       return { ...item, source: { type: 'base64', media_type: image.mediaType, data: image.data } };
     }
     if (!src && typeof block.data === 'string') {
       // MCP-shaped image content, which some tool results carry as it came.
-      const { mediaType, placeholder } = imageForRequest(block.data, block.mimeType);
-      if (placeholder) return placeholder;
+      const image = imageForRequest(block.data, block.mimeType);
+      if (image.placeholder) return placeholder(image.placeholder);
       const { data, mimeType: _declared, ...rest } = block;
-      return { ...rest, source: { type: 'base64', media_type: mediaType, data } };
+      return { ...rest, source: { type: 'base64', media_type: image.mediaType, data } };
     }
-    const { mediaType, placeholder } = imageForRequest(src?.data, src?.mediaType ?? src?.media_type);
-    if (placeholder) return placeholder;
+    const image = imageForRequest(src?.data, src?.mediaType ?? src?.media_type);
+    if (image.placeholder) return placeholder(image.placeholder);
     const { mediaType: _declared, ...source } = src ?? {};
-    return { ...item, source: { ...source, media_type: mediaType } };
+    return { ...item, source: { ...source, media_type: image.mediaType } };
   });
 }
 
