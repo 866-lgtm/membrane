@@ -12,6 +12,7 @@
  * Uses the standard OpenAI chat completions format with tool_calls support.
  */
 
+import { unreportedUsage } from '../utils/usage.js';
 import { assertMessagePrefillSupported } from './request-capabilities.js';
 
 import type {
@@ -32,6 +33,7 @@ import {
   withRawRequest,
 } from '../types/index.js';
 import { safeParseJson, textOnlyToolResultContent, createCombinedSignal, SSELineParser, isDeadlineAbort, deadlineTimeoutError, throwOnStreamErrorFrame, assertTerminalEventObserved } from './utils.js';
+import { requiresCompletionTokens, noTemperatureSupport, noStopSupport } from './openai.js';
 
 // ============================================================================
 // Types
@@ -376,17 +378,27 @@ export class OpenAICompatibleAdapter implements ProviderAdapter {
       }
     }
     
+    // OpenAI's own models keep their parameter surface when reached through
+    // this adapter (e.g. baseURL https://api.openai.com/v1): GPT-5+ and the
+    // o-series reject `max_tokens` ("Use 'max_completion_tokens' instead") and
+    // custom temperature/top_p, and some reject `stop`. Same model detection
+    // as OpenAIAdapter; every other model id keeps the legacy parameters that
+    // generic OpenAI-compatible servers expect.
+    const model = request.model;
+    const maxTokens = request.maxTokens || this.defaultMaxTokens;
     const params: any = {
-      model: request.model,
+      model,
       messages,
-      max_tokens: request.maxTokens || this.defaultMaxTokens,
+      ...(requiresCompletionTokens(model)
+        ? { max_completion_tokens: maxTokens }
+        : { max_tokens: maxTokens }),
     };
     
-    if (request.temperature !== undefined) {
+    if (request.temperature !== undefined && !noTemperatureSupport(model)) {
       params.temperature = request.temperature;
     }
 
-    if (request.topP !== undefined) {
+    if (request.topP !== undefined && !noTemperatureSupport(model)) {
       params.top_p = request.topP;
     }
 
@@ -403,7 +415,7 @@ export class OpenAICompatibleAdapter implements ProviderAdapter {
     }
 
     // OpenAI-compatible APIs may limit stop sequences (OpenAI: 4) — truncate to be safe
-    if (request.stopSequences && request.stopSequences.length > 0) {
+    if (request.stopSequences && request.stopSequences.length > 0 && !noStopSupport(model)) {
       params.stop = request.stopSequences.slice(0, 4);
     }
     
@@ -581,6 +593,7 @@ export class OpenAICompatibleAdapter implements ProviderAdapter {
         inputTokens: response.usage?.prompt_tokens ?? 0,
         outputTokens: response.usage?.completion_tokens ?? 0,
       },
+      ...unreportedUsage(response.usage?.prompt_tokens, response.usage?.completion_tokens),
       model: response.model ?? requestedModel,
       rawRequest,
       raw: response,
@@ -605,6 +618,7 @@ export class OpenAICompatibleAdapter implements ProviderAdapter {
         inputTokens: streamUsage?.prompt_tokens ?? 0,
         outputTokens: streamUsage?.completion_tokens ?? 0,
       },
+      ...unreportedUsage(streamUsage?.prompt_tokens, streamUsage?.completion_tokens),
       model: requestedModel,
       rawRequest,
       raw: { message, finish_reason: finishReason ?? 'stop', usage: streamUsage },
