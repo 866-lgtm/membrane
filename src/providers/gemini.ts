@@ -121,7 +121,8 @@ function geminiUnreportedUsage(usageMetadata: GeminiResponse['usageMetadata']): 
  * candidates reported a thinking turn at a fraction of its real size. The
  * reconciliation check makes the next such omission loud rather than silent:
  * Google's own total is the independent witness, and a mismatch means a
- * usageMetadata field membrane does not read is carrying tokens.
+ * usageMetadata field outside prompt, candidates and thoughts is carrying
+ * tokens.
  */
 function geminiUsageToProviderUsage(
   usageMetadata: GeminiResponse['usageMetadata']
@@ -138,7 +139,7 @@ function geminiUsageToProviderUsage(
         `[membrane:gemini] usageMetadata does not reconcile: promptTokenCount(${promptTokens})`
         + ` + candidatesTokenCount(${candidatesTokens}) + thoughtsTokenCount(${thoughtsTokens ?? 0})`
         + ` = ${accountedTokens}, but totalTokenCount = ${totalTokens}.`
-        + ' Some billed tokens are in a usageMetadata field membrane does not read.'
+        + ' Some billed tokens are in a usageMetadata field outside prompt, candidates and thoughts.'
       );
     }
   }
@@ -147,8 +148,9 @@ function geminiUsageToProviderUsage(
     ? (typeof usageMetadata.cachedContentTokenCount === 'number' ? usageMetadata.cachedContentTokenCount : 0)
     : undefined;
   // A cached span larger than the whole prompt can't be inside the prompt
-  // count, so this response's prompt count can only be the fresh input: it is
-  // read as cache-excluded, against the adapter's declared convention (see
+  // count, so the inclusive reading doesn't fit this response. Reading its
+  // prompt count as the fresh input is this adapter's choice: the response is
+  // read as cache-excluded, against the declared convention (see
   // GeminiAdapter.usageCacheConvention, whose basis is Google's definition,
   // not a measured implicit hit).
   const promptExcludesCache = cachedTokens !== undefined && cachedTokens > promptTokens;
