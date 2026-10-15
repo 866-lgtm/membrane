@@ -241,8 +241,8 @@ export class GeminiAdapter implements ProviderAdapter {
    * says `promptTokenCount` is "Number of tokens in the prompt. When
    * cachedContent is set, this is still the total effective prompt size
    * meaning this includes the number of tokens in the cached content", and
-   * that `totalTokenCount` is "prompt + thoughts + response candidates",
-   * with no cached term of its own. The "When cachedContent is set" sentence
+   * that `totalTokenCount` is "prompt + tool-use prompt + thoughts + response
+   * candidates" (read again 2026-10-15), with no cached term of its own. The "When cachedContent is set" sentence
    * is about explicit caching (`cachedContent`), which membrane never sets
    * itself: a hit through membrane is implicit unless a caller passes
    * `cachedContent` through `providerParams`, and for an implicit hit the
