@@ -153,19 +153,6 @@ function geminiUsageToProviderUsage(
   const thoughtsTokens = usageMetadata?.thoughtsTokenCount;
   const totalTokens = usageMetadata?.totalTokenCount;
 
-  if (usageMetadata && totalTokens != null) {
-    const accountedTokens = promptTokens + toolUsePromptTokens + candidatesTokens + (thoughtsTokens ?? 0);
-    if (accountedTokens !== totalTokens) {
-      console.warn(
-        `[membrane:gemini] usageMetadata does not reconcile: promptTokenCount(${promptTokens})`
-        + ` + toolUsePromptTokenCount(${toolUsePromptTokens})`
-        + ` + candidatesTokenCount(${candidatesTokens}) + thoughtsTokenCount(${thoughtsTokens ?? 0})`
-        + ` = ${accountedTokens}, but totalTokenCount = ${totalTokens}.`
-        + ' Some billed tokens are in a usageMetadata field outside prompt, tool-use prompt, candidates and thoughts.'
-      );
-    }
-  }
-
   const cachedTokens = usageMetadata
     ? (typeof usageMetadata.cachedContentTokenCount === 'number' ? usageMetadata.cachedContentTokenCount : 0)
     : undefined;
@@ -173,9 +160,29 @@ function geminiUsageToProviderUsage(
   // count, so the inclusive reading doesn't fit this response. Reading its
   // prompt count as the fresh input is this adapter's choice: the response is
   // read as cache-excluded, against the declared convention (see
-  // GeminiAdapter.usageCacheConvention, whose basis is Google's definition,
-  // not a measured implicit hit).
+  // GeminiAdapter.usageCacheConvention for its basis).
   const promptExcludesCache = cachedTokens !== undefined && cachedTokens > promptTokens;
+
+  if (usageMetadata && totalTokens != null) {
+    const accountedTokens = promptTokens + toolUsePromptTokens + candidatesTokens + (thoughtsTokens ?? 0);
+    // In the cache-excluded reading the cached span is outside the prompt
+    // count, so a total that counts it is the same arithmetic as an
+    // inclusive one: prompt + tool-use prompt + cached + candidates +
+    // thoughts.
+    const reconciles = accountedTokens === totalTokens
+      || (promptExcludesCache && accountedTokens + cachedTokens === totalTokens);
+    if (!reconciles) {
+      console.warn(
+        `[membrane:gemini] usageMetadata does not reconcile: promptTokenCount(${promptTokens})`
+        + ` + toolUsePromptTokenCount(${toolUsePromptTokens})`
+        + ` + candidatesTokenCount(${candidatesTokens}) + thoughtsTokenCount(${thoughtsTokens ?? 0})`
+        + ` = ${accountedTokens}`
+        + (promptExcludesCache ? ` (${accountedTokens + cachedTokens} with cachedContentTokenCount(${cachedTokens}))` : '')
+        + `, but totalTokenCount = ${totalTokens}.`
+        + ' Some billed tokens are in a usageMetadata field outside prompt, tool-use prompt, candidates and thoughts.'
+      );
+    }
+  }
   if (promptExcludesCache && !warnedPromptExcludesCache) {
     warnedPromptExcludesCache = true;
     console.warn(
@@ -236,24 +243,38 @@ export class GeminiAdapter implements ProviderAdapter {
    * as `cacheReadTokens`) reports, so membrane subtracts it to reach the
    * fresh input.
    *
-   * The basis is Google's definition, not a measured hit. The UsageMetadata
+   * The basis is Google's definition and published usage. The UsageMetadata
    * reference (https://ai.google.dev/api/generate-content, read 2026-10-10)
    * says `promptTokenCount` is "Number of tokens in the prompt. When
    * cachedContent is set, this is still the total effective prompt size
    * meaning this includes the number of tokens in the cached content", and
    * that `totalTokenCount` is "prompt + tool-use prompt + thoughts + response
-   * candidates" (read again 2026-10-15), with no cached term of its own. The "When cachedContent is set" sentence
-   * is about explicit caching (`cachedContent`), which membrane never sets
-   * itself: a hit through membrane is implicit unless a caller passes
-   * `cachedContent` through `providerParams`, and for an implicit hit the
-   * inclusion is inferred from the field's definition and the total, not
-   * stated. A response whose cached count exceeds its prompt count can't be
-   * read that way, so it is read as cache-excluded, with a warning (see
-   * geminiUsageToProviderUsage). No probe has measured an implicit hit: on
-   * 2026-08-25, three identical 10,893-token calls to gemini-3.5-flash-lite
-   * never reported the field (implicit caching did not trigger), and
-   * explicit `cachedContents` is refused on the free tier (429,
-   * TotalCachedContentStorageTokensPerModelFreeTier limit=0).
+   * candidates" (read again 2026-10-15), with no cached term of its own. The
+   * "When cachedContent is set" sentence is about explicit caching
+   * (`cachedContent`), which membrane never sets itself: a hit through
+   * membrane is implicit unless a caller passes `cachedContent` through
+   * `providerParams`. Published figures fit the inclusive reading for both
+   * kinds of hit (each read 2026-10-15):
+   *   - explicit: Google's caching cookbook (google-gemini/cookbook,
+   *     quickstarts/Caching.ipynb) prints a response with promptTokenCount
+   *     322,707, of which 322,698 cached, 282 candidates, 4,049 thoughts and
+   *     a totalTokenCount of 327,038, which is prompt + thoughts + candidates;
+   *   - implicit: googleapis/python-genai#2064 (gemini-3-flash-preview, a
+   *     chat growing about 1,000 tokens a turn) shows promptTokenCount rising
+   *     steadily (7,996, 8,986, ... 17,972) while cachedContentTokenCount
+   *     goes from 6,134 to 0 and later from 0 to 16,391, so the prompt count
+   *     is the whole prompt whether the cache hit or not;
+   *   - implicit: Simon Willison's note of 2025-05-09 on Gemini 2.5 Flash
+   *     shows a 204,082-token prompt (promptTokensDetails) with 200,658
+   *     cached.
+   * Membrane's own probe hasn't measured a hit: on 2026-08-25, three
+   * identical 10,893-token calls to gemini-3.5-flash-lite never reported the
+   * field (implicit caching did not trigger), and explicit `cachedContents`
+   * is refused on the free tier (429,
+   * TotalCachedContentStorageTokensPerModelFreeTier limit=0). A response
+   * whose cached count exceeds its prompt count can't be read the inclusive
+   * way, so it is read as cache-excluded, with a warning (see
+   * geminiUsageToProviderUsage).
    */
   readonly usageCacheConvention = 'cache-inclusive' as const;
   private apiKey: string;
