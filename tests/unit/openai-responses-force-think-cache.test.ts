@@ -53,8 +53,8 @@ describe('Responses 24h cache retention', () => {
   });
 
   it('keeps prompt_cache_key from provider params beside the retention', async () => {
-    const body = await sentBody({ cacheTtl: '24h', extra: { prompt_cache_key: 'polaris-main' } });
-    expect(body).toMatchObject({ prompt_cache_retention: '24h', prompt_cache_key: 'polaris-main' });
+    const body = await sentBody({ cacheTtl: '24h', extra: { prompt_cache_key: 'agent-main' } });
+    expect(body).toMatchObject({ prompt_cache_retention: '24h', prompt_cache_key: 'agent-main' });
   });
 });
 

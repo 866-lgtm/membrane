@@ -35,7 +35,7 @@ const reasoningItem: OpenAIResponsesOutputItem = {
   type: 'reasoning',
   id: 'rs_sum',
   summary: [
-    { type: 'summary_text', text: '**Checking the request**\n\nShe asked about the pond.' },
+    { type: 'summary_text', text: '**Checking the request**\n\nThe user asked about the pond.' },
     { type: 'summary_text', text: '**Planning a reply**\n\nKeep it short.' },
   ],
   encrypted_content: 'enc-sum',
@@ -63,7 +63,7 @@ describe('OpenAIResponsesAPIAdapter reasoning summaries', () => {
     expect(result.content.map((block) => block.type)).toEqual(['thinking', 'redacted_thinking', 'text']);
     expect(result.content[0]).toEqual({
       type: 'thinking',
-      thinking: '**Checking the request**\n\nShe asked about the pond.\n\n**Planning a reply**\n\nKeep it short.',
+      thinking: '**Checking the request**\n\nThe user asked about the pond.\n\n**Planning a reply**\n\nKeep it short.',
       // Display-only: never on the wire, never billed, no part of the raw-form pairing.
       tokenEstimate: 0,
       itemId: 'rs_sum',
@@ -129,7 +129,7 @@ describe('OpenAIResponsesAPIAdapter reasoning summaries', () => {
 describe('Responses reasoning summary round trip', () => {
   const options = {
     participantMode: 'multiuser' as const,
-    assistantParticipant: 'Polaris',
+    assistantParticipant: 'Agent',
     systemPrompt: 'system',
   };
 
@@ -140,7 +140,7 @@ describe('Responses reasoning summary round trip', () => {
       { type: 'text' as const, text: 'The pond is 1.6m deep.', rawItem: answerItem },
     ];
     for (const content of [[{ type: 'thinking' as const, thinking: 'summary text', tokenEstimate: 0 }, ...tail], tail]) {
-      expect(formatter.buildMessages([{ participant: 'Polaris', content }], options).messages)
+      expect(formatter.buildMessages([{ participant: 'Agent', content }], options).messages)
         .toEqual([reasoningItem, answerItem]);
     }
   });
@@ -149,14 +149,14 @@ describe('Responses reasoning summary round trip', () => {
     const formatter = new OpenAIResponsesFormatter();
     const result = formatter.buildMessages([
       {
-        participant: 'Polaris',
+        participant: 'Agent',
         content: [
           { type: 'thinking', thinking: 'summary text', rawItem: reasoningItem },
           { type: 'redacted_thinking', data: 'enc-sum', rawItem: reasoningItem },
           { type: 'text', text: 'The pond is 1.6m deep.', rawItem: answerItem },
         ],
       },
-      { participant: 'Helen', content: [{ type: 'text', text: 'thanks' }] },
+      { participant: 'User', content: [{ type: 'text', text: 'thanks' }] },
     ], options);
 
     expect(result.messages).toEqual([
@@ -170,7 +170,7 @@ describe('Responses reasoning summary round trip', () => {
     const formatter = new OpenAIResponsesFormatter();
     const result = formatter.buildMessages([
       {
-        participant: 'Polaris',
+        participant: 'Agent',
         content: [
           { type: 'thinking', thinking: 'summary text' },
           { type: 'redacted_thinking', data: 'enc-sum' },
@@ -193,23 +193,23 @@ describe('Responses reasoning summary round trip', () => {
 
     const membrane = new Membrane(
       new OpenAIResponsesAPIAdapter({ apiKey: 'sk-test' }),
-      { formatter: new OpenAIResponsesFormatter(), assistantParticipant: 'Polaris' },
+      { formatter: new OpenAIResponsesFormatter(), assistantParticipant: 'Agent' },
     );
     const first = await membrane.complete({
-      messages: [{ participant: 'Helen', content: [{ type: 'text', text: 'How deep is the pond?' }] }],
+      messages: [{ participant: 'User', content: [{ type: 'text', text: 'How deep is the pond?' }] }],
       config: { model: 'gpt-5.1', maxTokens: 1000 },
     });
 
     const thinking = first.content.find((block): block is ContentBlock & { type: 'thinking' } => block.type === 'thinking');
-    expect(thinking?.thinking).toContain('She asked about the pond.');
+    expect(thinking?.thinking).toContain('The user asked about the pond.');
     expect(thinking?.tokenEstimate).toBe(0);
     expect(first.content.some((block) => block.type === 'redacted_thinking')).toBe(true);
 
     await membrane.complete({
       messages: [
-        { participant: 'Helen', content: [{ type: 'text', text: 'How deep is the pond?' }] },
-        { participant: 'Polaris', content: first.content },
-        { participant: 'Helen', content: [{ type: 'text', text: 'thanks' }] },
+        { participant: 'User', content: [{ type: 'text', text: 'How deep is the pond?' }] },
+        { participant: 'Agent', content: first.content },
+        { participant: 'User', content: [{ type: 'text', text: 'thanks' }] },
       ],
       config: { model: 'gpt-5.1', maxTokens: 1000 },
     });
