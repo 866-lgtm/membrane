@@ -95,6 +95,7 @@ import {
 } from './formatters/normalize-tool-pairs.js';
 import { YieldingStreamImpl } from './yielding-stream.js';
 import { calculateCost, warnUnpricedModel } from './utils/cost.js';
+import { isAnthropicServerBlock } from './utils/anthropic-server-blocks.js';
 import {
   TurnUsageAccumulator,
   calculateCacheHitRatio,
@@ -4548,10 +4549,11 @@ export class Membrane {
  * represents (an Anthropic server-tool block, an opaque Responses item): the
  * item rides on it as `rawItem`, so a formatter for its wire can send it back,
  * and normalized consumers see no text. An item that already holds its native
- * form as `rawItem` is carried as that form; one that doesn't is new to this
- * module, and warns once per type.
+ * form as `rawItem` is carried as that form, and so is an Anthropic server-tool
+ * block, which is its own native form; any other is new to this module, and
+ * warns once per type.
  */
 function providerItemCarrier(item: { type?: unknown; rawItem?: unknown }): ContentBlock {
-  if (!item.rawItem) warnUnconvertibleProviderItem(String(item.type));
+  if (!item.rawItem && !isAnthropicServerBlock(item)) warnUnconvertibleProviderItem(String(item.type));
   return { type: 'text', text: '', rawItem: item.rawItem ?? item };
 }

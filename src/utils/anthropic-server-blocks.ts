@@ -16,12 +16,16 @@
  * included, and request shapes for other wires leave it out.
  */
 
+import type { ContentBlock } from '../types/content.js';
+import { isRawItemCarrier } from './fidelity.js';
+
 /**
  * The response block types for server tools that membrane has no normalized
- * block for, as the Anthropic SDK publishes them (0.115.0): its `ContentBlock`
+ * block for, as the Anthropic SDK 0.115.0 publishes them: its `ContentBlock`
  * union's server blocks, and the MCP connector's two, from its beta types.
- * This package builds against an older SDK whose stable union has only the
- * first two.
+ * The SDK this package builds against, 0.52.0, defines six of them (the first
+ * two in its stable types; code execution's result, `container_upload` and
+ * the MCP connector's two in its beta types); the other four are 0.115.0's.
  */
 export const ANTHROPIC_SERVER_BLOCK_TYPES: ReadonlySet<string> = new Set([
   'server_tool_use',
@@ -55,11 +59,12 @@ export function isAnthropicServerBlock(item: unknown): item is AnthropicServerBl
  * holding another provider's item.
  */
 function serverBlockOf(block: unknown): AnthropicServerBlock | undefined {
-  if (isAnthropicServerBlock(block)) return block;
-  if (block === null || typeof block !== 'object') return undefined;
-  const carrier = block as { type?: unknown; text?: unknown; rawItem?: unknown };
-  if (carrier.type !== 'text' || carrier.text !== '') return undefined;
-  return isAnthropicServerBlock(carrier.rawItem) ? carrier.rawItem : undefined;
+  const item = isAnthropicServerBlock(block)
+    ? block
+    : block !== null && typeof block === 'object' && isRawItemCarrier(block as ContentBlock)
+      ? (block as { rawItem?: unknown }).rawItem
+      : undefined;
+  return isAnthropicServerBlock(item) ? item : undefined;
 }
 
 /** True for an Anthropic server-tool block, or a zero-width carrier holding one. */
@@ -74,12 +79,16 @@ export function carriesAnthropicServerBlock(block: unknown): boolean {
  * marker is the request's own, placed by the builder, so a stale one kept in
  * history isn't sent and doesn't count toward the four-marker limit, as it
  * never did while carriers were dropped. Because it's a copy, a breakpoint
- * the builder places marks it and never the stored item. Undefined for every
- * other block.
+ * the builder places marks it and never the stored item. A server call whose
+ * streamed input didn't arrive whole carries `unparseableInput` (the
+ * Anthropic adapter marks it, as it marks a tool_use); it goes out as stored,
+ * with the start's input, as a marked tool_use does, and without the marker,
+ * which is membrane's record, not the API's field. Undefined for every other
+ * block.
  */
 export function anthropicServerBlockFor(block: unknown): AnthropicServerBlock | undefined {
   const item = serverBlockOf(block);
   if (item === undefined) return undefined;
-  const { cache_control: _stored, ...sent } = item;
+  const { cache_control: _stored, unparseableInput: _marker, ...sent } = item;
   return sent as AnthropicServerBlock;
 }

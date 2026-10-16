@@ -534,21 +534,31 @@ export class AnthropicAdapter implements ProviderAdapter {
                 block.unparseableInput = currentBlockInputJson;
               }
             }
-          } else if (isAnthropicServerBlock(block) && 'input' in block && currentBlockInputJson) {
+          } else if (isAnthropicServerBlock(block) && 'input' in block) {
             // A server tool's call (server_tool_use, mcp_tool_use) streams its
             // input as input_json_delta fragments, as a tool_use does, and its
             // content_block_start carried `input: {}`. The block is sent back
             // verbatim in later turns, so it must hold the input the model
-            // wrote. Fragments that don't parse (a call cut off mid-input)
-            // leave the start's input. The block goes back as it is, so the
-            // log names it.
-            try {
-              block.input = JSON.parse(currentBlockInputJson);
-            } catch {
+            // wrote: only a block that stopped has all of it. One that didn't
+            // stop, or whose fragments don't parse, keeps the start's input
+            // and the raw accumulation in `unparseableInput`, as a tool_use
+            // does, so a consumer can tell the call it holds isn't the one the
+            // model made. It's sent back as stored, as a marked tool_use is,
+            // so the result that may follow it isn't left without its call.
+            let whole = sawBlockStop;
+            if (whole && currentBlockInputJson) {
+              try {
+                block.input = JSON.parse(currentBlockInputJson);
+              } catch {
+                whole = false;
+              }
+            }
+            if (!whole) {
+              block.unparseableInput = currentBlockInputJson;
               console.warn(
                 `[membrane:anthropic] the streamed input of ${String(block.type)} ${String(block.id ?? '(no id)')} ` +
-                `didn't parse (${currentBlockInputJson.length} characters` +
-                `${sawBlockStop ? '' : ', cut off before its block stopped'}); it keeps the start's input`,
+                `${sawBlockStop ? "didn't parse" : 'was cut off before its block stopped'} ` +
+                `(${currentBlockInputJson.length} characters); it keeps the start's input, marked`,
               );
             }
           }
@@ -1117,14 +1127,16 @@ export function detectImageMediaType(data: string | undefined, fallback?: string
 }
 
 /**
- * Convert one turn's normalized content to Anthropic content blocks.
+ * Convert one turn's normalized content to Anthropic content blocks, for a
+ * caller outside membrane's own builds, which go through NativeFormatter.
  *
  * With `role: 'assistant'`, an Anthropic server-tool block, or its zero-width
  * carrier, goes out as the block itself, in the place it had in the turn that
- * produced it, as NativeFormatter and the native tool loop's builder send it
- * (see utils/anthropic-server-blocks.ts). Otherwise it's left out, as those
- * builders leave it out of a user turn, which has no place for one. A caller
- * that names no role gets that too, as it always got for a carrier.
+ * produced it, as NativeFormatter sends it when its build replays server
+ * blocks (see utils/anthropic-server-blocks.ts). Otherwise it's left out, as
+ * NativeFormatter leaves it out of a user turn, which has no place for one. A
+ * caller that names no role gets that too, as it always got for a carrier.
+ * Nothing reports what it leaves out: it has no alteration callback.
  */
 export function toAnthropicContent(
   blocks: ContentBlock[],

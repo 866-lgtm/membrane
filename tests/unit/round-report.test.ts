@@ -1062,10 +1062,17 @@ describe('slimepriestess\'s review of #104', () => {
       expect(rounds[0]!.altered.messages).toEqual([]);
     });
 
+    it('BedrockAdapter doesn\'t declare that it replays server blocks', async () => {
+      const { BedrockAdapter } = await import('../../src/providers/bedrock.js');
+      const bedrock = new BedrockAdapter({ accessKeyId: 'test', secretAccessKey: 'test', region: 'us-west-2' });
+      expect((bedrock as { replaysAnthropicServerBlocks?: boolean }).replaysAnthropicServerBlocks).not.toBe(true);
+      expect(new AnthropicAdapter({ apiKey: 'zz-key', cacheKeepalive: { enabled: false } }).replaysAnthropicServerBlocks).toBe(true);
+    });
+
     it('an Anthropic-shaped build that doesn\'t replay server blocks leaves the block out, and names its message', async () => {
       for (const messages of Object.values(conversations)) {
         const adapter = new ScriptedAnthropic([{ content: [{ type: 'text', text: 'done' }], stopReason: 'end_turn' }]);
-        (adapter as { replaysAnthropicServerBlocks: boolean }).replaysAnthropicServerBlocks = false; // as a Bedrock build
+        (adapter as { replaysAnthropicServerBlocks: boolean }).replaysAnthropicServerBlocks = false; // as a build that doesn't declare it
         const { rounds } = await drive(new Membrane(adapter), {
           messages: messages(), config: { model: 'claude-sonnet-4-5', maxTokens: 1000 }, tools: [noopTool], toolMode: 'native', promptCaching: false,
         });

@@ -43,10 +43,13 @@ export interface TextContent {
    * Responses output item, or an Anthropic server-tool block). Formatters
    * for its own wire replay it verbatim; other providers must ignore it. A
    * zero-width carrier (`text: ''` plus `rawItem`) has no normalized
-   * equivalent. An Anthropic-shaped request sends one holding an Anthropic
-   * server-tool block as that block, in the assistant turn that produced it
-   * (`utils/anthropic-server-blocks.ts`), and filters out any other, since
-   * Anthropic rejects empty text blocks. Text serializations leave it out.
+   * equivalent. A build for an adapter that declares
+   * `replaysAnthropicServerBlocks` (AnthropicAdapter) sends one holding an
+   * Anthropic server-tool block as that block, in the assistant turn that
+   * produced it (`utils/anthropic-server-blocks.ts`). Other Anthropic-shaped
+   * builds, Bedrock's included, leave it out, and every Anthropic-shaped build
+   * filters out any other carrier, since Anthropic rejects empty text blocks.
+   * Text serializations leave it out.
    *
    * Where it is replayed, it goes out in place of this block's other fields,
    * which are not read: a consumer that changes the block's content

@@ -20,6 +20,7 @@ import { OpenRouterAdapter, toOpenRouterMessages } from '../../src/providers/ope
 import { normalizeResponsesInput } from '../../src/providers/responses-input.js';
 import { ANTHROPIC_SERVER_BLOCK_TYPES, anthropicServerBlockFor } from '../../src/utils/anthropic-server-blocks.js';
 import { extractText } from '../../src/types/message.js';
+import { FidelityNotes } from '../../src/utils/fidelity.js';
 import type { ContentBlock, NormalizedMessage, NormalizedRequest, ProviderAdapter, ProviderRequest } from '../../src/types/index.js';
 
 // A web-search turn in the order the API returned one: signed thinking, the
@@ -187,6 +188,7 @@ describe('toAnthropicContent', () => {
 
 describe('complete()', () => {
   it('keeps a turn\'s server blocks on carriers, and sends them back verbatim', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     const bodies: any[] = [];
     vi.stubGlobal('fetch', vi.fn().mockImplementation(async (_url: string, init: { body: string }) => {
       bodies.push(JSON.parse(init.body));
@@ -211,6 +213,8 @@ describe('complete()', () => {
       config,
     });
     expect(bodies[1].messages[1]).toEqual({ role: 'assistant', content: sentTurn });
+    // A server block is its own native form, so keeping it warns of nothing.
+    expect(warn.mock.calls.map((c) => String(c[0])).filter((line) => /unconvertible|no normalized/i.test(line))).toEqual([]);
   });
 
   it('keeps a provider item with no normalized form as its native item, as the Responses adapter gives it', async () => {
@@ -399,21 +403,24 @@ describe('the Anthropic adapter\'s stream', () => {
     expect(res.content).toEqual([{ type: 'mcp_tool_use', id: 'mcptoolu_zz1', name: 'zz_lookup', server_name: 'zz', input: { key: 'zz' } }]);
   });
 
-  it('keeps the start\'s input when a server call is cut off before its block stopped, and says so', async () => {
-    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
-    const res = await streamed([
-      { type: 'message_start', message: { model: 'claude-zz-1', usage: { input_tokens: 10 } } },
-      { type: 'content_block_start', index: 0, content_block: { type: 'mcp_tool_use', id: 'mcptoolu_zz2', name: 'zz_lookup', server_name: 'zz', input: {} } },
-      { type: 'content_block_delta', index: 0, delta: { type: 'input_json_delta', partial_json: '{"q": "zz' } },
-      { type: 'message_delta', delta: { stop_reason: 'max_tokens' }, usage: { output_tokens: 5 } },
-    ]);
-    expect(res.content).toEqual([{ type: 'mcp_tool_use', id: 'mcptoolu_zz2', name: 'zz_lookup', server_name: 'zz', input: {} }]);
-    expect(warn.mock.calls.map((c) => String(c[0]))).toContainEqual(
-      expect.stringMatching(/mcp_tool_use mcptoolu_zz2 didn't parse \(9 characters, cut off before its block stopped\); it keeps the start's input$/),
-    );
-  });
+  for (const [label, fragment] of [['part of its input', '{"q": "zz'], ['input that happens to parse', '{"q": "zz"}']] as const) {
+    it(`marks a server call cut off before its block stopped, with ${label}, and keeps the start's input, and says so`, async () => {
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const res = await streamed([
+        { type: 'message_start', message: { model: 'claude-zz-1', usage: { input_tokens: 10 } } },
+        { type: 'content_block_start', index: 0, content_block: { type: 'mcp_tool_use', id: 'mcptoolu_zz2', name: 'zz_lookup', server_name: 'zz', input: {} } },
+        { type: 'content_block_delta', index: 0, delta: { type: 'input_json_delta', partial_json: fragment } },
+        { type: 'message_delta', delta: { stop_reason: 'max_tokens' }, usage: { output_tokens: 5 } },
+      ]);
+      // Only a block that stopped has all of its input.
+      expect(res.content).toEqual([{ type: 'mcp_tool_use', id: 'mcptoolu_zz2', name: 'zz_lookup', server_name: 'zz', input: {}, unparseableInput: fragment }]);
+      expect(warn.mock.calls.map((c) => String(c[0]))).toContainEqual(
+        expect.stringMatching(new RegExp(`mcp_tool_use mcptoolu_zz2 was cut off before its block stopped \\(${fragment.length} characters\\); it keeps the start's input, marked$`)),
+      );
+    });
+  }
 
-  it('keeps the start\'s input {} when a server call\'s fragments don\'t parse, and says so', async () => {
+  it('marks a server call whose fragments don\'t parse, and keeps the start\'s input, and says so', async () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     const res = await streamed([
       { type: 'message_start', message: { model: 'claude-zz-1', usage: { input_tokens: 10 } } },
@@ -422,10 +429,41 @@ describe('the Anthropic adapter\'s stream', () => {
       { type: 'content_block_stop', index: 0 },
       { type: 'message_delta', delta: { stop_reason: 'max_tokens' }, usage: { output_tokens: 5 } },
     ]);
-    expect(res.content).toEqual([{ type: 'server_tool_use', id: 'srvtoolu_zz1', name: 'web_search', input: {} }]);
+    expect(res.content).toEqual([{ type: 'server_tool_use', id: 'srvtoolu_zz1', name: 'web_search', input: {}, unparseableInput: '{"query": "zz lat' }]);
     expect(warn.mock.calls.map((c) => String(c[0]))).toContainEqual(
-      expect.stringMatching(/server_tool_use srvtoolu_zz1 didn't parse \(17 characters\); it keeps the start's input$/),
+      expect.stringMatching(/server_tool_use srvtoolu_zz1 didn't parse \(17 characters\); it keeps the start's input, marked$/),
     );
+  });
+
+  it('keeps a server call with no input fragments, which stopped, as the call it is', async () => {
+    const res = await streamed([
+      { type: 'message_start', message: { model: 'claude-zz-1', usage: { input_tokens: 10 } } },
+      { type: 'content_block_start', index: 0, content_block: { type: 'server_tool_use', id: 'srvtoolu_zz3', name: 'web_search', input: {} } },
+      { type: 'content_block_stop', index: 0 },
+      { type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 5 } },
+    ]);
+    expect(res.content).toEqual([{ type: 'server_tool_use', id: 'srvtoolu_zz3', name: 'web_search', input: {} }]);
+  });
+});
+
+describe('a server call that didn\'t arrive whole', () => {
+  it('goes back as stored, with the start\'s input and without the marker, beside the result that follows it', () => {
+    const broken = { type: 'server_tool_use', id: 'srvtoolu_zz9', name: 'web_search', input: {}, unparseableInput: '{"query": "zz' };
+    const result = { type: 'web_search_tool_result', tool_use_id: 'srvtoolu_zz9', content: [] };
+    const sent = { type: 'server_tool_use', id: 'srvtoolu_zz9', name: 'web_search', input: {} };
+    expect(anthropicServerBlockFor(carrier(broken))).toEqual(sent);
+    expect(anthropicServerBlockFor(broken)).toEqual(sent);
+    const notes = new FidelityNotes();
+    const built = new NativeFormatter().buildMessages([
+      { participant: 'User', content: [{ type: 'text', text: 'zz ask' }] },
+      { participant: 'Claude', content: [{ type: 'text', text: 'zz searching' }, carrier(broken), carrier(result)] },
+      { participant: 'User', content: [{ type: 'text', text: 'zz go on' }] },
+    ], { assistantParticipant: 'Claude', participantMode: 'multiuser', fidelity: notes } as any);
+    const assistant = JSON.stringify(built.messages[1]);
+    expect(assistant).toContain('"id":"srvtoolu_zz9"');
+    expect(assistant).toContain('"tool_use_id":"srvtoolu_zz9"');
+    expect(assistant).not.toContain('unparseableInput');
+    expect([...notes.altered]).toEqual([]);
   });
 });
 

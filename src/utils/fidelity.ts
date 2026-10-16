@@ -37,8 +37,8 @@ import type { ContentBlock } from '../types/content.js';
  *     other block from its fields;
  *   - the Anthropic XML formatter sends `rawXml` in place of a tool_use's or
  *     tool_result's fields (consecutive blocks sharing it, once);
- *   - NativeFormatter sends a zero-width carrier holding an Anthropic
- *     server-tool block as that block, in an assistant turn, when the build
+ *   - NativeFormatter sends an Anthropic server-tool block, bare or on a
+ *     zero-width carrier, as that block, in an assistant turn, when the build
  *     replays server blocks (`BuildOptions.anthropicServerBlocks`, see
  *     utils/anthropic-server-blocks.ts).
  * Where a raw form is sent, it is the content of the block or message it is
