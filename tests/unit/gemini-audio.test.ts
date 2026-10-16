@@ -62,4 +62,13 @@ describe('GeminiAdapter audio input', () => {
       inlineData: { mimeType: 'image/png', data: 'iVBORw0KGgo=' },
     });
   });
+
+  it('labels a canonical image block (mediaType) by its own type, not as JPEG', async () => {
+    const req = await buildRequest([
+      { type: 'image', source: { type: 'base64', data: 'iVBORw0KGgo=', mediaType: 'image/png' } },
+    ]);
+    expect(req.contents[0].parts).toContainEqual({
+      inlineData: { mimeType: 'image/png', data: 'iVBORw0KGgo=' },
+    });
+  });
 });
