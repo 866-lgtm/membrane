@@ -287,6 +287,8 @@ export class OpenAIResponsesAPIAdapter implements ProviderAdapter {
           this.applyTextDelta(output, event);
         } else if (event.type === 'response.function_call_arguments.delta') {
           this.applyFunctionArgumentsDelta(output, event);
+        } else if (event.type === 'response.reasoning_summary_text.delta') {
+          this.applyReasoningSummaryDelta(output, event);
         } else if (
           event.type === 'response.output_item.added' ||
           event.type === 'response.output_item.done'
@@ -578,6 +580,21 @@ export class OpenAIResponsesAPIAdapter implements ProviderAdapter {
         });
       } else if (item.type === 'reasoning') {
         if (typeof item.encrypted_content === 'string') {
+          // The summary (requested via reasoning.summary) is the only readable
+          // reasoning the API returns; the encrypted payload is what the next
+          // turn needs. Keep both: a display thinking block, then the
+          // round-trip carrier. They share rawItem, which the Responses
+          // formatter replays once.
+          const summary = this.extractReasoningSummary(item);
+          if (summary) {
+            content.push({
+              type: 'thinking',
+              thinking: summary,
+              itemId: item.id,
+              outputIndex,
+              rawItem: item,
+            });
+          }
           content.push({
             type: 'redacted_thinking',
             data: item.encrypted_content,
@@ -648,6 +665,15 @@ export class OpenAIResponsesAPIAdapter implements ProviderAdapter {
     return values.join('\n');
   }
 
+  /** Summary parts are separate paragraphs, each usually opening with a bold title. */
+  private extractReasoningSummary(item: OpenAIResponsesOutputItem): string {
+    if (!Array.isArray(item.summary)) return '';
+    return (item.summary as unknown[])
+      .map((part: any) => part?.text)
+      .filter((text): text is string => typeof text === 'string' && text.trim().length > 0)
+      .join('\n\n');
+  }
+
   private asPhase(value: unknown): 'commentary' | 'final_answer' | null | undefined {
     return value === 'commentary' || value === 'final_answer' || value === null
       ? value
@@ -699,6 +725,19 @@ export class OpenAIResponsesAPIAdapter implements ProviderAdapter {
     if (item?.type === 'function_call') {
       item.arguments = `${item.arguments ?? ''}${event.delta}`;
     }
+  }
+
+  /** output_item.done and the terminal output carry the full summary and win;
+   * this only matters for a stream that delivers neither. */
+  private applyReasoningSummaryDelta(output: OpenAIResponsesOutputItem[], event: any): void {
+    if (!Number.isInteger(event.output_index) || typeof event.delta !== 'string') return;
+    const item = output[event.output_index as number] as any;
+    if (item?.type !== 'reasoning') return;
+    const summaryIndex = Number.isInteger(event.summary_index) ? event.summary_index : 0;
+    if (!Array.isArray(item.summary)) item.summary = [];
+    const part = item.summary[summaryIndex] ?? { type: 'summary_text', text: '' };
+    part.text = `${part.text ?? ''}${event.delta}`;
+    item.summary[summaryIndex] = part;
   }
 
   // --------------------------------------------------------------------------
