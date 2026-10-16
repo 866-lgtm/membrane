@@ -17,16 +17,28 @@
   still leaves it out. `toAnthropicContent` sends it when given
   `{ role: 'assistant' }`, and otherwise leaves it out, as it always left
   out a carrier.
-- Membrane sends these blocks back only through `AnthropicAdapter`: a live
-  check had the Anthropic API accept web search's two. It leaves them out of every
-  other provider's requests, Bedrock's included, in the build itself,
-  before it places cache markers and merges turns, so those requests are what
-  they were before: a provider adapter declares
-  `replaysAnthropicServerBlocks`, and NativeFormatter takes
-  `anthropicServerBlocks` (on by default, as a token count wants). Whether
-  Bedrock accepts them is unknown, and a refusal there would fail every
-  request carrying the conversation. A caller that builds with NativeFormatter
-  itself for another provider passes `anthropicServerBlocks: false`.
+- Except where the API refuses a block in its turn. A server call goes only
+  with its result after it in the turn, and a result only with its call
+  before it: the API refuses either alone, so a lone one is left out of its
+  turn and its message is reported altered. The request's final assistant
+  message keeps its lone calls, since a paused turn (`pause_turn`) resumes
+  there; `toAnthropicContent` takes `lastMessage` for that turn. A turn left
+  with nothing is dropped. `container_upload`, which the API refuses in any
+  assistant turn, is always left out.
+- Membrane sends these blocks back only through `AnthropicAdapter`. Live
+  checks on claude-haiku-4-5 had the Anthropic API accept each type sent
+  back beside its partner, with or without a cache marker on it, except
+  `container_upload`; the MCP connector's pair was checked through
+  `count_tokens` only, and code execution's success results were built from
+  the SDK's types. It leaves them out of every other provider's requests,
+  Bedrock's included, in the build itself, before it places cache markers
+  and merges turns, so those requests are what they were before: a provider
+  adapter declares `replaysAnthropicServerBlocks`, and NativeFormatter takes
+  `anthropicServerBlocks`, off by default, so a caller that builds with
+  NativeFormatter itself for the Anthropic API, such as a token count,
+  passes `true`. Whether Bedrock accepts them is unknown, and a refusal
+  there would fail every request carrying the conversation. In XML tool
+  mode the turn is text, so these blocks still aren't sent there.
 - Anthropic API requests for a stored history with such a turn change from
   that turn on: a prompt-cache prefix written before upgrading that reaches
   past the turn no longer matches, and the search results are input tokens on
@@ -36,22 +48,28 @@
 - Streaming: a server tool's call (`server_tool_use`, `mcp_tool_use`) kept
   the empty `input` of its `content_block_start`, because only a `tool_use`
   assembled its `input_json_delta` fragments. It now holds the input the
-  model wrote. Fragments that don't parse (a call cut off mid-input) leave
-  the start's `input: {}`, and a warning names the block.
+  model wrote. Fragments that don't parse to an object, and a call cut off
+  mid-input, leave the start's `input: {}` with the text in
+  `unparseableInput`, and a warning names the block; whitespace alone is no
+  input. Either call goes back as stored, `{}` without the marker, wherever
+  the pairing rule keeps it: a stopped call with its result after it, or a
+  lone call in the request's final message. A cut-off call has no result
+  after it, so only the final message keeps it.
 - `complete()` keeps a provider block it has no normalized form for (an
   Anthropic server-tool block, or an opaque Responses item such as a
   compaction) on a zero-width carrier, as the native tool loops do, instead
-  of dropping it. It still keeps no `rawItem` on the text and thinking
-  blocks it normalizes, which the native tool loops do keep.
+  of dropping it, and an XML closing tag it restores goes on the last text
+  block that isn't a carrier. It still keeps no `rawItem` on the text and
+  thinking blocks it normalizes, which the native tool loops do keep.
+  `fromAnthropicContent` carries a server-tool block without the
+  unknown-type warning.
 - Request shapes for other wires leave a server-tool block out, bare or on
   its carrier. The OpenAI Responses formatter no longer replays one as an
   input item, the Responses input normalization no longer passes one through
   as a message part or an empty text part, and the XML and completions
   formatters, the OpenAI, OpenAI-compatible, OpenRouter and OpenAI
   completions adapters, and the exported `toOpenAIMessages`,
-  `toOpenRouterMessages` and `toOpenAIContent`, no longer write a zero-width
-  carrier as an empty text part or line, and neither does the exported
-  `extractText`. `toOpenAIContent` now answers
-  `null`, its answer for no text, for a turn whose only text blocks are
-  carriers, where it gave `''`. In XML
-  (prefill) mode the turn is text, so these blocks still aren't sent there.
+  `toOpenRouterMessages`, `toOpenAIContent` and `toGeminiParts`, no longer
+  write a zero-width carrier as an empty text part or line, and neither does
+  the exported `extractText`. `toOpenAIContent` still answers `''` for a
+  turn whose only text blocks are carriers.

@@ -452,8 +452,9 @@ export class BedrockAdapter implements ProviderAdapter {
     // caller that sets cacheTtl. (Connectome issue #35.)
     // Bedrock is strict about the wire shape of image sources: internal blocks
     // carry camelCase `mediaType`, the API requires snake_case `media_type`.
-    // The Anthropic adapter converts on both paths (toAnthropicContent /
-    // toAnthropicToolResultContent); without the same conversion here a
+    // The Anthropic adapter converts in its own buildRequest, top-level
+    // images and those inside tool results (toAnthropicToolResultContent);
+    // without the same conversion here a
     // tool-returned image 400s with "media_type: Field required" mid-turn
     // (observed on eidoverse snapshot results, 2026-08-08). Applies to
     // top-level image blocks AND images nested inside tool_result content.

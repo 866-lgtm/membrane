@@ -254,7 +254,7 @@ export class AnthropicAdapter implements ProviderAdapter {
   /** Carries message content verbatim, and reports the nested tool-result blocks it can't carry. */
   readonly reportsContentAlterations = true;
   readonly cacheReceiptBasis = 'wire-request' as const;
-  /** Membrane sends server-tool blocks back through this adapter, in the turn that produced them. A live check had the API accept web search's two (see utils/anthropic-server-blocks.ts). */
+  /** Membrane sends server-tool blocks back through this adapter, in the turn that produced them. Live checks had the API accept each type, with or without a cache marker, but `container_upload`, which it refuses in an assistant turn and so is left out (see utils/anthropic-server-blocks.ts). */
   readonly replaysAnthropicServerBlocks = true;
 
   /**
@@ -553,7 +553,8 @@ export class AnthropicAdapter implements ProviderAdapter {
             // as stored, without the marker; anywhere else it's left out as
             // a lone call (unpairedServerBlocks).
             let whole = sawBlockStop;
-            if (whole && currentBlockInputJson) {
+            // Whitespace alone is no input, {} unmarked, as a tool_use's is.
+            if (whole && currentBlockInputJson.trim()) {
               let parsed: unknown;
               try {
                 parsed = JSON.parse(currentBlockInputJson);
@@ -1156,7 +1157,9 @@ export function detectImageMediaType(data: string | undefined, fallback?: string
  * left out. In any other role a server block is left out, as NativeFormatter
  * leaves it out of a user turn, which has no place for one. A caller that
  * names no role gets that too, as it always got for a carrier. Nothing
- * reports what it leaves out: it has no alteration callback.
+ * reports what it leaves out: it has no alteration callback. It sees one
+ * turn, so a turn whose only blocks pairing leaves out comes back empty, for
+ * the caller to drop as NativeFormatter drops it.
  */
 export function toAnthropicContent(
   blocks: ContentBlock[],
@@ -1355,9 +1358,13 @@ export function fromAnthropicContent(blocks: Anthropic.ContentBlock[]): ContentB
           // Preserve the encrypted `data` payload — without it the block
           // cannot be round-tripped and prior reasoning is lost.
           result.push({ type: 'redacted_thinking', data: (block as any).data } as any);
+        } else if (isAnthropicServerBlock(block)) {
+          // A server-tool block is its own native form: carried as itself,
+          // with no unknown-type warning, as membrane's response path does.
+          result.push({ type: 'text', text: '', rawItem: block } as ContentBlock);
         } else {
-          // server_tool_use, web_search_tool_result, search_result, mcp_tool_use
-          // and anything Anthropic adds later used to fall out here silently.
+          // search_result and anything Anthropic adds later used to fall out
+          // here silently.
           result.push(preserveUnconvertibleBlock(block, 'anthropic'));
         }
         break;

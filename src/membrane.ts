@@ -112,7 +112,7 @@ import {
   shedImagesToFitByteBudget, assertWithinByteBudget,
 } from './utils/image-media.js';
 import { getDefaultPricing } from './registry/default-pricing.js';
-import { FidelityNotes, requestFingerprint, type MessageOrigin } from './utils/fidelity.js';
+import { FidelityNotes, isRawItemCarrier, requestFingerprint, type MessageOrigin } from './utils/fidelity.js';
 
 /** Anthropic's thinking-binding controls, as a thinking config carries them. */
 type BlockBindingParam = { prefix_mismatch_behavior: 'error' | 'drop_block' };
@@ -2914,10 +2914,12 @@ export class Membrane {
       providerResponse.stopSequence?.startsWith('</');
     if (stoppedOnClosingTag && providerResponse.stopSequence) {
       rawAssistantText += providerResponse.stopSequence;
-      // Update the last text content block if it exists
+      // Update the last text content block if it exists. A zero-width
+      // carrier is a text block holding a provider item, not text, so it keeps
+      // its empty text and stays a carrier.
       for (let i = content.length - 1; i >= 0; i--) {
         const block = content[i]!;
-        if (block.type === 'text') {
+        if (block.type === 'text' && !isRawItemCarrier(block)) {
           (block as { type: 'text'; text: string }).text += providerResponse.stopSequence;
           break;
         }

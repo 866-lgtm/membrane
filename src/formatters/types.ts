@@ -100,8 +100,10 @@ export interface BuildOptions {
    * Membrane sets this from its adapter's `replaysAnthropicServerBlocks`,
    * which only AnthropicAdapter declares. Off, they are left out before
    * cache markers are placed and messages merged, exactly as a carrier was
-   * before they went back at all. On by default, so a direct caller, such as
-   * a token count, builds what the Anthropic API is sent.
+   * before they went back at all. Off by default, as membrane's own flag is:
+   * a direct caller building for the Anthropic API, such as a token count,
+   * passes true to build what membrane sends it, and one building for another
+   * wire gets none.
    */
   anthropicServerBlocks?: boolean;
 

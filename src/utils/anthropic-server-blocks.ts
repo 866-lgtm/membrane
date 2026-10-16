@@ -12,8 +12,10 @@
  * and a model replayed without its search results no longer has them. So
  * Membrane sends each one back in its carrier's place, in the assistant turn
  * that produced it, through an adapter that declares
- * replaysAnthropicServerBlocks (AnthropicAdapter). Its other builds, Bedrock's
- * included, and request shapes for other wires leave it out.
+ * replaysAnthropicServerBlocks (AnthropicAdapter), unless the API refuses it
+ * there (unpairedServerBlocks: a lone call or result, and `container_upload`).
+ * Its other builds, Bedrock's included, and request shapes for other wires
+ * leave it out.
  */
 
 import type { ContentBlock } from '../types/content.js';
@@ -101,11 +103,12 @@ const ANTHROPIC_SERVER_CALL_TYPES: ReadonlySet<string> = new Set(['server_tool_u
  * the API refuses a server call that has no result after it in its turn, and
  * a result whose call isn't before it in its turn, so a request that replays
  * either alone fails, and so does every later request that replays the turn
- * (measured with count_tokens on claude-haiku-4-5 for web search's pair; the
- * MCP connector's pair is taken to follow the same rule, unprobed). With
- * `lastTurn`, a lone call can go: a paused turn (`pause_turn`) is resumed by
- * sending it back as it is, as the request's final message, where the API
- * takes a lone call. Blocks of no pair (`container_upload`) always can.
+ * (measured with count_tokens on claude-haiku-4-5 for web search's, web
+ * fetch's, bash code execution's, tool search's and the MCP connector's
+ * pairs). It refuses `container_upload` in any assistant turn, so that never
+ * goes. With `lastTurn`, the turn keeps its lone calls: a paused turn
+ * (`pause_turn`) is resumed by sending it back as it is, as the request's
+ * final message, where the API takes a lone call.
  */
 export function unpairedServerBlocks(turn: readonly unknown[], lastTurn: boolean): Set<unknown> {
   const callAt = new Map<string, number>();
@@ -121,7 +124,9 @@ export function unpairedServerBlocks(turn: readonly unknown[], lastTurn: boolean
   const unpaired = new Set<unknown>();
   turn.forEach((block, i) => {
     if (!isAnthropicServerBlock(block)) return;
-    if (ANTHROPIC_SERVER_CALL_TYPES.has(block.type)) {
+    if (block.type === 'container_upload') {
+      unpaired.add(block);
+    } else if (ANTHROPIC_SERVER_CALL_TYPES.has(block.type)) {
       const answered = typeof block.id === 'string' && (answeredAt.get(block.id) ?? -1) > i;
       if (!answered && !lastTurn) unpaired.add(block);
     } else if (typeof block.tool_use_id === 'string') {

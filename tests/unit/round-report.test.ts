@@ -1100,7 +1100,7 @@ describe('slimepriestess\'s review of #104', () => {
     it('NativeFormatter sends a server block in the assistant turn that holds it, and names nothing; in a user turn it leaves it out, and names that message', () => {
       for (const messages of Object.values(conversations)) {
         const notes = new FidelityNotes();
-        const built = new NativeFormatter().buildMessages(messages(), { assistantParticipant: 'Claude', participantMode: 'multiuser', fidelity: notes } as any);
+        const built = new NativeFormatter().buildMessages(messages(), { assistantParticipant: 'Claude', participantMode: 'multiuser', fidelity: notes, anthropicServerBlocks: true } as any);
         expect(JSON.stringify(built.messages)).toContain('web_search_tool_result');
         expect(sorted(notes.altered)).toEqual([]);
       }
@@ -1108,7 +1108,7 @@ describe('slimepriestess\'s review of #104', () => {
       const built = new NativeFormatter().buildMessages([
         { participant: 'User', content: [text('search for it'), carrier()] },
         { participant: 'Claude', content: [text('found it')] },
-      ], { assistantParticipant: 'Claude', participantMode: 'multiuser', fidelity: notes } as any);
+      ], { assistantParticipant: 'Claude', participantMode: 'multiuser', fidelity: notes, anthropicServerBlocks: true } as any);
       expect(JSON.stringify(built.messages)).not.toContain('web_search_tool_result');
       expect(sorted(notes.altered)).toEqual([0]);
     });

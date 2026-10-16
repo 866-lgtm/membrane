@@ -250,7 +250,7 @@ export class NativeFormatter implements PrefillFormatter {
       const content = this.convertContent(message.content, message.participant, {
         includeNames: participantMode === 'multiuser' && !isAssistant,
         isAssistant,
-        serverBlocks: options.anthropicServerBlocks !== false,
+        serverBlocks: options.anthropicServerBlocks === true,
         ...(options.fidelity ? { onAltered: () => options.fidelity!.alter(i) } : {}),
       });
 

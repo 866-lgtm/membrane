@@ -10,9 +10,9 @@ import { NativeFormatter } from '../../src/formatters/native.js';
 import { AnthropicXmlFormatter } from '../../src/formatters/anthropic-xml.js';
 import { CompletionsFormatter } from '../../src/formatters/completions.js';
 import { OpenAIResponsesFormatter } from '../../src/formatters/openai-responses.js';
-import { AnthropicAdapter, toAnthropicContent } from '../../src/providers/anthropic.js';
+import { AnthropicAdapter, fromAnthropicContent, resetUnconvertibleBlockWarnings, toAnthropicContent } from '../../src/providers/anthropic.js';
 import { BedrockAdapter } from '../../src/providers/bedrock.js';
-import { GeminiAdapter } from '../../src/providers/gemini.js';
+import { GeminiAdapter, toGeminiParts } from '../../src/providers/gemini.js';
 import { OpenAIAdapter, toOpenAIContent } from '../../src/providers/openai.js';
 import { OpenAICompatibleAdapter, toOpenAIMessages } from '../../src/providers/openai-compatible.js';
 import { OpenAICompletionsAdapter } from '../../src/providers/openai-completions.js';
@@ -53,7 +53,7 @@ const history = (assistant: ContentBlock[] = turn()): NormalizedMessage[] => [
   { participant: 'Claude', content: assistant },
   { participant: 'User', content: [{ type: 'text', text: 'zz thanks' }] },
 ];
-const options = { participantMode: 'simple' as const, assistantParticipant: 'Claude', humanParticipant: 'User' };
+const options = { participantMode: 'simple' as const, assistantParticipant: 'Claude', humanParticipant: 'User', anthropicServerBlocks: true };
 
 /** Every object in `value` whose `type` is one of the listed server block types. */
 function serverBlocksIn(value: unknown): unknown[] {
@@ -233,6 +233,27 @@ describe('complete()', () => {
     expect(bodies[1].messages[1]).toEqual({ role: 'assistant', content: sentTurn });
     // A server block is its own native form, so keeping it warns of nothing.
     expect(warn.mock.calls.map((c) => String(c[0])).filter((line) => /unconvertible|no normalized/i.test(line))).toEqual([]);
+  });
+
+  it('restores an XML closing tag onto the last text block, not onto a server block carrier after it', async () => {
+    const adapter: ProviderAdapter = {
+      name: 'anthropic', supportsModel: () => true, replaysAnthropicServerBlocks: true,
+      complete: async () => ({
+        content: [{ type: 'text', text: 'zz before <zz_note>zz noted' }, serverUse],
+        stopReason: 'stop_sequence',
+        stopSequence: '</zz_note>',
+        usage: { inputTokens: 1, outputTokens: 1 },
+        raw: {},
+      }) as any,
+      stream: async () => { throw new Error('Unexpected stream'); },
+    };
+    const membrane = new Membrane(adapter, { formatter: new AnthropicXmlFormatter() });
+    const res = await membrane.complete({
+      messages: [history()[0]!], assistantParticipant: 'Claude', config: { model: 'claude-zz', maxTokens: 32 }, toolMode: 'xml',
+    } as any);
+    expect(res.content).toContainEqual(carrier(serverUse));
+    const texts = res.content.filter((block) => block.type === 'text' && !('rawItem' in block)) as Array<{ text: string }>;
+    expect(texts.at(-1)!.text.endsWith('</zz_note>')).toBe(true);
   });
 
   it('keeps a provider item with no normalized form as its native item, as the Responses adapter gives it', async () => {
@@ -470,6 +491,19 @@ describe('the Anthropic adapter\'s stream', () => {
     });
   }
 
+  it('keeps a stopped server call whose fragments are only whitespace as a call with no input, unmarked', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const res = await streamed([
+      { type: 'message_start', message: { model: 'claude-zz-1', usage: { input_tokens: 10 } } },
+      { type: 'content_block_start', index: 0, content_block: { type: 'server_tool_use', id: 'srvtoolu_zz6', name: 'web_search', input: {} } },
+      { type: 'content_block_delta', index: 0, delta: { type: 'input_json_delta', partial_json: '  \n' } },
+      { type: 'content_block_stop', index: 0 },
+      { type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 5 } },
+    ]);
+    expect(res.content).toEqual([{ type: 'server_tool_use', id: 'srvtoolu_zz6', name: 'web_search', input: {} }]);
+    expect(warn.mock.calls.map((c) => String(c[0])).some((line) => line.includes('srvtoolu_zz6'))).toBe(false);
+  });
+
   it('marks a server call cut off before its block stopped with no input fragments, and says so', async () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     const res = await streamed([
@@ -506,7 +540,7 @@ describe('a server call that didn\'t arrive whole', () => {
       { participant: 'User', content: [{ type: 'text', text: 'zz ask' }] },
       { participant: 'Claude', content: [{ type: 'text', text: 'zz searching' }, carrier(broken), carrier(result)] },
       { participant: 'User', content: [{ type: 'text', text: 'zz go on' }] },
-    ], { assistantParticipant: 'Claude', participantMode: 'multiuser', fidelity: notes } as any);
+    ], { assistantParticipant: 'Claude', participantMode: 'multiuser', fidelity: notes, anthropicServerBlocks: true } as any);
     const assistant = JSON.stringify(built.messages[1]);
     expect(assistant).toContain('"id":"srvtoolu_zz9"');
     expect(assistant).toContain('"tool_use_id":"srvtoolu_zz9"');
@@ -675,15 +709,16 @@ describe('a server call and its result go out together, or not at all', () => {
   const result = (id: string) => ({ type: 'web_search_tool_result', tool_use_id: id, content: [] });
   const say = (text: string): ContentBlock => ({ type: 'text', text });
   const options = (notes: FidelityNotes, extra: Record<string, unknown> = {}) =>
-    ({ assistantParticipant: 'Claude', participantMode: 'multiuser', fidelity: notes, ...extra }) as any;
+    ({ assistantParticipant: 'Claude', participantMode: 'multiuser', fidelity: notes, anthropicServerBlocks: true, ...extra }) as any;
 
   it('unpairedServerBlocks names a call with no result after it in the turn, and a result with no call before it', () => {
     const c1 = call('a'); const r1 = result('a'); const c2 = call('b'); const r3 = result('c');
     const upload = { type: 'container_upload', file_id: 'zz-file' };
     const turn = [c1, r1, c2, r3, upload, answer];
-    expect([...unpairedServerBlocks(turn, false)]).toEqual([c2, r3]);
+    // The API refuses container_upload in any assistant turn, so it never goes.
+    expect([...unpairedServerBlocks(turn, false)]).toEqual([c2, r3, upload]);
     // As the request's last message, a paused turn keeps its lone calls, but not a lone result.
-    expect([...unpairedServerBlocks(turn, true)]).toEqual([r3]);
+    expect([...unpairedServerBlocks(turn, true)]).toEqual([r3, upload]);
     // A result before its call pairs with nothing.
     const r4 = result('d'); const c4 = call('d');
     expect([...unpairedServerBlocks([r4, c4], false)]).toEqual([r4, c4]);
@@ -766,6 +801,43 @@ describe('a server call and its result go out together, or not at all', () => {
     expect(turn.at(-1)!.cache_control).toEqual({ type: 'ephemeral' });
   });
 
+  it('NativeFormatter leaves a dropped marker where it is when a kept block of the turn already holds one', () => {
+    const notes = new FidelityNotes();
+    const built = new NativeFormatter().buildMessages([
+      { participant: 'User', content: [say('zz ask')] },
+      { participant: 'Claude', content: [say('zz first')], cacheBreakpoint: true },
+      { participant: 'Claude', content: [say('zz second'), carrier(call('zz-lone-marked'))], cacheBreakpoint: true },
+      { participant: 'User', content: [say('zz go on')] },
+    ], options(notes, { promptCaching: true }));
+    const turn = built.messages[1]!.content as Array<Record<string, unknown>>;
+    expect(turn.map((block) => block.type)).toEqual(['text', 'text']);
+    expect(turn[0]!.cache_control).toEqual({ type: 'ephemeral' });
+    expect(turn[1]!.cache_control).toBeUndefined();
+  });
+
+  it('NativeFormatter leaves container_upload out of an assistant turn, which the API refuses there, and names its message', () => {
+    const notes = new FidelityNotes();
+    const upload = { type: 'container_upload', file_id: 'zz-file' };
+    const built = new NativeFormatter().buildMessages([
+      { participant: 'User', content: [say('zz ask')] },
+      { participant: 'Claude', content: [say('zz uploaded'), carrier(upload)] },
+      { participant: 'User', content: [say('zz go on')] },
+    ], options(notes));
+    expect(JSON.stringify(built.messages)).not.toContain('container_upload');
+    expect([...notes.altered]).toEqual([1]);
+  });
+
+  it('NativeFormatter replays server blocks only when the build asks for them', () => {
+    const messages: NormalizedMessage[] = [
+      { participant: 'User', content: [say('zz ask')] },
+      { participant: 'Claude', content: [say('zz searching'), carrier(call('zz-default')), carrier(result('zz-default'))] },
+      { participant: 'User', content: [say('zz go on')] },
+    ];
+    const plain = { assistantParticipant: 'Claude', participantMode: 'multiuser' } as any;
+    expect(JSON.stringify(new NativeFormatter().buildMessages(messages, plain).messages)).not.toContain('zz-default');
+    expect(JSON.stringify(new NativeFormatter().buildMessages(messages, { ...plain, anthropicServerBlocks: true }).messages)).toContain('zz-default');
+  });
+
   it('NativeFormatter puts a moved marker on the last block that can hold one, not on thinking after it', () => {
     const notes = new FidelityNotes();
     const built = new NativeFormatter().buildMessages([
@@ -836,5 +908,28 @@ describe('a server call and its result go out together, or not at all', () => {
     const paired = (NativeFormatter as unknown as { pairServerBlocks(m: unknown[], f: FidelityNotes): Array<{ role: string; content: unknown[] }> })
       .pairServerBlocks(messages, notes);
     expect(paired.map((message) => [message.role, message.content.length])).toEqual([['user', 1], ['assistant', 0], ['user', 2]]);
+  });
+});
+
+describe('direct conversions and a zero-width carrier', () => {
+  it('toGeminiParts adds no part for a carrier', () => {
+    expect(toGeminiParts([{ type: 'text', text: 'zz said' } as ContentBlock, carrier(serverUse)])).toEqual([{ text: 'zz said' }]);
+  });
+
+  it("toOpenAIContent gives '' for a turn whose only text blocks are carriers, and null for one with no text block", () => {
+    expect(toOpenAIContent([carrier(serverUse)])).toBe('');
+    expect(toOpenAIContent([])).toBe(null);
+    expect(toOpenAIContent([{ type: 'text', text: 'zz said' } as ContentBlock, carrier(serverUse)])).toBe('zz said');
+  });
+
+  it('fromAnthropicContent carries a server block without the unknown-type warning', () => {
+    resetUnconvertibleBlockWarnings();
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      expect(fromAnthropicContent([serverUse as never])).toEqual([{ type: 'text', text: '', rawItem: serverUse }]);
+      expect(warn).not.toHaveBeenCalled();
+    } finally {
+      warn.mockRestore();
+    }
   });
 });
