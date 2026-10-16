@@ -8,9 +8,9 @@ const warnedUndeclaredAdapters = new Set<string>();
 /**
  * Restate a provider's usage in membrane's single convention: `inputTokens`,
  * `cacheReadTokens` and `cacheCreationTokens` DISJOINT, each priced at its own
- * rate. Adapters reporting `cache-inclusive` counts have the cached span
- * subtracted out of `inputTokens`; the total prompt size stays recoverable as
- * `inputTokens + cacheReadTokens`.
+ * rate. Adapters reporting `cache-inclusive` counts have the cached span, read
+ * and written, subtracted out of `inputTokens`; the total prompt size stays
+ * recoverable as `inputTokens + cacheCreationTokens + cacheReadTokens`.
  *
  * Without this, one field name carried two incomparable meanings — the cache
  * hit ratio was unbounded on cache-excluded adapters and cost double-charged
@@ -25,6 +25,7 @@ export function normalizeUsageToCacheExcluded(
   // which is why the interface field is optional and lands here.
   const convention = usage.cacheConvention ?? adapterConvention ?? 'unknown';
   const cacheReadTokens = usage.cacheReadTokens ?? 0;
+  const cacheCreationTokens = usage.cacheCreationTokens ?? 0;
 
   if (convention === 'unknown' && cacheReadTokens > 0 && !warnedUndeclaredAdapters.has(adapterName)) {
     warnedUndeclaredAdapters.add(adapterName);
@@ -37,21 +38,25 @@ export function normalizeUsageToCacheExcluded(
     );
   }
 
-  if (convention !== 'cache-inclusive' || cacheReadTokens === 0) return usage;
+  if (convention !== 'cache-inclusive' || (cacheReadTokens === 0 && cacheCreationTokens === 0)) return usage;
 
-  return { ...usage, inputTokens: Math.max(0, usage.inputTokens - cacheReadTokens) };
+  // The clamp keeps a count that can't be right from going negative: an
+  // adapter declaring itself inclusive while reporting cached tokens outside
+  // its input count, reads or writes alike.
+  return { ...usage, inputTokens: Math.max(0, usage.inputTokens - cacheReadTokens - cacheCreationTokens) };
 }
 
 /**
- * Share of the prompt that was served from cache. Both terms are in the
- * cache-excluded convention, so this is a true ratio in [0, 1] regardless of
- * which provider produced the counts.
+ * Share of the prompt that was served from cache: cache reads over the whole
+ * prompt, fresh input, cache writes and cache reads together. Every term is in
+ * the cache-excluded convention, so this is a true ratio in [0, 1] regardless
+ * of which provider produced the counts.
  */
 export function calculateCacheHitRatio(
-  usage: { inputTokens: number; cacheReadTokens?: number },
+  usage: { inputTokens: number; cacheCreationTokens?: number; cacheReadTokens?: number },
 ): number {
   const cacheReadTokens = usage.cacheReadTokens ?? 0;
-  const promptTokens = (usage.inputTokens ?? 0) + cacheReadTokens;
+  const promptTokens = (usage.inputTokens ?? 0) + (usage.cacheCreationTokens ?? 0) + cacheReadTokens;
   if (promptTokens === 0) return 0;
   return cacheReadTokens / promptTokens;
 }

@@ -118,6 +118,26 @@ describe('cache-excluded adapters (Anthropic convention)', () => {
     expect(response.details.usage.estimatedCost?.input).toBeCloseTo(120 * 1000 / 1e6, 12);
     expect(response.details.usage.estimatedCost?.cacheRead).toBeCloseTo(48_000 * 100 / 1e6, 12);
   });
+
+  it('counts cache writes as part of the prompt in the hit ratio', async () => {
+    // 100 fresh + 5,000 written + 5,000 read is a 10,100-token prompt, half
+    // of it served from cache. Leaving the writes out of the prompt made it
+    // 5,100 tokens and the ratio 98%.
+    const membrane = new Membrane(
+      adapterReporting(
+        { inputTokens: 100, outputTokens: 40, cacheCreationTokens: 5_000, cacheReadTokens: 5_000 },
+        'cache-excluded',
+      ),
+      { registry: zzRegistry },
+    );
+    const complete = await membrane.complete(ZZ_REQUEST);
+    const stream = await membrane.stream(ZZ_REQUEST);
+
+    expect(complete.details.cache.hitRatio).toBeCloseTo(5_000 / 10_100, 10);
+    expect(stream.details.cache.hitRatio).toBeCloseTo(5_000 / 10_100, 10);
+    expect(complete.usage.inputTokens).toBe(100);
+    expect(complete.usage.cacheCreationTokens).toBe(5_000);
+  });
 });
 
 describe('cache-inclusive adapters (OpenAI convention)', () => {
@@ -142,6 +162,53 @@ describe('cache-inclusive adapters (OpenAI convention)', () => {
     // Fresh input is prompt - cached = 68, not the full 1732.
     expect(response.details.usage.estimatedCost?.input).toBeCloseTo(68 * 1000 / 1e6, 12);
     expect(response.details.usage.estimatedCost?.cacheRead).toBeCloseTo(1664 * 100 / 1e6, 12);
+  });
+
+  it('subtracts cache writes too, since an inclusive input count holds every cached token', async () => {
+    // No built-in inclusive adapter reports writes. One that did would count
+    // them inside its input, as it counts its reads: a 10,000-token prompt
+    // with 1,000 written and 2,000 read has 7,000 fresh.
+    const membrane = new Membrane(
+      adapterReporting(
+        { inputTokens: 10_000, outputTokens: 2, cacheCreationTokens: 1_000, cacheReadTokens: 2_000 },
+        'cache-inclusive',
+      ),
+      { registry: zzRegistry },
+    );
+    const response = await membrane.complete(ZZ_REQUEST);
+
+    expect(response.usage.inputTokens).toBe(7_000);
+    expect(response.usage.cacheCreationTokens).toBe(1_000);
+    expect(response.usage.cacheReadTokens).toBe(2_000);
+    // Each part priced once at its own rate.
+    expect(response.details.usage.estimatedCost?.input).toBeCloseTo(7_000 * 1000 / 1e6, 12);
+    expect(response.details.usage.estimatedCost?.cacheWrite).toBeCloseTo(1_000 * 1000 / 1e6, 12);
+    expect(response.details.cache.hitRatio).toBeCloseTo(2_000 / 10_000, 10);
+  });
+
+  it('subtracts the writes of a response that reports no reads', async () => {
+    const membrane = new Membrane(
+      adapterReporting({ inputTokens: 10_000, outputTokens: 2, cacheCreationTokens: 1_000 }, 'cache-inclusive'),
+      { registry: zzRegistry },
+    );
+    const response = await membrane.complete(ZZ_REQUEST);
+
+    expect(response.usage.inputTokens).toBe(9_000);
+  });
+
+  it('clamps the fresh input at zero when the cached counts exceed the input count', async () => {
+    // A count that can't be right: an adapter declaring itself inclusive
+    // while reporting its cached span outside the input count.
+    const membrane = new Membrane(
+      adapterReporting(
+        { inputTokens: 1_000, outputTokens: 2, cacheCreationTokens: 600, cacheReadTokens: 600 },
+        'cache-inclusive',
+      ),
+      { registry: zzRegistry },
+    );
+    const response = await membrane.complete(ZZ_REQUEST);
+
+    expect(response.usage.inputTokens).toBe(0);
   });
 
   it('normalizes the streaming path too', async () => {
