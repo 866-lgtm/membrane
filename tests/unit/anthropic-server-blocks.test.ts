@@ -449,9 +449,26 @@ describe('the Anthropic adapter\'s stream', () => {
     ]);
     expect(res.content).toEqual([{ type: 'server_tool_use', id: 'srvtoolu_zz1', name: 'web_search', input: {}, unparseableInput: '{"query": "zz lat' }]);
     expect(warn.mock.calls.map((c) => String(c[0]))).toContainEqual(
-      expect.stringMatching(/server_tool_use srvtoolu_zz1 didn't parse \(17 characters\); it keeps the start's input, marked$/),
+      expect.stringMatching(/server_tool_use srvtoolu_zz1 didn't parse to an object \(17 characters\); it keeps the start's input, marked$/),
     );
   });
+
+  for (const fragment of ['null', '"zz"', '["zz"]', '5']) {
+    it(`marks a stopped server call whose fragments parse to ${fragment}, which isn't an object, and says so`, async () => {
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const res = await streamed([
+        { type: 'message_start', message: { model: 'claude-zz-1', usage: { input_tokens: 10 } } },
+        { type: 'content_block_start', index: 0, content_block: { type: 'server_tool_use', id: 'srvtoolu_zz5', name: 'web_search', input: {} } },
+        { type: 'content_block_delta', index: 0, delta: { type: 'input_json_delta', partial_json: fragment } },
+        { type: 'content_block_stop', index: 0 },
+        { type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 5 } },
+      ]);
+      expect(res.content).toEqual([{ type: 'server_tool_use', id: 'srvtoolu_zz5', name: 'web_search', input: {}, unparseableInput: fragment }]);
+      expect(warn.mock.calls.map((c) => String(c[0]))).toContainEqual(
+        expect.stringMatching(new RegExp(`server_tool_use srvtoolu_zz5 didn't parse to an object \\(${fragment.length} characters\\); it keeps the start's input, marked$`)),
+      );
+    });
+  }
 
   it('marks a server call cut off before its block stopped with no input fragments, and says so', async () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});

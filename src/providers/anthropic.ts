@@ -33,6 +33,7 @@ import {
 } from '../types/index.js';
 import { statusForProviderCode } from '../types/errors.js';
 import { flattenRootSchemaUnion } from './anthropic-tool-schema.js';
+import { isPlainObject } from '../utils/tool-schema.js';
 import { assertTerminalEventObserved, toolUseInputFromText, toolUseInputFromValue, isDeadlineAbort, deadlineTimeoutError } from './utils.js';
 import { fetchWithCredentials, validateCredential, type CredentialContext, type CredentialResolver } from './credentials.js';
 import { CacheKeepalive, type CacheKeepaliveConfig } from '../cache-keepalive.js';
@@ -543,26 +544,30 @@ export class AnthropicAdapter implements ProviderAdapter {
             // content_block_start carried `input: {}`. The block is sent back
             // verbatim in later turns, so it must hold the input the model
             // wrote: only a block that stopped has all of it. One that didn't
-            // stop, or whose fragments don't parse, keeps the start's input
-            // and the raw accumulation in `unparseableInput`, as a tool_use
-            // does, so a consumer can tell the call it holds isn't the one the
-            // model made. A cut-off call has no result after it, so it goes
+            // stop, or whose fragments don't parse to an object (the API
+            // refuses any other input), keeps the start's input and the raw
+            // accumulation in `unparseableInput`, as a tool_use does, so a
+            // consumer can tell the call it holds isn't the one the model
+            // made. A cut-off call has no result after it, so it goes
             // back only where a lone call can (the request's final message),
             // as stored, without the marker; anywhere else it's left out as
             // a lone call (unpairedServerBlocks).
             let whole = sawBlockStop;
             if (whole && currentBlockInputJson) {
+              let parsed: unknown;
               try {
-                block.input = JSON.parse(currentBlockInputJson);
+                parsed = JSON.parse(currentBlockInputJson);
               } catch {
                 whole = false;
               }
+              if (whole && isPlainObject(parsed)) block.input = parsed;
+              else whole = false;
             }
             if (!whole) {
               block.unparseableInput = currentBlockInputJson;
               console.warn(
                 `[membrane:anthropic] the streamed input of ${String(block.type)} ${String(block.id ?? '(no id)')} ` +
-                `${sawBlockStop ? "didn't parse" : 'was cut off before its block stopped'} ` +
+                `${sawBlockStop ? "didn't parse to an object" : 'was cut off before its block stopped'} ` +
                 `(${currentBlockInputJson.length} characters); it keeps the start's input, marked`,
               );
             }
