@@ -522,7 +522,7 @@ describe('the XML tool loop', () => {
   it('describes a tool-result image by its header, and gives data that is no image the placeholder', () => {
     const xml = formatToolResults([{ toolUseId: 'shot_1', toolName: 'shot', content: [notes() as any, imageOf(PNG, 'image/webp') as any] }]);
     expect(placeholders(xml)).toBe(1);
-    expect(xml).toContain('[Image: image/png, ~0KB]');
+    expect(xml).toContain('[Image: image/png, ~0KB, not shown to you]');
     expect(xml).not.toContain('image/webp');
   });
 });

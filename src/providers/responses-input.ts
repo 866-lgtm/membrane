@@ -183,7 +183,7 @@ export function responsesToolOutput(content: unknown): { output: unknown; loses:
     } else if (block.type === 'image') {
       const part = responsesImagePart(block);
       if (part?.type !== 'input_image') loses = true;
-      parts.push(part ?? { type: 'input_text', text: '[image omitted: unsupported image source]' });
+      parts.push(part ?? { type: 'input_text', text: UNUSABLE_IMAGE_SOURCE_TEXT });
     } else if (block.type === 'input_text') {
       parts.push(block);
     } else if (block.type === 'input_image') {
@@ -197,6 +197,17 @@ export function responsesToolOutput(content: unknown): { output: unknown; loses:
   }
   return { output: parts, loses };
 }
+
+/** Stand-in for a tool-result image with no usable source, worded like
+ *  imageForRequest's placeholder: the model must know an image was there. It
+ *  names no cause, since several reach it (a source that isn't a URL or
+ *  base64 data, an empty URL, or base64 outside `source`), and offers no
+ *  remedy, since nothing in the request can show the image. Base64 data in a
+ *  source is decided instead, and data that is no accepted image gets
+ *  imageForRequest's placeholder. */
+const UNUSABLE_IMAGE_SOURCE_TEXT =
+  '[system: an image in this tool result was NOT shown to you. This request couldn\'t carry it, ' +
+  'so you are not seeing it.]';
 
 type ResponsesImagePart = { type: 'input_image'; image_url: string } | { type: 'input_text'; text: string };
 

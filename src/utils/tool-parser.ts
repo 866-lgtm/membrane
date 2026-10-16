@@ -605,15 +605,16 @@ function toolResultImage(block: unknown): { data: unknown; declared: unknown } {
 }
 
 /** The text that stands for a tool-result image where XML can't carry it:
- *  the format and size of an image the request would send, or the
- *  placeholder for data it wouldn't. The placeholder quotes the image's
- *  label, so callers guard it as they guard the result's own text. */
+ *  the format and size of an image the request would send, saying the model
+ *  isn't seeing it, or the placeholder for data it wouldn't send. The
+ *  placeholder quotes the image's label, so callers guard it as they guard
+ *  the result's own text. */
 function imageNote(block: Extract<ToolResultContentBlock, { type: 'image' }>): string {
   const { data, declared } = toolResultImage(block);
   const { mediaType, placeholder } = imageForRequest(data, declared);
   if (placeholder) return placeholder.text;
   const sizeKb = Math.round(((data as string).length * 0.75) / 1024);
-  return `[Image: ${mediaType}, ~${sizeKb}KB]`;
+  return `[Image: ${mediaType}, ~${sizeKb}KB, not shown to you]`;
 }
 
 function renderResultContentString(result: ToolResult): string {
@@ -625,8 +626,8 @@ function renderResultContentString(result: ToolResult): string {
     if (block.type === 'text') {
       parts.push(block.text);
     } else if (block.type === 'image') {
-      // For XML mode, we can't embed images directly
-      // Add a note about the image for the model
+      // For XML mode, we can't embed images directly. The note says the
+      // model isn't seeing it, so the size isn't read as its contents.
       parts.push(imageNote(block));
     }
   }
