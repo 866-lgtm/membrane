@@ -32,7 +32,7 @@ import {
 } from '../types/index.js';
 import { statusForProviderCode } from '../types/errors.js';
 import { flattenRootSchemaUnion } from './anthropic-tool-schema.js';
-import { assertTerminalEventObserved } from './utils.js';
+import { assertTerminalEventObserved, toolUseInputFromText, toolUseInputFromValue, isDeadlineAbort, deadlineTimeoutError } from './utils.js';
 import { fetchWithCredentials, validateCredential, type CredentialContext, type CredentialResolver } from './credentials.js';
 import { CacheKeepalive, type CacheKeepaliveConfig } from '../cache-keepalive.js';
 
@@ -394,6 +394,9 @@ export class AnthropicAdapter implements ProviderAdapter {
 
       return this.parseResponse(response, fullRequest);
     } catch (error) {
+      // A deadline on the caller's signal (Membrane's progressTimeoutMs) is a
+      // timeout, as on every adapter; the SDK's abort error can't say so.
+      if (isDeadlineAbort(options?.signal?.reason)) throw deadlineTimeoutError(options!.signal!.reason, fullRequest);
       throw this.handleError(error, fullRequest);
     }
   }
@@ -528,13 +531,13 @@ export class AnthropicAdapter implements ProviderAdapter {
               // call that nothing downstream can distinguish from a real one.
               block.unparseableInput = currentBlockInputJson;
             } else if (currentBlockInputJson) {
-              try {
-                block.input = JSON.parse(currentBlockInputJson);
-              } catch {
-                // Same fabrication, reached by a block that did stop: keep the
-                // raw accumulation and mark it so consumers can refuse.
-                block.unparseableInput = currentBlockInputJson;
-              }
+              // Arguments that don't parse, or parse to anything but an
+              // object, are the same fabrication reached by a block that did
+              // stop: keep the raw accumulation and mark it so consumers can
+              // refuse.
+              const parsed = toolUseInputFromText(currentBlockInputJson);
+              if (parsed.unparseableInput === undefined) block.input = parsed.input;
+              else block.unparseableInput = parsed.unparseableInput;
             }
           }
         }
@@ -544,6 +547,8 @@ export class AnthropicAdapter implements ProviderAdapter {
       for await (const event of stream) {
         sawEvent = true;
         resetIdleTimer();
+        // Every SDK event is progress; pings never reach this loop.
+        options?.onProgress?.();
         if (event.type === 'message_start') {
           model = event.message.model;
           inputTransformations = (event.message as { input_transformations?: unknown }).input_transformations;
@@ -721,6 +726,9 @@ export class AnthropicAdapter implements ProviderAdapter {
           rawRequest: fullRequest,
         });
       }
+      // A deadline on the caller's signal (Membrane's progressTimeoutMs) is a
+      // timeout with its own message, whatever the SDK wrapped the abort in.
+      if (isDeadlineAbort(options?.signal?.reason)) throw deadlineTimeoutError(options!.signal!.reason, fullRequest);
       throw this.handleError(session.failure() ?? error, fullRequest);
     }
   }
@@ -1269,7 +1277,7 @@ export function fromAnthropicContent(blocks: Anthropic.ContentBlock[]): ContentB
           type: 'tool_use',
           id: block.id,
           name: block.name,
-          input: block.input as Record<string, unknown>,
+          ...toolUseInputFromValue(block.input),
         });
         break;
         
