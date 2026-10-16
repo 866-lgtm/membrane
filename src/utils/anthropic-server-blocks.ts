@@ -13,7 +13,8 @@
  * Membrane sends each one back in its carrier's place, in the assistant turn
  * that produced it, through an adapter that declares
  * replaysAnthropicServerBlocks (AnthropicAdapter), unless the API refuses it
- * there (unpairedServerBlocks: a lone call or result, and `container_upload`).
+ * there (unpairedServerBlocks: a lone call or result, a second block with an
+ * id, an id that isn't a string, and `container_upload`).
  * Its other builds, Bedrock's included, and request shapes for other wires
  * leave it out.
  */
@@ -99,40 +100,42 @@ export function anthropicServerBlockFor(block: unknown): AnthropicServerBlock | 
 const ANTHROPIC_SERVER_CALL_TYPES: ReadonlySet<string> = new Set(['server_tool_use', 'mcp_tool_use']);
 
 /**
- * The Anthropic server-tool blocks of one assistant turn that can't go out:
- * the API refuses a server call that has no result after it in its turn, and
+ * The Anthropic server-tool blocks of one assistant turn that can't go out.
+ * The API refuses a server call that has no result after it in its turn, and
  * a result whose call isn't before it in its turn, so a request that replays
  * either alone fails, and so does every later request that replays the turn
  * (measured with count_tokens on claude-haiku-4-5 for web search's, web
  * fetch's, bash code execution's, tool search's and the MCP connector's
- * pairs). It refuses `container_upload` in any assistant turn, so that never
- * goes. With `lastTurn`, the turn keeps its lone calls: a paused turn
- * (`pause_turn`) is resumed by sending it back as it is, as the request's
- * final message, where the API takes a lone call.
+ * pairs). It takes each id once per turn: a second call with a call's id, or
+ * a second result for one call, is refused ("ids must be unique per assistant
+ * turn"), so the first call of an id and the first result after it pair, and
+ * every later block with that id goes. It refuses a call whose `id`, or a
+ * result whose `tool_use_id`, isn't a string, in any turn, and
+ * `container_upload` in any assistant turn, so those never go. With
+ * `lastTurn`, the turn keeps its lone calls: a paused turn (`pause_turn`) is
+ * resumed by sending it back as it is, as the request's final message, where
+ * the API takes a lone call.
  */
 export function unpairedServerBlocks(turn: readonly unknown[], lastTurn: boolean): Set<unknown> {
-  const callAt = new Map<string, number>();
-  const answeredAt = new Map<string, number>();
-  turn.forEach((block, i) => {
-    if (!isAnthropicServerBlock(block)) return;
-    if (ANTHROPIC_SERVER_CALL_TYPES.has(block.type)) {
-      if (typeof block.id === 'string' && !callAt.has(block.id)) callAt.set(block.id, i);
-    } else if (typeof block.tool_use_id === 'string') {
-      answeredAt.set(block.tool_use_id, Math.max(answeredAt.get(block.tool_use_id) ?? -1, i));
-    }
-  });
   const unpaired = new Set<unknown>();
-  turn.forEach((block, i) => {
-    if (!isAnthropicServerBlock(block)) return;
+  // The first call of each id, and whether a result has paired with it yet.
+  const calls = new Map<string, { block: unknown; answered: boolean }>();
+  for (const block of turn) {
+    if (!isAnthropicServerBlock(block)) continue;
     if (block.type === 'container_upload') {
       unpaired.add(block);
     } else if (ANTHROPIC_SERVER_CALL_TYPES.has(block.type)) {
-      const answered = typeof block.id === 'string' && (answeredAt.get(block.id) ?? -1) > i;
-      if (!answered && !lastTurn) unpaired.add(block);
-    } else if (typeof block.tool_use_id === 'string') {
-      const call = callAt.get(block.tool_use_id);
-      if (call === undefined || call > i) unpaired.add(block);
+      if (typeof block.id !== 'string' || calls.has(block.id)) unpaired.add(block);
+      else calls.set(block.id, { block, answered: false });
+    } else {
+      const call = typeof block.tool_use_id === 'string' ? calls.get(block.tool_use_id) : undefined;
+      if (call === undefined || call.answered) unpaired.add(block);
+      else call.answered = true;
     }
-  });
-  return unpaired;
+  }
+  if (!lastTurn) {
+    for (const call of calls.values()) if (!call.answered) unpaired.add(call.block);
+  }
+  // In the turn's order, as the blocks are found.
+  return new Set(turn.filter((block) => unpaired.has(block)));
 }

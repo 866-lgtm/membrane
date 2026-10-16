@@ -22,9 +22,13 @@
   before it: the API refuses either alone, so a lone one is left out of its
   turn and its message is reported altered. The request's final assistant
   message keeps its lone calls, since a paused turn (`pause_turn`) resumes
-  there; `toAnthropicContent` takes `lastMessage` for that turn. A turn left
-  with nothing is dropped. `container_upload`, which the API refuses in any
-  assistant turn, is always left out.
+  there; `toAnthropicContent` takes `lastMessage` for that turn. The API
+  takes each id once per turn, so the first call of an id pairs with the
+  first result after it, and a second call with that id, or a second result
+  for it, is left out too. A call whose `id`, or a result whose
+  `tool_use_id`, isn't a string is left out of every turn, the final one
+  included. A turn left with nothing is dropped. `container_upload`, which
+  the API refuses in any assistant turn, is always left out.
 - Membrane sends these blocks back only through `AnthropicAdapter`. Live
   checks on claude-haiku-4-5 had the Anthropic API accept each type sent
   back beside its partner, with or without a cache marker on it, except

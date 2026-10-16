@@ -715,8 +715,11 @@ describe('a server call and its result go out together, or not at all', () => {
     const c1 = call('a'); const r1 = result('a'); const c2 = call('b'); const r3 = result('c');
     const upload = { type: 'container_upload', file_id: 'zz-file' };
     const turn = [c1, r1, c2, r3, upload, answer];
-    // The API refuses container_upload in any assistant turn, so it never goes.
+    // The API refuses container_upload in any assistant turn, so it never goes,
+    // whatever it carries.
     expect([...unpairedServerBlocks(turn, false)]).toEqual([c2, r3, upload]);
+    const naming = { type: 'container_upload', file_id: 'zz-file', tool_use_id: 'a' };
+    expect([...unpairedServerBlocks([c1, naming, r1], false)]).toEqual([naming]);
     // As the request's last message, a paused turn keeps its lone calls, but not a lone result.
     expect([...unpairedServerBlocks(turn, true)]).toEqual([r3, upload]);
     // A result before its call pairs with nothing.
@@ -727,6 +730,38 @@ describe('a server call and its result go out together, or not at all', () => {
     const mcpResult = { type: 'mcp_tool_result', tool_use_id: 'zz-m1', content: [] };
     expect(unpairedServerBlocks([mcpCall, mcpResult], false).size).toBe(0);
     expect([...unpairedServerBlocks([mcpCall], false)]).toEqual([mcpCall]);
+  });
+
+  it('unpairedServerBlocks pairs each id once in a turn: a second call with an id, and a second result for a call, go', () => {
+    // The API refuses a turn holding either ("`server_tool_use` ids must be
+    // unique per assistant turn", "found multiple `web_search_tool_result`
+    // blocks with id"), and takes what's left: one call and its result.
+    for (const lastTurn of [false, true]) {
+      const c1 = call('a'); const c2 = call('a'); const r1 = result('a');
+      expect([...unpairedServerBlocks([c1, c2, r1], lastTurn)], 'two calls, one result').toEqual([c2]);
+      const c3 = call('a'); const r2 = result('a'); const r3 = result('a');
+      expect([...unpairedServerBlocks([c3, r2, r3], lastTurn)], 'one call, two results').toEqual([r3]);
+      const c4 = call('a'); const r4 = result('a'); const c5 = call('a'); const r5 = result('a');
+      expect([...unpairedServerBlocks([c4, r4, c5, r5], lastTurn)], 'the same pair twice').toEqual([c5, r5]);
+      // A result before the first call of its id pairs with nothing, and the result after it pairs.
+      const r6 = result('a'); const c6 = call('a'); const r7 = result('a');
+      expect([...unpairedServerBlocks([r6, c6, r7], lastTurn)], 'a result before its call').toEqual([r6]);
+      // Two ids, each once, both pair.
+      expect(unpairedServerBlocks([call('a'), result('a'), call('b'), result('b')], lastTurn).size, 'two ids').toBe(0);
+    }
+  });
+
+  it('unpairedServerBlocks names a call whose id, or a result whose tool_use_id, isn\'t a string, in every turn, the last included', () => {
+    // The API refuses each: "Field required", "Input should be a valid string".
+    for (const lastTurn of [false, true]) {
+      const unnamed = { type: 'web_search_tool_result', content: [] };
+      const numbered = { type: 'web_search_tool_result', tool_use_id: 7, content: [] };
+      const c1 = call('a'); const r1 = result('a');
+      expect([...unpairedServerBlocks([c1, unnamed, r1, numbered], lastTurn)], 'results').toEqual([unnamed, numbered]);
+      const noId = { type: 'server_tool_use', name: 'web_search', input: { query: 'zz' } };
+      const numberId = { type: 'server_tool_use', id: 7, name: 'web_search', input: { query: 'zz' } };
+      expect([...unpairedServerBlocks([noId, numberId], lastTurn)], 'calls').toEqual([noId, numberId]);
+    }
   });
 
   it('NativeFormatter leaves a lone call or a lone result out of a turn that isn\'t the request\'s last, and names each message', () => {
@@ -772,6 +807,24 @@ describe('a server call and its result go out together, or not at all', () => {
     expect(turn).toContain('"id":"zz-split"');
     expect(turn).toContain('"tool_use_id":"zz-split"');
     expect([...notes.altered]).toEqual([]);
+  });
+
+  it('NativeFormatter sends a pair stored twice, in two assistant messages that merge into one turn, once', () => {
+    // As a retry that stores the same turn again leaves it. The API takes each
+    // id once per turn as sent, so the second copy goes, and its message is named.
+    const notes = new FidelityNotes();
+    const built = new NativeFormatter().buildMessages([
+      { participant: 'User', content: [say('zz ask')] },
+      { participant: 'Claude', content: [carrier(call('zz-twice')), carrier(result('zz-twice')), say('zz found')] },
+      { participant: 'Claude', content: [carrier(call('zz-twice')), carrier(result('zz-twice')), say('zz found again')] },
+      { participant: 'User', content: [say('zz go on')] },
+    ], options(notes));
+    expect(built.messages.map((message) => message.role)).toEqual(['user', 'assistant', 'user']);
+    const turn = JSON.stringify(built.messages[1]!.content);
+    expect(turn.split('"id":"zz-twice"').length - 1).toBe(1);
+    expect(turn.split('"tool_use_id":"zz-twice"').length - 1).toBe(1);
+    expect(turn).toContain('zz found again');
+    expect([...notes.altered]).toEqual([2]);
   });
 
   it('NativeFormatter drops an assistant turn left with nothing, and the user turns around it become one', () => {

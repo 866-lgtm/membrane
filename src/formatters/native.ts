@@ -413,14 +413,15 @@ export class NativeFormatter implements PrefillFormatter {
   // ==========================================================================
 
   /**
-   * Leave out of each assistant turn the server blocks that can't go alone
-   * (unpairedServerBlocks), reporting each one's message altered. The final
-   * message, if it's the assistant's, keeps its lone calls: a paused turn is
-   * resumed as the request's last message. A marker the builder put on a
-   * block left out moves to the turn's last block that can hold one, unless
-   * a kept block already carries one; with no kept block that can hold one,
-   * it goes. A turn left with nothing is dropped, its marker with it, and
-   * its neighbours merge again.
+   * Leave out of each assistant turn the server blocks the API refuses there
+   * (unpairedServerBlocks: a lone call or result, a second block with an id,
+   * an id that isn't a string, `container_upload`), reporting each one's
+   * message altered. The final message, if it's the assistant's, keeps its
+   * lone calls: a paused turn is resumed as the request's last message. A
+   * marker the builder put on a block left out moves to the turn's last block
+   * that can hold one, unless a kept block already carries one; with no kept
+   * block that can hold one, it goes. A turn left with nothing is dropped,
+   * its marker with it, and its neighbours merge again.
    */
   private static pairServerBlocks(messages: ProviderMessage[], fidelity?: FidelityNotes): ProviderMessage[] {
     const emptied = new Set<number>();
