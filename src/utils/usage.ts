@@ -27,10 +27,15 @@ export function normalizeUsageToCacheExcluded(
   const cacheReadTokens = usage.cacheReadTokens ?? 0;
   const cacheCreationTokens = usage.cacheCreationTokens ?? 0;
 
-  if (convention === 'unknown' && cacheReadTokens > 0 && !warnedUndeclaredAdapters.has(adapterName)) {
+  if (
+    convention === 'unknown'
+    && (cacheReadTokens > 0 || cacheCreationTokens > 0)
+    && !warnedUndeclaredAdapters.has(adapterName)
+  ) {
     warnedUndeclaredAdapters.add(adapterName);
     console.warn(
-      `[membrane:usage] adapter "${adapterName}" reported ${cacheReadTokens} cache-read tokens but`
+      `[membrane:usage] adapter "${adapterName}" reported ${cacheReadTokens} cache-read and`
+      + ` ${cacheCreationTokens} cache-write tokens but`
       + ' declares usageCacheConvention "unknown", so membrane cannot tell whether inputTokens'
       + ` (${usage.inputTokens}) already includes them. Counts are passed through unchanged;`
       + ' cost and cache hit ratio may be off by the cached span until the adapter declares'
@@ -48,9 +53,10 @@ export function normalizeUsageToCacheExcluded(
 
 /**
  * Share of the prompt that was served from cache: cache reads over the whole
- * prompt, fresh input, cache writes and cache reads together. Every term is in
- * the cache-excluded convention, so this is a true ratio in [0, 1] regardless
- * of which provider produced the counts.
+ * prompt, fresh input, cache writes and cache reads together. For an adapter
+ * that declares its convention, the three terms are disjoint once restated, so
+ * this is a true ratio in [0, 1]. An `unknown` adapter's counts pass through as
+ * the provider gave them, so its ratio may be off by the cached span.
  */
 export function calculateCacheHitRatio(
   usage: { inputTokens: number; cacheCreationTokens?: number; cacheReadTokens?: number },

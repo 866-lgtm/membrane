@@ -97,8 +97,8 @@ export interface ProviderCapabilities {
  *
  * `unknown` is a real epistemic state, not a default to lean on: it means no
  * one has established this adapter's convention, and membrane will pass the
- * counts through unchanged and warn the first time a cache read makes the
- * ambiguity bite.
+ * counts through unchanged and warn the first time a cache read or write makes
+ * the ambiguity bite.
  */
 export type UsageCacheConvention = 'cache-excluded' | 'cache-inclusive' | 'unknown';
 
