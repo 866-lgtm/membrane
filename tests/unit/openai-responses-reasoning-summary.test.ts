@@ -61,14 +61,14 @@ describe('OpenAIResponsesAPIAdapter reasoning summaries', () => {
     const result = await adapter.complete(providerRequest());
 
     expect(result.content.map((block) => block.type)).toEqual(['thinking', 'redacted_thinking', 'text']);
-    expect(result.content[0]).toMatchObject({
+    expect(result.content[0]).toEqual({
       type: 'thinking',
       thinking: '**Checking the request**\n\nShe asked about the pond.\n\n**Planning a reply**\n\nKeep it short.',
+      // Display-only: never on the wire, never billed, no part of the raw-form pairing.
+      tokenEstimate: 0,
       itemId: 'rs_sum',
       outputIndex: 0,
-      rawItem: reasoningItem,
     });
-    expect(result.content[0]).not.toHaveProperty('signature');
     expect(result.content[1]).toMatchObject({
       type: 'redacted_thinking', data: 'enc-sum', itemId: 'rs_sum', outputIndex: 0, rawItem: reasoningItem,
     });
@@ -133,7 +133,19 @@ describe('Responses reasoning summary round trip', () => {
     systemPrompt: 'system',
   };
 
-  it('replays a reasoning item shared by the summary and carrier blocks once', () => {
+  it('replays the reasoning item once, from the carrier, whether or not the summary block survives', () => {
+    const formatter = new OpenAIResponsesFormatter();
+    const tail = [
+      { type: 'redacted_thinking' as const, data: 'enc-sum', rawItem: reasoningItem },
+      { type: 'text' as const, text: 'The pond is 1.6m deep.', rawItem: answerItem },
+    ];
+    for (const content of [[{ type: 'thinking' as const, thinking: 'summary text', tokenEstimate: 0 }, ...tail], tail]) {
+      expect(formatter.buildMessages([{ participant: 'Polaris', content }], options).messages)
+        .toEqual([reasoningItem, answerItem]);
+    }
+  });
+
+  it('replays a reasoning item shared by several blocks once', () => {
     const formatter = new OpenAIResponsesFormatter();
     const result = formatter.buildMessages([
       {
@@ -190,6 +202,7 @@ describe('Responses reasoning summary round trip', () => {
 
     const thinking = first.content.find((block): block is ContentBlock & { type: 'thinking' } => block.type === 'thinking');
     expect(thinking?.thinking).toContain('She asked about the pond.');
+    expect(thinking?.tokenEstimate).toBe(0);
     expect(first.content.some((block) => block.type === 'redacted_thinking')).toBe(true);
 
     await membrane.complete({

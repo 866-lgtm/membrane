@@ -625,16 +625,21 @@ export class OpenAIResponsesAPIAdapter implements ProviderAdapter {
           // The summary (requested via reasoning.summary) is the only readable
           // reasoning the API returns; the encrypted payload is what the next
           // turn needs. Keep both: a display thinking block, then the
-          // round-trip carrier. They share rawItem, which the Responses
-          // formatter replays once.
+          // round-trip carrier, which alone holds rawItem and replays the
+          // whole item. The summary block never reaches the wire (the
+          // formatter has no form for an unsigned thinking block), and the
+          // summary text is never billed when the item is replayed (probed on
+          // gpt-5.1, 2026-10-16), so it is priced at 0. Without rawItem it is
+          // also no part of the item's raw-form pairing: dropping it leaves
+          // the replay intact.
           const summary = this.extractReasoningSummary(item);
           if (summary) {
             content.push({
               type: 'thinking',
               thinking: summary,
+              tokenEstimate: 0,
               itemId: item.id,
               outputIndex,
-              rawItem: item,
             });
           }
           content.push({

@@ -168,6 +168,10 @@ export interface ThinkingContent {
   type: 'thinking';
   thinking: string;
   signature?: string;
+  /** Replay price in tokens, preferred over any heuristic by consumers that
+   * budget context. 0 marks a display-only block that never reaches the
+   * wire (a Responses reasoning summary). */
+  tokenEstimate?: number;
   /** See {@link TextContent.rawItem}. */
   rawItem?: unknown;
 }

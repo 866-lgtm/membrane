@@ -1887,6 +1887,7 @@ export class Membrane {
             type: 'thinking',
             thinking: item.thinking ?? '',
             ...(item.signature ? { signature: item.signature } : {}),
+            ...(typeof item.tokenEstimate === 'number' ? { tokenEstimate: item.tokenEstimate } : {}),
             ...(item.rawItem ? { rawItem: item.rawItem } : {}),
           });
         } else if (item.type === 'redacted_thinking') {
@@ -1956,6 +1957,7 @@ export class Membrane {
           type: 'thinking',
           thinking: (block as any).thinking ?? '',
           ...((block as any).signature ? { signature: (block as any).signature } : {}),
+          ...(typeof (block as any).tokenEstimate === 'number' ? { tokenEstimate: (block as any).tokenEstimate } : {}),
         } as ContentBlock);
       } else if (block?.type === 'redacted_thinking') {
         sink.push({ ...(block as any) } as ContentBlock);
@@ -2590,6 +2592,7 @@ export class Membrane {
             type: 'thinking',
             thinking: block.thinking ?? '',
             ...(block.signature ? { signature: block.signature } : {}),
+            ...(typeof block.tokenEstimate === 'number' ? { tokenEstimate: block.tokenEstimate } : {}),
           });
         } else if (block.type === 'redacted_thinking') {
           // Pass through verbatim — carries the encrypted `data` payload
