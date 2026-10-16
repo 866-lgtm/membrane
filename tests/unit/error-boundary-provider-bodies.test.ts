@@ -4,11 +4,11 @@
  * The status-guarded classifier must read each form a provider actually
  * sends: a context overflow in Anthropic's and Gemini's own words (and inside
  * OpenRouter's wrapper), a bad Google key that arrives as a 400, a refusal of
- * the account that Anthropic sends as a 400, a Gemini quota no retry can
- * outlast, a retry hint stated only in prose, Bedrock's exception type in a
- * header, and transport failures that carry no status at all. Anything typed
- * wrongly here reaches agent-framework's poison-history breaker as
- * `invalid_request`, or is retried for nothing.
+ * the account or its credential that Anthropic sends as a 400, a Gemini quota
+ * no retry can outlast, a retry hint stated only in prose, Bedrock's exception
+ * type in a header, and transport failures that carry no status at all.
+ * Anything typed wrongly here reaches agent-framework's poison-history
+ * breaker as `invalid_request`, or is retried for nothing.
  */
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -199,7 +199,7 @@ describe('a credential failure sent as a 400 is auth', () => {
   });
 });
 
-describe('a refusal of the account sent as a 400 is auth', () => {
+describe('a refusal of the account or its credential sent as a 400 is auth', () => {
   const anthropic400 = (message: string) =>
     anthropicHandled(new Anthropic.APIError(
       400,
@@ -227,6 +227,22 @@ describe('a refusal of the account sent as a 400 is auth', () => {
     expect(error.httpStatus).toBe(400);
   });
 
+  it('anthropic: "This organization has been disabled."', () => {
+    const error = anthropic400('This organization has been disabled.');
+    expect(error.type).toBe('auth');
+    expect(error.retryable).toBe(false);
+    expect(error.httpStatus).toBe(400);
+  });
+
+  it('anthropic: a credential only authorized for use with Claude Code', () => {
+    const error = anthropic400(
+      'This credential is only authorized for use with Claude Code and cannot be used for other API requests.',
+    );
+    expect(error.type).toBe('auth');
+    expect(error.retryable).toBe(false);
+    expect(error.httpStatus).toBe(400);
+  });
+
   it('anthropic: a 400 about the request itself stays invalid_request', () => {
     const error = anthropic400('messages: roles must alternate between "user" and "assistant", but found multiple "user" roles in a row');
     expect(error.type).toBe('invalid_request');
@@ -244,6 +260,10 @@ describe('a refusal of the account sent as a 400 is auth', () => {
   it('anthropic: a plain-text body the SDK could not parse is still read', () => {
     const error = anthropicHandled(new Anthropic.APIError(400, undefined, '400 prompt is too long: 210123 tokens > 200000 maximum', undefined as never));
     expect(error.type).toBe('context_length');
+    // The disabled organization is reported only as text with a 400.
+    const refusal = anthropicHandled(new Anthropic.APIError(400, undefined, '400 This organization has been disabled.', undefined as never));
+    expect(refusal.type).toBe('auth');
+    expect(refusal.httpStatus).toBe(400);
   });
 
   it('a 400 whose body echoes a refusal outside any message stays invalid_request', async () => {
@@ -477,7 +497,12 @@ describe("every shape of a provider's own message, and nothing else, types the e
 
   // A router's upstream body is read only as its own message.
   it("openrouter: an upstream body with no message of its own isn't read, though it echoes a refusal or an overflow", async () => {
-    for (const echo of ['Your credit balance is too low to access the Anthropic API', 'my prompt is too long for the context window']) {
+    for (const echo of [
+      'Your credit balance is too low to access the Anthropic API',
+      'This organization has been disabled.',
+      'This credential is only authorized for use with Claude Code and cannot be used for other API requests.',
+      'my prompt is too long for the context window',
+    ]) {
       stubHttpFailure(400, {
         error: {
           code: 400,
@@ -551,11 +576,22 @@ describe("every shape of a provider's own message, and nothing else, types the e
 
   // Without a status, the echo-sensitive forms read the provider's own message too.
   it('without a status, a refusal in the provider\'s own message is auth, as with one', () => {
-    expect(classifyError(new Error('Your credit balance is too low to access the Anthropic API.'))).toMatchObject({ type: 'auth', retryable: false });
+    for (const message of [
+      'Your credit balance is too low to access the Anthropic API.',
+      'This organization has been disabled.',
+      'This credential is only authorized for use with Claude Code and cannot be used for other API requests.',
+    ]) {
+      expect(classifyError(new Error(message)), message).toMatchObject({ type: 'auth', retryable: false });
+    }
   });
 
   it("without a status, a frame with no message of its own isn't read for an overflow or a refusal", async () => {
-    for (const echo of ['my prompt is too long for the context window', 'Your credit balance is too low to access the Anthropic API']) {
+    for (const echo of [
+      'my prompt is too long for the context window',
+      'Your credit balance is too low to access the Anthropic API',
+      'This organization has been disabled.',
+      'This credential is only authorized for use with Claude Code and cannot be used for other API requests.',
+    ]) {
       const error = await streamFailure(new GeminiAdapter({ apiKey: 'zz-key-gemini' }), { error: { details: [{ request: echo }] } });
       expect(error.httpStatus, echo).toBeUndefined();
       expect(error.type, echo).not.toBe('context_length');

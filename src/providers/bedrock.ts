@@ -26,7 +26,7 @@ import {
   withRawRequest,
 } from '../types/index.js';
 import { stripEmptyTextRequest } from '../utils/empty-text.js';
-import { createCombinedSignal, isDeadlineAbort, deadlineTimeoutError, assertTerminalEventObserved } from './utils.js';
+import { createCombinedSignal, isDeadlineAbort, deadlineTimeoutError, assertTerminalEventObserved, toolUseInputFromText, toolUseInputFromValue } from './utils.js';
 import {
   INTERLEAVED_THINKING_BETA,
   THINKING_BINDING_BETA,
@@ -109,6 +109,8 @@ interface BedrockMessageResponse {
     id?: string;
     name?: string;
     input?: unknown;
+    /** Set by the stream assembly, never by Bedrock (ToolUseContent.unparseableInput). */
+    unparseableInput?: string;
   }>;
   model: string;
   stop_reason: 'end_turn' | 'max_tokens' | 'stop_sequence' | 'tool_use' | null;
@@ -423,7 +425,7 @@ export class BedrockAdapter implements ProviderAdapter {
 
     const { signal: combinedSignal, cleanup } = createCombinedSignal(options?.signal, options?.timeoutMs);
     try {
-      return await this.invokeModelWithStream(bedrockModelId, bedrockRequest, callbacks, combinedSignal, fullRequest);
+      return await this.invokeModelWithStream(bedrockModelId, bedrockRequest, callbacks, combinedSignal, fullRequest, options?.onProgress);
     } catch (error) {
       throw this.handleError(error, fullRequest);
     } finally {
@@ -629,7 +631,8 @@ export class BedrockAdapter implements ProviderAdapter {
     request: BedrockMessageRequest,
     callbacks: StreamCallbacks,
     signal: AbortSignal | undefined,
-    rawRequest: unknown
+    rawRequest: unknown,
+    onProgress?: () => void,
   ): Promise<ProviderResponse> {
     const url = new URL(
       `${this.baseURL ?? `https://bedrock-runtime.${this.region}.amazonaws.com`}/model/${encodeURIComponent(modelId)}/invoke-with-response-stream`
@@ -666,6 +669,9 @@ export class BedrockAdapter implements ProviderAdapter {
 
     // Parse the binary event stream
     const contentBlocks: Array<{ type: string; text?: string; thinking?: string; signature?: string }> = [];
+    // Indices of blocks content_block_stop finalized. A tool call truncated by
+    // max_tokens never gets one, as in the Anthropic adapter.
+    const stoppedBlocks = new Set<number>();
     let currentBlockIndex = -1;
     let finalMessage: BedrockMessageResponse | undefined;
     let inputTokens = 0;
@@ -783,6 +789,8 @@ export class BedrockAdapter implements ProviderAdapter {
                   bytes[i] = binaryStr.charCodeAt(i);
                 }
                 const eventData = JSON.parse(new TextDecoder().decode(bytes)) as BedrockStreamEvent;
+                // A decoded model event is progress; a ping only proves the connection.
+                if ((eventData as { type?: string }).type !== 'ping') onProgress?.();
 
                 // Check for error events within the stream
                 if (eventData.type === 'error') {
@@ -854,12 +862,18 @@ export class BedrockAdapter implements ProviderAdapter {
                   // on the dual-fire convention (e.g. membrane's native
                   // yielding path) silently drops block_complete on Bedrock.
                   const blockIdx = (eventData as { index?: number }).index ?? currentBlockIndex;
+                  stoppedBlocks.add(blockIdx);
                   // Finalize tool_use blocks: parse accumulated argument JSON
                   // into `input` before the block_complete fire, so consumers
                   // of the dual-fire convention see a complete tool call.
-                  const stoppedBlk = contentBlocks[blockIdx] as ((typeof contentBlocks)[number] & { partialJson?: string; input?: unknown }) | undefined;
+                  const stoppedBlk = contentBlocks[blockIdx] as ((typeof contentBlocks)[number] & { partialJson?: string; input?: unknown; unparseableInput?: string }) | undefined;
                   if (stoppedBlk?.type === 'tool_use' && stoppedBlk.partialJson !== undefined) {
-                    try { stoppedBlk.input = JSON.parse(stoppedBlk.partialJson || '{}'); } catch { /* keep prior input */ }
+                    // As in the Anthropic adapter: arguments that don't parse,
+                    // or parse to anything but an object, leave the input
+                    // content_block_start carried, and the raw text marks it.
+                    const parsed = toolUseInputFromText(stoppedBlk.partialJson);
+                    if (parsed.unparseableInput === undefined) stoppedBlk.input = parsed.input;
+                    else stoppedBlk.unparseableInput = parsed.unparseableInput;
                   }
                   callbacks.onContentBlock?.(blockIdx, contentBlocks[blockIdx]);
                 } else if (eventData.type === 'message_delta') {
@@ -927,7 +941,7 @@ export class BedrockAdapter implements ProviderAdapter {
       id: 'msg_stream',
       type: 'message',
       role: 'assistant',
-      content: contentBlocks.map(b => {
+      content: contentBlocks.map((b, blockIdx) => {
         if (b.type === 'thinking') {
           return { type: 'thinking' as const, thinking: b.thinking ?? '', signature: b.signature };
         }
@@ -939,12 +953,17 @@ export class BedrockAdapter implements ProviderAdapter {
           // Preserve id/name and the input accumulated from input_json_delta
           // fragments — the generic text mapping below would strip them and
           // parseResponse would then drop the block (requires id && name).
-          const tb = b as { type: string; id?: string; name?: string; input?: unknown; partialJson?: string };
-          let input: unknown = tb.input ?? {};
-          if (tb.partialJson) {
-            try { input = JSON.parse(tb.partialJson); } catch { /* keep prior input */ }
-          }
-          return { type: 'tool_use', id: tb.id, name: tb.name, input } as unknown as { type: 'text'; text?: string };
+          const tb = b as { type: string; id?: string; name?: string; input?: unknown; partialJson?: string; unparseableInput?: string };
+          // A block content_block_stop finalized keeps what it set there. One
+          // the stream left open keeps the input content_block_start carried,
+          // and whatever argument text arrived marks it, none included, as in
+          // the Anthropic adapter: the call never finished, so nothing says
+          // its arguments were complete, even text that parses.
+          const unparseableInput = stoppedBlocks.has(blockIdx) ? tb.unparseableInput : (tb.partialJson ?? '');
+          return {
+            type: 'tool_use', id: tb.id, name: tb.name, input: tb.input ?? {},
+            ...(unparseableInput !== undefined ? { unparseableInput } : {}),
+          } as unknown as { type: 'text'; text?: string };
         }
         return { type: b.type as 'text', text: b.text };
       }),
@@ -976,11 +995,14 @@ export class BedrockAdapter implements ProviderAdapter {
       if (block.type === 'text' && block.text) {
         content.push({ type: 'text', text: block.text });
       } else if (block.type === 'tool_use' && block.id && block.name) {
+        // The stream assembly's marker, which keeps the text as it came, wins
+        // over the value's JSON.
         content.push({
           type: 'tool_use',
           id: block.id,
           name: block.name,
-          input: block.input as Record<string, unknown>,
+          ...toolUseInputFromValue(block.input),
+          ...(block.unparseableInput !== undefined ? { unparseableInput: block.unparseableInput } : {}),
         });
       } else if (block.type === 'thinking') {
         // Signature-only thinking blocks (display:'omitted') have an empty

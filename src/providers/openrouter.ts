@@ -26,7 +26,7 @@ import {
   withRawRequest,
 } from '../types/index.js';
 import { isRawItemCarrier } from '../utils/fidelity.js';
-import { safeParseJson, textOnlyToolResultContent, createCombinedSignal, SSELineParser, isDeadlineAbort, deadlineTimeoutError, throwOnStreamErrorFrame, assertTerminalEventObserved } from './utils.js';
+import { toolUseInputFromText, textOnlyToolResultContent, createCombinedSignal, SSELineParser, isDeadlineAbort, deadlineTimeoutError, throwOnStreamErrorFrame, assertTerminalEventObserved } from './utils.js';
 
 // ============================================================================
 // Types
@@ -275,6 +275,8 @@ export class OpenRouterAdapter implements ProviderAdapter {
         } catch {
           return; // Ignore parse errors (partial/keep-alive lines)
         }
+        // A parsed provider event is progress (comments never reach here).
+        options?.onProgress?.();
 
         // OpenRouter delivers mid-stream failures (e.g. upstream 429s) as an
         // SSE data line with an `error` payload. Silently ignoring it would
@@ -911,7 +913,7 @@ export function fromOpenRouterMessage(message: OpenRouterMessage): ContentBlock[
         type: 'tool_use',
         id: tc.id,
         name: tc.function.name,
-        input: safeParseJson(tc.function.arguments),
+        ...toolUseInputFromText(tc.function.arguments),
       });
     }
   }

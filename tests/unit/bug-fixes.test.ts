@@ -4,8 +4,9 @@
  * Covers:
  * 1. Temperature=1 enforcement when thinking is enabled
  * 2. Stop sequence capture in native mode streaming
- * 3. JSON.parse safety for malformed tool arguments
- * 4. Abort signal respected during retry delay
+ * 3. Abort signal respected during retry delay
+ *
+ * Malformed tool arguments are covered by tool-input-object.test.ts.
  */
 
 import { describe, it, expect, vi } from 'vitest';
@@ -200,36 +201,6 @@ describe('Temperature enforcement for thinking', () => {
     const lastMsg = capturedRequest.messages[capturedRequest.messages.length - 1];
     expect(lastMsg.role).toBe('assistant');
     expect(String(lastMsg.content)).toContain('<thinking>');
-  });
-});
-
-// ============================================================================
-// 2. JSON.parse safety for malformed tool arguments
-// ============================================================================
-
-describe('JSON.parse safety for tool arguments', () => {
-  it('safeParseJson handles malformed JSON without throwing', async () => {
-    const { safeParseJson } = await import('../../src/providers/utils.js');
-
-    expect(safeParseJson(undefined)).toEqual({});
-    expect(safeParseJson('')).toEqual({});
-    expect(safeParseJson('{invalid json')).toEqual({});
-    expect(safeParseJson('{"key":"value"}')).toEqual({ key: 'value' });
-  });
-
-  it('verifies all OpenAI-family adapters use safeParseJson', async () => {
-    const fs = await import('fs');
-    const path = await import('path');
-
-    for (const file of ['openai.ts', 'openai-compatible.ts', 'openrouter.ts']) {
-      const adapterPath = path.join(process.cwd(), 'src/providers', file);
-      const source = fs.readFileSync(adapterPath, 'utf-8');
-
-      expect(source).toMatch(/import\s*\{[^}]*\bsafeParseJson\b[^}]*\}\s*from\s*['"]\.\/utils\.js['"]/);
-      expect(source).toContain('input: safeParseJson(tc.function.arguments)');
-      // Verify raw JSON.parse on tool arguments is gone
-      expect(source).not.toContain("JSON.parse(tc.function.arguments || '{}')");
-    }
   });
 });
 
