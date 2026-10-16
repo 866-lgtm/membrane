@@ -18,7 +18,7 @@ import { OpenAICompatibleAdapter, toOpenAIMessages } from '../../src/providers/o
 import { OpenAICompletionsAdapter } from '../../src/providers/openai-completions.js';
 import { OpenRouterAdapter, toOpenRouterMessages } from '../../src/providers/openrouter.js';
 import { normalizeResponsesInput } from '../../src/providers/responses-input.js';
-import { ANTHROPIC_SERVER_BLOCK_TYPES, anthropicServerBlockFor } from '../../src/utils/anthropic-server-blocks.js';
+import { ANTHROPIC_SERVER_BLOCK_TYPES, anthropicServerBlockFor, unpairedServerBlocks } from '../../src/utils/anthropic-server-blocks.js';
 import { extractText } from '../../src/types/message.js';
 import { FidelityNotes } from '../../src/utils/fidelity.js';
 import type { ContentBlock, NormalizedMessage, NormalizedRequest, ProviderAdapter, ProviderRequest } from '../../src/types/index.js';
@@ -175,8 +175,14 @@ describe('toAnthropicContent', () => {
   });
 
   it('in an assistant turn, sends a server block given as itself', () => {
-    expect(toAnthropicContent([serverUse as unknown as ContentBlock, answer as ContentBlock], { role: 'assistant' }))
-      .toEqual([serverUse, answer]);
+    expect(toAnthropicContent([serverUse as unknown as ContentBlock, searchResult as unknown as ContentBlock, answer as ContentBlock], { role: 'assistant' }))
+      .toEqual([serverUse, searchResult, answer]);
+  });
+
+  it('in an assistant turn, leaves out a call with no result after it, and a result with no call before it', () => {
+    expect(toAnthropicContent([serverUse as unknown as ContentBlock, answer as ContentBlock], { role: 'assistant' })).toEqual([answer]);
+    expect(toAnthropicContent([searchResult as unknown as ContentBlock, answer as ContentBlock], { role: 'assistant' })).toEqual([answer]);
+    expect(toAnthropicContent([carrier(serverUse), answer as ContentBlock], { role: 'assistant' })).toEqual([answer]);
   });
 
   it.each([[undefined], ['user' as const]])('with role %s, leaves them out, bare or on a carrier', (role) => {
@@ -619,5 +625,102 @@ describe('an adapter Membrane doesn\'t replay them through', () => {
     expect(sent[0].messages[1].content).toEqual([thinking1, thinking2, answer]);
     expect(new AnthropicAdapter({ apiKey: 'zz-key', cacheKeepalive: { enabled: false } }).replaysAnthropicServerBlocks).toBe(true);
     expect(new BedrockAdapter({ accessKeyId: 'zz', secretAccessKey: 'zz', region: 'us-west-2' }).replaysAnthropicServerBlocks).toBeUndefined();
+  });
+});
+
+describe('a server call and its result go out together, or not at all', () => {
+  const call = (id: string) => ({ type: 'server_tool_use', id, name: 'web_search', input: { query: 'zz' } });
+  const result = (id: string) => ({ type: 'web_search_tool_result', tool_use_id: id, content: [] });
+  const say = (text: string): ContentBlock => ({ type: 'text', text });
+  const options = (notes: FidelityNotes, extra: Record<string, unknown> = {}) =>
+    ({ assistantParticipant: 'Claude', participantMode: 'multiuser', fidelity: notes, ...extra }) as any;
+
+  it('unpairedServerBlocks names a call with no result after it in the turn, and a result with no call before it', () => {
+    const c1 = call('a'); const r1 = result('a'); const c2 = call('b'); const r3 = result('c');
+    const upload = { type: 'container_upload', file_id: 'zz-file' };
+    const turn = [c1, r1, c2, r3, upload, answer];
+    expect([...unpairedServerBlocks(turn, false)]).toEqual([c2, r3]);
+    // As the request's last message, a paused turn keeps its lone calls, but not a lone result.
+    expect([...unpairedServerBlocks(turn, true)]).toEqual([r3]);
+    // A result before its call pairs with nothing.
+    const r4 = result('d'); const c4 = call('d');
+    expect([...unpairedServerBlocks([r4, c4], false)]).toEqual([r4, c4]);
+    // The MCP connector's pair, by the same rule.
+    const mcpCall = { type: 'mcp_tool_use', id: 'zz-m1', name: 'zz_lookup', server_name: 'zz', input: {} };
+    const mcpResult = { type: 'mcp_tool_result', tool_use_id: 'zz-m1', content: [] };
+    expect(unpairedServerBlocks([mcpCall, mcpResult], false).size).toBe(0);
+    expect([...unpairedServerBlocks([mcpCall], false)]).toEqual([mcpCall]);
+  });
+
+  it('NativeFormatter leaves a lone call or a lone result out of a turn that isn\'t the request\'s last, and names each message', () => {
+    const notes = new FidelityNotes();
+    const built = new NativeFormatter().buildMessages([
+      { participant: 'User', content: [say('zz ask')] },
+      { participant: 'Claude', content: [say('zz searching'), carrier(call('zz-lone-call'))] },
+      { participant: 'User', content: [say('zz go on')] },
+      { participant: 'Claude', content: [carrier(result('zz-lone-result')), say('zz found')] },
+      { participant: 'User', content: [say('zz and?')] },
+    ], options(notes));
+    const sent = JSON.stringify(built.messages);
+    expect(sent).not.toContain('zz-lone-call');
+    expect(sent).not.toContain('zz-lone-result');
+    expect(sent).toContain('zz searching');
+    expect(sent).toContain('zz found');
+    expect([...notes.altered].sort()).toEqual([1, 3]);
+  });
+
+  it('NativeFormatter keeps a lone call in the request\'s last message when it\'s the assistant\'s, as a paused turn is resumed', () => {
+    const notes = new FidelityNotes();
+    const built = new NativeFormatter().buildMessages([
+      { participant: 'User', content: [say('zz ask')] },
+      { participant: 'Claude', content: [say('zz searching'), carrier(call('zz-paused')), carrier(result('zz-no-call'))] },
+    ], options(notes));
+    const last = built.messages.at(-1)!;
+    expect(last.role).toBe('assistant');
+    expect(JSON.stringify(last.content)).toContain('"id":"zz-paused"');
+    expect(JSON.stringify(last.content)).not.toContain('zz-no-call');
+    expect([...notes.altered]).toEqual([1]);
+  });
+
+  it('NativeFormatter sends a call and its result stored as two consecutive assistant messages together, as the one turn they become', () => {
+    const notes = new FidelityNotes();
+    const built = new NativeFormatter().buildMessages([
+      { participant: 'User', content: [say('zz ask')] },
+      { participant: 'Claude', content: [say('zz searching'), carrier(call('zz-split'))] },
+      { participant: 'Claude', content: [carrier(result('zz-split')), say('zz found')] },
+      { participant: 'User', content: [say('zz go on')] },
+    ], options(notes));
+    expect(built.messages.map((message) => message.role)).toEqual(['user', 'assistant', 'user']);
+    const turn = JSON.stringify(built.messages[1]!.content);
+    expect(turn).toContain('"id":"zz-split"');
+    expect(turn).toContain('"tool_use_id":"zz-split"');
+    expect([...notes.altered]).toEqual([]);
+  });
+
+  it('NativeFormatter drops an assistant turn left with nothing, and the user turns around it become one', () => {
+    const notes = new FidelityNotes();
+    const built = new NativeFormatter().buildMessages([
+      { participant: 'User', content: [say('zz ask')] },
+      { participant: 'Claude', content: [carrier(call('zz-only'))] },
+      { participant: 'User', content: [say('zz go on')] },
+    ], options(notes));
+    expect(built.messages.map((message) => message.role)).toEqual(['user']);
+    const sent = JSON.stringify(built.messages);
+    expect(sent).toContain('zz ask');
+    expect(sent).toContain('zz go on');
+    expect(sent).not.toContain('zz-only');
+    expect([...notes.altered]).toEqual([1]);
+  });
+
+  it('NativeFormatter moves a marker from a block it leaves out to the turn\'s last block that can hold one', () => {
+    const notes = new FidelityNotes();
+    const built = new NativeFormatter().buildMessages([
+      { participant: 'User', content: [say('zz ask')] },
+      { participant: 'Claude', content: [say('zz searching'), carrier(call('zz-marked'))], cacheBreakpoint: true },
+      { participant: 'User', content: [say('zz go on')] },
+    ], options(notes, { promptCaching: true }));
+    const turn = built.messages[1]!.content as Array<Record<string, unknown>>;
+    expect(JSON.stringify(turn)).not.toContain('zz-marked');
+    expect(turn.at(-1)!.cache_control).toEqual({ type: 'ephemeral' });
   });
 });

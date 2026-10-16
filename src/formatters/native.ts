@@ -9,7 +9,7 @@
  * - 'multiuser': Multiple participants, names prefixed to content
  */
 
-import { followNormalizedBlocks, isRawItemCarrier, ownBlocks } from '../utils/fidelity.js';
+import { followNormalizedBlocks, isRawItemCarrier, ownBlocks, type FidelityNotes } from '../utils/fidelity.js';
 import { sanitizeToolName } from '../utils/tool-names.js';
 import { unsupportedError } from '../types/errors.js';
 
@@ -36,7 +36,7 @@ import type {
 import { normalizeToolPairs, mergeConsecutiveRoles } from './normalize-tool-pairs.js';
 import { resolveImageMediaType, isAcceptedImageMediaType, strippedImagePlaceholder } from '../utils/image-media.js';
 import { assertCacheMarkersWithinLimit, countWireCacheMarkers } from '../utils/cache-marker-budget.js';
-import { anthropicServerBlockFor } from '../utils/anthropic-server-blocks.js';
+import { anthropicServerBlockFor, unpairedServerBlocks } from '../utils/anthropic-server-blocks.js';
 
 /** Index of the last content block that can carry cache_control. Anthropic
  *  rejects cache_control on thinking / redacted_thinking blocks, so a cache
@@ -305,7 +305,14 @@ export class NativeFormatter implements PrefillFormatter {
     });
 
     // Merge consecutive same-role messages (API requires alternating)
-    const mergedMessages = mergeConsecutiveRoles(normalized.messages);
+    let mergedMessages = mergeConsecutiveRoles(normalized.messages);
+    // A server call goes out only with its result in its turn, and a result
+    // only with its call: the API refuses either alone. The turn is the one
+    // sent, after the merge, so a call and its result stored as two
+    // consecutive assistant messages stay together.
+    if (options.anthropicServerBlocks !== false) {
+      mergedMessages = NativeFormatter.pairServerBlocks(mergedMessages, options.fidelity);
+    }
 
     // Build system content. The system block is cached only as a FALLBACK: a
     // message breakpoint already caches a prefix that begins at the front of
@@ -404,6 +411,40 @@ export class NativeFormatter implements PrefillFormatter {
   // ==========================================================================
   // PRIVATE HELPERS
   // ==========================================================================
+
+  /**
+   * Leave out of each assistant turn the server blocks that can't go alone
+   * (unpairedServerBlocks), reporting each one's message altered. The final
+   * message, if it's the assistant's, keeps its lone calls: a paused turn is
+   * resumed as the request's last message. A marker the builder put on a
+   * block left out moves to the turn's last block that can hold one. A turn
+   * left with nothing is dropped, its marker with it, and its neighbours
+   * merge again.
+   */
+  private static pairServerBlocks(messages: ProviderMessage[], fidelity?: FidelityNotes): ProviderMessage[] {
+    let emptied = false;
+    const paired = messages.map((message, index) => {
+      if (message.role !== 'assistant' || !Array.isArray(message.content)) return message;
+      const unpaired = unpairedServerBlocks(message.content, index === messages.length - 1);
+      if (unpaired.size === 0) return message;
+      const blocks = message.content as Record<string, unknown>[];
+      let marker: unknown;
+      const kept = blocks.filter((block) => {
+        if (!unpaired.has(block)) return true;
+        fidelity?.alterBlock(block);
+        if (block.cache_control) marker = block.cache_control;
+        return false;
+      });
+      if (marker !== undefined && !kept.some((block) => block.cache_control)) {
+        const at = lastCacheableBlockIndex(kept);
+        if (at >= 0) kept[at]!.cache_control = marker;
+      }
+      if (kept.length === 0) emptied = true;
+      return { ...message, content: kept };
+    });
+    if (!emptied) return paired;
+    return mergeConsecutiveRoles(paired.filter((message) => !Array.isArray(message.content) || message.content.length > 0));
+  }
 
   /** Replace API-unacceptable image blocks nested in tool_result content with
    *  text placeholders. Non-array content passes through untouched.

@@ -92,3 +92,42 @@ export function anthropicServerBlockFor(block: unknown): AnthropicServerBlock | 
   const { cache_control: _stored, unparseableInput: _marker, ...sent } = item;
   return sent as AnthropicServerBlock;
 }
+
+/** The server-tool call types: a result's `tool_use_id` names a call's `id`. */
+const ANTHROPIC_SERVER_CALL_TYPES: ReadonlySet<string> = new Set(['server_tool_use', 'mcp_tool_use']);
+
+/**
+ * The Anthropic server-tool blocks of one assistant turn that can't go out:
+ * the API refuses a server call that has no result after it in its turn, and
+ * a result whose call isn't before it in its turn, so a request that replays
+ * either alone fails, and so does every later request that replays the turn
+ * (measured with count_tokens on claude-haiku-4-5 for web search's pair; the
+ * MCP connector's pair is taken to follow the same rule, unprobed). With
+ * `lastTurn`, a lone call can go: a paused turn (`pause_turn`) is resumed by
+ * sending it back as it is, as the request's final message, where the API
+ * takes a lone call. Blocks of no pair (`container_upload`) always can.
+ */
+export function unpairedServerBlocks(turn: readonly unknown[], lastTurn: boolean): Set<unknown> {
+  const callAt = new Map<string, number>();
+  const answeredAt = new Map<string, number>();
+  turn.forEach((block, i) => {
+    if (!isAnthropicServerBlock(block)) return;
+    if (ANTHROPIC_SERVER_CALL_TYPES.has(block.type)) {
+      if (typeof block.id === 'string' && !callAt.has(block.id)) callAt.set(block.id, i);
+    } else if (typeof block.tool_use_id === 'string') {
+      answeredAt.set(block.tool_use_id, Math.max(answeredAt.get(block.tool_use_id) ?? -1, i));
+    }
+  });
+  const unpaired = new Set<unknown>();
+  turn.forEach((block, i) => {
+    if (!isAnthropicServerBlock(block)) return;
+    if (ANTHROPIC_SERVER_CALL_TYPES.has(block.type)) {
+      const answered = typeof block.id === 'string' && (answeredAt.get(block.id) ?? -1) > i;
+      if (!answered && !lastTurn) unpaired.add(block);
+    } else if (typeof block.tool_use_id === 'string') {
+      const call = callAt.get(block.tool_use_id);
+      if (call === undefined || call > i) unpaired.add(block);
+    }
+  });
+  return unpaired;
+}

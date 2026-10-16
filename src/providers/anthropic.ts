@@ -7,7 +7,7 @@ import { assertMessagePrefillSupported } from './request-capabilities.js';
 
 import Anthropic, { type ClientOptions } from '@anthropic-ai/sdk';
 import { stripEmptyTextBlocks, stripEmptyTextRequest } from '../utils/empty-text.js';
-import { anthropicServerBlockFor, isAnthropicServerBlock, type AnthropicServerBlock } from '../utils/anthropic-server-blocks.js';
+import { anthropicServerBlockFor, isAnthropicServerBlock, unpairedServerBlocks, type AnthropicServerBlock } from '../utils/anthropic-server-blocks.js';
 import { resolveImageMediaType, isAcceptedImageMediaType, assertWithinByteBudget, shedImagesToFitByteBudget } from '../utils/image-media.js';
 import type {
   ProviderAdapter,
@@ -1133,10 +1133,15 @@ export function detectImageMediaType(data: string | undefined, fallback?: string
  * With `role: 'assistant'`, an Anthropic server-tool block, or its zero-width
  * carrier, goes out as the block itself, in the place it had in the turn that
  * produced it, as NativeFormatter sends it when its build replays server
- * blocks (see utils/anthropic-server-blocks.ts). Otherwise it's left out, as
- * NativeFormatter leaves it out of a user turn, which has no place for one. A
- * caller that names no role gets that too, as it always got for a carrier.
- * Nothing reports what it leaves out: it has no alteration callback.
+ * blocks (see utils/anthropic-server-blocks.ts), except a server call with no
+ * result after it in the turn, or a result with no call before it, which the
+ * API refuses (unpairedServerBlocks). The one turn this converts can't say
+ * whether it's a paused turn being resumed as the request's last message,
+ * where a lone call can go, so it leaves every lone one out. In any other
+ * role a server block is left out, as NativeFormatter leaves it out of a user
+ * turn, which has no place for one. A caller that names no role gets that
+ * too, as it always got for a carrier. Nothing reports what it leaves out: it
+ * has no alteration callback.
  */
 export function toAnthropicContent(
   blocks: ContentBlock[],
@@ -1149,13 +1154,13 @@ export function toAnthropicContent(
   // the model produced (see utils/anthropic-server-blocks.ts). In an
   // assistant turn, swap it in before the empty-text cleanup, which would
   // drop the carrier as empty text; in any other, leave it out.
-  const sendable = stripEmptyTextBlocks(
-    blocks.flatMap((block): Array<ContentBlock | AnthropicServerBlock> => {
-      const serverBlock = anthropicServerBlockFor(block);
-      if (serverBlock === undefined) return [block];
-      return options.role === 'assistant' ? [serverBlock] : [];
-    }),
-  );
+  const swapped = blocks.flatMap((block): Array<ContentBlock | AnthropicServerBlock> => {
+    const serverBlock = anthropicServerBlockFor(block);
+    if (serverBlock === undefined) return [block];
+    return options.role === 'assistant' ? [serverBlock] : [];
+  });
+  const unpaired = unpairedServerBlocks(swapped, false);
+  const sendable = stripEmptyTextBlocks(swapped.filter((block) => !unpaired.has(block)));
   for (const block of sendable) {
     if (isAnthropicServerBlock(block)) {
       result.push(block as unknown as Anthropic.ContentBlockParam);

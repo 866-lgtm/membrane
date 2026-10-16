@@ -1030,15 +1030,17 @@ describe('slimepriestess\'s review of #104', () => {
   describe('a zero-width carrier is all raw form: a path that leaves it out alters its message, and one that sends its item carries it', () => {
     // How Anthropic's unconvertible response blocks (server-tool results) are kept.
     const carrier = (): ContentBlock => ({ type: 'text', text: '', rawItem: { type: 'web_search_tool_result', tool_use_id: 'srv_1', content: [] } }) as ContentBlock;
+    // The call the result answers: the API takes a result only after its call.
+    const callCarrier = (): ContentBlock => ({ type: 'text', text: '', rawItem: { type: 'server_tool_use', id: 'srv_1', name: 'web_search', input: { query: 'zz' } } }) as ContentBlock;
     const conversations = {
       'beside text': (): NormalizedRequest['messages'] => [
         { participant: 'User', content: [text('search for it')] },
-        { participant: 'Claude', content: [text('found it'), carrier()] },
+        { participant: 'Claude', content: [text('found it'), callCarrier(), carrier()] },
         { participant: 'User', content: [text('go on')] },
       ],
       alone: (): NormalizedRequest['messages'] => [
         { participant: 'User', content: [text('search for it')] },
-        { participant: 'Claude', content: [carrier()] },
+        { participant: 'Claude', content: [callCarrier(), carrier()] },
         { participant: 'User', content: [text('go on')] },
       ],
     };
