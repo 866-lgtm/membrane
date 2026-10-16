@@ -5,6 +5,13 @@
  * `openaiResponsesItems` or on content blocks as `rawItem`. Those items are
  * emitted verbatim and in order. Normalized messages created after import are
  * converted to Responses input items without rewriting the native prefix.
+ *
+ * Native items stand in for what they're attached to: a message's metadata
+ * items for its whole content (an empty array sends nothing), a block's
+ * `rawItem` for that block. The fields they replace aren't read, and round
+ * reports count the message or block as carried when its items are
+ * (utils/fidelity.ts). Blocks whose items share a type and id are one item,
+ * sent once; a block whose item differs under the same key isn't carried.
  */
 
 import type {
@@ -22,7 +29,7 @@ import type {
   StreamEmission,
   StreamParser,
 } from './types.js';
-import { responsesToolOutputParts } from '../providers/responses-input.js';
+import { responsesToolOutputLoses, responsesToolOutputParts } from '../providers/responses-input.js';
 
 import { resolveImageMediaType } from '../utils/image-media.js';
 
@@ -74,15 +81,32 @@ class ResponsesPassthroughParser implements StreamParser {
 
 type NativeItem = { type?: string; id?: string; [key: string]: unknown };
 
+/**
+ * The identity under which a block's rawItem is replayed: by type and id, or
+ * by its JSON when it has no id. Blocks of one message whose raw items share
+ * a key replay that item once.
+ */
+export function responsesRawItemKey(rawItem: { type?: unknown; id?: unknown }): string {
+  return typeof rawItem.id === 'string'
+    ? `${rawItem.type ?? ''}:${rawItem.id}`
+    : JSON.stringify(rawItem);
+}
+
 export class OpenAIResponsesFormatter implements PrefillFormatter {
   readonly name = 'openai-responses';
   readonly usesPrefill = false;
+  readonly supportsNativeTools = true;
+  readonly supportsXmlTools = false;
+  /** buildMessages records every consumer message it doesn't carry verbatim (utils/fidelity.ts). */
+  readonly reportsAlterations = true;
 
   buildMessages(messages: NormalizedMessage[], options: BuildOptions): BuildResult {
     const items: NativeItem[] = [];
     let hasImportedItems = false;
 
-    for (const message of messages) {
+    for (let index = 0; index < messages.length; index++) {
+      const message = messages[index]!;
+      const onAltered = options.fidelity ? () => options.fidelity!.alter(index) : undefined;
       const nativeItems = message.metadata?.[OPENAI_RESPONSES_ITEMS_METADATA_KEY];
       if (Array.isArray(nativeItems)) {
         items.push(...nativeItems as NativeItem[]);
@@ -90,11 +114,13 @@ export class OpenAIResponsesFormatter implements PrefillFormatter {
         continue;
       }
 
-      const seenRawItems = new Set<string>();
+      // Each item sent, by its key: blocks of one item share it (the adapter
+      // gives them one object; a JSON round trip, equal copies).
+      const seenRawItems = new Map<string, NativeItem>();
       let pendingParts: ContentBlock[] = [];
       const flushPending = () => {
         if (pendingParts.length === 0) return;
-        items.push(...this.convertBlocks(message, pendingParts, options.assistantParticipant));
+        items.push(...this.convertBlocks(message, pendingParts, options.assistantParticipant, onAltered));
         pendingParts = [];
       };
 
@@ -106,12 +132,15 @@ export class OpenAIResponsesFormatter implements PrefillFormatter {
         }
 
         flushPending();
-        const key = typeof rawItem.id === 'string'
-          ? `${rawItem.type ?? ''}:${rawItem.id}`
-          : JSON.stringify(rawItem);
-        if (!seenRawItems.has(key)) {
+        const key = responsesRawItemKey(rawItem);
+        const sent = seenRawItems.get(key);
+        if (!sent) {
           items.push(rawItem);
-          seenRawItems.add(key);
+          seenRawItems.set(key, rawItem);
+        } else if (sent !== rawItem && JSON.stringify(sent) !== JSON.stringify(rawItem)) {
+          // Another block's item went out under this key, so this block's
+          // differing item isn't carried.
+          onAltered?.();
         }
       }
       flushPending();
@@ -154,6 +183,7 @@ export class OpenAIResponsesFormatter implements PrefillFormatter {
     message: NormalizedMessage,
     blocks: ContentBlock[],
     assistantParticipant: string,
+    onAltered?: () => void,
   ): NativeItem[] {
     const isAssistant = message.participant === assistantParticipant;
     const out: NativeItem[] = [];
@@ -190,6 +220,9 @@ export class OpenAIResponsesFormatter implements PrefillFormatter {
         });
       } else if (block.type === 'tool_result') {
         flushMessage();
+        // A function_call_output has no error flag, so a failed result reads
+        // as a plain one.
+        if (responsesToolOutputLoses(block.content) || block.isError) onAltered?.();
         out.push({
           type: 'function_call_output',
           call_id: block.toolUseId,
@@ -203,6 +236,10 @@ export class OpenAIResponsesFormatter implements PrefillFormatter {
       } else if (block.type === 'redacted_thinking') {
         flushMessage();
         out.push({ type: 'reasoning', encrypted_content: block.data, summary: [] });
+      } else {
+        // An assistant image, a thinking block without its provider item, and
+        // any other block type have no input form here: left out.
+        onAltered?.();
       }
     }
     flushMessage();

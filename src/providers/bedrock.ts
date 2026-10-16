@@ -4,6 +4,9 @@
  * Uses the Anthropic Messages API format through AWS Bedrock.
  */
 
+import { unreportedUsage } from '../utils/usage.js';
+import { assertMessagePrefillSupported } from './request-capabilities.js';
+
 import type {
   ProviderAdapter,
   ProviderRequest,
@@ -15,17 +18,21 @@ import type {
 import {
   MembraneError,
   invalidRequestError,
-  rateLimitError,
-  contextLengthError,
-  authError,
-  serverError,
   abortError,
+  classifyError,
+  errorFromHttpResponse,
+  errorFromProviderStatus,
+  isTypedAbortError,
+  withRawRequest,
 } from '../types/index.js';
 import { stripEmptyTextRequest } from '../utils/empty-text.js';
-import { createCombinedSignal, isDeadlineAbort, deadlineTimeoutError, assertTerminalEventObserved } from './utils.js';
+import { createCombinedSignal, isDeadlineAbort, deadlineTimeoutError, assertTerminalEventObserved, toolUseInputFromText, toolUseInputFromValue } from './utils.js';
 import {
   INTERLEAVED_THINKING_BETA,
+  THINKING_BINDING_BETA,
   needsInterleavedThinkingBeta,
+  readInputTransformations,
+  sendsBlockBinding,
   thinkingEnabled,
   detectImageMediaType,
 } from './anthropic.js';
@@ -81,7 +88,11 @@ interface BedrockMessageRequest {
   top_k?: number;
   stop_sequences?: string[];
   tools?: unknown[];
-  thinking?: { type: 'enabled'; budget_tokens: number };
+  /** As membrane builds it: enabled with a budget, or adaptive, either with
+   *  `display` and binding controls when they're set. */
+  thinking?:
+    | { type: 'enabled'; budget_tokens: number; display?: 'summarized' | 'omitted'; block_binding?: { prefix_mismatch_behavior: 'error' | 'drop_block' } }
+    | { type: 'adaptive'; display?: 'summarized' | 'omitted'; block_binding?: { prefix_mismatch_behavior: 'error' | 'drop_block' } };
   /** Beta flags. On bedrock-runtime these ride in the body, not a header. */
   anthropic_beta?: string[];
 }
@@ -98,6 +109,8 @@ interface BedrockMessageResponse {
     id?: string;
     name?: string;
     input?: unknown;
+    /** Set by the stream assembly, never by Bedrock (ToolUseContent.unparseableInput). */
+    unparseableInput?: string;
   }>;
   model: string;
   stop_reason: 'end_turn' | 'max_tokens' | 'stop_sequence' | 'tool_use' | null;
@@ -108,6 +121,8 @@ interface BedrockMessageResponse {
     cache_creation_input_tokens?: number;
     cache_read_input_tokens?: number;
   };
+  /** The thinking-binding report (with THINKING_BINDING_BETA). */
+  input_transformations?: unknown;
 }
 
 interface BedrockStreamEvent {
@@ -136,6 +151,8 @@ interface BedrockStreamEvent {
     cache_creation_input_tokens?: number | null;
     cache_read_input_tokens?: number | null;
   };
+  /** On message_delta, after a server-side model fallback: the serving model's report. */
+  input_transformations?: unknown;
 }
 
 /**
@@ -274,6 +291,13 @@ async function signRequest(
 
 export class BedrockAdapter implements ProviderAdapter {
   readonly name = 'bedrock';
+  /**
+   * Reports what it leaves out: whitespace-only text its cleanup removes, and
+   * a passthrough `messages` that replaces the built ones. Otherwise it
+   * carries message content as built, nested tool-result blocks included;
+   * only wire fields (sourceUrl, cache ttl, media_type spelling) change.
+   */
+  readonly reportsContentAlterations = true;
   readonly cacheReceiptBasis = 'wire-request' as const;
 
   /**
@@ -372,13 +396,14 @@ export class BedrockAdapter implements ProviderAdapter {
     options?: ProviderRequestOptions
   ): Promise<ProviderResponse> {
     const bedrockModelId = this.toBedrockModelId(request.model);
-    const bedrockRequest = this.buildRequest(request, bedrockModelId);
+    const bedrockRequest = this.buildRequest(request, bedrockModelId, options?.onContentAltered);
     const fullRequest = { modelId: bedrockModelId, ...bedrockRequest };
+    assertMessagePrefillSupported(bedrockModelId, fullRequest.messages, options, this.name, fullRequest);
     options?.onRequest?.(fullRequest);
 
     const { signal: combinedSignal, cleanup } = createCombinedSignal(options?.signal, options?.timeoutMs);
     try {
-      const response = await this.invokeModel(bedrockModelId, bedrockRequest, combinedSignal);
+      const response = await this.invokeModel(bedrockModelId, bedrockRequest, combinedSignal, fullRequest);
       return this.parseResponse(response, fullRequest);
     } catch (error) {
       throw this.handleError(error, fullRequest);
@@ -393,13 +418,14 @@ export class BedrockAdapter implements ProviderAdapter {
     options?: ProviderRequestOptions
   ): Promise<ProviderResponse> {
     const bedrockModelId = this.toBedrockModelId(request.model);
-    const bedrockRequest = this.buildRequest(request, bedrockModelId);
+    const bedrockRequest = this.buildRequest(request, bedrockModelId, options?.onContentAltered);
     const fullRequest = { modelId: bedrockModelId, ...bedrockRequest, stream: true };
+    assertMessagePrefillSupported(bedrockModelId, fullRequest.messages, options, this.name, fullRequest);
     options?.onRequest?.(fullRequest);
 
     const { signal: combinedSignal, cleanup } = createCombinedSignal(options?.signal, options?.timeoutMs);
     try {
-      return await this.invokeModelWithStream(bedrockModelId, bedrockRequest, callbacks, combinedSignal);
+      return await this.invokeModelWithStream(bedrockModelId, bedrockRequest, callbacks, combinedSignal, fullRequest, options?.onProgress);
     } catch (error) {
       throw this.handleError(error, fullRequest);
     } finally {
@@ -407,7 +433,14 @@ export class BedrockAdapter implements ProviderAdapter {
     }
   }
 
-  private buildRequest(request: ProviderRequest, bedrockModelId?: string): BedrockMessageRequest {
+  private buildRequest(request: ProviderRequest, bedrockModelId?: string, onContentAltered?: (block?: unknown) => void): BedrockMessageRequest {
+    // Wire copies of the request's own blocks, so a block the cleanup drops
+    // is reported as the block membrane built (and can attribute).
+    const originals = new WeakMap<object, unknown>();
+    const remember = <T>(copy: T, original: unknown): T => {
+      if (copy !== original && copy !== null && typeof copy === 'object') originals.set(copy as object, original);
+      return copy;
+    };
     // Strip provider-specific fields (e.g., sourceUrl for Gemini) from image blocks
     // before sending to Bedrock/Anthropic, which rejects extra inputs.
     //
@@ -440,7 +473,7 @@ export class BedrockAdapter implements ProviderAdapter {
       if (!Array.isArray(msg.content)) return msg;
       return {
         ...msg,
-        content: msg.content.map((block: any) => {
+        content: msg.content.map((block: any) => remember((() => {
           if (block.type === 'image' && block.sourceUrl !== undefined) {
             const { sourceUrl, ...rest } = block;
             return stripCacheTtl(toWireImage(rest));
@@ -457,7 +490,7 @@ export class BedrockAdapter implements ProviderAdapter {
             });
           }
           return stripCacheTtl(block);
-        }),
+        })(), block)),
       };
     });
 
@@ -514,6 +547,8 @@ export class BedrockAdapter implements ProviderAdapter {
     // Apply extra params, excluding internal membrane fields
     if (request.extra) {
       const { normalizedMessages, prompt, ...rest } = request.extra as Record<string, unknown>;
+      // A passthrough `messages` replaces the built messages wholesale.
+      if (rest.messages !== undefined) onContentAltered?.();
       Object.assign(params, rest);
     }
 
@@ -537,15 +572,23 @@ export class BedrockAdapter implements ProviderAdapter {
       const existing = params.anthropic_beta ?? [];
       params.anthropic_beta = [...new Set([...existing, INTERLEAVED_THINKING_BETA])];
     }
+    // Thinking-binding controls need their beta, the same way.
+    if (sendsBlockBinding(params)) {
+      const existing = params.anthropic_beta ?? [];
+      params.anthropic_beta = [...new Set([...existing, THINKING_BINDING_BETA])];
+    }
 
-    stripEmptyTextRequest(params);
+    stripEmptyTextRequest(params, onContentAltered
+      ? (dropped) => onContentAltered(dropped !== null && typeof dropped === 'object' ? originals.get(dropped) ?? dropped : dropped)
+      : undefined);
     return params;
   }
 
   private async invokeModel(
     modelId: string,
     request: BedrockMessageRequest,
-    signal?: AbortSignal
+    signal: AbortSignal | undefined,
+    rawRequest: unknown
   ): Promise<BedrockMessageResponse> {
     const url = new URL(
       `${this.baseURL ?? `https://bedrock-runtime.${this.region}.amazonaws.com`}/model/${encodeURIComponent(modelId)}/invoke`
@@ -577,8 +620,7 @@ export class BedrockAdapter implements ProviderAdapter {
     });
 
     if (!response.ok) {
-      const errorText = await response.text();
-      throw new BedrockError(response.status, errorText);
+      throw errorFromHttpResponse(this.name, response, await response.text(), rawRequest);
     }
 
     return response.json() as Promise<BedrockMessageResponse>;
@@ -588,7 +630,9 @@ export class BedrockAdapter implements ProviderAdapter {
     modelId: string,
     request: BedrockMessageRequest,
     callbacks: StreamCallbacks,
-    signal?: AbortSignal
+    signal: AbortSignal | undefined,
+    rawRequest: unknown,
+    onProgress?: () => void,
   ): Promise<ProviderResponse> {
     const url = new URL(
       `${this.baseURL ?? `https://bedrock-runtime.${this.region}.amazonaws.com`}/model/${encodeURIComponent(modelId)}/invoke-with-response-stream`
@@ -620,22 +664,29 @@ export class BedrockAdapter implements ProviderAdapter {
     });
 
     if (!response.ok) {
-      const errorText = await response.text();
-      throw new BedrockError(response.status, errorText);
+      throw errorFromHttpResponse(this.name, response, await response.text(), rawRequest);
     }
 
     // Parse the binary event stream
     const contentBlocks: Array<{ type: string; text?: string; thinking?: string; signature?: string }> = [];
+    // Indices of blocks content_block_stop finalized. A tool call truncated by
+    // max_tokens never gets one, as in the Anthropic adapter.
+    const stoppedBlocks = new Set<number>();
     let currentBlockIndex = -1;
     let finalMessage: BedrockMessageResponse | undefined;
     let inputTokens = 0;
     let outputTokens = 0;
+    // Whether the stream reported each count (an unreported one stays a 0 default).
+    let inputReported = false;
+    let outputReported = false;
     let cacheCreationTokens: number | undefined;
     let cacheReadTokens: number | undefined;
-    let stopReason: string = 'end_turn';
+    let stopReason: string | undefined;
     let sawTerminalEvent = false;
     let stopSequence: string | undefined;
     let fullText = '';
+    // Final in message_start, replaced by a message_delta's after a fallback.
+    let inputTransformations: unknown;
 
     const reader = response.body?.getReader();
     if (!reader) {
@@ -719,8 +770,9 @@ export class BedrockAdapter implements ProviderAdapter {
               // Use exception type as message
             }
             throw new BedrockError(
-              exceptionType.toLowerCase().includes('throttl') ? 429 : 500,
-              `Bedrock stream error (${exceptionType}): ${errorMessage}`
+              BEDROCK_STREAM_EXCEPTION_STATUS.get(exceptionType.toLowerCase()) ?? 500,
+              `Bedrock stream error (${exceptionType}): ${errorMessage}`,
+              exceptionType
             );
           }
 
@@ -737,12 +789,20 @@ export class BedrockAdapter implements ProviderAdapter {
                   bytes[i] = binaryStr.charCodeAt(i);
                 }
                 const eventData = JSON.parse(new TextDecoder().decode(bytes)) as BedrockStreamEvent;
+                // A decoded model event is progress; a ping only proves the connection.
+                if ((eventData as { type?: string }).type !== 'ping') onProgress?.();
 
                 // Check for error events within the stream
                 if (eventData.type === 'error') {
+                  // Anthropic's own error event: its error.type
+                  // (overloaded_error, rate_limit_error, ...) is the code
+                  // the shared table reads a status from; one it doesn't
+                  // know stays a 500.
+                  const streamError = (eventData as any).error;
                   throw new BedrockError(
-                    500,
-                    `Bedrock stream error: ${(eventData as any).error?.message || JSON.stringify(eventData)}`
+                    undefined,
+                    `Bedrock stream error: ${streamError?.message || JSON.stringify(eventData)}`,
+                    typeof streamError?.type === 'string' ? streamError.type : undefined
                   );
                 }
 
@@ -752,8 +812,10 @@ export class BedrockAdapter implements ProviderAdapter {
                   // permanently inert on Bedrock streams: complete() surfaced
                   // them, stream() zeroed them, and every ledger/pricing
                   // consumer downstream saw zeros. (Connectome issue #35.)
+                  inputTransformations = eventData.message.input_transformations;
                   const startUsage = eventData.message.usage;
                   inputTokens = startUsage?.input_tokens ?? 0;
+                  inputReported = typeof startUsage?.input_tokens === 'number';
                   if (startUsage?.cache_creation_input_tokens != null) {
                     cacheCreationTokens = startUsage.cache_creation_input_tokens;
                   }
@@ -779,6 +841,9 @@ export class BedrockAdapter implements ProviderAdapter {
                   } else if (eventData.delta?.type === 'signature_delta' && (eventData.delta as any).signature) {
                     if (contentBlocks[currentBlockIndex]) {
                       contentBlocks[currentBlockIndex]!.signature = (contentBlocks[currentBlockIndex]!.signature ?? '') + (eventData.delta as any).signature;
+                      // Reported as it accumulates, so a stream that ends before
+                      // content_block_stop still keeps the signature it received.
+                      callbacks.onThinkingSignature?.(currentBlockIndex, contentBlocks[currentBlockIndex]!.signature!);
                     }
                   } else if (eventData.delta?.type === 'input_json_delta' && (eventData.delta as any).partial_json !== undefined) {
                     // Tool-call arguments stream as input_json_delta fragments.
@@ -797,18 +862,26 @@ export class BedrockAdapter implements ProviderAdapter {
                   // on the dual-fire convention (e.g. membrane's native
                   // yielding path) silently drops block_complete on Bedrock.
                   const blockIdx = (eventData as { index?: number }).index ?? currentBlockIndex;
+                  stoppedBlocks.add(blockIdx);
                   // Finalize tool_use blocks: parse accumulated argument JSON
                   // into `input` before the block_complete fire, so consumers
                   // of the dual-fire convention see a complete tool call.
-                  const stoppedBlk = contentBlocks[blockIdx] as ((typeof contentBlocks)[number] & { partialJson?: string; input?: unknown }) | undefined;
+                  const stoppedBlk = contentBlocks[blockIdx] as ((typeof contentBlocks)[number] & { partialJson?: string; input?: unknown; unparseableInput?: string }) | undefined;
                   if (stoppedBlk?.type === 'tool_use' && stoppedBlk.partialJson !== undefined) {
-                    try { stoppedBlk.input = JSON.parse(stoppedBlk.partialJson || '{}'); } catch { /* keep prior input */ }
+                    // As in the Anthropic adapter: arguments that don't parse,
+                    // or parse to anything but an object, leave the input
+                    // content_block_start carried, and the raw text marks it.
+                    const parsed = toolUseInputFromText(stoppedBlk.partialJson);
+                    if (parsed.unparseableInput === undefined) stoppedBlk.input = parsed.input;
+                    else stoppedBlk.unparseableInput = parsed.unparseableInput;
                   }
                   callbacks.onContentBlock?.(blockIdx, contentBlocks[blockIdx]);
                 } else if (eventData.type === 'message_delta') {
                   sawTerminalEvent = true;
+                  if (Array.isArray(eventData.input_transformations)) inputTransformations = eventData.input_transformations;
                   if (eventData.usage) {
                     outputTokens = eventData.usage.output_tokens;
+                    if (typeof eventData.usage.output_tokens === 'number') outputReported = true;
                     // message_delta carries cumulative cache metrics — use as
                     // authoritative when present (same contract as the
                     // Anthropic adapter).
@@ -868,7 +941,7 @@ export class BedrockAdapter implements ProviderAdapter {
       id: 'msg_stream',
       type: 'message',
       role: 'assistant',
-      content: contentBlocks.map(b => {
+      content: contentBlocks.map((b, blockIdx) => {
         if (b.type === 'thinking') {
           return { type: 'thinking' as const, thinking: b.thinking ?? '', signature: b.signature };
         }
@@ -880,17 +953,22 @@ export class BedrockAdapter implements ProviderAdapter {
           // Preserve id/name and the input accumulated from input_json_delta
           // fragments — the generic text mapping below would strip them and
           // parseResponse would then drop the block (requires id && name).
-          const tb = b as { type: string; id?: string; name?: string; input?: unknown; partialJson?: string };
-          let input: unknown = tb.input ?? {};
-          if (tb.partialJson) {
-            try { input = JSON.parse(tb.partialJson); } catch { /* keep prior input */ }
-          }
-          return { type: 'tool_use', id: tb.id, name: tb.name, input } as unknown as { type: 'text'; text?: string };
+          const tb = b as { type: string; id?: string; name?: string; input?: unknown; partialJson?: string; unparseableInput?: string };
+          // A block content_block_stop finalized keeps what it set there. One
+          // the stream left open keeps the input content_block_start carried,
+          // and whatever argument text arrived marks it, none included, as in
+          // the Anthropic adapter: the call never finished, so nothing says
+          // its arguments were complete, even text that parses.
+          const unparseableInput = stoppedBlocks.has(blockIdx) ? tb.unparseableInput : (tb.partialJson ?? '');
+          return {
+            type: 'tool_use', id: tb.id, name: tb.name, input: tb.input ?? {},
+            ...(unparseableInput !== undefined ? { unparseableInput } : {}),
+          } as unknown as { type: 'text'; text?: string };
         }
         return { type: b.type as 'text', text: b.text };
       }),
       model: modelId,
-      stop_reason: stopReason as BedrockMessageResponse['stop_reason'],
+      stop_reason: (stopReason ?? 'end_turn') as BedrockMessageResponse['stop_reason'],
       stop_sequence: stopSequence ?? null,
       usage: {
         input_tokens: inputTokens,
@@ -898,9 +976,16 @@ export class BedrockAdapter implements ProviderAdapter {
         ...(cacheCreationTokens != null ? { cache_creation_input_tokens: cacheCreationTokens } : {}),
         ...(cacheReadTokens != null ? { cache_read_input_tokens: cacheReadTokens } : {}),
       },
+      ...(Array.isArray(inputTransformations) ? { input_transformations: inputTransformations } : {}),
     };
 
-    return this.parseResponse(finalMessage, { modelId, ...request, stream: true });
+    const parsed = this.parseResponse(finalMessage, rawRequest);
+    const { unreportedUsage: _fromSynthetic, ...rest } = parsed;
+    return {
+      ...rest,
+      ...unreportedUsage(inputReported ? inputTokens : undefined, outputReported ? outputTokens : undefined),
+      providerStopReason: stopReason,
+    };
   }
 
   private parseResponse(response: BedrockMessageResponse, rawRequest: unknown): ProviderResponse {
@@ -910,11 +995,14 @@ export class BedrockAdapter implements ProviderAdapter {
       if (block.type === 'text' && block.text) {
         content.push({ type: 'text', text: block.text });
       } else if (block.type === 'tool_use' && block.id && block.name) {
+        // The stream assembly's marker, which keeps the text as it came, wins
+        // over the value's JSON.
         content.push({
           type: 'tool_use',
           id: block.id,
           name: block.name,
-          input: block.input as Record<string, unknown>,
+          ...toolUseInputFromValue(block.input),
+          ...(block.unparseableInput !== undefined ? { unparseableInput: block.unparseableInput } : {}),
         });
       } else if (block.type === 'thinking') {
         // Signature-only thinking blocks (display:'omitted') have an empty
@@ -933,6 +1021,7 @@ export class BedrockAdapter implements ProviderAdapter {
     return {
       content,
       stopReason: response.stop_reason ?? 'end_turn',
+      providerStopReason: response.stop_reason ?? undefined,
       stopSequence: response.stop_sequence ?? undefined,
       usage: {
         inputTokens: response.usage.input_tokens,
@@ -940,53 +1029,41 @@ export class BedrockAdapter implements ProviderAdapter {
         cacheCreationTokens: response.usage.cache_creation_input_tokens,
         cacheReadTokens: response.usage.cache_read_input_tokens,
       },
+      ...unreportedUsage(response.usage?.input_tokens, response.usage?.output_tokens),
+      ...readInputTransformations(response.input_transformations, (rawRequest as { messages?: unknown } | undefined)?.messages),
       model: response.model,
       rawRequest,
       raw: response,
     };
   }
 
+  /**
+   * HTTP failures are classified at the fetch boundary. What reaches here is
+   * a synthesized stream-event failure (BedrockError, which carries the
+   * status its exception type implies, and the type itself as the provider
+   * code), a typed abort, or a non-HTTP throwable.
+   */
   private handleError(error: unknown, rawRequest?: unknown): MembraneError {
-    // A deadline abort is a timeout and stays one. Collapsing it into a bare
-    // abortError() here is what erased the identity before Membrane's
-    // caller-signal > timeout > error ladder could read it.
     if (isDeadlineAbort(error)) return deadlineTimeoutError(error, rawRequest);
-    // Already-classified failures (e.g. the stream-integrity guards) keep
-    // their type and retryability instead of being re-derived from a string.
-    if (error instanceof MembraneError) return error;
+    if (error instanceof MembraneError) return withRawRequest(error, rawRequest);
+    if (isTypedAbortError(error)) return abortError(undefined, rawRequest);
 
     if (error instanceof BedrockError) {
-      const status = error.status;
-      const message = error.message;
-
-      if (status === 429) {
-        return rateLimitError(message, undefined, error, rawRequest);
-      }
-
-      if (status === 401 || status === 403) {
-        return authError(message, error, rawRequest);
-      }
-
-      if (message.includes('context') || message.includes('too long') || message.includes('token')) {
-        return contextLengthError(message, error, rawRequest);
-      }
-
-      if (status >= 500) {
-        return serverError(message, status, error, rawRequest);
-      }
+      return errorFromProviderStatus({
+        provider: this.name,
+        status: error.status,
+        fallbackStatus: 500,
+        code: error.code,
+        body: error.message,
+        message: error.message,
+        rawError: error,
+        rawRequest,
+      });
     }
 
-    if (error instanceof Error && error.name === 'AbortError') {
-      return abortError(undefined, rawRequest);
-    }
-
-    return new MembraneError({
-      type: 'unknown',
-      message: error instanceof Error ? error.message : String(error),
-      retryable: false,
-      rawError: error,
-      rawRequest,
-    });
+    const info = classifyError(error);
+    info.rawRequest = rawRequest;
+    return new MembraneError(info);
   }
 }
 
@@ -996,10 +1073,29 @@ export class BedrockAdapter implements ProviderAdapter {
 
 class BedrockError extends Error {
   constructor(
-    public status: number,
-    message: string
+    /** Undefined when the code decides it (a 500 if the table doesn't know the code). */
+    public status: number | undefined,
+    message: string,
+    /** The exception's own type, or an in-band error event's error.type. */
+    public code?: string
   ) {
     super(message);
     this.name = 'BedrockError';
   }
 }
+
+/**
+ * The status each exception Bedrock sends inside a response stream implies:
+ * the HTTP status AWS documents for the same exception. AWS documents
+ * modelStreamErrorException as a 424 and asks for a retry, and a 424 would
+ * read here as a bad request, so it stays a retryable 500. A type not listed
+ * is a 500 too, as every non-throttling exception was.
+ */
+const BEDROCK_STREAM_EXCEPTION_STATUS = new Map<string, number>([
+  ['validationexception', 400],
+  ['modeltimeoutexception', 408],
+  ['throttlingexception', 429],
+  ['internalserverexception', 500],
+  ['modelstreamerrorexception', 500],
+  ['serviceunavailableexception', 503],
+]);

@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { AnthropicAdapter } from '../../src/providers/anthropic.js';
+import { createProgressDeadline } from '../../src/providers/utils.js';
 import type { ProviderRequest } from '../../src/types/index.js';
 
 /**
@@ -134,6 +135,27 @@ describe('Anthropic stream idle watchdog with live transport', () => {
       type: 'timeout', retryable: true, message: expect.stringMatching(/first-event timeout/),
     });
     expect(probes[0]?.torn).toBe(true);
+  });
+
+  it('keeps the first-event deadline fixed with a longer shared progress deadline', async () => {
+    stubFetch(init => liveResponse(init, async io => {
+      await keepalives(io, LIVE_MS);
+      io.emit(messageStart());
+      for (const part of answer()) io.emit(part);
+      io.close();
+    }));
+    const progress = createProgressDeadline(undefined, 2 * LIVE_MS);
+    try {
+      await expect(newAdapter().stream(request, { onChunk: () => {} }, {
+        ...timing, signal: progress.signal, onProgress: progress.renew,
+      })).rejects.toMatchObject({
+        type: 'timeout', retryable: true, message: expect.stringMatching(/first-event timeout/),
+      });
+      expect(progress.signal?.aborted).toBe(false);
+      expect(probes[0]?.torn).toBe(true);
+    } finally {
+      progress.cleanup();
+    }
   });
 
   it('enforces the fixed first-event deadline while partial SSE bytes arrive', async () => {

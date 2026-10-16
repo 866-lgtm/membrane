@@ -9,9 +9,11 @@
  * exposes the response's ordered output array verbatim for the next turn.
  */
 
+import { unreportedUsage } from '../utils/usage.js';
 import { createHash, randomUUID } from 'node:crypto';
 import { normalizeResponsesInput } from './responses-input.js';
 import { fetchWithCredentials, type CredentialResolver } from './credentials.js';
+import { assertMessagePrefillSupported } from './request-capabilities.js';
 
 import type {
   ContentBlock,
@@ -24,13 +26,13 @@ import type {
 import {
   MembraneError,
   abortError,
-  authError,
-  contextLengthError,
+  classifyError,
+  errorFromHttpResponse,
+  isTypedAbortError,
   networkError,
-  rateLimitError,
-  serverError,
+  withRawRequest,
 } from '../types/index.js';
-import { createCombinedSignal, SSELineParser, safeParseJson, isDeadlineAbort, deadlineTimeoutError, throwOnStreamErrorFrame } from './utils.js';
+import { createCombinedSignal, SSELineParser, toolUseInputFromText, isDeadlineAbort, deadlineTimeoutError, throwOnStreamErrorFrame } from './utils.js';
 
 // ============================================================================
 // Provider-native Responses API types
@@ -163,6 +165,8 @@ function headerSafeSessionId(key: string): string {
 
 export class OpenAIResponsesAPIAdapter implements ProviderAdapter {
   readonly name: string = 'openai-responses-api';
+  /** Carries native input items verbatim, and reports what subscription-mode normalization leaves out. */
+  readonly reportsContentAlterations = true;
 
   /**
    * Reads `usage.input_tokens_details.cached_tokens` from OpenAI's account-wide
@@ -227,7 +231,10 @@ export class OpenAIResponsesAPIAdapter implements ProviderAdapter {
     options?: ProviderRequestOptions
   ): Promise<OpenAIResponsesAPIProviderResponse> {
     if (this.subscription) return this.stream(request, { onChunk: () => {} }, options);
-    const responsesRequest = this.buildRequest(request);
+    const responsesRequest = this.buildRequest(request, options?.onContentAltered);
+    // A gateway's Responses endpoint can serve a Claude model, which refuses
+    // an input ending in an assistant turn: refuse it here, typed, before HTTP.
+    assertMessagePrefillSupported(responsesRequest.model, responsesRequest.input, options, this.name, responsesRequest);
     options?.onRequest?.(responsesRequest);
 
     const { signal, cleanup } = createCombinedSignal(options?.signal, options?.timeoutMs);
@@ -250,8 +257,9 @@ export class OpenAIResponsesAPIAdapter implements ProviderAdapter {
     callbacks: StreamCallbacks,
     options?: ProviderRequestOptions
   ): Promise<OpenAIResponsesAPIProviderResponse> {
-    const responsesRequest = this.buildRequest(request);
+    const responsesRequest = this.buildRequest(request, options?.onContentAltered);
     responsesRequest.stream = true;
+    assertMessagePrefillSupported(responsesRequest.model, responsesRequest.input, options, this.name, responsesRequest);
     options?.onRequest?.(responsesRequest);
 
     const { signal, cleanup } = createCombinedSignal(options?.signal, options?.timeoutMs);
@@ -277,6 +285,8 @@ export class OpenAIResponsesAPIAdapter implements ProviderAdapter {
         } catch {
           return;
         }
+        // A parsed provider event is progress (comments never reach here).
+        options?.onProgress?.();
         events.push(event);
 
         if (event.type === 'response.output_text.delta') {
@@ -405,7 +415,7 @@ export class OpenAIResponsesAPIAdapter implements ProviderAdapter {
     }, this.credentials ?? { token: this.apiKey });
   }
 
-  private buildRequest(request: ProviderRequest): OpenAIResponsesAPIRequest {
+  private buildRequest(request: ProviderRequest, onContentAltered?: (block?: unknown) => void): OpenAIResponsesAPIRequest {
     if (!Array.isArray(request.messages)) {
       throw new Error('OpenAI Responses API input must be a provider-native input-item array');
     }
@@ -448,7 +458,7 @@ export class OpenAIResponsesAPIAdapter implements ProviderAdapter {
     // These invariants define the adapter's stateless native-item contract and
     // cannot be overridden through provider params.
     responsesRequest.input = this.subscription
-      ? normalizeResponsesInput(request.messages)
+      ? normalizeResponsesInput(request.messages, onContentAltered)
       : request.messages as OpenAIResponsesInputItem[];
     responsesRequest.store = false;
     responsesRequest.include = this.mergeEncryptedReasoningInclude(responsesRequest.include);
@@ -526,18 +536,21 @@ export class OpenAIResponsesAPIAdapter implements ProviderAdapter {
   ): OpenAIResponsesAPIProviderResponse {
     const outputItems = Array.isArray(response.output) ? response.output : [];
     const content = this.outputToContent(outputItems);
-    const cachedTokens = response.usage?.input_tokens_details?.cached_tokens ?? 0;
+    // A reported 0 is a fact (no cache read); only an unreported count is absent.
+    const cachedTokens = response.usage?.input_tokens_details?.cached_tokens;
 
     return {
       content,
       outputItems,
       stopReason: this.getStopReason(response, outputItems),
+      providerStopReason: response.incomplete_details?.reason ?? response.status,
       stopSequence: undefined,
       usage: {
         inputTokens: response.usage?.input_tokens ?? 0,
         outputTokens: response.usage?.output_tokens ?? 0,
-        cacheReadTokens: cachedTokens > 0 ? cachedTokens : undefined,
+        ...(typeof cachedTokens === 'number' ? { cacheReadTokens: cachedTokens } : {}),
       },
+      ...unreportedUsage(response.usage?.input_tokens, response.usage?.output_tokens),
       model: response.model ?? requestedModel,
       rawRequest,
       raw: response,
@@ -599,7 +612,7 @@ export class OpenAIResponsesAPIAdapter implements ProviderAdapter {
           type: 'tool_use',
           id: callId,
           name: typeof item.name === 'string' ? item.name : '',
-          input: safeParseJson(typeof item.arguments === 'string' ? item.arguments : '{}'),
+          ...toolUseInputFromText(item.arguments),
           itemId: item.id,
           outputIndex,
           rawItem: item,
@@ -664,8 +677,13 @@ export class OpenAIResponsesAPIAdapter implements ProviderAdapter {
     )) return 'refusal';
 
     const reason = response.incomplete_details?.reason;
-    if (response.status === 'incomplete' && reason?.includes('max_output_tokens')) {
-      return 'max_tokens';
+    if (response.status === 'incomplete' && reason) {
+      if (reason.includes('max_output_tokens')) return 'max_tokens';
+      // A filtered response is a refusal, as on the sibling OpenAI adapters.
+      if (reason === 'content_filter') return 'refusal';
+      // Any other incomplete reason travels as the provider's own token, so
+      // membrane discloses and logs it instead of reading a clean end_turn.
+      return reason;
     }
     return 'end_turn';
   }
@@ -705,34 +723,9 @@ export class OpenAIResponsesAPIAdapter implements ProviderAdapter {
 
   private async assertSuccessfulHTTPResponse(response: Response, rawRequest: unknown): Promise<void> {
     if (response.ok) return;
-    const detail = await response.text();
-    const message = `OpenAI Responses API error: ${response.status} ${detail}`;
-    const status = response.status;
-    if (status === 401 || status === 403) {
-      throw new MembraneError({ type: 'auth', message, retryable: false, httpStatus: status, rawError: detail, rawRequest });
-    }
-    if (status === 429) {
-      const retryAfter = response.headers.get('retry-after');
-      const seconds = retryAfter == null ? NaN : Number(retryAfter);
-      const date = retryAfter == null ? NaN : Date.parse(retryAfter);
-      const delay = Number.isFinite(seconds) ? Math.max(0, seconds * 1000)
-        : Number.isFinite(date) ? Math.max(0, date - Date.now()) : undefined;
-      throw rateLimitError(message, delay, detail, rawRequest);
-    }
-    if (status >= 500) throw serverError(message, status, detail, rawRequest);
-    if (status === 400 && /context_length|maximum context|token limit|too long/i.test(detail)) {
-      throw contextLengthError(message, detail, rawRequest);
-    }
-    throw new MembraneError({ type: 'invalid_request', message, retryable: false, httpStatus: status, rawError: detail, rawRequest });
+    throw errorFromHttpResponse(this.name, response, await response.text(), rawRequest);
   }
 
-  /**
-   * A terminal response can carry a structured `error` object on a 200, from
-   * the stream's terminal frame or from a non-streaming body. That payload
-   * never reaches an HTTP-status boundary classifier — the status was 200 —
-   * so it is classified here, by the same helper and the same token lists as
-   * every other provider error payload.
-   */
   private assertSuccessfulAPIResponse(
     response: OpenAIResponsesAPIResponse,
     rawRequest?: unknown,
@@ -743,56 +736,12 @@ export class OpenAIResponsesAPIAdapter implements ProviderAdapter {
   }
 
   private handleError(error: unknown, rawRequest?: unknown): MembraneError {
-    // A deadline abort is a timeout and stays one. Collapsing it into a bare
-    // abortError() here is what erased the identity before Membrane's
-    // caller-signal > timeout > error ladder could read it.
     if (isDeadlineAbort(error)) return deadlineTimeoutError(error, rawRequest);
-    if (error instanceof MembraneError) return error;
-    if (error instanceof Error) {
-      const message = error.message;
-      if (message.includes('429') || message.includes('rate_limit')) {
-        const retryMatch = message.match(/retry after (\d+)/i);
-        const retryAfter = retryMatch?.[1] ? Number(retryMatch[1]) * 1000 : undefined;
-        return rateLimitError(message, retryAfter, error, rawRequest);
-      }
-      if (
-        message.includes('401') ||
-        message.includes('invalid_api_key') ||
-        message.includes('Incorrect API key')
-      ) {
-        return authError(message, error, rawRequest);
-      }
-      if (
-        message.includes('context_length') ||
-        message.includes('maximum context') ||
-        message.includes('too long')
-      ) {
-        return contextLengthError(message, error, rawRequest);
-      }
-      if (
-        message.includes('500') ||
-        message.includes('502') ||
-        message.includes('503') ||
-        message.includes('server_error')
-      ) {
-        return serverError(message, undefined, error, rawRequest);
-      }
-      if (error.name === 'AbortError') return abortError(undefined, rawRequest);
-      if (
-        message.includes('network') ||
-        message.includes('fetch') ||
-        message.includes('ECONNREFUSED')
-      ) {
-        return networkError(message, error, rawRequest);
-      }
-    }
+    if (error instanceof MembraneError) return withRawRequest(error, rawRequest);
+    if (isTypedAbortError(error)) return abortError(undefined, rawRequest);
 
-    return new MembraneError({
-      type: 'unknown',
-      message: error instanceof Error ? error.message : String(error),
-      retryable: false,
-      rawError: error,
-      rawRequest,
-    });
+    const info = classifyError(error);
+    info.rawRequest = rawRequest;
+    return new MembraneError(info);
   }
 }

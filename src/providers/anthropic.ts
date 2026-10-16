@@ -2,11 +2,15 @@
  * Anthropic provider adapter
  */
 
+import { unreportedUsage } from '../utils/usage.js';
+import { assertMessagePrefillSupported } from './request-capabilities.js';
+
 import Anthropic, { type ClientOptions } from '@anthropic-ai/sdk';
 import { stripEmptyTextBlocks, stripEmptyTextRequest } from '../utils/empty-text.js';
 import { resolveImageMediaType, isAcceptedImageMediaType, assertWithinByteBudget, shedImagesToFitByteBudget } from '../utils/image-media.js';
 import type {
   ProviderAdapter,
+  ProviderInputTransformation,
   ProviderRequest,
   ProviderRequestOptions,
   ProviderResponse,
@@ -15,16 +19,20 @@ import type {
 } from '../types/index.js';
 import {
   MembraneError,
-  rateLimitError,
-  contextLengthError,
-  invalidRequestError,
-  authError,
-  serverError,
   abortError,
+  authError,
+  classifyError,
+  errorFromProviderStatus,
+  isTypedAbortError,
+  networkError,
+  serverError,
+  timeoutError,
+  withRawRequest,
   unsupportedError,
 } from '../types/index.js';
+import { statusForProviderCode } from '../types/errors.js';
 import { flattenRootSchemaUnion } from './anthropic-tool-schema.js';
-import { assertTerminalEventObserved } from './utils.js';
+import { assertTerminalEventObserved, toolUseInputFromText, toolUseInputFromValue, isDeadlineAbort, deadlineTimeoutError } from './utils.js';
 import { fetchWithCredentials, validateCredential, type CredentialContext, type CredentialResolver } from './credentials.js';
 import { CacheKeepalive, type CacheKeepaliveConfig } from '../cache-keepalive.js';
 
@@ -115,6 +123,50 @@ function extractBetaHeader(headers: ClientOptions['defaultHeaders']): string | u
     }
   }
   return undefined;
+}
+
+/** Beta flag for thinking-binding controls (`thinking.block_binding`) and
+ *  the `input_transformations` report that comes back with them. Shared with
+ *  the Bedrock adapter, where it rides in `anthropic_beta`. */
+export const THINKING_BINDING_BETA = 'thinking-binding-controls-2026-08-01';
+
+/** Whether a built request asks for thinking-binding controls, which need
+ *  their beta. Read from the final body, so a thinking config passed through
+ *  `extra` counts too. */
+export function sendsBlockBinding(params: { thinking?: unknown }): boolean {
+  const binding = (params.thinking as { block_binding?: unknown } | null | undefined)?.block_binding;
+  return binding !== undefined && binding !== null;
+}
+
+/**
+ * A response's `input_transformations` (Anthropic and Bedrock alike), each
+ * entry with the block at its `messages.{i}.content.{j}` path in `messages`,
+ * the messages as sent. Both adapters send a request's thinking blocks as
+ * the request's own objects, so that is the block membrane built. Nothing
+ * when the response carried no report.
+ */
+export function readInputTransformations(
+  raw: unknown,
+  messages: unknown,
+): { inputTransformations?: ProviderInputTransformation[] } {
+  if (!Array.isArray(raw)) return {};
+  const sent = Array.isArray(messages) ? messages : [];
+  const inputTransformations: ProviderInputTransformation[] = [];
+  for (const entry of raw) {
+    if (entry === null || typeof entry !== 'object') continue;
+    const { type, reason, path } = entry as { type?: unknown; reason?: unknown; path?: unknown };
+    if (typeof type !== 'string') continue;
+    const at = typeof path === 'string' ? /^messages\.(\d+)\.content\.(\d+)$/.exec(path) : null;
+    const content = at ? (sent[Number(at[1])] as { content?: unknown } | undefined)?.content : undefined;
+    const block = at && Array.isArray(content) ? content[Number(at[2])] : undefined;
+    inputTransformations.push({
+      type,
+      ...(typeof reason === 'string' ? { reason } : {}),
+      ...(typeof path === 'string' ? { path } : {}),
+      ...(block !== undefined ? { block } : {}),
+    });
+  }
+  return { inputTransformations };
 }
 
 /** Resolve whether a thinking config is enabled on a request. Thinking can
@@ -230,6 +282,8 @@ function observeBodyActivity(base: SdkFetch, observe?: () => void): SdkFetch {
 
 export class AnthropicAdapter implements ProviderAdapter {
   readonly name = 'anthropic';
+  /** Carries message content verbatim, and reports the nested tool-result blocks it can't carry. */
+  readonly reportsContentAlterations = true;
   readonly cacheReceiptBasis = 'wire-request' as const;
 
   /**
@@ -359,11 +413,12 @@ export class AnthropicAdapter implements ProviderAdapter {
     request: ProviderRequest,
     options?: ProviderRequestOptions
   ): Promise<ProviderResponse> {
-    const anthropicRequest = this.buildRequest(request);
+    const anthropicRequest = this.buildRequest(request, options?.onContentAltered);
     const fullRequest = { ...anthropicRequest, stream: false as const };
+    assertMessagePrefillSupported(fullRequest.model, fullRequest.messages, options, this.name, fullRequest);
     options?.onRequest?.(fullRequest);
 
-    const headers = this.betaHeaders(request);
+    const headers = this.betaHeaders(request, anthropicRequest);
     this.cacheKeepalive?.record(
       fullRequest as unknown as Record<string, unknown>, headers, 'complete',
     );
@@ -375,6 +430,9 @@ export class AnthropicAdapter implements ProviderAdapter {
 
       return this.parseResponse(response, fullRequest);
     } catch (error) {
+      // A deadline on the caller's signal (Membrane's progressTimeoutMs) is a
+      // timeout, as on every adapter; the SDK's abort error can't say so.
+      if (isDeadlineAbort(options?.signal?.reason)) throw deadlineTimeoutError(options!.signal!.reason, fullRequest);
       throw this.handleError(error, fullRequest);
     }
   }
@@ -384,16 +442,17 @@ export class AnthropicAdapter implements ProviderAdapter {
     callbacks: StreamCallbacks,
     options?: ProviderRequestOptions
   ): Promise<ProviderResponse> {
-    const anthropicRequest = this.buildRequest(request);
+    const anthropicRequest = this.buildRequest(request, options?.onContentAltered);
     // Note: stream is implicitly true when using .stream()
     const fullRequest = { ...anthropicRequest, stream: true };
+    assertMessagePrefillSupported(fullRequest.model, fullRequest.messages, options, this.name, fullRequest);
     options?.onRequest?.(fullRequest);
 
     // Snapshot the primary lane's prefix so it can be held warm across idle
     // gaps. `stream: true` is dropped at replay time (transport, not cache key).
     this.cacheKeepalive?.record(
       fullRequest as unknown as Record<string, unknown>,
-      this.betaHeaders(request),
+      this.betaHeaders(request, anthropicRequest),
       'stream',
     );
 
@@ -455,7 +514,7 @@ export class AnthropicAdapter implements ProviderAdapter {
       session = this.credentialSession(idleAbort.signal, onTransportActivity);
       const stream = await session.client.messages.stream(anthropicRequest, {
         signal: session.signal,
-        headers: this.liveHeaders(this.betaHeaders(request), 'stream'),
+        headers: this.liveHeaders(this.betaHeaders(request, anthropicRequest), 'stream'),
       });
 
       // Accumulate response metadata from SSE events directly, so we can
@@ -463,6 +522,9 @@ export class AnthropicAdapter implements ProviderAdapter {
       let model = '';
       let inputTokens = 0;
       let outputTokens = 0;
+      // Whether the stream reported each count (an unreported one stays a 0 default).
+      let inputReported = false;
+      let outputReported = false;
       let cacheCreationTokens: number | undefined;
       let cacheReadTokens: number | undefined;
       let cacheCreation5mTokens: number | undefined;
@@ -471,9 +533,13 @@ export class AnthropicAdapter implements ProviderAdapter {
       let inferenceGeo: string | undefined;
       let serviceTier: string | undefined;
       let stopReason: string = 'end_turn';
+      let providerStopReason: string | undefined;
       let sawTerminalEvent = false;
       let stopSequence: string | undefined;
       let stopDetails: unknown;
+      // The thinking-binding report: final in message_start, replaced by a
+      // message_delta's after a server-side model fallback.
+      let inputTransformations: unknown;
 
       // Content block tracking — finalized on content_block_stop
       const contentBlocks: Record<string, unknown>[] = [];
@@ -512,13 +578,13 @@ export class AnthropicAdapter implements ProviderAdapter {
               // call that nothing downstream can distinguish from a real one.
               block.unparseableInput = currentBlockInputJson;
             } else if (currentBlockInputJson) {
-              try {
-                block.input = JSON.parse(currentBlockInputJson);
-              } catch {
-                // Same fabrication, reached by a block that did stop: keep the
-                // raw accumulation and mark it so consumers can refuse.
-                block.unparseableInput = currentBlockInputJson;
-              }
+              // Arguments that don't parse, or parse to anything but an
+              // object, are the same fabrication reached by a block that did
+              // stop: keep the raw accumulation and mark it so consumers can
+              // refuse.
+              const parsed = toolUseInputFromText(currentBlockInputJson);
+              if (parsed.unparseableInput === undefined) block.input = parsed.input;
+              else block.unparseableInput = parsed.unparseableInput;
             }
           }
         }
@@ -528,10 +594,14 @@ export class AnthropicAdapter implements ProviderAdapter {
       for await (const event of stream) {
         sawEvent = true;
         resetIdleTimer();
+        // Every SDK event is progress; pings never reach this loop.
+        options?.onProgress?.();
         if (event.type === 'message_start') {
           model = event.message.model;
+          inputTransformations = (event.message as { input_transformations?: unknown }).input_transformations;
           const usage = event.message.usage as unknown as Record<string, unknown>;
           inputTokens = typeof usage.input_tokens === 'number' ? usage.input_tokens : 0;
+          inputReported = typeof usage.input_tokens === 'number';
           cacheCreationTokens = typeof usage.cache_creation_input_tokens === 'number'
             ? usage.cache_creation_input_tokens : undefined;
           cacheReadTokens = typeof usage.cache_read_input_tokens === 'number'
@@ -576,6 +646,9 @@ export class AnthropicAdapter implements ProviderAdapter {
             const block = contentBlocks[currentBlockIndex];
             if (block && block.type === 'thinking' && sig) {
               block.signature = ((block.signature as string | undefined) ?? '') + sig;
+              // Reported as it accumulates, so a stream that ends before
+              // content_block_stop still keeps the signature it received.
+              callbacks.onThinkingSignature?.(currentBlockIndex, block.signature as string);
             }
           } else if ((event.delta as { type: string }).type === 'input_json_delta') {
             currentBlockInputJson += (event.delta as { partial_json: string }).partial_json;
@@ -596,7 +669,10 @@ export class AnthropicAdapter implements ProviderAdapter {
             stop_details?: unknown;
           };
           stopReason = delta.stop_reason ?? 'end_turn';
+          providerStopReason = delta.stop_reason ?? undefined;
           sawTerminalEvent = true;
+          const fallback = (event as { input_transformations?: unknown }).input_transformations;
+          if (Array.isArray(fallback)) inputTransformations = fallback;
           stopSequence = delta.stop_sequence ?? undefined;
           // stop_details carries refusal metadata (e.g., category: 'reasoning_extraction')
           stopDetails = delta.stop_details ?? undefined;
@@ -606,6 +682,7 @@ export class AnthropicAdapter implements ProviderAdapter {
             cache_read_input_tokens?: number | null;
           };
           outputTokens = deltaUsage.output_tokens ?? 0;
+          if (typeof deltaUsage.output_tokens === 'number') outputReported = true;
           // message_delta carries cumulative cache metrics — use as authoritative
           if (deltaUsage.cache_creation_input_tokens != null) {
             cacheCreationTokens = deltaUsage.cache_creation_input_tokens;
@@ -641,6 +718,7 @@ export class AnthropicAdapter implements ProviderAdapter {
       return {
         content: contentBlocks,
         stopReason,
+        providerStopReason,
         stopSequence,
         usage: {
           inputTokens,
@@ -648,6 +726,8 @@ export class AnthropicAdapter implements ProviderAdapter {
           cacheCreationTokens,
           cacheReadTokens,
         },
+        ...unreportedUsage(inputReported ? inputTokens : undefined, outputReported ? outputTokens : undefined),
+        ...readInputTransformations(inputTransformations, anthropicRequest.messages),
         model,
         rawRequest: fullRequest,
         raw: {
@@ -670,6 +750,7 @@ export class AnthropicAdapter implements ProviderAdapter {
             ...(inferenceGeo ? { inference_geo: inferenceGeo } : {}),
             ...(serviceTier ? { service_tier: serviceTier } : {}),
           },
+          ...(Array.isArray(inputTransformations) ? { input_transformations: inputTransformations } : {}),
         },
       };
 
@@ -694,16 +775,13 @@ export class AnthropicAdapter implements ProviderAdapter {
           rawRequest: fullRequest,
         });
       }
+      // A deadline on the caller's signal (Membrane's progressTimeoutMs) is a
+      // timeout with its own message, whatever the SDK wrapped the abort in.
+      if (isDeadlineAbort(options?.signal?.reason)) throw deadlineTimeoutError(options!.signal!.reason, fullRequest);
       throw this.handleError(session?.failure() ?? error, fullRequest);
     }
   }
 
-  /** Per-request headers for both create() and stream(): the interleaved-
-   *  thinking beta when thinking is enabled on a pre-4.6 Claude 4 model.
-   *  Any default anthropic-beta (oauth) is re-carried in the same header —
-   *  the SDK replaces same-key defaults instead of merging, and the API
-   *  accepts comma-separated betas. Undefined when nothing to add, so the
-   *  defaults apply untouched. */
   /** Base headers + the live dynamicHeaders stamp. Request time only: the
    *  keepalive recorder receives the base headers BEFORE this merge, so
    *  replayed touches never carry a stale telemetry value. */
@@ -717,20 +795,28 @@ export class AnthropicAdapter implements ProviderAdapter {
     return Object.keys(out).length ? out : undefined;
   }
 
-  private betaHeaders(request: ProviderRequest): Record<string, string> | undefined {
-    if (!thinkingEnabled(request) || !needsInterleavedThinkingBeta(request.model)) {
-      return undefined;
-    }
-    // Set-join so a default that already carries the interleaved beta
-    // doesn't emit it twice (the API tolerates duplicates; this is hygiene).
+  /** Per-request headers for both create() and stream(): the interleaved-
+   *  thinking beta when thinking is enabled on a pre-4.6 Claude 4 model, and
+   *  the thinking-binding beta when the built request asks for binding
+   *  controls. Any default anthropic-beta (oauth) is re-carried in the same
+   *  header — the SDK replaces same-key defaults instead of merging, and the
+   *  API accepts comma-separated betas. Undefined when nothing to add, so
+   *  the defaults apply untouched. */
+  private betaHeaders(request: ProviderRequest, built: { thinking?: unknown }): Record<string, string> | undefined {
+    const needed: string[] = [];
+    if (thinkingEnabled(request) && needsInterleavedThinkingBeta(request.model)) needed.push(INTERLEAVED_THINKING_BETA);
+    if (sendsBlockBinding(built)) needed.push(THINKING_BINDING_BETA);
+    if (needed.length === 0) return undefined;
+    // Set-join so a default that already carries a beta doesn't emit it
+    // twice (the API tolerates duplicates; this is hygiene).
     const betas = new Set(
       (this.defaultBeta ?? '').split(',').map((b) => b.trim()).filter(Boolean),
     );
-    betas.add(INTERLEAVED_THINKING_BETA);
+    for (const beta of needed) betas.add(beta);
     return { 'anthropic-beta': [...betas].join(',') };
   }
 
-  private buildRequest(request: ProviderRequest): Anthropic.MessageCreateParams {
+  private buildRequest(request: ProviderRequest, onContentAltered?: (block?: unknown) => void): Anthropic.MessageCreateParams {
     // Strip provider-specific fields (e.g., sourceUrl for Gemini) from image blocks
     // before sending to Anthropic, which rejects extra inputs.
     // Also normalize nested tool_result content blocks: Membrane uses camelCase
@@ -758,10 +844,15 @@ export class AnthropicAdapter implements ProviderAdapter {
             };
           }
           if (block.type === 'tool_result' && Array.isArray(block.content)) {
-            return {
-              ...block,
-              content: toAnthropicToolResultContent(block.content as ContentBlock[]),
-            };
+            const content = toAnthropicToolResultContent(block.content as ContentBlock[]);
+            // Nested blocks other than text and base64/URL images have no
+            // Anthropic tool_result form and are left out, and whitespace-only
+            // nested text is cleaned away. Only an exactly empty '' text block
+            // carried nothing.
+            const carried = (block.content as Array<{ type?: string; text?: unknown }>)
+              .filter((b) => !(b?.type === 'text' && (typeof b.text !== 'string' || b.text === ''))).length;
+            if (content.length !== carried) onContentAltered?.(block);
+            return { ...block, content };
           }
           return block;
         }),
@@ -870,10 +961,12 @@ export class AnthropicAdapter implements ProviderAdapter {
           delete rest.top_p;
         }
       }
+      // A passthrough `messages` replaces the built messages wholesale.
+      if (rest.messages !== undefined) onContentAltered?.();
       Object.assign(params, rest);
     }
 
-    stripEmptyTextRequest(params);
+    stripEmptyTextRequest(params, onContentAltered);
     return params;
   }
 
@@ -881,6 +974,7 @@ export class AnthropicAdapter implements ProviderAdapter {
     return {
       content: response.content,
       stopReason: response.stop_reason ?? 'end_turn',
+      providerStopReason: response.stop_reason ?? undefined,
       stopSequence: response.stop_sequence ?? undefined,
       usage: {
         inputTokens: response.usage.input_tokens,
@@ -888,6 +982,11 @@ export class AnthropicAdapter implements ProviderAdapter {
         cacheCreationTokens: (response.usage as any).cache_creation_input_tokens,
         cacheReadTokens: (response.usage as any).cache_read_input_tokens,
       },
+      ...unreportedUsage(response.usage?.input_tokens, response.usage?.output_tokens),
+      ...readInputTransformations(
+        (response as { input_transformations?: unknown }).input_transformations,
+        (rawRequest as { messages?: unknown } | undefined)?.messages,
+      ),
       model: response.model,
       rawRequest,
       raw: response,
@@ -895,109 +994,113 @@ export class AnthropicAdapter implements ProviderAdapter {
   }
 
   private handleError(error: unknown, rawRequest?: unknown): MembraneError {
-    // Already-classified failures (e.g. the stream-integrity guards) keep
-    // their type and retryability instead of being re-derived from a string.
-    if (error instanceof MembraneError) return error;
+    if (error instanceof MembraneError) return withRawRequest(error, rawRequest);
+
+    // A cancellation is a type, never a phrase — not even the SDK's own exact
+    // phrase, which any caller can produce. The instanceof arm is what
+    // actually catches the SDK abort: APIUserAbortError inherits `name ===
+    // 'Error'` (measured against @anthropic-ai/sdk 0.52), so isTypedAbortError
+    // does NOT match it; isTypedAbortError covers the other typed shapes —
+    // DOMException AbortError, name === 'AbortError', and a membrane abort.
+    // The idle watchdog that motivated the old message arm never reaches here:
+    // the stream catch throws its typed timeout before calling handleError.
+    if (error instanceof Anthropic.APIUserAbortError || isTypedAbortError(error)) {
+      return abortError(undefined, rawRequest);
+    }
+
+    // The SDK's transport failures carry no status ("Connection error.",
+    // `cause: TypeError: fetch failed`), so the status path below can't type
+    // them. They are the SDK's own types: the timeout subclass first.
+    if (error instanceof Anthropic.APIConnectionTimeoutError) {
+      return timeoutError(error.message, error, rawRequest);
+    }
+    if (error instanceof Anthropic.APIConnectionError) {
+      return networkError(error.message, error, rawRequest);
+    }
 
     if (error instanceof Anthropic.APIError) {
-      // Mid-stream SSE `error` events are rethrown by the SDK as APIError
-      // with status === undefined (sdk core/streaming.js), so the HTTP
-      // status branches below would never match them — overloaded_error
-      // (529) most commonly arrives exactly this way and used to fall
-      // through to `unknown, retryable: false`. Recover the effective
-      // status from the error body's type instead.
-      const bodyType = (error.error as { error?: { type?: string } } | undefined)?.error?.type;
-      const status = error.status ?? (bodyType !== undefined ? {
-        invalid_request_error: 400,
-        authentication_error: 401,
-        permission_error: 403,
-        not_found_error: 404,
-        request_too_large: 413,
-        rate_limit_error: 429,
-        api_error: 500,
-        overloaded_error: 529,
-      }[bodyType] : undefined);
       const message = error.message;
 
-      if (status === 429) {
-        // Try to parse retry-after
-        const retryAfter = this.parseRetryAfter(error);
-        return rateLimitError(message, retryAfter, error, rawRequest);
-      }
+      const gw = message.toLowerCase();
 
-      if (status === 401) {
-        return authError(message, error, rawRequest);
-      }
-
-      // Context-length is a client-side request-shape problem — it only ever
-      // arrives as a 400 (invalid_request_error). Without the status guard, a
-      // transient 5xx whose body happens to contain "context" or "too long"
-      // (e.g. "Internal error: context processing failed") was misclassified
-      // as non-retryable context_length, silently suppressing retries.
-      if (status === 400 && (message.includes('context') || message.includes('too long'))) {
-        return contextLengthError(message, error, rawRequest);
-      }
-
-      // 400 invalid_request_error — malformed payload (e.g. orphan tool_use_id,
-      // unknown model, schema violation). Retrying with the same payload is
-      // guaranteed to produce the same 400, so classify these as non-retryable
-      // here. Previously these fell through to the generic `unknown` branch
-      // below, which left them with `retryable: false` but also with no
-      // structured type — making framework-level error policies unable to
-      // distinguish them from genuinely unknown errors.
-      if (status === 400) {
-        return invalidRequestError(message, error, rawRequest);
-      }
-
-      if (status !== undefined && status >= 500) {
-        return serverError(message, status, error, rawRequest);
-      }
-
-      // Safety net: if the SSE error body wasn't parseable JSON, neither
-      // status nor bodyType resolves — match the message itself rather
-      // than let a transient capacity error become non-retryable.
-      if (message.toLowerCase().includes('overloaded')) {
-        return serverError(message, 529, error, rawRequest);
-      }
+      // Mid-stream SSE `error` events are rethrown by the SDK as APIError
+      // with status === undefined (sdk core/streaming.js) — overloaded_error
+      // (529) most commonly arrives exactly this way. The shared table
+      // recovers the effective status from the body's error type, so those
+      // no longer fall through to `unknown, retryable: false`.
+      const classified = errorFromProviderStatus({
+        provider: this.name,
+        status: error.status,
+        body: error.error,
+        message,
+        retryAfterMs: this.parseRetryAfter(error),
+        rawError: error,
+        rawRequest,
+      });
 
       // Vercel AI Gateway wraps transient upstream outages (a fallback
       // provider 503, routing churn on a sunsetting model) in non-5xx
       // aggregate errors whose body carries gateway routing metadata. The
       // SAME request frequently succeeds on retry once a live provider is
-      // picked, so classify these as retryable instead of terminal.
-      const gw = message.toLowerCase();
-      if (gw.includes("providermetadata") || gw.includes("fallbacksavailable") ||
-          gw.includes("modelattempts") || gw.includes("temporarily unavailable") ||
-          gw.includes("no_providers_available")) {
-        return serverError(message, status ?? 503, error, rawRequest);
+      // picked, so such an aggregate stays a retryable server error whatever
+      // other status it reports. This exception belongs to this adapter alone
+      // and keeps main's precedence: the statuses main typed before this rule
+      // (400, 401 and 429, terminal quota included), sent or implied by the
+      // provider code, still classify normally, and a 5xx is retryable either
+      // way. Any other status (a 402, 403 or 404 from one route) stays
+      // retryable, since another route may serve the request, and an
+      // aggregate whose message says overloaded takes 529, the overloaded
+      // schedule, as main's overloaded safety net gave it. The exception
+      // keeps the provider code, retry hint and raw evidence.
+      const status = error.status ?? statusForProviderCode(classified.providerErrorCode);
+      const gatewayAggregate = gw.includes("providermetadata") || gw.includes("fallbacksavailable") ||
+        gw.includes("modelattempts") || gw.includes("temporarily unavailable") ||
+        gw.includes("no_providers_available");
+      if (gatewayAggregate && status !== 400 && status !== 401 && status !== 429 && !(status !== undefined && status >= 500)) {
+        return new MembraneError({
+          type: 'server',
+          message,
+          retryable: true,
+          httpStatus: gw.includes('overloaded') ? 529 : status ?? 503,
+          retryAfterMs: classified.retryAfterMs,
+          providerErrorCode: classified.providerErrorCode,
+          rawError: error,
+          rawRequest,
+        });
+      }
+      if (classified.type !== 'unknown') return classified;
+
+      // Safety net: if the SSE error body wasn't parseable JSON, neither
+      // status nor body type resolves — match the message itself rather
+      // than let a transient capacity error become non-retryable.
+      if (gw.includes('overloaded')) {
+        return serverError(message, 529, error, rawRequest);
       }
     }
 
-    if (
-      error instanceof Error &&
-      (error.name === 'AbortError' ||
-        error.name === 'APIUserAbortError' ||
-        error.message === 'Request was aborted.')
-    ) {
-      return abortError(undefined, rawRequest);
-    }
-
-    return new MembraneError({
-      type: 'unknown',
-      message: error instanceof Error ? error.message : String(error),
-      retryable: false,
-      rawError: error,
-      rawRequest,
-    });
+    const info = classifyError(error);
+    info.rawRequest = rawRequest;
+    return new MembraneError(info);
   }
 
-  private parseRetryAfter(error: { message: string }): number | undefined {
-    // Try to extract retry-after from headers or message
-    const message = error.message;
-    const match = message.match(/retry after (\d+)/i);
-    if (match && match[1]) {
-      return parseInt(match[1], 10) * 1000;
+  /**
+   * `retry-after` off the response headers: the authoritative source, and the
+   * one nobody was reading. An error that carries no headers (a mid-stream SSE
+   * rethrow) states no wait here; errorFromProviderStatus then reads its
+   * message through the guarded prose reader.
+   */
+  private parseRetryAfter(error: { headers?: Headers }): number | undefined {
+    const header = error.headers?.get?.('retry-after');
+    if (header) {
+      const seconds = Number(header.trim());
+      if (Number.isFinite(seconds)) return Math.round(seconds * 1000);
+      const at = Date.parse(header.trim());
+      if (!Number.isNaN(at)) return Math.max(0, at - Date.now());
     }
+    // No prose fallback here: a wait read from a message belongs to the
+    // shared, guarded reader (errorFromProviderStatus), which believes one only
+    // as stated seconds on a retryable error. A loose /retry after (\d+)/ over
+    // any status made 'do not retry after 3 attempts' a three-second hold.
     return undefined;
   }
 }
@@ -1216,7 +1319,7 @@ export function fromAnthropicContent(blocks: Anthropic.ContentBlock[]): ContentB
           type: 'tool_use',
           id: block.id,
           name: block.name,
-          input: block.input as Record<string, unknown>,
+          ...toolUseInputFromValue(block.input),
         });
         break;
         

@@ -212,6 +212,28 @@ export interface ProviderAdapter {
    * maintenance messages). Wrappers must forward this capability. */
   readonly requiresNativeResponsesInput?: boolean;
 
+  /**
+   * True when this adapter carries the content of every message in the
+   * ProviderRequest it receives into its API call (format conversion
+   * aside), or calls `ProviderRequestOptions.onContentAltered` for any
+   * request where it substitutes, drops or rewrites some, through every step
+   * up to the final body, passthrough parameters and cleanup included.
+   *
+   * Declaring it also commits the adapter to leaving the supplied
+   * ProviderRequest unchanged: it derives its wire body as a separate object
+   * and never mutates the request, its messages or their blocks. Membrane
+   * reuses one request across refusal-retry attempts and attributes reports
+   * by the identity of the blocks it built, so an adapter that edited the
+   * request in place would change what later attempts carry without any
+   * report saying so. The built-in declaring adapters build their bodies
+   * this way.
+   *
+   * Round reports (UsageEvent.round) rely on it: an adapter that doesn't
+   * declare it leaves a round's fidelity 'unknown'. Decorators must forward
+   * this capability and the callback, and keep the same obligation.
+   */
+  readonly reportsContentAlterations?: boolean;
+
   /** Representation used for cache-layout receipts. The default provider-request
    * basis preserves post-hook semantic breakpoints even when this adapter's API
    * does not transmit cache_control. wire-request opts into the final body
@@ -283,7 +305,23 @@ export interface ProviderRequest {
   extra?: Record<string, unknown>;
 }
 
+export interface ProviderRequestContext {
+  formatterName: string;
+  toolMode: 'native' | 'xml';
+  toolsDeclared: boolean;
+  /** An XML streaming runner may manufacture prefill on a later continuation. */
+  requiresAssistantPrefill: boolean;
+}
+
 export interface ProviderRequestOptions {
+  /** Build/protocol facts for validation against the adapter's final model/body.
+   * Not provider JSON. Decorators forward this context with the other options. */
+  requestContext?: ProviderRequestContext;
+  /** Current normalized participant messages for prompt serialization. Native
+   * loops pass them outside ProviderRequest so opaque message metadata is not
+   * serialized by semantic receipts. Explicit extra.prompt/normalizedMessages
+   * retain precedence in OpenAICompletionsAdapter. */
+  promptMessages?: import('./message.js').NormalizedMessage[];
   signal?: AbortSignal;
   timeoutMs?: number;
   /** Anthropic idle deadline after the first SDK event (default: 600000 ms).
@@ -297,6 +335,17 @@ export interface ProviderRequestOptions {
    * swallows ping keepalives (default: max(idleTimeoutMs, 600000)).
    */
   firstEventTimeoutMs?: number;
+  /**
+   * Stream progress, for the progress deadline Membrane core keeps per
+   * provider call (`progressTimeoutMs`). An adapter calls it once per parsed
+   * provider event: each SDK event, each SSE data frame that parses, each
+   * decoded event-stream message. Never for keepalives (Anthropic's and
+   * Bedrock's `ping`), SSE comments or raw body bytes: those prove the
+   * connection is up, not that the model is making progress. Decorators must
+   * forward it with the other options; one that drops it turns the progress
+   * deadline into a total one.
+   */
+  onProgress?: () => void;
   /** Report the final API request body immediately before sending it.
    * Required for adapters declaring cacheReceiptBasis: 'wire-request'.
    * Decorators forward it; raw logging observes each attempt, even when
@@ -309,14 +358,47 @@ export interface ProviderRequestOptions {
    * indistinguishably from visible text.
    */
   wrapThinkingTags?: boolean;
+  /**
+   * Called when the adapter did not carry some message content of this
+   * request verbatim: it substituted, dropped or rewrote a block, including
+   * whitespace-only text its cleanup removed and message content a
+   * passthrough parameter replaced. Pass the request's own block object when
+   * the alteration is to one block (membrane attributes it to the message
+   * that block came from); call it with no argument otherwise. Adapters
+   * declaring `reportsContentAlterations` call it; decorators forward it.
+   */
+  onContentAltered?: (block?: unknown) => void;
+}
+
+/** One entry of a provider's report on what it did with a request's input (ProviderResponse.inputTransformations). */
+export interface ProviderInputTransformation {
+  /** The provider's entry type, such as 'thinking_dropped' or 'thinking_mismatch_allowed'. */
+  type: string;
+  /** Why, as the provider names it. */
+  reason?: string;
+  /** Where the block is in the request the provider received, as it names it: `messages.{i}.content.{j}`. */
+  path?: string;
+  /**
+   * The request's own block object at that path, when the adapter could
+   * resolve it (as `ProviderRequestOptions.onContentAltered` takes one), so
+   * membrane can say which message it came from.
+   */
+  block?: unknown;
 }
 
 export interface ProviderResponse {
   /** Raw response content */
   content: unknown;
   
-  /** Stop reason in provider format */
+  /** Adapter-level stop reason, which may already be normalized. */
   stopReason: string;
+
+  /**
+   * Verbatim terminal reason reported by the provider, before normalization.
+   * Omit when no reason was reported. Custom adapters opt in by supplying it;
+   * Membrane does not infer it from stopReason or parse adapter-specific raw data.
+   */
+  providerStopReason?: string;
   
   /** Which stop sequence triggered */
   stopSequence?: string;
@@ -341,10 +423,29 @@ export interface ProviderResponse {
      * reads `cache_read_input_tokens` (Anthropic, cache-excluded) OR
      * `prompt_tokens_details.cached_tokens` (OpenAI, cache-inclusive) depending
      * on which provider it routed to, so the convention is a per-response fact
-     * there rather than a per-adapter one.
+     * there rather than a per-adapter one. Gemini sets it too, for a response
+     * whose cached count exceeds its prompt count: the inclusive reading it
+     * declares can't hold there, so that response is read as cache-excluded.
      */
     cacheConvention?: UsageCacheConvention;
   };
+
+  /**
+   * Required usage counts the provider did not report. Their value in
+   * `usage` is a 0 default kept for accounting, not an observation; round
+   * reports (UsageEvent.round) leave them out. Absent when both were reported.
+   */
+  unreportedUsage?: Array<'inputTokens' | 'outputTokens'>;
+
+  /**
+   * What the provider reported doing with blocks of this request's messages
+   * before the model saw them, one entry per block, in request order:
+   * Anthropic's `input_transformations`, which come back when the request
+   * asks for thinking-binding controls (`thinking.block_binding`). Empty
+   * when the provider reported nothing to report; absent when the response
+   * carried no report.
+   */
+  inputTransformations?: ProviderInputTransformation[];
   
   /** Model that actually ran */
   model: string;
@@ -358,5 +459,26 @@ export interface ProviderResponse {
 
 export interface StreamCallbacks {
   onChunk: (chunk: string) => void;
+  /**
+   * A provider content block, by its position in the response. Built-in
+   * adapters follow one of two conventions, and Membrane's native loops rely
+   * on them to tell a finished block from one still arriving:
+   * - paired (Anthropic, Bedrock): once when the block starts, with its start
+   *   payload, and again when it is finished, with the final payload. A start
+   *   payload is not the block's content: a tool call's `input` there is an
+   *   empty placeholder until its arguments have arrived.
+   * - single-final (OpenAI Responses): once per block, already finished,
+   *   after the terminal response has been parsed successfully.
+   * Images (OpenRouter) are reported once, when received.
+   */
   onContentBlock?: (index: number, block: unknown) => void;
+  /**
+   * A thinking block's signature as received so far: the whole accumulated
+   * string, after each signature delta (Anthropic, Bedrock). It neither starts
+   * nor completes a block, and the block's finished payload, when it arrives,
+   * is authoritative. It lets a stream that ends before the block finishes
+   * keep the signature it received. That preserves what arrived; a signature
+   * cut off part-way is not thereby valid for replay.
+   */
+  onThinkingSignature?: (index: number, signature: string) => void;
 }

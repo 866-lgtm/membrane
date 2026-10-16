@@ -44,6 +44,13 @@ export interface TextContent {
    * other providers must ignore it. A zero-width carrier (`text: ''` plus
    * `rawItem`) has no normalized equivalent and must be filtered out of
    * requests for providers that reject empty text blocks (Anthropic).
+   *
+   * Where it is replayed, it goes out in place of this block's other fields,
+   * which are not read: a consumer that changes the block's content
+   * (compression, redaction) must drop or replace `rawItem` too, or the
+   * change won't reach the provider, and round reports count the block as
+   * carried when its item is (utils/fidelity.ts). A path that leaves out a
+   * zero-width carrier reports its message altered.
    */
   rawItem?: unknown;
 }
@@ -119,19 +126,34 @@ export interface ToolUseContent {
    * both corrupts the record and teaches the model a syntax the parser
    * does not accept (membrane#36). Analogous to `signature` on a thinking
    * block. Absent on native-tools blocks and on legacy stored blocks.
+   *
+   * Replayed in place of the block's other fields (`name`, `input`), which
+   * the prefill path then doesn't read: a consumer that changes the call
+   * (truncating its input, say) must drop or replace `rawXml` too, or the
+   * change won't reach the provider, and round reports count the block as
+   * carried when its raw text is (utils/fidelity.ts).
    */
   rawXml?: string;
   /**
-   * Raw accumulated argument text that FAILED to parse as JSON, kept verbatim.
+   * The model's arguments as they came, kept verbatim, when they weren't a
+   * JSON object.
    *
-   * Present only when the provider's streamed `input_json_delta` fragments did
-   * not assemble into valid JSON — a call truncated mid-arguments (max_tokens)
-   * is the usual cause. `input` then holds whatever the provider's
-   * content_block_start carried, which for Anthropic is `{}`: a wire-valid
-   * tool call with empty arguments, indistinguishable from a genuine no-arg
-   * call once it is written to durable history. Presence of this field means
-   * `input` is NOT the model's arguments, so a consumer can refuse the block
-   * (or attempt its own repair) instead of trusting a plausible `{}`.
+   * Present when the argument text a provider sent didn't parse, or parsed to
+   * something other than an object (null, a number, a string, a boolean or an
+   * array), and when an Anthropic or Bedrock stream ended before a call's
+   * block finished (no content_block_stop), whatever had arrived of its
+   * arguments, even nothing: then it is the empty string. A call truncated by
+   * max_tokens is the usual cause. Where arguments come as a value rather
+   * than text (Gemini's, or an `input` that isn't an object), it holds that
+   * value as JSON. `input` is then `{}`, or for a streamed Anthropic or
+   * Bedrock call whatever its content_block_start carried: a wire-valid tool
+   * call with empty arguments, indistinguishable from a genuine no-arg call
+   * once it is written to durable history. Presence of this field, the empty
+   * string included, means `input` is NOT the model's arguments, so a
+   * consumer can refuse the block (or attempt its own repair) instead of
+   * trusting a plausible `{}`. The call's ToolCall carries it too. A
+   * request sends `input` as stored, so round reports don't count a marked
+   * call as altered: this field records the replacement.
    */
   unparseableInput?: string;
 
@@ -153,7 +175,12 @@ export interface ToolResultContent {
    * Verbatim document text this result was parsed from in prefill/XML mode:
    * the full `<function_results>…</function_results>` block as the harness
    * originally placed it in the document, shared by every result parsed
-   * from that block. Replayed exactly on the prefill path (membrane#36).
+   * from that block. Replayed exactly on the prefill path (membrane#36), in
+   * place of the block's other fields (`content`, `toolName`, `isError`): a
+   * consumer that changes the result (truncating it, say) must drop or
+   * replace `rawXml` too, or the change won't reach the provider, and round
+   * reports count the block as carried when its raw text is
+   * (utils/fidelity.ts).
    */
   rawXml?: string;
   /** See {@link TextContent.rawItem}. */

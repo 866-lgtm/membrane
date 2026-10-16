@@ -1,0 +1,1 @@
+- `timeoutMs` past 2³¹−1 ms (about 24.8 days), `Infinity` included, no longer times a request out after about 1 ms. Node runs a timer whose delay is longer than that after 1 ms, so deadlines are now armed in steps within the limit: a long one fires on time, and `Infinity` never fires. `progressTimeoutMs` follows the same rule.

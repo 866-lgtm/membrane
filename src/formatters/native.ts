@@ -9,6 +9,10 @@
  * - 'multiuser': Multiple participants, names prefixed to content
  */
 
+import { followNormalizedBlocks, isRawItemCarrier, ownBlocks } from '../utils/fidelity.js';
+import { sanitizeToolName } from '../utils/tool-names.js';
+import { unsupportedError } from '../types/errors.js';
+
 import type {
   NormalizedMessage,
   ContentBlock,
@@ -18,6 +22,7 @@ import type {
 } from '../types/index.js';
 import type {
   PrefillFormatter,
+  ContentParseContext,
   StreamParser,
   BuildOptions,
   BuildResult,
@@ -30,7 +35,7 @@ import type {
 } from './types.js';
 import { normalizeToolPairs, mergeConsecutiveRoles } from './normalize-tool-pairs.js';
 import { resolveImageMediaType, isAcceptedImageMediaType, strippedImagePlaceholder } from '../utils/image-media.js';
-import { assertCacheMarkersWithinLimit } from '../utils/cache-marker-budget.js';
+import { assertCacheMarkersWithinLimit, countWireCacheMarkers } from '../utils/cache-marker-budget.js';
 
 /** Index of the last content block that can carry cache_control. Anthropic
  *  rejects cache_control on thinking / redacted_thinking blocks, so a cache
@@ -160,8 +165,12 @@ class PassthroughParser implements StreamParser {
 // ============================================================================
 
 export class NativeFormatter implements PrefillFormatter {
+  /** buildMessages records every consumer message it doesn't carry verbatim (utils/fidelity.ts). */
+  readonly reportsAlterations = true;
   readonly name = 'native';
   readonly usesPrefill = false;
+  readonly supportsNativeTools = true;
+  readonly supportsXmlTools = false;
 
   readonly nameFormat: string;
   private config: Required<FormatterConfig>;
@@ -198,15 +207,6 @@ export class NativeFormatter implements PrefillFormatter {
       ? { type: 'ephemeral', ...(cacheTtl ? { ttl: cacheTtl } : {}) }
       : undefined;
 
-    // The system block is cached only as a FALLBACK. When the context strategy
-    // marks any message breakpoint, that breakpoint already caches a prefix
-    // beginning at the front of the request — tools + system included — so a
-    // separate system breakpoint is redundant. Placing it anyway both wastes one
-    // of Anthropic's 4 cache_control slots and can push a 4-marker turn to 5,
-    // which the API hard-rejects. So we only cache the system block when the
-    // caller/strategy marked no breakpoints of its own.
-    let markedBreakpoints = 0;
-
     const providerMessages: ProviderMessage[] = [];
 
     // Add context prefix as first assistant message (for simulacrum seeding)
@@ -214,7 +214,6 @@ export class NativeFormatter implements PrefillFormatter {
       const prefixBlock: Record<string, unknown> = { type: 'text', text: contextPrefix };
       if (promptCaching && cacheControl && cacheMarkers === 'membrane-system') {
         prefixBlock.cache_control = cacheControl;
-        markedBreakpoints++;
       }
       providerMessages.push({
         role: 'assistant',
@@ -246,9 +245,10 @@ export class NativeFormatter implements PrefillFormatter {
 
       const role: 'user' | 'assistant' = isAssistant ? 'assistant' : 'user';
 
-      // Convert content
+      // Convert content (recording alterations against this message's index)
       const content = this.convertContent(message.content, message.participant, {
         includeNames: participantMode === 'multiuser' && !isAssistant,
+        ...(options.fidelity ? { onAltered: () => options.fidelity!.alter(i) } : {}),
       });
 
       if (
@@ -261,6 +261,8 @@ export class NativeFormatter implements PrefillFormatter {
       if (content.length === 0) {
         continue; // Skip empty messages
       }
+      // An adapter's report about one of these blocks names this message.
+      ownBlocks(options.fidelity, content, i);
 
       // hasCacheMarker: cache boundary is BEFORE this message — tag previous message's last block
       if (hasCacheMarker && hasCacheMarker(message, i) && cacheControl && providerMessages.length > 0) {
@@ -269,7 +271,6 @@ export class NativeFormatter implements PrefillFormatter {
         const prevIdx = lastCacheableBlockIndex(prevContent);
         if (prevIdx >= 0) {
           prevContent[prevIdx]!.cache_control = cacheControl;
-          markedBreakpoints++;
         }
       }
 
@@ -280,20 +281,7 @@ export class NativeFormatter implements PrefillFormatter {
         const bpIdx = lastCacheableBlockIndex(content as Record<string, unknown>[]);
         if (bpIdx >= 0) {
           (content[bpIdx] as Record<string, unknown>).cache_control = cacheControl;
-          markedBreakpoints++;
         }
-      }
-    }
-
-    // Block-level cache_control can also arrive via convertContent passthrough
-    // (stale request-time markers on imported/stored blocks — Arc exports carry
-    // them). Recount ALL message-level cache_control blocks — deliberate marks
-    // and passthroughs alike — so the system fallback below can't stack on top.
-    markedBreakpoints = 0;
-    for (const msg of providerMessages) {
-      if (!Array.isArray(msg.content)) continue;
-      for (const b of msg.content as Record<string, unknown>[]) {
-        if (b.cache_control) markedBreakpoints++;
       }
     }
 
@@ -304,17 +292,30 @@ export class NativeFormatter implements PrefillFormatter {
     const normalized = normalizeToolPairs(providerMessages, {
       pendingToolCallIds: options.pendingToolCallIds,
       onEvent: options.onNormalize,
+      // A tool_result textified as an orphan or a duplicate alters the
+      // message that occurrence came from, and its replacement keeps the owner.
+      ...followNormalizedBlocks(options.fidelity),
+      // The caller's synthetic user text, used where the normalizer decides a
+      // leading user turn is needed: after a contextPrefix, before
+      // assistant-first history, or after role repair moved a block forward.
+      leadingUserText: options.prefillUserMessage,
     });
 
     // Merge consecutive same-role messages (API requires alternating)
     const mergedMessages = mergeConsecutiveRoles(normalized.messages);
 
-    // Build system content. Cache the system block only as a fallback — when no
-    // message breakpoint was marked (see note above; otherwise a message
-    // breakpoint already caches tools+system as part of its prefix).
-    if (markedBreakpoints > 4) {
-      throw new Error(`cache_control limit exceeded: ${markedBreakpoints} markers (maximum 4)`);
-    }
+    // Build system content. The system block is cached only as a FALLBACK: a
+    // message breakpoint already caches a prefix that begins at the front of
+    // the request, tools and system included, so a separate system marker
+    // would waste one of Anthropic's 4 slots and can push a 4-marker turn to 5,
+    // which the API rejects. The count is of the markers this request already
+    // carries: on the merged messages (this build's own, a contextPrefix's,
+    // and stale ones passed through on stored blocks) and on the caller's
+    // system content, so a caller who marked their own system block gets no
+    // fallback either. The budget check below covers the whole built request;
+    // Membrane defers it (deferCacheBudgetCheck) to after its hooks, which
+    // can still add markers.
+    const markedBreakpoints = countWireCacheMarkers({ messages: mergedMessages, system: systemPrompt });
     const cacheSystem =
       cacheMarkers === 'membrane-system' && cacheControl && markedBreakpoints === 0
         ? cacheControl
@@ -343,7 +344,7 @@ export class NativeFormatter implements PrefillFormatter {
 
     // Native tools
     const nativeTools = tools?.length ? this.convertToNativeTools(tools) : undefined;
-    if (cacheMarkers === 'cm-owned') {
+    if (cacheMarkers === 'cm-owned' || !options.deferCacheBudgetCheck) {
       assertCacheMarkersWithinLimit(
         { messages: mergedMessages, system: systemContent, tools: nativeTools },
         'native'
@@ -388,9 +389,10 @@ export class NativeFormatter implements PrefillFormatter {
     return false;
   }
 
-  parseContentBlocks(content: string): ContentBlock[] {
-    // Native mode - content is plain text
-    if (!content.trim()) {
+  parseContentBlocks(content: string, _tools?: ToolDefinition[], context?: ContentParseContext): ContentBlock[] {
+    // Only a wholly blank response is omitted. Whitespace-only spans of a
+    // nonblank response are still its text, including before thinking.
+    if (!content || !(context?.visibleText ?? content).trim()) {
       return [];
     }
     return [{ type: 'text', text: content }];
@@ -401,8 +403,9 @@ export class NativeFormatter implements PrefillFormatter {
   // ==========================================================================
 
   /** Replace API-unacceptable image blocks nested in tool_result content with
-   *  text placeholders. Non-array content passes through untouched. */
-  private static sanitizeToolResultContent(content: unknown): unknown {
+   *  text placeholders. Non-array content passes through untouched.
+   *  `onAltered` hears each placeholder substitution. */
+  private static sanitizeToolResultContent(content: unknown, onAltered?: () => void): unknown {
     if (!Array.isArray(content)) return content;
     return content.map((item) => {
       if (
@@ -411,34 +414,42 @@ export class NativeFormatter implements PrefillFormatter {
         (item as { type?: string }).type === 'image'
       ) {
         const src = (item as { source?: { type?: string; data?: string; mediaType?: string; media_type?: string } }).source;
-        if (src?.type === 'url') return item;
+        if (src?.type === 'url') return { ...item };
         const mediaType = resolveImageMediaType(src?.data, src?.mediaType ?? src?.media_type);
         if (!isAcceptedImageMediaType(mediaType)) {
+          onAltered?.();
           return strippedImagePlaceholder(mediaType);
         }
         const { mediaType: _declared, ...source } = src ?? {};
         return { ...item, source: { ...source, media_type: mediaType } };
       }
-      return item;
+      // Its own object per occurrence, so an adapter's report names one.
+      return item !== null && typeof item === 'object' ? { ...item } : item;
     });
   }
 
   private convertContent(
     content: ContentBlock[],
     participant: string,
-    options: { includeNames: boolean }
+    options: { includeNames: boolean; onAltered?: () => void }
   ): unknown[] {
     const result: unknown[] = [];
     let hasUnsupportedMedia = false;
     let hasText = false;
+    // Any non-empty block not carried verbatim alters the consumer message.
+    const altered = () => options.onAltered?.();
 
     for (const block of content) {
       if (block.type === 'text') {
         // Empty text blocks are rejected by the Anthropic API. In particular,
         // zero-width rawItem carriers (opaque provider-native items smuggled
         // through normalized history) must not leak here. Filter BEFORE the
-        // name prefix below would make them non-empty.
-        if (block.text === '') continue;
+        // name prefix below would make them non-empty. A carrier's item is
+        // its content, and it is not sent here.
+        if (block.text === '') {
+          if (isRawItemCarrier(block)) altered();
+          continue;
+        }
         let text = block.text;
         if (options.includeNames && !hasText) {
           const prefix = this.nameFormat.replace('{name}', () => participant);
@@ -457,6 +468,7 @@ export class NativeFormatter implements PrefillFormatter {
             // Unacceptable media type (e.g. image/svg): degrade to a text
             // placeholder instead of poisoning the whole request.
             result.push(strippedImagePlaceholder(mediaType));
+            altered();
           } else {
             const imageBlock: Record<string, unknown> = {
               type: 'image',
@@ -472,6 +484,8 @@ export class NativeFormatter implements PrefillFormatter {
             }
             result.push(imageBlock);
           }
+        } else {
+          altered(); // a non-base64 image source has no branch here
         }
       } else if (block.type === 'audio') {
         // Pass audio through in the same shape as images — the provider
@@ -486,19 +500,21 @@ export class NativeFormatter implements PrefillFormatter {
               data: block.source.data,
             },
           });
+        } else {
+          altered();
         }
       } else if (block.type === 'tool_use') {
         result.push({
           type: 'tool_use',
           id: block.id,
-          name: block.name,
+          name: sanitizeToolName(block.name),
           input: block.input,
         });
       } else if (block.type === 'tool_result') {
         result.push({
           type: 'tool_result',
           tool_use_id: block.toolUseId,
-          content: NativeFormatter.sanitizeToolResultContent(block.content),
+          content: NativeFormatter.sanitizeToolResultContent(block.content, options.onAltered),
           is_error: block.isError,
         });
       } else if (block.type === 'thinking') {
@@ -518,6 +534,10 @@ export class NativeFormatter implements PrefillFormatter {
         result.push({ ...(block as unknown as Record<string, unknown>) });
       } else if (block.type === 'document') {
         hasUnsupportedMedia = true;
+        altered();
+      } else {
+        // A block type this formatter does not convert is left out.
+        altered();
       }
     }
 
@@ -533,10 +553,14 @@ export class NativeFormatter implements PrefillFormatter {
   }
 
   private convertToNativeTools(tools: ToolDefinition[]): unknown[] {
-    return tools.map(tool => ({
-      name: tool.name,
-      description: tool.description,
-      input_schema: tool.inputSchema,
-    }));
+    const names = new Set<string>();
+    return tools.map(tool => {
+      const name = sanitizeToolName(tool.name);
+      if (names.has(name)) {
+        throw unsupportedError('Native tool names collide after colon escaping: "' + name + '". Choose distinct wire names.');
+      }
+      names.add(name);
+      return { name, description: tool.description, input_schema: tool.inputSchema };
+    });
   }
 }
