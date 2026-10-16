@@ -428,6 +428,15 @@ export class OpenAIResponsesAPIAdapter implements ProviderAdapter {
     if (request.topP !== undefined) responsesRequest.top_p = request.topP;
     if (request.tools?.length) responsesRequest.tools = this.convertTools(request.tools);
 
+    // Same mapping as the Chat Completions adapter: OpenAI accepts only
+    // "in_memory" or "24h" here, and Membrane's 5m/1h are Anthropic
+    // cache-control TTLs that must not leak onto this API. API mode only: the
+    // subscription backend's cache is keyed by its session_id header instead.
+    if (request.cacheTtl === '24h' && !this.subscription) {
+      responsesRequest.prompt_cache_retention = '24h';
+    }
+
+    let forceThinkFirst = false;
     if (request.extra) {
       const {
         normalizedMessages,
@@ -437,8 +446,10 @@ export class OpenAIResponsesAPIAdapter implements ProviderAdapter {
         store,
         stream,
         include,
+        force_think_first,
         ...extra
       } = request.extra;
+      forceThinkFirst = !!force_think_first;
       void normalizedMessages;
       void prompt;
       void messages;
@@ -456,6 +467,7 @@ export class OpenAIResponsesAPIAdapter implements ProviderAdapter {
       : request.messages as OpenAIResponsesInputItem[];
     responsesRequest.store = false;
     responsesRequest.include = this.mergeEncryptedReasoningInclude(responsesRequest.include);
+    if (forceThinkFirst) this.applyForceThinkFirst(responsesRequest);
     if (this.subscription) {
       for (const key of ['temperature', 'top_p', 'top_k', 'max_output_tokens', 'max_tokens', 'max_completion_tokens']) {
         delete responsesRequest[key];
@@ -472,6 +484,29 @@ export class OpenAIResponsesAPIAdapter implements ProviderAdapter {
       }
     }
     return responsesRequest;
+  }
+
+  /**
+   * Round-0 think forcing. `force_think_first` is a control flag (set from the
+   * recipe via framework-agent-config), NOT an API param: it is stripped from
+   * extra and never forwarded. When set, force a `think` call on the FIRST
+   * round of a turn only. A fresh turn's input ends with a user (or
+   * system/developer) message, while every resumed tool round ends with a
+   * function_call_output, so any other tail means "not round 0" and
+   * tool_choice stays at the provider default (auto). The named form coexists
+   * with reasoning (probed on /v1/responses, gpt-5.1, 2026-10-13). No-op if no
+   * `think` tool is present or the caller already set tool_choice.
+   */
+  private applyForceThinkFirst(request: OpenAIResponsesAPIRequest): void {
+    if ('tool_choice' in request || !Array.isArray(request.tools)) return;
+    const last = request.input[request.input.length - 1] as { type?: unknown; role?: unknown } | undefined;
+    const isFirstRound = !!last &&
+      (last.type === 'message' || last.type === undefined) &&
+      (last.role === 'user' || last.role === 'system' || last.role === 'developer');
+    const hasThink = request.tools.some((tool: any) => tool?.type === 'function' && tool?.name === 'think');
+    if (isFirstRound && hasThink) {
+      request.tool_choice = { type: 'function', name: 'think' };
+    }
   }
 
   private mergeEncryptedReasoningInclude(value: unknown): string[] {
