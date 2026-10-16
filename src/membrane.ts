@@ -1929,9 +1929,11 @@ export class Membrane {
           // An item with a `type` this switch does not know (server_tool_use,
           // web_search_tool_result, search_result, mcp_tool_use, or whatever a
           // provider adds next) used to fall out of this chain and vanish. It
-          // gets the same carrier treatment, holding the item itself, plus a
-          // one-time warning so the gap surfaces instead of being inferred
-          // later from missing content.
+          // gets the same carrier treatment, holding the item itself. An
+          // Anthropic server-tool block is a known type there (a build that
+          // replays them sends it back as itself), so only another type gets
+          // a one-time warning, which surfaces the gap instead of leaving it
+          // to be inferred later from missing content.
           blocks.push(providerItemCarrier(item));
         }
       }

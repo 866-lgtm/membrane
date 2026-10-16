@@ -40,7 +40,9 @@ import type { ContentBlock } from '../types/content.js';
  *   - NativeFormatter sends an Anthropic server-tool block, bare or on a
  *     zero-width carrier, as that block, in an assistant turn, when the build
  *     replays server blocks (`BuildOptions.anthropicServerBlocks`, see
- *     utils/anthropic-server-blocks.ts).
+ *     utils/anthropic-server-blocks.ts), except a call or result that can't
+ *     go alone in its turn, which it leaves out (unpairedServerBlocks; the
+ *     request's final assistant message keeps its lone calls).
  * Where a raw form is sent, it is the content of the block or message it is
  * attached to: that is carried verbatim when its raw form is, and the fields
  * it stands in for (text, input, result content, a message's blocks) are not

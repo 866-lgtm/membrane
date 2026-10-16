@@ -21,6 +21,7 @@ import { normalizeResponsesInput } from '../../src/providers/responses-input.js'
 import { ANTHROPIC_SERVER_BLOCK_TYPES, anthropicServerBlockFor, unpairedServerBlocks } from '../../src/utils/anthropic-server-blocks.js';
 import { extractText } from '../../src/types/message.js';
 import { FidelityNotes } from '../../src/utils/fidelity.js';
+import { resetUnconvertibleProviderItemWarnings } from '../../src/utils/usage.js';
 import type { ContentBlock, NormalizedMessage, NormalizedRequest, ProviderAdapter, ProviderRequest } from '../../src/types/index.js';
 
 // A web-search turn in the order the API returned one: signed thinking, the
@@ -185,6 +186,15 @@ describe('toAnthropicContent', () => {
     expect(toAnthropicContent([carrier(serverUse), answer as ContentBlock], { role: 'assistant' })).toEqual([answer]);
   });
 
+  it('with lastMessage, keeps a lone call, as the request\'s final message a paused turn is resumed in, and still leaves out a lone result', () => {
+    expect(toAnthropicContent([serverUse as unknown as ContentBlock, answer as ContentBlock], { role: 'assistant', lastMessage: true }))
+      .toEqual([serverUse, answer]);
+    expect(toAnthropicContent([carrier(serverUse), answer as ContentBlock], { role: 'assistant', lastMessage: true }))
+      .toEqual([serverUse, answer]);
+    expect(toAnthropicContent([searchResult as unknown as ContentBlock, answer as ContentBlock], { role: 'assistant', lastMessage: true }))
+      .toEqual([answer]);
+  });
+
   it.each([[undefined], ['user' as const]])('with role %s, leaves them out, bare or on a carrier', (role) => {
     const given = role ? { role } : undefined;
     expect(toAnthropicContent([...turn(), responsesCarrier], given)).toEqual([thinking1, thinking2, answer]);
@@ -194,6 +204,8 @@ describe('toAnthropicContent', () => {
 
 describe('complete()', () => {
   it('keeps a turn\'s server blocks on carriers, and sends them back verbatim', async () => {
+    // The warning is once per type per process: forget any an earlier test gave.
+    resetUnconvertibleProviderItemWarnings();
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     const bodies: any[] = [];
     vi.stubGlobal('fetch', vi.fn().mockImplementation(async (_url: string, init: { body: string }) => {
@@ -438,6 +450,19 @@ describe('the Anthropic adapter\'s stream', () => {
     expect(res.content).toEqual([{ type: 'server_tool_use', id: 'srvtoolu_zz1', name: 'web_search', input: {}, unparseableInput: '{"query": "zz lat' }]);
     expect(warn.mock.calls.map((c) => String(c[0]))).toContainEqual(
       expect.stringMatching(/server_tool_use srvtoolu_zz1 didn't parse \(17 characters\); it keeps the start's input, marked$/),
+    );
+  });
+
+  it('marks a server call cut off before its block stopped with no input fragments, and says so', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const res = await streamed([
+      { type: 'message_start', message: { model: 'claude-zz-1', usage: { input_tokens: 10 } } },
+      { type: 'content_block_start', index: 0, content_block: { type: 'server_tool_use', id: 'srvtoolu_zz4', name: 'web_search', input: {} } },
+      { type: 'message_delta', delta: { stop_reason: 'max_tokens' }, usage: { output_tokens: 5 } },
+    ]);
+    expect(res.content).toEqual([{ type: 'server_tool_use', id: 'srvtoolu_zz4', name: 'web_search', input: {}, unparseableInput: '' }]);
+    expect(warn.mock.calls.map((c) => String(c[0]))).toContainEqual(
+      expect.stringMatching(/server_tool_use srvtoolu_zz4 was cut off before its block stopped \(0 characters\); it keeps the start's input, marked$/),
     );
   });
 
@@ -722,5 +747,77 @@ describe('a server call and its result go out together, or not at all', () => {
     const turn = built.messages[1]!.content as Array<Record<string, unknown>>;
     expect(JSON.stringify(turn)).not.toContain('zz-marked');
     expect(turn.at(-1)!.cache_control).toEqual({ type: 'ephemeral' });
+  });
+
+  it('NativeFormatter puts a moved marker on the last block that can hold one, not on thinking after it', () => {
+    const notes = new FidelityNotes();
+    const built = new NativeFormatter().buildMessages([
+      { participant: 'User', content: [say('zz ask')] },
+      { participant: 'Claude', content: [say('zz searching'), thinking1 as unknown as ContentBlock, carrier(call('zz-marked-2'))], cacheBreakpoint: true },
+      { participant: 'User', content: [say('zz go on')] },
+    ], options(notes, { promptCaching: true }));
+    const turn = built.messages[1]!.content as Array<Record<string, unknown>>;
+    expect(turn.map((block) => block.type)).toEqual(['text', 'thinking']);
+    expect(turn[0]!.cache_control).toEqual({ type: 'ephemeral' });
+    expect(turn[1]!.cache_control).toBeUndefined();
+  });
+
+  it('NativeFormatter drops the marker when no kept block of the turn can hold one', () => {
+    const notes = new FidelityNotes();
+    const built = new NativeFormatter().buildMessages([
+      { participant: 'User', content: [say('zz ask')] },
+      { participant: 'Claude', content: [thinking1 as unknown as ContentBlock, carrier(call('zz-marked-3'))], cacheBreakpoint: true },
+      { participant: 'User', content: [say('zz go on')] },
+    ], options(notes, { promptCaching: true }));
+    const turn = built.messages[1]!.content as Array<Record<string, unknown>>;
+    expect(turn.map((block) => block.type)).toEqual(['thinking']);
+    expect(turn[0]!.cache_control).toBeUndefined();
+    expect([...notes.altered]).toEqual([1]);
+  });
+
+  it('NativeFormatter pairs within each turn: a call and its result with a user turn between them are both left out', () => {
+    const notes = new FidelityNotes();
+    const built = new NativeFormatter().buildMessages([
+      { participant: 'User', content: [say('zz ask')] },
+      { participant: 'Claude', content: [say('zz searching'), carrier(call('zz-across'))] },
+      { participant: 'User', content: [say('zz meanwhile')] },
+      { participant: 'Claude', content: [carrier(result('zz-across')), say('zz found')] },
+      { participant: 'User', content: [say('zz and?')] },
+    ], options(notes));
+    expect(JSON.stringify(built.messages)).not.toContain('zz-across');
+    expect([...notes.altered].sort()).toEqual([1, 3]);
+  });
+
+  it('a call cut off mid-stream, which has no result after it, is left out of a turn that isn\'t the last, and goes back as stored in the final one', () => {
+    const broken = { type: 'server_tool_use', id: 'srvtoolu_zz8', name: 'web_search', input: {}, unparseableInput: '{"query": "zz' };
+    const notes = new FidelityNotes();
+    const mid = new NativeFormatter().buildMessages([
+      { participant: 'User', content: [say('zz ask')] },
+      { participant: 'Claude', content: [say('zz searching'), carrier(broken)] },
+      { participant: 'User', content: [say('zz go on')] },
+    ], options(notes));
+    expect(JSON.stringify(mid.messages)).not.toContain('srvtoolu_zz8');
+    expect([...notes.altered]).toEqual([1]);
+    const last = new NativeFormatter().buildMessages([
+      { participant: 'User', content: [say('zz ask')] },
+      { participant: 'Claude', content: [say('zz searching'), carrier(broken)] },
+    ], options(new FidelityNotes()));
+    const turn = JSON.stringify(last.messages.at(-1));
+    expect(turn).toContain('"id":"srvtoolu_zz8"');
+    expect(turn).not.toContain('unparseableInput');
+  });
+
+  it('NativeFormatter drops only the turns pairing empties, not another message with no content', () => {
+    const notes = new FidelityNotes();
+    const messages = [
+      { role: 'user', content: [{ type: 'text', text: 'zz ask' }] },
+      { role: 'assistant', content: [] },
+      { role: 'user', content: [{ type: 'text', text: 'zz go on' }] },
+      { role: 'assistant', content: [{ type: 'server_tool_use', id: 'zz-only-2', name: 'web_search', input: {} }] },
+      { role: 'user', content: [{ type: 'text', text: 'zz and?' }] },
+    ];
+    const paired = (NativeFormatter as unknown as { pairServerBlocks(m: unknown[], f: FidelityNotes): Array<{ role: string; content: unknown[] }> })
+      .pairServerBlocks(messages, notes);
+    expect(paired.map((message) => [message.role, message.content.length])).toEqual([['user', 1], ['assistant', 0], ['user', 2]]);
   });
 });

@@ -307,12 +307,12 @@ export class NativeFormatter implements PrefillFormatter {
     // Merge consecutive same-role messages (API requires alternating)
     let mergedMessages = mergeConsecutiveRoles(normalized.messages);
     // A server call goes out only with its result in its turn, and a result
-    // only with its call: the API refuses either alone. The turn is the one
-    // sent, after the merge, so a call and its result stored as two
-    // consecutive assistant messages stay together.
-    if (options.anthropicServerBlocks !== false) {
-      mergedMessages = NativeFormatter.pairServerBlocks(mergedMessages, options.fidelity);
-    }
+    // only with its call: the API refuses either alone. The request's final
+    // message, if it's the assistant's, keeps its lone calls (a paused turn
+    // is resumed there). The turn is the one sent, after the merge, so a
+    // call and its result stored as two consecutive assistant messages stay
+    // together. With server blocks off, none reached this far.
+    mergedMessages = NativeFormatter.pairServerBlocks(mergedMessages, options.fidelity);
 
     // Build system content. The system block is cached only as a FALLBACK: a
     // message breakpoint already caches a prefix that begins at the front of
@@ -417,12 +417,13 @@ export class NativeFormatter implements PrefillFormatter {
    * (unpairedServerBlocks), reporting each one's message altered. The final
    * message, if it's the assistant's, keeps its lone calls: a paused turn is
    * resumed as the request's last message. A marker the builder put on a
-   * block left out moves to the turn's last block that can hold one. A turn
-   * left with nothing is dropped, its marker with it, and its neighbours
-   * merge again.
+   * block left out moves to the turn's last block that can hold one, unless
+   * a kept block already carries one; with no kept block that can hold one,
+   * it goes. A turn left with nothing is dropped, its marker with it, and
+   * its neighbours merge again.
    */
   private static pairServerBlocks(messages: ProviderMessage[], fidelity?: FidelityNotes): ProviderMessage[] {
-    let emptied = false;
+    const emptied = new Set<number>();
     const paired = messages.map((message, index) => {
       if (message.role !== 'assistant' || !Array.isArray(message.content)) return message;
       const unpaired = unpairedServerBlocks(message.content, index === messages.length - 1);
@@ -439,11 +440,11 @@ export class NativeFormatter implements PrefillFormatter {
         const at = lastCacheableBlockIndex(kept);
         if (at >= 0) kept[at]!.cache_control = marker;
       }
-      if (kept.length === 0) emptied = true;
+      if (kept.length === 0) emptied.add(index);
       return { ...message, content: kept };
     });
-    if (!emptied) return paired;
-    return mergeConsecutiveRoles(paired.filter((message) => !Array.isArray(message.content) || message.content.length > 0));
+    if (emptied.size === 0) return paired;
+    return mergeConsecutiveRoles(paired.filter((_, index) => !emptied.has(index)));
   }
 
   /** Replace API-unacceptable image blocks nested in tool_result content with

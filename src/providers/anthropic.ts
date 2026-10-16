@@ -543,8 +543,10 @@ export class AnthropicAdapter implements ProviderAdapter {
             // stop, or whose fragments don't parse, keeps the start's input
             // and the raw accumulation in `unparseableInput`, as a tool_use
             // does, so a consumer can tell the call it holds isn't the one the
-            // model made. It's sent back as stored, as a marked tool_use is,
-            // so the result that may follow it isn't left without its call.
+            // model made. A cut-off call has no result after it, so it goes
+            // back only where a lone call can (the request's final message),
+            // as stored, without the marker; anywhere else it's left out as
+            // a lone call (unpairedServerBlocks).
             let whole = sawBlockStop;
             if (whole && currentBlockInputJson) {
               try {
@@ -1135,17 +1137,17 @@ export function detectImageMediaType(data: string | undefined, fallback?: string
  * produced it, as NativeFormatter sends it when its build replays server
  * blocks (see utils/anthropic-server-blocks.ts), except a server call with no
  * result after it in the turn, or a result with no call before it, which the
- * API refuses (unpairedServerBlocks). The one turn this converts can't say
- * whether it's a paused turn being resumed as the request's last message,
- * where a lone call can go, so it leaves every lone one out. In any other
- * role a server block is left out, as NativeFormatter leaves it out of a user
- * turn, which has no place for one. A caller that names no role gets that
- * too, as it always got for a carrier. Nothing reports what it leaves out: it
- * has no alteration callback.
+ * API refuses (unpairedServerBlocks). With `lastMessage`, the turn is the
+ * request's final message, a paused turn being resumed, and keeps its lone
+ * calls, as NativeFormatter keeps them there; without it, every lone one is
+ * left out. In any other role a server block is left out, as NativeFormatter
+ * leaves it out of a user turn, which has no place for one. A caller that
+ * names no role gets that too, as it always got for a carrier. Nothing
+ * reports what it leaves out: it has no alteration callback.
  */
 export function toAnthropicContent(
   blocks: ContentBlock[],
-  options: { role?: 'user' | 'assistant' } = {},
+  options: { role?: 'user' | 'assistant'; lastMessage?: boolean } = {},
 ): Anthropic.ContentBlockParam[] {
   const result: Anthropic.ContentBlockParam[] = [];
 
@@ -1159,7 +1161,7 @@ export function toAnthropicContent(
     if (serverBlock === undefined) return [block];
     return options.role === 'assistant' ? [serverBlock] : [];
   });
-  const unpaired = unpairedServerBlocks(swapped, false);
+  const unpaired = unpairedServerBlocks(swapped, options.lastMessage === true);
   const sendable = stripEmptyTextBlocks(swapped.filter((block) => !unpaired.has(block)));
   for (const block of sendable) {
     if (isAnthropicServerBlock(block)) {
