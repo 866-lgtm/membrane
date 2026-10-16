@@ -5,6 +5,7 @@
  */
 
 import { restoreToolName } from './utils/tool-names.js';
+import { toolUseInputFromValue } from './providers/utils.js';
 import { StreamedThinking } from './utils/streamed-thinking.js';
 import { LocalStopSequences, firstStop, membraneBlockType } from './utils/local-stop-sequences.js';
 
@@ -32,6 +33,7 @@ import type {
   ToolCall,
   ToolResult,
   ToolContext,
+  ToolUseContent,
   RetryConfig,
   ToolDefinition,
   ErrorInfo,
@@ -297,6 +299,19 @@ class NativeBlockTracker {
     this.emit?.({ event: 'block_complete', index, block: mb });
     if (this.blockIndex === index) this.currentType = 'text';
   }
+}
+
+/**
+ * The call a caller runs, from its tool_use block, with the block's marker
+ * when `input` isn't the model's arguments.
+ */
+function toolCallOf(block: ToolUseContent): ToolCall {
+  return {
+    id: block.id,
+    name: block.name,
+    input: block.input,
+    ...(block.unparseableInput !== undefined ? { unparseableInput: block.unparseableInput } : {}),
+  };
 }
 
 /**
@@ -1637,11 +1652,7 @@ export class Membrane {
           }
 
           // Convert to normalized ToolCall[]
-          const toolCalls: ToolCall[] = toolUseBlocks.map(block => ({
-            id: block.id,
-            name: block.name,
-            input: block.input as Record<string, unknown>,
-          }));
+          const toolCalls: ToolCall[] = toolUseBlocks.map(toolCallOf);
 
           // Track tool calls
           executedToolCalls.push(...toolCalls);
@@ -1909,9 +1920,12 @@ export class Membrane {
             type: 'tool_use',
             id: item.id,
             name: restoreToolName(item.name, tools),
-            input: item.input,
-            // Arguments that never parsed: carry the marker through so a
-            // consumer can refuse the block instead of trusting `input`.
+            // `input` reaches callers as the object ToolUseContent promises,
+            // whatever the adapter gave.
+            ...toolUseInputFromValue(item.input),
+            // Arguments that weren't a JSON object: the adapter's marker, with
+            // the text as it came, so a consumer can refuse the block instead
+            // of trusting `input`.
             ...(item.unparseableInput !== undefined ? { unparseableInput: item.unparseableInput } : {}),
             ...(item.rawItem ? { rawItem: item.rawItem } : {}),
           });
@@ -2850,17 +2864,17 @@ export class Membrane {
           rawAssistantText += block.text;
         } else if (block.type === 'tool_use') {
           const name = restoreToolName(block.name, request.tools);
-          content.push({
+          // As in parseProviderContent: `input` is an object, and the
+          // adapter's marker comes through.
+          const toolUse: ToolUseContent = {
             type: 'tool_use',
             id: block.id,
             name,
-            input: block.input,
-          });
-          toolCalls.push({
-            id: block.id,
-            name,
-            input: block.input,
-          });
+            ...toolUseInputFromValue(block.input),
+            ...(block.unparseableInput !== undefined ? { unparseableInput: block.unparseableInput } : {}),
+          };
+          content.push(toolUse);
+          toolCalls.push(toolCallOf(toolUse));
         } else if (block.type === 'thinking') {
           content.push({
             type: 'thinking',
@@ -4402,11 +4416,7 @@ export class Membrane {
 
         if (toolUseBlocks.length > 0 && lastStopReason === 'tool_use') {
           // Convert to normalized ToolCall[]
-          const toolCalls: ToolCall[] = toolUseBlocks.map(block => ({
-            id: block.id,
-            name: block.name,
-            input: block.input as Record<string, unknown>,
-          }));
+          const toolCalls: ToolCall[] = toolUseBlocks.map(toolCallOf);
 
           // Track tool calls
           executedToolCalls.push(...toolCalls);

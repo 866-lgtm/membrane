@@ -28,7 +28,7 @@ import {
   isTypedAbortError,
   withRawRequest,
 } from '../types/index.js';
-import { createCombinedSignal, textOnlyToolResultContent, isDeadlineAbort, deadlineTimeoutError, throwOnStreamErrorFrame, assertTerminalEventObserved } from './utils.js';
+import { createCombinedSignal, textOnlyToolResultContent, toolUseInputFromValue, isDeadlineAbort, deadlineTimeoutError, throwOnStreamErrorFrame, assertTerminalEventObserved } from './utils.js';
 
 // ============================================================================
 // Gemini API Types
@@ -769,7 +769,9 @@ export class GeminiAdapter implements ProviderAdapter {
         type: 'tool_use',
         id: `gemini-tc-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
         name: tc.name,
-        input: tc.args,
+        // Gemini's API speaks proto3's JSON mapping, where a null field is
+        // unset: null args, like absent ones, are a call with no arguments.
+        ...toolUseInputFromValue(tc.args ?? undefined),
       });
     }
 
@@ -878,7 +880,8 @@ export function fromGeminiParts(parts: GeminiPart[]): ContentBlock[] {
         type: 'tool_use',
         id: `gemini-tc-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
         name: part.functionCall.name,
-        input: part.functionCall.args,
+        // As in the adapter's response: null args are unset (proto3 JSON).
+        ...toolUseInputFromValue(part.functionCall.args ?? undefined),
       });
     }
   }
