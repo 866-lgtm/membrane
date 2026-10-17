@@ -28,7 +28,7 @@ import {
   withRawRequest,
 } from '../types/index.js';
 import { errorFromThrown } from '../types/errors.js';
-import { createCombinedSignal, textOnlyToolResultContent, isDeadlineAbort, deadlineTimeoutError, throwOnStreamErrorFrame, assertTerminalEventObserved } from './utils.js';
+import { createCombinedSignal, textOnlyToolResultContent, toolUseInputFromValue, isDeadlineAbort, deadlineTimeoutError, throwOnStreamErrorFrame, assertTerminalEventObserved } from './utils.js';
 
 // ============================================================================
 // Gemini API Types
@@ -84,6 +84,14 @@ interface GeminiResponse {
      * prompt 35, candidates 2, thoughts 228, total 265 — 35+2+228 === 265.
      */
     thoughtsTokenCount?: number;
+    /**
+     * Tokens of the prompts Gemini's built-in tools add, such as code
+     * execution's intermediate tokens or URL context's retrieved pages.
+     * DISJOINT from promptTokenCount: Google defines totalTokenCount as
+     * "prompt + tool-use prompt + thoughts + response candidates"
+     * (UsageMetadata reference, read 2026-10-14).
+     */
+    toolUsePromptTokenCount?: number;
   };
   modelVersion?: string;
   promptFeedback?: { blockReason?: string; safetyRatings?: unknown[] };
@@ -121,25 +129,39 @@ function geminiUnreportedUsage(usageMetadata: GeminiResponse['usageMetadata']): 
  * candidates reported a thinking turn at a fraction of its real size. The
  * reconciliation check makes the next such omission loud rather than silent:
  * Google's own total is the independent witness, and a mismatch means a
- * usageMetadata field outside prompt, candidates and thoughts is carrying
- * tokens.
+ * usageMetadata field outside prompt, tool-use prompt, candidates and
+ * thoughts is carrying tokens.
+ *
+ * `toolUsePromptTokenCount` is disjoint from `promptTokenCount` and is read
+ * into `inputTokens`: Google bills code execution's intermediate tokens, URL
+ * context's retrieved content and file search's retrieved documents as input.
+ * Grounding, with Google Search or Google Maps, is billed per query or per
+ * grounded prompt instead, which membrane doesn't price, and for text models
+ * Google doesn't say whether grounding's retrieved context is counted here or
+ * charged as input. If it is counted here and not charged, a grounded
+ * response's input is overstated. A grounded candidate carries
+ * `groundingMetadata`, but a response that used grounding and another tool
+ * reports one count, which can't be split. The adapter's `raw` keeps
+ * `usageMetadata` as Google sent it.
  */
 function geminiUsageToProviderUsage(
   usageMetadata: GeminiResponse['usageMetadata']
 ): ProviderResponse['usage'] {
   const promptTokens = usageMetadata?.promptTokenCount ?? 0;
+  const toolUsePromptTokens = usageMetadata?.toolUsePromptTokenCount ?? 0;
   const candidatesTokens = usageMetadata?.candidatesTokenCount ?? 0;
   const thoughtsTokens = usageMetadata?.thoughtsTokenCount;
   const totalTokens = usageMetadata?.totalTokenCount;
 
   if (usageMetadata && totalTokens != null) {
-    const accountedTokens = promptTokens + candidatesTokens + (thoughtsTokens ?? 0);
+    const accountedTokens = promptTokens + toolUsePromptTokens + candidatesTokens + (thoughtsTokens ?? 0);
     if (accountedTokens !== totalTokens) {
       console.warn(
         `[membrane:gemini] usageMetadata does not reconcile: promptTokenCount(${promptTokens})`
+        + ` + toolUsePromptTokenCount(${toolUsePromptTokens})`
         + ` + candidatesTokenCount(${candidatesTokens}) + thoughtsTokenCount(${thoughtsTokens ?? 0})`
         + ` = ${accountedTokens}, but totalTokenCount = ${totalTokens}.`
-        + ' Some billed tokens are in a usageMetadata field outside prompt, candidates and thoughts.'
+        + ' Some billed tokens are in a usageMetadata field outside prompt, tool-use prompt, candidates and thoughts.'
       );
     }
   }
@@ -159,13 +181,14 @@ function geminiUsageToProviderUsage(
     console.warn(
       `[membrane:gemini] cachedContentTokenCount(${cachedTokens}) exceeds promptTokenCount(${promptTokens}),`
       + ' so this prompt count cannot include the cached span. The response is read as cache-excluded'
-      + ' (promptTokenCount is the fresh input); the adapter declares cache-inclusive from Google\'s'
+      + ' (promptTokenCount, with any tool-use prompt, is the fresh input); the adapter declares'
+      + ' cache-inclusive from Google\'s'
       + ' definition of the field.'
     );
   }
 
   return {
-    inputTokens: promptTokens,
+    inputTokens: promptTokens + toolUsePromptTokens,
     outputTokens: candidatesTokens + (thoughtsTokens ?? 0),
     ...(thoughtsTokens != null ? { thinkingTokens: thoughtsTokens } : {}),
     // A reported 0 is a fact (no cache read); only an unreported count is
@@ -208,17 +231,18 @@ export class GeminiAdapter implements ProviderAdapter {
   readonly name = 'gemini';
 
   /**
-   * Cache-inclusive: `promptTokenCount` (read as `inputTokens`) counts the
-   * cached span `cachedContentTokenCount` (read as `cacheReadTokens`)
-   * reports, so membrane subtracts it to reach the fresh input.
+   * Cache-inclusive: `promptTokenCount` (read into `inputTokens`, beside the
+   * tool-use prompt) counts the cached span `cachedContentTokenCount` (read
+   * as `cacheReadTokens`) reports, so membrane subtracts it to reach the
+   * fresh input.
    *
    * The basis is Google's definition, not a measured hit. The UsageMetadata
    * reference (https://ai.google.dev/api/generate-content, read 2026-10-10)
    * says `promptTokenCount` is "Number of tokens in the prompt. When
    * cachedContent is set, this is still the total effective prompt size
    * meaning this includes the number of tokens in the cached content", and
-   * that `totalTokenCount` is "prompt + thoughts + response candidates",
-   * with no cached term of its own. The "When cachedContent is set" sentence
+   * that `totalTokenCount` is "prompt + tool-use prompt + thoughts + response
+   * candidates" (read again 2026-10-15), with no cached term of its own. The "When cachedContent is set" sentence
    * is about explicit caching (`cachedContent`), which membrane never sets
    * itself: a hit through membrane is implicit unless a caller passes
    * `cachedContent` through `providerParams`, and for an implicit hit the
@@ -344,7 +368,7 @@ export class GeminiAdapter implements ProviderAdapter {
 
         for (const line of lines) {
           if (!line.startsWith('data: ')) continue;
-          this.consumeStreamFrame(line.slice(6).trim(), streamState, callbacks, geminiRequest);
+          this.consumeStreamFrame(line.slice(6).trim(), streamState, callbacks, geminiRequest, options?.onProgress);
         }
       }
 
@@ -355,7 +379,8 @@ export class GeminiAdapter implements ProviderAdapter {
           trailing.startsWith('data: ') ? trailing.slice(6).trim() : trailing,
           streamState,
           callbacks,
-          geminiRequest
+          geminiRequest,
+          options?.onProgress,
         );
       }
 
@@ -397,7 +422,8 @@ export class GeminiAdapter implements ProviderAdapter {
     frameData: string,
     streamState: GeminiStreamState,
     callbacks: StreamCallbacks,
-    rawRequest: unknown
+    rawRequest: unknown,
+    onProgress?: () => void,
   ): void {
     if (!frameData || frameData === '[DONE]') return;
 
@@ -408,6 +434,8 @@ export class GeminiAdapter implements ProviderAdapter {
       // A frame that isn't valid JSON carries nothing to accumulate
       return;
     }
+    // A parsed provider event is progress.
+    onProgress?.();
 
     throwOnStreamErrorFrame(parsed, 'Gemini', rawRequest);
     if (parsed.modelVersion) streamState.lastModelVersion = parsed.modelVersion;
@@ -741,7 +769,9 @@ export class GeminiAdapter implements ProviderAdapter {
         type: 'tool_use',
         id: `gemini-tc-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
         name: tc.name,
-        input: tc.args,
+        // Gemini's API speaks proto3's JSON mapping, where a null field is
+        // unset: null args, like absent ones, are a call with no arguments.
+        ...toolUseInputFromValue(tc.args ?? undefined),
       });
     }
 
@@ -848,7 +878,8 @@ export function fromGeminiParts(parts: GeminiPart[]): ContentBlock[] {
         type: 'tool_use',
         id: `gemini-tc-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
         name: part.functionCall.name,
-        input: part.functionCall.args,
+        // As in the adapter's response: null args are unset (proto3 JSON).
+        ...toolUseInputFromValue(part.functionCall.args ?? undefined),
       });
     }
   }

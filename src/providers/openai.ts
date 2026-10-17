@@ -31,7 +31,7 @@ import {
   withRawRequest,
 } from '../types/index.js';
 import { errorFromThrown } from '../types/errors.js';
-import { safeParseJson, textOnlyToolResultContent, createCombinedSignal, SSELineParser, isDeadlineAbort, deadlineTimeoutError, throwOnStreamErrorFrame, assertTerminalEventObserved } from './utils.js';
+import { toolUseInputFromText, textOnlyToolResultContent, createCombinedSignal, SSELineParser, isDeadlineAbort, deadlineTimeoutError, throwOnStreamErrorFrame, assertTerminalEventObserved } from './utils.js';
 
 // ============================================================================
 // Types
@@ -316,6 +316,8 @@ export class OpenAIAdapter implements ProviderAdapter {
         } catch {
           return; // Ignore parse errors (partial/keep-alive lines)
         }
+        // A parsed provider event is progress (comments never reach here).
+        options?.onProgress?.();
 
         throwOnStreamErrorFrame(parsed, 'OpenAI', openAIRequest);
 
@@ -696,7 +698,7 @@ export class OpenAIAdapter implements ProviderAdapter {
           type: 'tool_use',
           id: tc.id,
           name: tc.function.name,
-          input: safeParseJson(tc.function.arguments),
+          ...toolUseInputFromText(tc.function.arguments),
         });
       }
     }
@@ -768,7 +770,7 @@ export function fromOpenAIContent(message: OpenAIMessage): ContentBlock[] {
         type: 'tool_use',
         id: tc.id,
         name: tc.function.name,
-        input: safeParseJson(tc.function.arguments),
+        ...toolUseInputFromText(tc.function.arguments),
       });
     }
   }

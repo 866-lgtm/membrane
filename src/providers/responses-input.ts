@@ -177,7 +177,7 @@ export function responsesToolOutputParts(content: unknown): unknown[] | null {
       const imageUrl = responsesImageUrl(block);
       parts.push(imageUrl
         ? { type: 'input_image', image_url: imageUrl }
-        : { type: 'input_text', text: '[image omitted: unsupported image source]' });
+        : { type: 'input_text', text: UNUSABLE_IMAGE_SOURCE_TEXT });
     } else if (block.type === 'input_text' || block.type === 'input_image') {
       parts.push(block);
     } else {
@@ -186,6 +186,15 @@ export function responsesToolOutputParts(content: unknown): unknown[] | null {
   }
   return parts;
 }
+
+/** Stand-in for a tool-result image this request can't carry, worded like
+ *  `strippedImagePlaceholder`: the model must know an image was there. It
+ *  names no cause, since several reach it (a source that isn't a URL or
+ *  base64 data, an empty one, or base64 outside `source`), and offers no
+ *  remedy, since nothing in the request can show the image. */
+const UNUSABLE_IMAGE_SOURCE_TEXT =
+  '[system: an image in this tool result was NOT shown to you. This request couldn\'t carry it, ' +
+  'so you are not seeing it.]';
 
 function responsesImageUrl(block: JsonObject): string | undefined {
   const source = isObject(block.source) ? block.source : undefined;

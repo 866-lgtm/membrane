@@ -1376,7 +1376,7 @@ function inlineDataPlaceholder(part: Record<string, unknown>): string | undefine
       (value): value is string => typeof value === 'string' && value !== '',
     ) ?? 'unknown';
   const sizeKb = Math.round((data.length * 0.75) / 1024);
-  return `[${label}: ${mediaType}, ~${sizeKb}KB]`;
+  return `[${label}: ${mediaType}, ~${sizeKb}KB, not shown to you]`;
 }
 
 function collectToolUseIds(env: Envelope): string[] {

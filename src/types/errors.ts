@@ -422,22 +422,29 @@ const AUTH_REASONS = new Set(['api_key_invalid', 'api_key_expired', 'access_toke
 const AUTH_CODES = new Set(['invalid_api_key', 'authentication_error', 'unauthenticated', 'permission_error', 'permission_denied']);
 
 /**
- * 400s that refuse the account, not the request. Anthropic sends both as
+ * Refusals of the account or its credential, not the request, as a 400 or
+ * 422 or with no status: "Your credit balance is too low to access the
+ * Anthropic API", "You have reached your specified API usage limits. You
+ * will regain access on <date>", "This organization has been disabled.", and
+ * "This credential is only authorized for use with Claude Code and cannot be
+ * used for other API requests." (a Claude subscription's OAuth token sent to
+ * the API). Anthropic sends the first, second and fourth as
  * `invalid_request_error` with no code of their own, so only the text tells
- * them apart: "Your credit balance is too low to access the Anthropic API"
- * and "You have reached your specified API usage limits. You will regain
- * access on <date>". Like a 402 they are `auth`: no retry and no change to
- * the request succeeds until the account changes. They are read inside a
- * router's wrapper too. There the account may be the router's own, which
- * another route might serve, but membrane can't tell, and the type is what
- * matters: as `invalid_request` the refusal reaches agent-framework's
- * poison-history breaker, which sheds history over it, and `auth` never does.
- * A router's quota is another matter: retryability is all that rides on it,
- * so it stays retryable (see quotaFailureIsTerminal). Like the context-length
- * forms, these are read only over the provider's own error message, never
- * over a body that might echo the request, with or without a status.
+ * them apart; the disabled organization's type isn't attested. The text is
+ * matched from any provider. Like a 402 they are `auth`: no retry and no
+ * change to the request succeeds until the account or the credential
+ * changes. They are read inside a router's wrapper too. There the account
+ * may be the router's own, which another route might serve, but membrane
+ * can't tell, and the type is what matters: as `invalid_request` the refusal
+ * reaches agent-framework's poison-history breaker, which sheds history over
+ * it, and `auth` never does. A router's quota is another matter:
+ * retryability is all that rides on it, so it stays retryable (see
+ * quotaFailureIsTerminal). Like the context-length forms, these are read only
+ * over the provider's own error message, never over a body that might echo
+ * the request, with or without a status.
  */
-const ACCOUNT_REFUSAL_PATTERN = /credit balance is too low|reached your specified API usage limits/i;
+const ACCOUNT_REFUSAL_PATTERN =
+  /credit balance is too low|reached your specified API usage limits|organization has been disabled|only authorized for use with Claude Code/i;
 
 /**
  * A retry hint stated only in prose: Azure OpenAI's "Please retry after 60
