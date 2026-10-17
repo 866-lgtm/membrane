@@ -735,38 +735,87 @@ describe('the XML replay of a split image round', () => {
     expect(rounds.map((r) => r.altered.messages)).toEqual([[]]);
   });
 
-  it('picks the images the live split sent: by their data, whatever their label, one given as data and mimeType too, and none for data of no known format, which both carry as the placeholder', async () => {
+  it('picks the images the live split sent: by their data, whatever their label, one given as data and mimeType too, and none for data of no known format, which both carry as the placeholder, warned of once', async () => {
     const ZZ_GREEN = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJyyyy';
     const NOT_AN_IMAGE = Buffer.from('zz plain text, not an image at all').toString('base64');
-    const { adapter, response } = await runTurn(
+    const warned: string[] = [];
+    const original = console.warn;
+    console.warn = (...args: unknown[]) => { warned.push(String(args[0])); };
+    const stripped = () => warned.splice(0).filter((w) => w.includes('image block stripped'));
+    let turn: Awaited<ReturnType<typeof runTurn>>;
+    let replayed: Awaited<ReturnType<typeof replay>>;
+    let liveWarnings: string[];
+    try {
+      turn = await runTurn(
+        [{ text: `zz preamble one\n${CALL_XML}`, ...CALL }, { text: 'zz final answer', stopReason: 'end_turn' }],
+        (_round, ids) => [{
+          toolUseId: ids[0]!,
+          toolName: 'zz_shot',
+          content: [
+            { type: 'text', text: 'zz shot ok' },
+            { type: 'image', source: { type: 'base64', data: ZZ_RED, mediaType: 'image/png' } },
+            // A PNG labelled as a JPEG, and bytes of no known format labelled as a PNG.
+            { type: 'image', source: { type: 'base64', data: ZZ_BLUE, mediaType: 'image/jpeg' } },
+            { type: 'image', source: { type: 'base64', data: NOT_AN_IMAGE, mediaType: 'image/png' } },
+            // An image a tool gives MCP-style, which the live split reads too.
+            { type: 'image', data: ZZ_GREEN, mimeType: 'image/png' } as unknown as ToolResultContentBlock,
+          ],
+        }],
+        );
+      liveWarnings = stripped();
+      replayed = await replay(turn.response.content);
+    } finally {
+      console.warn = original;
+    }
+    const imagesOf = (request: ProviderRequest) => (request.messages as Array<{ content: unknown }>)
+      .flatMap((m) => (Array.isArray(m.content) ? m.content : []) as Array<{ type?: string }>)
+      .filter((b) => b.type === 'image');
+    const live = imagesOf(turn.adapter.requests[1]!);
+    expect(live.map((b) => (b as { source: { media_type: string; data: string } }).source))
+      .toEqual([ZZ_RED, ZZ_BLUE, ZZ_GREEN].map((data) => ({ type: 'base64', media_type: 'image/png', data })));
+    const { request, rounds } = replayed;
+    expect(imagesOf(request)).toEqual(live);
+    // The placeholder names the label the data came with, live and in the raw text the replay sends.
+    const PLACEHOLDER = 'its data is not a JPEG, PNG, GIF or WebP image, the formats this request can carry (it was labelled \\"image/png\\")';
+    expect(JSON.stringify(turn.adapter.requests[1]!.messages)).toContain(PLACEHOLDER);
+    expect(JSON.stringify(request.messages)).toContain(PLACEHOLDER);
+    expect(JSON.stringify(request.messages)).not.toContain(NOT_AN_IMAGE);
+    expect(rounds.map((r) => r.altered.messages)).toEqual([[]]);
+    // The turn warned once, for the data it left out; the replay warns of nothing.
+    expect(liveWarnings).toEqual(['[membrane] image block stripped: its data is not a JPEG, PNG, GIF or WebP image (it was labelled "image/png")']);
+    expect(stripped()).toEqual([]);
+  });
+
+  it('renders a marked result\'s MCP-style images as their notes once a consumer changes it and drops its raw text, as content.ts describes', async () => {
+    const NOT_AN_IMAGE = Buffer.from('zz plain text, not an image at all').toString('base64');
+    const { response } = await runTurn(
       [{ text: `zz preamble one\n${CALL_XML}`, ...CALL }, { text: 'zz final answer', stopReason: 'end_turn' }],
       (_round, ids) => [{
         toolUseId: ids[0]!,
         toolName: 'zz_shot',
         content: [
           { type: 'text', text: 'zz shot ok' },
-          { type: 'image', source: { type: 'base64', data: ZZ_RED, mediaType: 'image/png' } },
-          // A PNG labelled as a JPEG, and bytes of no known format labelled as a PNG.
-          { type: 'image', source: { type: 'base64', data: ZZ_BLUE, mediaType: 'image/jpeg' } },
-          { type: 'image', source: { type: 'base64', data: NOT_AN_IMAGE, mediaType: 'image/png' } },
-          // An image a tool gives MCP-style, which the live split reads too.
-          { type: 'image', data: ZZ_GREEN, mimeType: 'image/png' } as unknown as ToolResultContentBlock,
+          { type: 'image', data: ZZ_RED, mimeType: 'image/png' } as unknown as ToolResultContentBlock,
+          { type: 'image', data: NOT_AN_IMAGE, mimeType: 'image/png' } as unknown as ToolResultContentBlock,
         ],
       }],
     );
-    const imagesOf = (request: ProviderRequest) => (request.messages as Array<{ content: unknown }>)
-      .flatMap((m) => (Array.isArray(m.content) ? m.content : []) as Array<{ type?: string }>)
-      .filter((b) => b.type === 'image');
-    const live = imagesOf(adapter.requests[1]!);
-    expect(live.map((b) => (b as { source: { media_type: string; data: string } }).source))
-      .toEqual([ZZ_RED, ZZ_BLUE, ZZ_GREEN].map((data) => ({ type: 'base64', media_type: 'image/png', data })));
-    const { request, rounds } = await replay(response.content);
-    expect(imagesOf(request)).toEqual(live);
-    const PLACEHOLDER = 'its data is not a JPEG, PNG, GIF or WebP image';
-    expect(JSON.stringify(adapter.requests[1]!.messages)).toContain(PLACEHOLDER);
-    expect(JSON.stringify(request.messages)).toContain(PLACEHOLDER);
-    expect(JSON.stringify(request.messages)).not.toContain(NOT_AN_IMAGE);
-    expect(rounds.map((r) => r.altered.messages)).toEqual([[]]);
+    const marked = toolResults(response.content).find((b) => b.rawXmlImagesAt !== undefined)!;
+    // The split stores the images as the tool gave them.
+    expect(marked.content).toContainEqual({ type: 'image', data: ZZ_RED, mimeType: 'image/png' });
+    // A consumer shortens the result's text, and drops rawXml and rawXmlImagesAt with the change.
+    const { rawXml: _raw, rawXmlImagesAt: _at, ...rest } = marked;
+    const changed = response.content.map((b) => (b === marked
+      ? { ...rest, content: [{ type: 'text' as const, text: 'zz shot (shortened)' }, ...(marked.content as ContentBlock[]).filter((s) => s.type === 'image')] }
+      : b));
+    const { request, rounds } = await replay(changed);
+    const wire = JSON.stringify(request.messages);
+    expect(census(request)).toEqual(['user:text', 'assistant:text']);
+    expect(wire).toContain('zz shot (shortened)\\n[Image: image/png, ~0KB, not shown to you]\\n[system: an image that belongs here was NOT shown to you');
+    expect(wire).toContain('its data is not a JPEG, PNG, GIF or WebP image, the formats this request can carry (it was labelled \\"image/png\\")');
+    expect(wire).not.toContain(ZZ_RED);
+    expect(wire).not.toContain(NOT_AN_IMAGE);
+    expect(rounds.map((r) => r.altered.messages)).toEqual([[1]]);
   });
 
   it('sends a raw text the parser reads nothing from once for its whole run, results and calls alike', async () => {

@@ -592,8 +592,9 @@ describe('formats, labels and shapes', () => {
     }
     // An image sequence's brand is no still image here.
     expect(imageForRequest(brand('msf1'), 'image/heif', GEMINI_IMAGE_TYPES).placeholder).toBeDefined();
-    // Leading whitespace, which base64 decoding skips, doesn't hide a header.
-    expect(imageForRequest(`\n  ${PNG}`, 'image/png').mediaType).toBe('image/png');
+    // Leading whitespace, which base64 decoding skips, doesn't hide a header,
+    // even when there's more of it than the header's 24-character window holds.
+    expect(imageForRequest(`\n${' '.repeat(23)}${PNG}`, 'image/png').mediaType).toBe('image/png');
   });
 
   it('sends a data: URL as it came when its label already matches its header, extra parameters included', () => {

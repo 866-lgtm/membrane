@@ -87,8 +87,12 @@ export interface AnthropicXmlFormatterConfig extends FormatterConfig {
 
 /**
  * Convert a stored tool_result content block into a ToolResult for XML
- * re-rendering (legacy path — blocks without rawXml). Only text and base64
- * image sub-blocks survive; other block types have no XML representation.
+ * re-rendering (legacy path — blocks without rawXml). Only text and image
+ * sub-blocks survive, an image as it was stored, so its note reads it as the
+ * live notes read one (toolResultImage): a base64 source, or MCP-style `data`
+ * and `mimeType`, which is how a split stores the image a tool returned that
+ * way. An image with a url source, and other block types, have no XML
+ * representation.
  */
 function toToolResult(block: ToolResultContent): ToolResult {
   let content: string | ToolResultContentBlock[];
@@ -99,11 +103,9 @@ function toToolResult(block: ToolResultContent): ToolResult {
     for (const sub of block.content) {
       if (sub.type === 'text') {
         content.push({ type: 'text', text: sub.text });
-      } else if (sub.type === 'image' && sub.source.type === 'base64') {
-        content.push({
-          type: 'image',
-          source: { type: 'base64', data: sub.source.data, mediaType: sub.source.mediaType },
-        });
+      } else if (sub.type === 'image' && (!sub.source || sub.source.type === 'base64')) {
+        // Typed as a source image; an MCP-style one comes untyped, as the tool returned it.
+        content.push(sub as ToolResultContentBlock);
       }
     }
   }
@@ -138,11 +140,13 @@ interface SentSplit {
  * and when the marked result holds an image, its round report says the
  * message was altered. A split leaves out the images this rule refuses, with
  * no note and no warning: under the same rule the turn refused them too, and
- * wrote imageForRequest's placeholder for each into the raw text. Only a rule
- * that changed between versions can leave out an image the turn sent, such as
- * bytes of no known format that an earlier version sent by their label, and
- * that goes unreported, since `content` doesn't say which of its images the
- * turn sent.
+ * wrote imageForRequest's placeholder for each into the raw text. A consumer
+ * that removes an image drops the raw text with it (ToolResultContent's
+ * rawXmlImagesAt), so only a rule that changed between versions can leave out
+ * an image the turn sent: bytes of no known format that an earlier version
+ * sent by their label, which the API refuses, so the request that carried
+ * them failed. That goes unreported, since `content` doesn't say which of its
+ * images the turn sent.
  */
 function sentSplit(group: readonly ToolResultContent[]): SentSplit | null {
   const rawXml = group[0]!.rawXml!;
