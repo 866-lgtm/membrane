@@ -604,7 +604,7 @@ function renderResultContentString(result: ToolResult): string {
   for (const block of result.content) {
     if (block.type === 'text') {
       parts.push(block.text);
-    } else if (block.type === 'image' && hasNoSourceObject(block)) {
+    } else if (block.type === 'image' && hasNoDataToShow(block)) {
       parts.push(strippedImagePlaceholder(undefined, block).text);
     } else if (block.type === 'image') {
       // For XML mode, we can't embed images directly. The note says the
@@ -617,12 +617,14 @@ function renderResultContentString(result: ToolResult): string {
 }
 
 /**
- * An image a result renderer has no source for: media in MCP's form that
- * didn't convert (utils/mcp-media.ts), with no media type or no data. It
- * gets the stripped-image note, as an image the split can't send does.
+ * An image a result renderer has no data to show or measure: media in MCP's
+ * form that didn't convert (utils/mcp-media.ts), a URL source, or a base64
+ * source without its data. It gets the stripped-image note, as an image the
+ * split can't send does, rather than a TypeError reading its data.
  */
-function hasNoSourceObject(block: { source?: unknown }): boolean {
-  return typeof block.source !== 'object' || block.source === null || Array.isArray(block.source);
+function hasNoDataToShow(block: { source?: unknown }): boolean {
+  const source = block.source as { data?: unknown } | null | undefined;
+  return typeof source !== 'object' || source === null || typeof source.data !== 'string' || source.data === '';
 }
 
 /**
@@ -1374,7 +1376,7 @@ export function formatToolResultsForSplitTurn(handed: ToolResult[]): SplitTurnCo
       for (const block of result.content) {
         if (block.type === 'text') {
           textParts.push(guardResultContent(block.text));
-        } else if (block.type === 'image' && hasNoSourceObject(block)) {
+        } else if (block.type === 'image' && hasNoDataToShow(block)) {
           textParts.push(strippedImagePlaceholder(undefined, block).text);
         } else if (block.type === 'image') {
           const mediaType = resolveImageMediaType(block.source.data, block.source.mediaType);
@@ -1458,7 +1460,7 @@ function formatSingleResultXml(result: ToolResult): string {
     for (const block of result.content) {
       if (block.type === 'text') {
         xml += guardResultContent(block.text);
-      } else if (block.type === 'image' && hasNoSourceObject(block)) {
+      } else if (block.type === 'image' && hasNoDataToShow(block)) {
         xml += strippedImagePlaceholder(undefined, block).text;
       } else if (block.type === 'image') {
         // For remaining results after split, images become text placeholders

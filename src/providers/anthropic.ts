@@ -8,7 +8,7 @@ import { assertMessagePrefillSupported } from './request-capabilities.js';
 import Anthropic, { type ClientOptions } from '@anthropic-ai/sdk';
 import { stripEmptyTextBlocks, stripEmptyTextRequest } from '../utils/empty-text.js';
 import { resolveImageMediaType, isAcceptedImageMediaType, assertWithinByteBudget, shedImagesToFitByteBudget } from '../utils/image-media.js';
-import { convertMcpMedia } from '../utils/mcp-media.js';
+import { convertMcpMedia, isSourcelessMedia } from '../utils/mcp-media.js';
 import type {
   ProviderAdapter,
   ProviderInputTransformation,
@@ -781,6 +781,13 @@ export class AnthropicAdapter implements ProviderAdapter {
         ...msg,
         content: msg.content.map((original: any, index: number) => {
           const block = converted[index] as any;
+          if (isSourcelessMedia(block)) {
+            // Media with no source object (MCP's form that didn't convert)
+            // has no form the API takes: left out, as in a tool_result, and
+            // reported.
+            onContentAltered?.(original);
+            return undefined;
+          }
           if (block.type === 'image') {
             const { sourceUrl, ...rest } = block;
             if (block.source?.type !== 'base64') return rest;
@@ -808,7 +815,7 @@ export class AnthropicAdapter implements ProviderAdapter {
             return { ...block, content };
           }
           return block;
-        }),
+        }).filter((block: unknown) => block !== undefined),
       };
     });
 

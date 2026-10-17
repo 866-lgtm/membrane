@@ -348,33 +348,48 @@ describe('a media block with no source object that doesn\'t convert is a source 
     expect(sent).not.toMatch(/"type":"(image|audio)"\}/);
   });
 
-  it('the Anthropic adapter built directly leaves them out of a tool_result, and reports the block it was handed', () => {
+  it('the Anthropic adapter built directly leaves them out, at the top of a message and in a tool_result, and reports each block it was handed', () => {
     const adapter = new AnthropicAdapter({ apiKey: 'test', cacheKeepalive: { enabled: false } }) as any;
+    const top = unconvertible();
     // With an image that converts beside them, so the result it builds from is a copy.
     const result = { type: 'tool_result', tool_use_id: 'shot', content: [text('here'), mcp('image', PNG, 'image/png'), ...unconvertible()] };
     const reported: unknown[] = [];
     const built = adapter.buildRequest({ model: 'claude-sonnet-4-5', maxTokens: 64, messages: [
+      { role: 'user', content: [text('look'), ...top] },
       { role: 'assistant', content: [{ type: 'tool_use', id: 'shot', name: 'noop', input: {} }] },
       { role: 'user', content: [result] },
     ] }, (block: unknown) => reported.push(block));
-    expect(built.messages[1].content[0].content).toEqual([
+    expect(built.messages[0].content).toEqual([text('look')]);
+    expect(built.messages[2].content[0].content).toEqual([
       text('here'), { type: 'image', source: { type: 'base64', media_type: 'image/png', data: PNG } },
     ]);
-    expect(reported).toHaveLength(1);
-    expect(reported[0]).toBe(result);
+    expect(reported).toHaveLength(4);
+    top.forEach((block, i) => expect(reported[i]).toBe(block));
+    expect(reported[3]).toBe(result);
   });
 
-  const sourceless = { toolUseId: 't', content: [text('here'), { type: 'image' }, { type: 'image', data: PNG }] } as ToolResult;
+  // With the images these renderers had no data for on main either: a URL
+  // image, which two of them threw on, reading its data's length, and a
+  // base64 source with no data, or with an empty string for it.
+  const unshowable = { toolUseId: 't', content: [
+    text('here'), { type: 'image' }, { type: 'image', data: PNG },
+    { type: 'image', source: { type: 'url', url: 'https://example.com/a.png' } },
+    { type: 'image', source: { type: 'base64', mediaType: 'image/png' } },
+    { type: 'image', source: { type: 'base64', data: '', mediaType: 'image/png' } },
+  ] } as ToolResult;
   const shown = { toolUseId: 's', content: [text('shot'), ours('image', PNG, 'image/png')] } as ToolResult;
+  const count = (xml: string, note: string) => xml.split(note).length - 1;
   it.each([
-    ['formatToolResults', () => formatToolResults([sourceless])],
-    ['formatToolResultsForSplitTurn', () => formatToolResultsForSplitTurn([sourceless]).beforeImageXml],
-    ['formatToolResultsForSplitTurn, after the split', () => formatToolResultsForSplitTurn([shown, sourceless]).afterImageXml],
-  ] as const)('%s, which takes an xml tool loop\'s results, notes them', (_name, render) => {
+    ['formatToolResults', () => formatToolResults([unshowable])],
+    ['formatToolResultsForSplitTurn', () => formatToolResultsForSplitTurn([unshowable]).beforeImageXml],
+    ['formatToolResultsForSplitTurn, after the split', () => formatToolResultsForSplitTurn([shown, unshowable]).afterImageXml],
+  ] as const)('%s, which takes an xml tool loop\'s results, notes them, and any other image it has no data for', (_name, render) => {
     vi.spyOn(console, 'warn').mockImplementation(() => {});
     const xml = render();
-    expect(xml).toContain(NO_DATA);
-    expect(xml).toContain(UNDEFINED_TYPE);
+    // The block with no data, and the two base64 sources without it.
+    expect(count(xml, NO_DATA)).toBe(3);
+    // The block with data and no type, and the URL image.
+    expect(count(xml, UNDEFINED_TYPE)).toBe(2);
   });
 });
 

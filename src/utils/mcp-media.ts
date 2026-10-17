@@ -9,12 +9,16 @@
  * request builders read only the second: the formatters threw on it, and the
  * native formatter replaced a tool result's image with a note that its media
  * type "undefined" isn't accepted. So membrane converts where content enters
- * it, and every reader after that point reads one form: `Membrane`'s request
- * build (`transformRequest`, which every path's messages go through, the
- * native tool loop's each round), the xml document's tool results
- * (`formatToolResults` and `formatToolResultsForSplitTurn`, which take an xml
- * tool loop's results each round), and the Anthropic adapter's request
- * sanitizer, for a caller that builds a request directly.
+ * it, and every request builder after that point reads one form:
+ * `Membrane`'s request build (`transformRequest`, which every path's messages
+ * go through, the native tool loop's each round), the xml document's tool
+ * results (`formatToolResults` and `formatToolResultsForSplitTurn`, which take
+ * an xml tool loop's results each round), and the Anthropic adapter's request
+ * sanitizer, for a caller that builds a request directly. Three carry the
+ * caller's form instead: what a `beforeRequest` hook is handed; a
+ * continuation's `normalizedMessages`, which no adapter reads for media,
+ * since a continuation carries its prompt; and the native loop's prompt
+ * messages, which the completions serializer reads for text.
  *
  * The rule is the one context-manager's read applies to stored content: a
  * media block (image, document, audio or video) with no `source` object whose
@@ -50,6 +54,13 @@ export function convertMcpMedia<T>(items: T[]): T[] {
     if (converted !== item) (out ??= items.slice())[i] = converted as T;
   }
   return out ?? items;
+}
+
+/** A media block (image, document, audio or video) with no `source` object:
+ *  MCP's form that didn't convert, or media without its source in any form.
+ *  No request has a form for it. */
+export function isSourcelessMedia(block: unknown): boolean {
+  return isRecord(block) && MEDIA_TYPES.has(block.type) && !isRecord(block.source);
 }
 
 function convertedItem(item: unknown): unknown {
