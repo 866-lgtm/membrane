@@ -335,6 +335,10 @@ export class IncrementalXmlParser {
     const events: BlockEvent[] = [];
     const isClosing = tag.startsWith('</');
 
+    // A closing tag completes the block in progress, if there is one. After
+    // a flush, or after resetForNewIteration, there is none, and nothing went
+    // out for the tag to complete. Depths stop at 0, as in scanForDepth.
+
     if (tag.includes('thinking')) {
       if (!isClosing) {
         if (this.state.currentBlockStarted) {
@@ -344,8 +348,8 @@ export class IncrementalXmlParser {
         this.state.currentBlockType = 'thinking';
         events.push(this.makeBlockStart('thinking'));
       } else {
-        events.push(this.makeBlockComplete());
-        this.state.thinkingDepth--;
+        if (this.state.currentBlockStarted) events.push(this.makeBlockComplete());
+        this.state.thinkingDepth = Math.max(0, this.state.thinkingDepth - 1);
         this.state.currentBlockType = this.getCurrentBlockType();
       }
     } else if (tag.includes('function_calls')) {
@@ -357,8 +361,8 @@ export class IncrementalXmlParser {
         this.state.currentBlockType = 'tool_call';
         events.push(this.makeBlockStart('tool_call'));
       } else {
-        events.push(this.makeBlockComplete());
-        this.state.functionCallsDepth--;
+        if (this.state.currentBlockStarted) events.push(this.makeBlockComplete());
+        this.state.functionCallsDepth = Math.max(0, this.state.functionCallsDepth - 1);
         this.state.currentBlockType = this.getCurrentBlockType();
       }
     } else if (tag.includes('function_results')) {
@@ -370,8 +374,8 @@ export class IncrementalXmlParser {
         this.state.currentBlockType = 'tool_result';
         events.push(this.makeBlockStart('tool_result'));
       } else {
-        events.push(this.makeBlockComplete());
-        this.state.functionResultsDepth--;
+        if (this.state.currentBlockStarted) events.push(this.makeBlockComplete());
+        this.state.functionResultsDepth = Math.max(0, this.state.functionResultsDepth - 1);
         this.state.currentBlockType = this.getCurrentBlockType();
       }
     }

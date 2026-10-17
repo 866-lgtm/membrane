@@ -335,6 +335,37 @@ const MAX_LOGGED_STOP_REASONS = 64;
 /** Longest stop-reason token printed whole; real tokens are short. */
 const MAX_LOGGED_STOP_REASON_CHARS = 128;
 
+/**
+ * Feed a provider chunk to an XML loop's parser, up to the first stop.
+ *
+ * The stop that ends first in the round's text so far, from `checkFrom`, is
+ * found before the parser sees the chunk, and the parser takes only the text
+ * before it. So what goes out up to a stop is the parser's own emissions,
+ * each labelled by the block it belongs to, as on every other chunk: a chunk
+ * that closes a <thinking> block before the stop, or holds the end of a tool
+ * call before its own `</function_calls>` stop, doesn't go out as visible
+ * text. A chunk with nothing before the stop, as when the stop began in an
+ * earlier chunk, gives nothing, not even the empty piece a plain parser would
+ * send. `head` is the round's accepted text when a stop was found.
+ */
+function parseUpToStop(
+  parser: StreamParser,
+  chunk: string,
+  checkFrom: number,
+  stops: readonly string[],
+): { found: { stop: string; at: number } | undefined; head: string; emissions: ProcessChunkResult['emissions'] } {
+  const before = parser.getAccumulated();
+  const text = before + chunk;
+  // The stop that ends first, where a provider applying the request's stops
+  // would end, whatever order they're listed in.
+  const found = firstStop(text.slice(checkFrom), stops);
+  if (!found) return { found, head: text, emissions: parser.processChunk(chunk).emissions };
+  // Where the accepted text ends and the stop begins.
+  const cut = checkFrom + found.at;
+  const taken = chunk.slice(0, Math.max(0, cut - before.length));
+  return { found, head: text.slice(0, cut), emissions: taken ? parser.processChunk(taken).emissions : [] };
+}
+
 export class Membrane {
   private adapter: ProviderAdapter;
   private registry?: ModelRegistry;
@@ -983,6 +1014,28 @@ export class Membrane {
         const textStarts = new Map<number, number>();
         streamedThinking.beginRound(parser.getAccumulated().length - initialPrefillLength);
         const tracker = new NativeBlockTracker((event) => { if (typedCallbacks) onBlock?.(event); });
+        // The parser's emissions go out in order: its block events unless the
+        // provider's typed blocks report them, and its text with its block's
+        // label.
+        const forward = (emissions: ProcessChunkResult['emissions']) => {
+          for (const emission of emissions) {
+            if (emission.kind === 'blockEvent') {
+              if (!typedCallbacks) onBlock?.(emission.event);
+            } else {
+              onChunk?.(emission.text, typedCallbacks ? { ...emission.meta, blockIndex: tracker.blockIndex } : emission.meta);
+            }
+          }
+        };
+        // Under typed blocks the stream carries the provider's blocks, and by
+        // a round's end the provider's last block has completed, so what the
+        // parser held back then isn't streamed, as on main, though the
+        // provider's block and the content keep it. Neither is what a flush
+        // before a break sends: the stream carries none of the parser's block
+        // events under typed blocks, and a put-back stop has already gone out
+        // whole (below).
+        const forwardOwn = (emissions: ProcessChunkResult['emissions']) => {
+          if (!typedCallbacks) forward(emissions);
+        };
         const onProviderBlock = (index: number, block: unknown) => {
           if (!xmlToolProtocol && (!detectedStopSequence || textStarts.has(index))) {
             const type = (block as { type?: string } | undefined)?.type;
@@ -1020,44 +1073,16 @@ export class Membrane {
                 onChunk?.(chunk, { type: 'thinking', visible: false, blockIndex: tracker.blockIndex });
                 return;
               }
-              // Only visible text enters a plain formatter's parser.
-              const { emissions } = parser.processChunk(chunk);
-
-              // Check for stop sequences only in NEW content (not already-processed)
-              const accumulated = parser.getAccumulated();
-              const newContent = accumulated.slice(checkFromIndex);
-
-              // The stop that ends first, where a provider applying the
-              // request's stops would end, whatever order they're listed in.
-              const found = firstStop(newContent, prefillResult.stopSequences);
+              // Only visible text enters a plain formatter's parser, and only
+              // the text before a stop: the stop is found in the round's new
+              // text first, so what goes out up to it is labelled by the block
+              // each piece belongs to, as on every other chunk.
+              const { found, head, emissions } = parseUpToStop(parser, chunk, checkFromIndex, prefillResult.stopSequences);
               if (found) {
-                // Found stop sequence - mark it and truncate
-                const absoluteIdx = checkFromIndex + found.at;
                 detectedStopSequence = found.stop;
-                truncatedAccumulated = accumulated.slice(0, absoluteIdx);
-
-                // Emit only the portion up to stop sequence with metadata
-                const alreadyEmitted = accumulated.length - chunk.length;
-                if (absoluteIdx > alreadyEmitted) {
-                  const truncatedChunk = accumulated.slice(alreadyEmitted, absoluteIdx);
-                  const meta: ChunkMeta = {
-                    type: parser.getCurrentBlockType(),
-                    visible: parser.getCurrentBlockType() === 'text',
-                    blockIndex: 0, // Approximate
-                  };
-                  onChunk?.(truncatedChunk, meta);
-                }
-                return;
+                truncatedAccumulated = head;
               }
-
-              // Emit in correct interleaved order using emissions array
-              for (const emission of emissions) {
-                if (emission.kind === 'blockEvent') {
-                  if (!typedCallbacks) onBlock?.(emission.event);
-                } else {
-                  onChunk?.(emission.text, typedCallbacks ? { ...emission.meta, blockIndex: tracker.blockIndex } : emission.meta);
-                }
-              }
+              forward(emissions);
             },
             onContentBlock: onProviderBlock,
             // Only a thinking span already recorded takes it (see onProviderBlock).
@@ -1087,10 +1112,15 @@ export class Membrane {
         rounds++;
         providerCalls += streamResult.providerCalls;
 
-        // If we detected stop sequence manually, fix up the parser and result
+        // A stop found here ends the round at the text before it. The parser
+        // took only that text, so it ends the round as it would a round the
+        // provider stopped, unless the stop began in an earlier chunk, which
+        // it took whole: then it starts again from the accepted text.
         if (detectedStopSequence && truncatedAccumulated !== null) {
-          parser.reset();
-          parser.push(truncatedAccumulated);
+          if (parser.getAccumulated() !== truncatedAccumulated) {
+            parser.reset();
+            parser.push(truncatedAccumulated);
+          }
           streamResult.stopReason = 'stop_sequence';
           streamResult.stopSequence = detectedStopSequence;
         }
@@ -1120,13 +1150,10 @@ export class Membrane {
         const usageSoFar = turnUsage.addRound(streamResult.model, streamResult.usage);
         onUsage?.(usageSoFar);
 
-        // Flush the parser to complete any in-progress streaming block
-        const flushResult = parser.flush();
-        for (const emission of flushResult.emissions) {
-          if (emission.kind === 'blockEvent' && !typedCallbacks) {
-            onBlock?.(emission.event);
-          }
-        }
+        // Flush the parser: the block in progress completes, and the text it
+        // held back at the round's end (a possible tag's start) goes out with
+        // it. Under typed blocks neither is streamed (forwardOwn).
+        forwardOwn(parser.flush().emissions);
 
         // Get accumulated text from parser
         const accumulated = parser.getAccumulated();
@@ -1389,24 +1416,37 @@ export class Membrane {
 
         if (lastStopReason === 'stop_sequence' && modelOpenedNewBlock) {
           // False positive! The stop sequence (e.g., "\nUser:") appeared inside XML content
-          // Re-add the consumed stop sequence and resume streaming
+          // Re-add the consumed stop sequence and resume streaming. It's the
+          // model's text, inside the block it opened, so it goes through the
+          // parser as a chunk does. No block is in progress after the round's
+          // flush, so text starts a new block of its type, and a closing tag,
+          // such as a </function_calls> stop with no call run, sends no block
+          // event.
           if (streamResult.stopSequence) {
-            parser.push(streamResult.stopSequence);
-            const meta: ChunkMeta = {
-              type: parser.getCurrentBlockType(),
-              visible: parser.getCurrentBlockType() === 'text',
-              blockIndex: 0,
-            };
-            onChunk?.(streamResult.stopSequence, meta);
+            // Under typed blocks the stop's text goes out as one piece at
+            // index 0, as main sent it, labelled with the block it sits in,
+            // read before the parser takes it, so a closing tag is labelled
+            // with the block it closes.
+            const type = parser.getCurrentBlockType();
+            const putBack = parser.processChunk(streamResult.stopSequence).emissions;
+            if (typedCallbacks) {
+              onChunk?.(streamResult.stopSequence, { type, visible: type === 'text', blockIndex: 0 });
+            } else {
+              forward(putBack);
+            }
           }
 
-          // Resume streaming - but limit resumptions to prevent infinite loops
+          // Resume streaming - but limit resumptions to prevent infinite loops.
+          // A turn that ends at either break below completes the block the
+          // stop's text opened, streamed unless under typed blocks.
           toolDepth++; // Count this as a "depth" to limit iterations
           if (toolDepth > maxToolDepth) {
+            forwardOwn(parser.flush().emissions);
             break;
           }
           if (!registerResumptionRound()) {
             lastStopReason = 'round_limit';
+            forwardOwn(parser.flush().emissions);
             break;
           }
           enteredViaResumption = true;
@@ -1416,8 +1456,8 @@ export class Membrane {
             prefillResult,
             parser.getAccumulated()
           );
-          // Reset parser state for new streaming iteration
-          parser.resetForNewIteration();
+          // The parser isn't reset for the next round, so a block the stop's
+          // text started goes on there.
           continue;
         }
 
@@ -3665,6 +3705,21 @@ export class Membrane {
         const textStarts = new Map<number, number>();
         streamedThinking.beginRound(parser.getAccumulated().length - initialPrefillLength);
         const tracker = new NativeBlockTracker((event) => { if (typedCallbacks && emitBlocks) stream.emit({ type: 'block', event }); });
+        // The parser's emissions go out in order (see streamWithXmlTools).
+        const forward = (emissions: ProcessChunkResult['emissions']) => {
+          for (const emission of emissions) {
+            if (emission.kind === 'blockEvent') {
+              if (emitBlocks && !typedCallbacks) stream.emit({ type: 'block', event: emission.event });
+            } else if (emitTokens) {
+              stream.emit({ type: 'tokens', content: emission.text, meta: typedCallbacks ? { ...emission.meta, blockIndex: tracker.blockIndex } : emission.meta });
+            }
+          }
+        };
+        // Under typed blocks, what the parser held back at a round's end
+        // isn't streamed, as on main (see streamWithXmlTools).
+        const forwardOwn = (emissions: ProcessChunkResult['emissions']) => {
+          if (!typedCallbacks) forward(emissions);
+        };
         const onProviderBlock = (index: number, block: unknown) => {
           if (!xmlToolProtocol && (!detectedStopSequence || textStarts.has(index))) {
             const type = (block as { type?: string } | undefined)?.type;
@@ -3700,46 +3755,14 @@ export class Membrane {
                 if (emitTokens) stream.emit({ type: 'tokens', content: chunk, meta: { type: 'thinking', visible: false, blockIndex: tracker.blockIndex } });
                 return;
               }
-              // Only visible text enters a plain formatter's parser.
-              const { emissions } = parser.processChunk(chunk);
-
-              // Check for stop sequences only in NEW content
-              const accumulated = parser.getAccumulated();
-              const newContent = accumulated.slice(checkFromIndex);
-
-              // The stop that ends first (see streamWithXmlTools).
-              const found = firstStop(newContent, prefillResult.stopSequences);
+              // Only visible text enters a plain formatter's parser, and only
+              // the text before a stop (see streamWithXmlTools).
+              const { found, head, emissions } = parseUpToStop(parser, chunk, checkFromIndex, prefillResult.stopSequences);
               if (found) {
-                const absoluteIdx = checkFromIndex + found.at;
                 detectedStopSequence = found.stop;
-                truncatedAccumulated = accumulated.slice(0, absoluteIdx);
-
-                // Emit only the portion up to stop sequence
-                const alreadyEmitted = accumulated.length - chunk.length;
-                if (emitTokens && absoluteIdx > alreadyEmitted) {
-                  const truncatedChunk = accumulated.slice(alreadyEmitted, absoluteIdx);
-                  const meta: ChunkMeta = {
-                    type: parser.getCurrentBlockType(),
-                    visible: parser.getCurrentBlockType() === 'text',
-                    blockIndex: 0,
-                  };
-                  stream.emit({ type: 'tokens', content: truncatedChunk, meta });
-                }
-                return;
+                truncatedAccumulated = head;
               }
-
-              // Emit in correct interleaved order
-              for (const emission of emissions) {
-                if (emission.kind === 'blockEvent') {
-                  if (emitBlocks && !typedCallbacks) {
-                    stream.emit({ type: 'block', event: emission.event });
-                  }
-                } else {
-                  if (emitTokens) {
-                    stream.emit({ type: 'tokens', content: emission.text, meta: typedCallbacks ? { ...emission.meta, blockIndex: tracker.blockIndex } : emission.meta });
-                  }
-                }
-              }
+              forward(emissions);
             },
             onContentBlock: onProviderBlock,
             // Only a thinking span already recorded takes it (see onProviderBlock).
@@ -3768,10 +3791,14 @@ export class Membrane {
         rounds++;
         providerCalls += streamResult.providerCalls;
 
-        // If we detected stop sequence manually, fix up the parser and result
+        // A stop found here ends the round at the text before it (see
+        // streamWithXmlTools): the parser starts again from the accepted text
+        // only when the stop began in an earlier chunk, which it took whole.
         if (detectedStopSequence && truncatedAccumulated !== null) {
-          parser.reset();
-          parser.push(truncatedAccumulated);
+          if (parser.getAccumulated() !== truncatedAccumulated) {
+            parser.reset();
+            parser.push(truncatedAccumulated);
+          }
           streamResult.stopReason = 'stop_sequence';
           streamResult.stopSequence = detectedStopSequence;
         }
@@ -3811,13 +3838,10 @@ export class Membrane {
           });
         }
 
-        // Flush the parser
-        const flushResult = parser.flush();
-        for (const emission of flushResult.emissions) {
-          if (emission.kind === 'blockEvent' && emitBlocks && !typedCallbacks) {
-            stream.emit({ type: 'block', event: emission.event });
-          }
-        }
+        // Flush the parser: the block in progress completes, and the text it
+        // held back at the round's end goes out with it. Under typed blocks
+        // neither is streamed (forwardOwn).
+        forwardOwn(parser.flush().emissions);
 
         // Stall accounting (issue #39): only rounds ENTERED via automatic
         // resumption can stall; the turn ends only after several consecutive
@@ -4100,24 +4124,34 @@ export class Membrane {
           currentDepths.thinking > prefillDepths.thinking;
 
         if (lastStopReason === 'stop_sequence' && modelOpenedNewBlock) {
+          // The stop's text is the model's, inside the block it opened: it
+          // goes through the parser as a chunk does. No block is in progress
+          // after the round's flush, so text starts a new block of its type,
+          // and a closing tag sends no block event.
           if (streamResult.stopSequence) {
-            parser.push(streamResult.stopSequence);
-            if (emitTokens) {
-              const meta: ChunkMeta = {
-                type: parser.getCurrentBlockType(),
-                visible: parser.getCurrentBlockType() === 'text',
-                blockIndex: 0,
-              };
-              stream.emit({ type: 'tokens', content: streamResult.stopSequence, meta });
+            // Under typed blocks the stop's text goes out as one piece,
+            // labelled with the block it sits in (see streamWithXmlTools).
+            const type = parser.getCurrentBlockType();
+            const putBack = parser.processChunk(streamResult.stopSequence).emissions;
+            if (typedCallbacks) {
+              if (emitTokens) {
+                stream.emit({ type: 'tokens', content: streamResult.stopSequence, meta: { type, visible: type === 'text', blockIndex: 0 } });
+              }
+            } else {
+              forward(putBack);
             }
           }
 
+          // A turn that ends at either break below completes the block the
+          // stop's text opened, streamed unless under typed blocks.
           toolDepth++;
           if (toolDepth > maxToolDepth) {
+            forwardOwn(parser.flush().emissions);
             break;
           }
           if (!registerResumptionRound()) {
             lastStopReason = 'round_limit';
+            forwardOwn(parser.flush().emissions);
             break;
           }
           enteredViaResumption = true;
@@ -4127,7 +4161,7 @@ export class Membrane {
             prefillResult,
             parser.getAccumulated()
           );
-          parser.resetForNewIteration();
+          // A block the stop's text started goes on in the next round.
           continue;
         }
 
