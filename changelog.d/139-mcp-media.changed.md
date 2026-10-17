@@ -24,7 +24,8 @@
   shown to you — it came as a link (https://…), which tool results here
   can't carry. You are not seeing this image.]", with the warning
   `[membrane] image block stripped: a URL source, which the XML tool path can't carry`.
-  Only an http or https link is repeated, cut at 2,048 characters; for any
-  other URL, such as a data URL, the note leaves out the parenthesis.
-  `formatToolResults` and the remainder after a split threw on such an image
-  before (see Fixed), and write this note now.
+  Only an http or https link is repeated, cut at 2,048 characters between
+  code points; for any other URL, such as a data URL, or one holding half a
+  surrogate pair, which the API refuses in a request's JSON, the note leaves
+  out the parenthesis. `formatToolResults` and the remainder after a split
+  threw on such an image before (see Fixed), and write this note now.

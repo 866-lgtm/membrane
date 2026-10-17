@@ -198,13 +198,20 @@ function cameAsLink(image: unknown): boolean {
  *  text. */
 const MAX_NOTED_LINK_CHARS = 2048;
 
+/** Half of a UTF-16 surrogate pair, which a request's JSON can't carry. */
+const LONE_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
+
 /** A link image's URL for its note, so an agent with a fetch or browser tool
- *  can open it: an http or https URL, cut to `MAX_NOTED_LINK_CHARS`. Any
- *  other URL, such as a data URL's payload, isn't repeated. */
+ *  can open it: an http or https URL, cut to `MAX_NOTED_LINK_CHARS` between
+ *  code points. Any other URL, such as a data URL's payload, isn't repeated,
+ *  and nor is one holding half a surrogate pair, since the API refuses the
+ *  request's JSON then. */
 function notedLink(image: unknown): string | undefined {
   const url = ((image as { source?: { url?: unknown } }).source)?.url;
-  if (typeof url !== 'string' || !/^https?:\/\//i.test(url)) return undefined;
-  return url.length > MAX_NOTED_LINK_CHARS ? `${url.slice(0, MAX_NOTED_LINK_CHARS)}…` : url;
+  if (typeof url !== 'string' || !/^https?:\/\//i.test(url) || LONE_SURROGATE.test(url)) return undefined;
+  if (url.length <= MAX_NOTED_LINK_CHARS) return url;
+  const end = /[\uD800-\uDBFF]/.test(url.charAt(MAX_NOTED_LINK_CHARS - 1)) ? MAX_NOTED_LINK_CHARS - 1 : MAX_NOTED_LINK_CHARS;
+  return `${url.slice(0, end)}…`;
 }
 
 /** An image block with no base64 data, in its source or, with no source

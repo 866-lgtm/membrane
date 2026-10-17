@@ -619,15 +619,17 @@ function renderResultContentString(result: ToolResult): string {
 
 /**
  * An image a result renderer has no data to show or measure: media in MCP's
- * form that didn't convert (utils/mcp-media.ts), a URL source, or a base64
- * source without its data. It gets the stripped-image note, as an image the
- * split can't send does, rather than a TypeError reading its data. The XML
- * replay of a split round (AnthropicXmlFormatter) leaves out the same images,
- * so it sends what the split sent.
+ * form that didn't convert (utils/mcp-media.ts), a source that isn't base64,
+ * such as a URL, or a base64 source without its data. It gets the
+ * stripped-image note, as an image the split can't send does, rather than a
+ * TypeError reading its data. The XML replay of a split round
+ * (AnthropicXmlFormatter) leaves out the same images, so it sends what the
+ * split sent.
  */
 export function hasNoDataToShow(block: { source?: unknown }): boolean {
-  const source = block.source as { data?: unknown } | null | undefined;
-  return typeof source !== 'object' || source === null || typeof source.data !== 'string' || source.data === '';
+  const source = block.source as { type?: unknown; data?: unknown } | null | undefined;
+  return typeof source !== 'object' || source === null || source.type !== 'base64'
+    || typeof source.data !== 'string' || source.data === '';
 }
 
 /**
@@ -1416,11 +1418,13 @@ export function formatToolResultsForSplitTurn(handed: ToolResult[]): SplitTurnCo
         if (block.type === 'text') {
           textParts.push(guardResultContent(block.text));
         } else if (block.type === 'image' && hasNoDataToShow(block)) {
-          textParts.push(strippedImagePlaceholder(undefined, block).text);
+          // A note carries the caller's text (a link, a declared media type), so it
+          // passes the guard the result's own text does.
+          textParts.push(guardResultContent(strippedImagePlaceholder(undefined, block).text));
         } else if (block.type === 'image') {
           const mediaType = resolveImageMediaType(block.source.data, block.source.mediaType);
           if (!isAcceptedImageMediaType(mediaType)) {
-            textParts.push(strippedImagePlaceholder(mediaType, block).text);
+            textParts.push(guardResultContent(strippedImagePlaceholder(mediaType, block).text));
           } else {
             resultHasImages = true;
             resultImages.push({
@@ -1502,11 +1506,12 @@ function formatSingleResultXml(result: ToolResult): string {
       if (block.type === 'text') {
         xml += guardResultContent(block.text);
       } else if (block.type === 'image' && hasNoDataToShow(block)) {
-        xml += strippedImagePlaceholder(undefined, block).text;
+        // Notes carry the caller's text, as the split's do.
+        xml += guardResultContent(strippedImagePlaceholder(undefined, block).text);
       } else if (block.type === 'image') {
         // For remaining results after split, images become text placeholders
         const sizeKb = Math.round((block.source.data.length * 0.75) / 1024);
-        xml += `[Image: ${block.source.mediaType}, ~${sizeKb}KB, not shown to you]`;
+        xml += guardResultContent(`[Image: ${block.source.mediaType}, ~${sizeKb}KB, not shown to you]`);
       }
     }
   }

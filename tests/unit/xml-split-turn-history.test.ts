@@ -419,8 +419,10 @@ describe('the XML replay of a split image round', () => {
 
   it("sends a marked result's images as the live split chose them: media in MCP's form converted, and none it couldn't send", async () => {
     // Beside its text, the tool returns an image in MCP's form, which converts
-    // and is sent; one in MCP's form with no mimeType, which can't convert;
-    // and a base64 source with no data. The response keeps them as returned.
+    // and is sent; one in MCP's form with no mimeType, which can't convert; a
+    // base64 source with no data, and one whose data is empty; a URL image;
+    // and a URL source that also carries data, which isn't base64 data either.
+    // The response keeps them as returned.
     const { adapter, response } = await runTurn(
       [{ text: `zz preamble one\n${CALL_XML}`, ...CALL }, { text: 'zz final answer', stopReason: 'end_turn' }],
       (_round, ids) => [{ toolUseId: ids[0]!, toolName: 'zz_shot', content: [
@@ -428,6 +430,9 @@ describe('the XML replay of a split image round', () => {
         { type: 'image', data: ZZ_RED, mimeType: 'image/png' },
         { type: 'image', data: ZZ_BLUE },
         { type: 'image', source: { type: 'base64', mediaType: 'image/png' } },
+        { type: 'image', source: { type: 'base64', data: '', mediaType: 'image/png' } },
+        { type: 'image', source: { type: 'url', url: 'https://example.com/zz.png' } },
+        { type: 'image', source: { type: 'url', url: 'https://example.com/zz.png', data: ZZ_BLUE } },
       ] as unknown as ToolResultContentBlock[] }],
     );
     const sent = (request: ProviderRequest) => (request.messages as Array<{ content: unknown }>)

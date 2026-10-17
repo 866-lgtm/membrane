@@ -21,13 +21,15 @@
  * since a continuation carries its prompt; and the native loop's prompt
  * messages, which the completions serializer reads for text.
  *
- * The rule is the one context-manager's read applies to stored content: a
- * media block (image, document, audio or video) with no `source` object whose
- * `data` and `mimeType` are both strings becomes
+ * The rule: a media block (image, document, audio or video) with no `source`
+ * object whose `data` is a string that isn't empty and whose `mimeType` is a
+ * string becomes
  * `{ ...rest, source: { type: 'base64', data, mediaType: mimeType } }`,
- * keeping its other fields. A media block without a `source` object that
- * doesn't fit is left as it is, and each reader treats it as a source it
- * can't represent.
+ * keeping its other fields. It's the rule context-manager's read applies to
+ * stored content, but for empty data, which converts there: the API refuses
+ * an image whose data is empty, so a block with no data to send stays as it
+ * is here. A media block without a `source` object that doesn't fit is left as
+ * it is, and each reader treats it as a source it can't represent.
  */
 
 const MEDIA_TYPES: ReadonlySet<unknown> = new Set(['image', 'document', 'audio', 'video']);
@@ -72,6 +74,6 @@ function convertedItem(item: unknown): unknown {
   }
   if (!MEDIA_TYPES.has(item.type) || isRecord(item.source)) return item;
   const { data, mimeType, ...rest } = item;
-  if (typeof data !== 'string' || typeof mimeType !== 'string') return item;
+  if (typeof data !== 'string' || data === '' || typeof mimeType !== 'string') return item;
   return { ...rest, source: { type: 'base64', data, mediaType: mimeType } };
 }
