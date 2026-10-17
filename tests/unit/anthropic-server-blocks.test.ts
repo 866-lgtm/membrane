@@ -170,6 +170,30 @@ describe('NativeFormatter', () => {
   });
 });
 
+describe('a server block and an image in one request', () => {
+  // Real 1x1 PNG, and text bytes labelled as one, which no request can carry as an image.
+  const PNG = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg==';
+  const NOTES = Buffer.from('notes: buy milk').toString('base64');
+  const image = (data: string): ContentBlock => ({ type: 'image', source: { type: 'base64', mediaType: 'image/png', data } }) as ContentBlock;
+
+  it('NativeFormatter sends the server blocks in their place and each image as it would alone', () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const messages: NormalizedMessage[] = [
+      { participant: 'User', content: [{ type: 'text', text: 'zz what is in this?' }, image(PNG)] },
+      { participant: 'Claude', content: turn() },
+      { participant: 'User', content: [{ type: 'text', text: 'zz and this?' }, image(NOTES)] },
+    ];
+    const built = new NativeFormatter().buildMessages(messages, options);
+    const sent = built.messages as Array<{ role: string; content: unknown[] }>;
+    expect(sent.map((message) => message.role)).toEqual(['user', 'assistant', 'user']);
+    expect(sent[1]).toEqual({ role: 'assistant', content: sentTurn });
+    expect(sent[0]!.content).toContainEqual({ type: 'image', source: { type: 'base64', media_type: 'image/png', data: PNG } });
+    expect(JSON.stringify(sent[2])).not.toContain(NOTES);
+    expect(JSON.stringify(sent[2])).toContain('the formats this request can carry');
+    expect(serverBlocksIn([sent[0], sent[2]])).toEqual([]);
+  });
+});
+
 describe('toAnthropicContent', () => {
   it('in an assistant turn, converts each carrier to its server block in place and leaves out another wire\'s item', () => {
     expect(toAnthropicContent([...turn(), responsesCarrier], { role: 'assistant' })).toEqual(sentTurn);
@@ -651,8 +675,7 @@ describe('wires with no form for them', () => {
 // A provider that doesn't take server blocks back, such as Bedrock, gets the
 // request it got before they went back at all. Only the build can leave them
 // out before it places cache markers and merges consecutive turns, so it does
-// when told the provider doesn't take them (Andrew-2310's comparisons with
-// 39ce7863, room-203 #78633).
+// when told the provider doesn't take them.
 describe('an adapter Membrane doesn\'t replay them through', () => {
   const T = (text: string): ContentBlock => ({ type: 'text', text });
   const U = (text: string): NormalizedMessage => ({ participant: 'User', content: [T(text)] });
