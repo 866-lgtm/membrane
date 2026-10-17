@@ -145,6 +145,11 @@ function sentSplit(group: readonly ToolResultContent[]): SentSplit | null {
   return images.length > 0 ? { before: rawXml.slice(0, at), images, after } : null;
 }
 
+/** Whether a result holds an image block among its content. */
+function holdsImage(block: ToolResultContent): boolean {
+  return Array.isArray(block.content) && block.content.some((sub) => sub.type === 'image');
+}
+
 // ============================================================================
 // Anthropic XML Formatter
 // ============================================================================
@@ -744,12 +749,25 @@ export class AnthropicXmlFormatter implements PrefillFormatter {
       }
       flushLegacy();
       // Every result parsed from one <function_results> block carries its
-      // text, which goes out once.
+      // text, which goes out once. A turn marks one result of a block at
+      // most, so a second marked result with the same text is another
+      // round's, stored beside it, and starts a group of its own.
       let end = i + 1;
-      while (end < run.length && run[end]!.rawXml === block.rawXml) end++;
+      let marked = typeof block.rawXmlImagesAt === 'number';
+      while (end < run.length && run[end]!.rawXml === block.rawXml) {
+        const nextMarked = typeof run[end]!.rawXmlImagesAt === 'number';
+        if (marked && nextMarked) break;
+        marked ||= nextMarked;
+        end++;
+      }
       const group = run.slice(i, end);
       i = end;
-      out.push(sentSplit(group) ?? block.rawXml);
+      const split = sentSplit(group);
+      // A marked result whose images the turn sent beside its text, and this
+      // request can't send, goes out as the raw text alone: the message is
+      // altered, and its round report says so.
+      if (!split && group.some((b) => typeof b.rawXmlImagesAt === 'number' && holdsImage(b))) onAltered?.();
+      out.push(split ?? block.rawXml);
     }
     flushLegacy();
     return out;

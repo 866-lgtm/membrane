@@ -509,9 +509,11 @@ describe('the XML replay of a split image round', () => {
     const shifted = response.content.map((b) => b.type === 'tool_result' && b.rawXmlImagesAt !== undefined
       ? { ...b, rawXmlImagesAt: b.rawXmlImagesAt - 3 }
       : b);
-    const { request } = await replay(shifted);
+    const { request, rounds } = await replay(shifted);
     expect(census(request)).toEqual(['user:text', 'assistant:text']);
     expect(JSON.stringify(request.messages)).not.toContain(ZZ_RED);
+    // The result still holds the image the turn sent, and this request doesn't: the message is altered.
+    expect(rounds.map((r) => r.altered.messages)).toEqual([[1]]);
   });
 
   it('sends the raw text whole when the marked result no longer holds an image', async () => {
@@ -523,8 +525,61 @@ describe('the XML replay of a split image round', () => {
     const edited = response.content.map((b) => b.type === 'tool_result'
       ? { ...b, content: [{ type: 'text' as const, text: 'zz shot ok' }] }
       : b);
-    const { request } = await replay(edited);
+    const { request, rounds } = await replay(edited);
     expect(census(request)).toEqual(['user:text', 'assistant:text']);
     expect(JSON.stringify(request.messages)).not.toContain(ZZ_RED);
+    // Nothing the message holds is left out: the raw text is what it carries.
+    expect(rounds.map((r) => r.altered.messages)).toEqual([[]]);
+  });
+
+  it('replays two rounds with the same text, stored next to each other, each with its own image', async () => {
+    const { response } = await runTurn(
+      [{ text: `zz preamble one\n${CALL_XML}`, ...CALL }, { text: `zz preamble two\n${CALL_XML}`, ...CALL }, { text: 'zz final answer', stopReason: 'end_turn' }],
+      (round, ids) => [imageResult(ids[0]!, round === 0 ? ZZ_RED : ZZ_BLUE)],
+    );
+    // A consumer that keeps a turn's results apart from its text stores both rounds' results in one message.
+    const results = response.content.filter((b) => b.type === 'tool_result');
+    const rest = response.content.filter((b) => b.type !== 'tool_result');
+    const lastCall = rest.map((b) => b.type).lastIndexOf('tool_use');
+    const { request } = await replayMessages([
+      { participant: 'Claude', content: rest.slice(0, lastCall + 1) },
+      { participant: 'Tools', content: results },
+      { participant: 'Claude', content: rest.slice(lastCall + 1) },
+    ]);
+    const wire = JSON.stringify(request.messages);
+    expect(wire.split(ZZ_RED).length - 1).toBe(1);
+    expect(wire.split(ZZ_BLUE).length - 1).toBe(1);
+    expect(census(request).filter((kind) => kind === 'user:[image]')).toHaveLength(2);
+  });
+});
+
+describe('a round whose every image is of a media type the API refuses', () => {
+  const bmpResult = (toolUseId: string): ToolResult => ({
+    toolUseId,
+    toolName: 'zz_shot',
+    content: [
+      { type: 'text', text: 'zz shot ok' },
+      { type: 'image', source: { type: 'base64', data: 'Qk0zzzz', mediaType: 'image/bmp' } },
+    ],
+  });
+  const SCRIPT: ScriptedRound[] = [{ text: `zz preamble one\n${CALL_XML}`, ...CALL }, { text: 'zz final answer', stopReason: 'end_turn' }];
+
+  it('goes in as text with the note where the image was, not as an empty user turn: stream()', async () => {
+    const { adapter, response } = await runTurn(SCRIPT, (_round, ids) => [bmpResult(ids[0]!)]);
+    const continuation = adapter.requests[1]!;
+    expect(census(continuation)).toEqual(['user:text', 'assistant:text']);
+    expect(JSON.stringify(continuation.messages)).toContain('media type \\"image/bmp\\" is not accepted');
+    expect(toolResults(response.content).some((b) => b.rawXmlImagesAt !== undefined)).toBe(false);
+  });
+
+  it('the same through streamYielding', async () => {
+    const adapter = new RecordingXmlAdapter(SCRIPT);
+    const stream = new Membrane(adapter).streamYielding(REQUEST, {});
+    for await (const event of stream) {
+      if (event.type === 'tool-calls') stream.provideToolResults([bmpResult(event.calls[0]!.id)]);
+    }
+    const continuation = adapter.requests[1]!;
+    expect(census(continuation)).toEqual(['user:text', 'assistant:text']);
+    expect(JSON.stringify(continuation.messages)).toContain('media type \\"image/bmp\\" is not accepted');
   });
 });

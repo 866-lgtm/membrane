@@ -1249,20 +1249,19 @@ export class Membrane {
             // Track the tool results
             executedToolResults.push(...results);
 
-            // Check if results contain images (requires split-turn injection)
-            if (hasImageInToolResults(results)) {
-              // Use split-turn injection for images
-              const splitContent = formatToolResultsForSplitTurn(results);
-              if (splitContent.hasImages) {
-                splitRounds.push({
-                  xml: splitContent.beforeImageXml + splitContent.afterImageXml,
-                  // The block goes into the document next, so it starts here.
-                  docAt: parser.getAccumulated().length - initialPrefillLength,
-                  at: splitContent.beforeImageXml.length,
-                  imageResult: splitContent.imageResult,
-                  results,
-                });
-              }
+            // A result's sendable images need split-turn injection. With none
+            // to send (every image a media type the API refuses), the block goes
+            // in as text, with the notes written where those images were.
+            const splitContent = hasImageInToolResults(results) ? formatToolResultsForSplitTurn(results) : null;
+            if (splitContent?.hasImages) {
+              splitRounds.push({
+                xml: splitContent.beforeImageXml + splitContent.afterImageXml,
+                // The block goes into the document next, so it starts here.
+                docAt: parser.getAccumulated().length - initialPrefillLength,
+                at: splitContent.beforeImageXml.length,
+                imageResult: splitContent.imageResult,
+                results,
+              });
 
               // Emit block events for tool results (image path)
               const toolResultBlockIndex = parser.getBlockIndex();
@@ -1323,8 +1322,8 @@ export class Membrane {
               // Reset parser state for new streaming iteration
               parser.resetForNewIteration();
             } else {
-              // Standard path: no images, use simple XML injection
-              const resultsXml = formatToolResults(results);
+              // Standard path: no image to send, use simple XML injection
+              const resultsXml = splitContent ? splitContent.beforeImageXml : formatToolResults(results);
 
               // Emit block events for tool results
               const toolResultBlockIndex = parser.getBlockIndex();
@@ -3971,19 +3970,19 @@ export class Membrane {
             // Track the tool results
             executedToolResults.push(...results);
 
-            // Check if results contain images
-            if (hasImageInToolResults(results)) {
-              const splitContent = formatToolResultsForSplitTurn(results);
-              if (splitContent.hasImages) {
-                splitRounds.push({
-                  xml: splitContent.beforeImageXml + splitContent.afterImageXml,
-                  // The block goes into the document next, so it starts here.
-                  docAt: parser.getAccumulated().length - initialPrefillLength,
-                  at: splitContent.beforeImageXml.length,
-                  imageResult: splitContent.imageResult,
-                  results,
-                });
-              }
+            // A result's sendable images need split-turn injection. With none
+            // to send (every image a media type the API refuses), the block goes
+            // in as text, with the notes written where those images were.
+            const splitContent = hasImageInToolResults(results) ? formatToolResultsForSplitTurn(results) : null;
+            if (splitContent?.hasImages) {
+              splitRounds.push({
+                xml: splitContent.beforeImageXml + splitContent.afterImageXml,
+                // The block goes into the document next, so it starts here.
+                docAt: parser.getAccumulated().length - initialPrefillLength,
+                at: splitContent.beforeImageXml.length,
+                imageResult: splitContent.imageResult,
+                results,
+              });
 
               // Emit block events for tool results
               if (emitBlocks) {
@@ -4050,8 +4049,8 @@ export class Membrane {
               prefillResult.assistantPrefill = parser.getAccumulated();
               parser.resetForNewIteration();
             } else {
-              // Standard path: no images
-              const resultsXml = formatToolResults(results);
+              // Standard path: no image to send
+              const resultsXml = splitContent ? splitContent.beforeImageXml : formatToolResults(results);
 
               if (emitBlocks) {
                 stream.emit({

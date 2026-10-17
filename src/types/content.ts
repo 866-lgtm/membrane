@@ -193,11 +193,17 @@ export interface ToolResultContent {
    * formats) between the two parts, as the turn sent it, and the images are
    * carried with the raw text. It sends `rawXml` whole instead when the
    * offset no longer falls where a result or error in the block closes, or when
-   * `content` holds no image a split sends. A message that also carries
-   * images of its own goes to the provider as one user turn, with these
-   * images where the split fell. What the turn added after the block, such
-   * as the thinking opener a thinking turn writes there, replays as it did
-   * before. A consumer that changes the result drops this with `rawXml`.
+   * `content` holds no image a split sends; if `content` still holds an image
+   * then, the request leaves it out and the round report counts the message
+   * altered. A message that also carries images of its own goes to the
+   * provider as one user turn, with these images where the split fell. What
+   * the turn added after the block, such as the thinking opener a thinking
+   * turn writes there, replays as it did before. A consumer that changes the
+   * result, removing an image included, drops this with `rawXml`: the result
+   * then renders from `content`, with a note where an image isn't sent.
+   * Results with the same `rawXml` replay as one block, its text sent once,
+   * except that a second marked result starts another block, since a turn
+   * marks one result of a block at most.
    */
   rawXmlImagesAt?: number;
   /** See {@link TextContent.rawItem}. */
