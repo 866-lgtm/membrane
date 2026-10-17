@@ -51,7 +51,8 @@ export interface ToolCallsEvent {
  * On the yielding paths it is emitted once per provider round whose response
  * stands (after any refusal retries), and then carries `round`: that round's
  * own report. Streams created with `emitUsage: false` emit no usage events,
- * so no round reports either.
+ * so no round reports either. A round whose response arrives after the
+ * stream was cancelled isn't reported: the stream ended at its aborted event.
  */
 export interface UsageEvent {
   type: 'usage';
@@ -364,10 +365,13 @@ export interface YieldingStream extends AsyncIterable<StreamEvent> {
 
   /**
    * Cancel the stream. Any in-flight requests will be aborted.
-   * The iterator will yield an 'aborted' event and then complete. The event
-   * carries what the turn had recorded when cancel() was called (see
-   * AbortedEvent). Results passed to provideToolResults() just before it
-   * aren't recorded yet, so their calls show no results.
+   * The iterator will yield an 'aborted' event and then complete, with
+   * nothing after it. The event carries what the turn had recorded when
+   * cancel() was called (see AbortedEvent). Results passed to
+   * provideToolResults() just before it aren't recorded yet, so their calls
+   * show no results. If the stream has already queued or delivered its
+   * complete, error or aborted event, cancel() adds no event of its own, and
+   * that event stays the stream's last.
    */
   cancel(): void;
 

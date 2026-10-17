@@ -14,15 +14,11 @@ import type {
   InjectedMessage,
   ProvideToolResultsOptions,
 } from './types/yielding-stream.js';
+import { isTerminalEvent } from './types/yielding-stream.js';
 import type { ToolResult } from './types/tools.js';
 
 /** What an aborted event carries besides its type and reason. */
 type AbortedSnapshot = Omit<AbortedEvent, 'type' | 'reason'>;
-
-/** The events that end a stream: exactly one of them is its last. */
-function isTerminal(event: StreamEvent): boolean {
-  return event.type === 'complete' || event.type === 'error' || event.type === 'aborted';
-}
 
 /**
  * Payload handed from provideToolResults() to the inference loop awaiting
@@ -266,7 +262,7 @@ export class YieldingStreamImpl implements YieldingStream {
           // Check for queued events
           const event = this.eventQueue.shift();
           if (event) {
-            if (isTerminal(event)) {
+            if (isTerminalEvent(event)) {
               this.state = { status: 'done' };
             }
             return { value: event, done: false };
@@ -321,7 +317,7 @@ export class YieldingStreamImpl implements YieldingStream {
     // wait had resolved before the abort reached it), nor the aborted event
     // of a cancel() that came after the loop's own terminal.
     if (this.terminalQueued) return;
-    if (isTerminal(event)) this.terminalQueued = true;
+    if (isTerminalEvent(event)) this.terminalQueued = true;
     this.eventQueue.push(event);
     this.notifyEventWaiter();
   }
