@@ -31,7 +31,7 @@ import {
   isTypedAbortError,
   withRawRequest,
 } from '../types/index.js';
-import { toolUseInputFromText, textOnlyToolResultContent, createCombinedSignal, SSELineParser, isDeadlineAbort, deadlineTimeoutError, throwOnStreamErrorFrame, assertTerminalEventObserved } from './utils.js';
+import { toolUseInputFromText, textOnlyToolResultContent, openAIImagePart, createCombinedSignal, SSELineParser, isDeadlineAbort, deadlineTimeoutError, throwOnStreamErrorFrame, assertTerminalEventObserved } from './utils.js';
 
 // ============================================================================
 // Types
@@ -508,19 +508,10 @@ export class OpenAIAdapter implements ProviderAdapter {
           if (block.type === 'text') {
             contentParts.push({ type: 'text', text: block.text });
           } else if (block.type === 'image') {
-            // Convert Anthropic-style image to OpenAI image_url with data URI
-            if (block.source?.type === 'base64') {
-              const mediaType = block.source.media_type ?? block.source.mediaType ?? 'image/png';
-              contentParts.push({
-                type: 'image_url',
-                image_url: { url: `data:${mediaType};base64,${block.source.data}` },
-              });
-            } else if (block.source?.type === 'url') {
-              contentParts.push({
-                type: 'image_url',
-                image_url: { url: block.source.url },
-              });
-            }
+            // Convert Anthropic-style image to OpenAI image_url with data URI,
+            // or to the placeholder for data these APIs don't accept
+            const part = openAIImagePart(block.source);
+            if (part) contentParts.push(part);
           } else if (block.type === 'tool_use') {
             toolCalls.push({
               id: block.id,

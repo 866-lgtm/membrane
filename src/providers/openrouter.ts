@@ -25,7 +25,7 @@ import {
   isTypedAbortError,
   withRawRequest,
 } from '../types/index.js';
-import { toolUseInputFromText, textOnlyToolResultContent, createCombinedSignal, SSELineParser, isDeadlineAbort, deadlineTimeoutError, throwOnStreamErrorFrame, assertTerminalEventObserved } from './utils.js';
+import { toolUseInputFromText, textOnlyToolResultContent, openAIImagePart, createCombinedSignal, SSELineParser, isDeadlineAbort, deadlineTimeoutError, throwOnStreamErrorFrame, assertTerminalEventObserved } from './utils.js';
 
 // ============================================================================
 // Types
@@ -533,18 +533,10 @@ export class OpenRouterAdapter implements ProviderAdapter {
             }
             textParts.length = 0;
 
-            if (block.source?.type === 'base64') {
-              const mediaType = block.source.media_type ?? block.source.mediaType ?? 'image/png';
-              contentBlocks.push({
-                type: 'image_url',
-                image_url: { url: `data:${mediaType};base64,${block.source.data}` },
-              });
-            } else if (block.source?.type === 'url') {
-              contentBlocks.push({
-                type: 'image_url',
-                image_url: { url: block.source.url },
-              });
-            }
+            // An image_url, or the placeholder for data OpenRouter's
+            // providers don't accept as an image
+            const part = openAIImagePart(block.source);
+            if (part) contentBlocks.push(part);
           } else if (block.type === 'audio') {
             // Audio input → OpenAI-style `input_audio` content part (sibling to
             // the Gemini inlineData path). Like images, this forces the array

@@ -28,6 +28,7 @@ import {
   isTypedAbortError,
   withRawRequest,
 } from '../types/index.js';
+import { imageForRequest, GEMINI_IMAGE_TYPES } from '../utils/image-media.js';
 import { createCombinedSignal, textOnlyToolResultContent, toolUseInputFromValue, isDeadlineAbort, deadlineTimeoutError, throwOnStreamErrorFrame, assertTerminalEventObserved } from './utils.js';
 
 // ============================================================================
@@ -589,15 +590,15 @@ export class GeminiAdapter implements ProviderAdapter {
               continue;
             }
 
-            // Anthropic image format → Gemini inlineData
+            // Anthropic image format → Gemini inlineData, labelled by its
+            // header, for a format Gemini's docs list; the placeholder for
+            // data that isn't one (a GIF included)
             const source = block.source;
-            if (source?.type === 'base64' && source.data) {
-              parts.push({
-                inlineData: {
-                  mimeType: source.media_type ?? 'image/jpeg',
-                  data: source.data,
-                },
-              });
+            if (source?.type === 'base64') {
+              const { mediaType, placeholder } = imageForRequest(source.data, source.media_type ?? source.mediaType, GEMINI_IMAGE_TYPES);
+              parts.push(placeholder
+                ? { text: placeholder.text }
+                : { inlineData: { mimeType: mediaType, data: source.data } });
             }
           } else if (block.type === 'audio') {
             // Audio input → Gemini inlineData (same mechanism as images). This is
