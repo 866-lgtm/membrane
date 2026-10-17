@@ -71,20 +71,24 @@ function frameTokensMatch(tokens: string[], needles: string[]): boolean {
 }
 
 /**
- * Throw when an SSE data frame carries a provider `error` payload.
+ * Throw when an SSE data frame, or a non-streaming response body, reports a
+ * provider failure inside an HTTP 200: an `error` object at its top level or
+ * on its first choice, whatever the finish reason, or a first choice that
+ * ends with `finish_reason: "error"`.
  *
- * Every provider delivers mid-stream failures (upstream 429s, capacity loss,
- * safety aborts) as a data line with an `error` object inside an HTTP-200
- * stream. A loop that only looks for `choices`/`candidates` drops that frame,
- * reaches EOF, and builds a well-formed success out of whatever arrived first:
- * partial content, the initialised default finish reason, zero usage. Nothing
- * distinguishes it from the model choosing to stop, so the truncated turn is
- * persisted as a real one.
+ * Providers deliver mid-stream failures (upstream 429s, capacity loss,
+ * safety aborts) inside an HTTP-200 stream, usually as a data line with an
+ * `error` object. A loop that only looks for `choices`/`candidates` drops that
+ * frame, reaches EOF, and builds a well-formed success out of whatever arrived
+ * first: partial content, the initialised default finish reason, zero usage.
+ * Nothing distinguishes it from the model choosing to stop, so the truncated
+ * turn is persisted as a real one.
  *
  * The house ruled this a bug twice before it was hoisted here — once in
  * openrouter.ts (tests/unit/openrouter-stream-error.test.ts) and once in
  * openai-responses-api.ts — and both times the fix stayed in the one adapter
- * that was being touched. This is the single site every SSE adapter calls.
+ * that was being touched. Every adapter that parses SSE data frames itself
+ * calls this one function; Anthropic's and Bedrock's read their own events.
  *
  * The frame is CLASSIFIED here rather than downstream. Throwing a bare
  * `Error(string)` left `code`/`type`/`status` as prose, and each adapter's
@@ -102,6 +106,20 @@ function frameTokensMatch(tokens: string[], needles: string[]): boolean {
  * including for an unclassified payload. Explicit 400 frames are typed
  * invalid_request errors rather than bare Error objects.
  *
+ * OpenRouter documents its mid-stream failure as an `error` object at the
+ * top level beside `finish_reason: "error"`, and a non-streaming response
+ * whose generation failed with the `error` object on its choice, beside that
+ * finish reason and the partial content. An `error` object classifies the
+ * failure by its own fields, wherever it sits and whatever the finish reason.
+ * A first choice that ends with `finish_reason: "error"` and comes with no
+ * `error` object either way is a shape OpenRouter doesn't document, and it
+ * carries nothing of its own to classify. Read as a finish reason alone, it
+ * would end the turn as end_turn over the partial content, since membrane's
+ * mapper normalizes a token it doesn't know to end_turn. So it takes the
+ * class of the failures partway that OpenRouter does document, a
+ * `server_error` mid-stream and a 502 on the choice: a retryable server
+ * error, with the httpStatus 500 the `server_error` frame gets from its code.
+ *
  * `errorNoun` names what carried the payload. It defaults to the SSE case, and
  * exists because the same `{ error: { code, message } }` object also arrives on
  * a non-streaming 200 body, where calling the failure a stream error would be
@@ -115,20 +133,23 @@ export function throwOnStreamErrorFrame(
   errorNoun: string = 'stream error'
 ): void {
   if (typeof parsed !== 'object' || parsed === null) return;
-  const streamError = (parsed as { error?: unknown }).error;
-  if (!streamError) return;
+  // The first choice is the one every adapter reads.
+  const choice = (parsed as { choices?: Array<{ finish_reason?: unknown; error?: unknown } | null> }).choices?.[0];
+  const topLevelError = (parsed as { error?: unknown }).error;
+  const streamError = topLevelError || choice?.error;
+  if (!streamError && choice?.finish_reason !== 'error') return;
 
   const fields: StreamErrorFrameFields =
-    typeof streamError === 'object' ? (streamError as StreamErrorFrameFields) : {};
+    streamError && typeof streamError === 'object' ? (streamError as StreamErrorFrameFields) : {};
   // A successful transport status or arbitrary provider-local number is not
   // an HTTP error status. Neither may suppress a usable symbolic error code.
   const httpStatus = [fields.status, fields.code].map(value => readNumericField(value))
     .find(value => value !== undefined && Number.isInteger(value) && value >= 400 && value <= 599);
   const tokens = readFrameClassificationTokens(fields);
   const providerMessage =
-    typeof fields.message === 'string' && fields.message !== ''
-      ? fields.message
-      : JSON.stringify(streamError);
+    !streamError ? 'the provider ended the response with finish_reason "error" and sent no error object saying why'
+    : typeof fields.message === 'string' && fields.message !== '' ? fields.message
+    : JSON.stringify(streamError);
 
   const description =
     `${providerLabel} ${errorNoun}` +
@@ -138,8 +159,11 @@ export function throwOnStreamErrorFrame(
   // Retain the adapters' established structured-token spellings as a fallback.
   // The shared classifier gives an explicit status or known provider code priority,
   // and owns terminal-quota versus transient-rate-limit retryability in either transport.
+  // finish_reason "error" with no error object takes the server_error frame's
+  // 500 (see above).
   const overloadedShaped = frameTokensMatch(tokens, OVERLOADED_FRAME_TOKENS);
-  const fallbackStatus = frameTokensMatch(tokens, RATE_LIMIT_FRAME_TOKENS) ? 429
+  const fallbackStatus = !streamError ? 500
+    : frameTokensMatch(tokens, RATE_LIMIT_FRAME_TOKENS) ? 429
     : frameTokensMatch(tokens, AUTH_FRAME_TOKENS) ? 401
     : overloadedShaped ? 529
     : frameTokensMatch(tokens, SERVER_FRAME_TOKENS) ? 500
@@ -148,9 +172,11 @@ export function throwOnStreamErrorFrame(
     provider: providerLabel,
     status: httpStatus,
     fallbackStatus,
-    body: parsed,
+    // The classifier reads an error body's top-level `error`.
+    body: !streamError ? undefined : topLevelError ? parsed : { error: streamError },
     message: description,
     retryAfterMs: readFrameRetryAfterMs(fields),
+    rawError: parsed,
     rawRequest,
   });
 }
