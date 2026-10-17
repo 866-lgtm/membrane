@@ -128,9 +128,11 @@ function geminiUnreportedUsage(usageMetadata: GeminiResponse['usageMetadata']): 
  * the output rate, so generated output is the SUM of the two; reading only
  * candidates reported a thinking turn at a fraction of its real size. The
  * reconciliation check makes the next such omission loud rather than silent:
- * Google's own total is the independent witness, and a mismatch means a
- * usageMetadata field outside prompt, tool-use prompt, candidates and
- * thoughts is carrying tokens.
+ * Google's own total is the independent witness, set against the tokens
+ * membrane counts, which are prompt, tool-use prompt, candidates and
+ * thoughts, and for a response read as cache-excluded the cached span
+ * besides. A total above them means a usageMetadata field outside those is
+ * carrying tokens. A total below them warns too, naming no field.
  *
  * `toolUsePromptTokenCount` is disjoint from `promptTokenCount` and is read
  * into `inputTokens`: Google bills code execution's intermediate tokens, URL
@@ -165,10 +167,13 @@ function geminiUsageToProviderUsage(
 
   if (usageMetadata && totalTokens != null) {
     const accountedTokens = promptTokens + toolUsePromptTokens + candidatesTokens + (thoughtsTokens ?? 0);
-    // In the cache-excluded reading the cached span is outside the prompt
-    // count, so a total that counts it is the same arithmetic as an
-    // inclusive one: prompt + tool-use prompt + cached + candidates +
-    // thoughts.
+    // A response read as cache-excluded counts its cached span beside its
+    // prompt, so a total that includes the span is the total membrane
+    // counts: prompt + tool-use prompt + cached + candidates + thoughts. None
+    // of the published responses GeminiAdapter.usageCacheConvention cites
+    // shows this regime, so both totals reconcile: Google's formula, which
+    // has no cached term, and that one. Meeting the regime is warned about
+    // once, below.
     const largestSum = promptExcludesCache ? accountedTokens + cachedTokens : accountedTokens;
     const reconciles = accountedTokens === totalTokens || largestSum === totalTokens;
     if (!reconciles) {
