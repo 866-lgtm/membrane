@@ -10,7 +10,7 @@ It sits at the bottom of the Connectome stack. [agent-framework](https://github.
 npm install @animalabs/membrane
 ```
 
-It needs Node 20 or later. Its one runtime dependency is `@anthropic-ai/sdk`.
+It needs Node 22.12 or later. Its one runtime dependency is `@anthropic-ai/sdk`.
 
 ## Quick start
 

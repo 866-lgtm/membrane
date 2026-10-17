@@ -605,10 +605,10 @@ function renderResultContentString(result: ToolResult): string {
     if (block.type === 'text') {
       parts.push(block.text);
     } else if (block.type === 'image') {
-      // For XML mode, we can't embed images directly
-      // Add a note about the image for the model
+      // For XML mode, we can't embed images directly. The note says the
+      // model isn't seeing it, so the size isn't read as its contents.
       const sizeKb = Math.round((block.source.data.length * 0.75) / 1024);
-      parts.push(`[Image: ${block.source.mediaType}, ~${sizeKb}KB]`);
+      parts.push(`[Image: ${block.source.mediaType}, ~${sizeKb}KB, not shown to you]`);
     }
   }
   return parts.join('\n');
@@ -1474,7 +1474,7 @@ function formatSingleResultXml(result: ToolResult): string {
       } else if (block.type === 'image') {
         // For remaining results after split, images become text placeholders
         const sizeKb = Math.round((block.source.data.length * 0.75) / 1024);
-        xml += `[Image: ${block.source.mediaType}, ~${sizeKb}KB]`;
+        xml += `[Image: ${block.source.mediaType}, ~${sizeKb}KB, not shown to you]`;
       }
     }
   }

@@ -53,6 +53,14 @@ export interface ToolCall {
   id: string;
   name: string;
   input: Record<string, unknown>;
+  /**
+   * The call's tool_use block's marker (ToolUseContent.unparseableInput):
+   * present, even as the empty string, when `input` isn't the model's
+   * arguments. It holds the arguments as they came, as JSON when they came as
+   * a value. An executor can answer the model with an error result instead of
+   * running the call with `{}`.
+   */
+  unparseableInput?: string;
 }
 
 export interface ToolResult {
