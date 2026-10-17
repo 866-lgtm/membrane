@@ -112,10 +112,32 @@ describe('a cancelled streamYielding() turn reports what it had', () => {
       const part = partOf(events);
       expect(part.toolCalls).toEqual([expect.objectContaining({ name: 'zz_noop', input: { x: 1 } })]);
       expect(part.toolResults).toEqual([expect.objectContaining({ content: 'zz ok' })]);
+      // Both rounds' text: the recorded round's and the open round's so far.
+      expect(String(part.rawAssistantText)).toContain('zz checking');
       expect(String(part.rawAssistantText)).toContain('zz second ');
+      const blocks = part.partialContent as Array<{ type: string }>;
+      expect(blocks.map((block) => block.type)).toEqual(['text', 'tool_use', 'tool_result', 'text']);
+      expect(JSON.stringify(blocks[0])).toContain('zz checking');
       // The XML path parses its blocks from the text, and that parse gives
       // this one as "zz second", without the trailing space.
-      expect(JSON.stringify(part.partialContent)).toContain('zz second');
+      expect(JSON.stringify(blocks[3])).toContain('zz second');
+    });
+
+    it(`cancel() while the round's tools are running carries its calls with no results (${mode})`, async () => {
+      const adapter = new TwoRoundAdapter(mode);
+      const stream = new Membrane(adapter).streamYielding(requestFor(mode), {});
+      const events: StreamEvent[] = [];
+      for await (const event of stream) {
+        events.push(event);
+        if (event.type === 'tool-calls') stream.cancel();
+      }
+      const part = partOf(events);
+      expect(part.toolCalls).toEqual([expect.objectContaining({ name: 'zz_noop', input: { x: 1 } })]);
+      expect(part.toolResults).toEqual([]);
+      expect(String(part.rawAssistantText)).toContain('zz checking');
+      const blocks = part.partialContent as Array<{ type: string }>;
+      expect(blocks.map((block) => block.type)).toEqual(['text', 'tool_use']);
+      expect(adapter.calls).toBe(1);
     });
 
     it(`cancel() carries what a deadline abort at the same point carries (${mode})`, async () => {
@@ -156,8 +178,10 @@ describe('a cancelled streamYielding() turn reports what it had', () => {
           stream.provideToolResults(event.calls.map((call) => ({ toolUseId: call.id, content: 'zz ok' })));
           stream.cancel();
         }
-        // Still reading when the loop resumes and records those results.
-        await new Promise((resolve) => setTimeout(resolve, 20));
+        // Still reading when the loop resumes and records those results: it
+        // records them as soon as its wait resolves, with no await between,
+        // so one turn of the event loop is enough.
+        await new Promise((resolve) => setImmediate(resolve));
       }
       const part = partOf(events);
       expect(part.toolCalls).toEqual([expect.objectContaining({ name: 'zz_noop' })]);
@@ -177,5 +201,34 @@ describe('a cancelled streamYielding() turn reports what it had', () => {
       if (event.type === 'tokens') expect(() => started.cancel()).not.toThrow();
     }
     expect(seen.filter((event) => event.type === 'aborted')).toEqual([{ type: 'aborted', reason: 'user' }]);
+  });
+
+  it('a consumer that leaves early does not run the builder, and one that cancels does', async () => {
+    const counted = (count: { built: number }) => new YieldingStreamImpl({}, async (running) => {
+      running.setAbortSnapshot(() => { count.built++; return {}; });
+      running.emit({ type: 'tokens', content: 'zz', meta: { visible: true } } as never);
+      await new Promise<void>((resolve) => running.signal.addEventListener('abort', () => resolve(), { once: true }));
+    });
+
+    const left = { built: 0 };
+    for await (const event of counted(left)) {
+      if (event.type === 'tokens') break;
+    }
+    expect(left.built).toBe(0);
+
+    const cancelled = { built: 0 };
+    const stream = counted(cancelled);
+    for await (const event of stream) {
+      if (event.type === 'tokens') stream.cancel();
+    }
+    expect(cancelled.built).toBe(1);
+  });
+
+  it('a finished stream lets go of its loop\'s builder', async () => {
+    const stream = new YieldingStreamImpl({}, async (running) => {
+      running.setAbortSnapshot(() => ({ rawAssistantText: 'zz' }));
+    });
+    for await (const _event of stream) { /* the loop ends at once */ }
+    expect((stream as unknown as { abortSnapshot?: unknown }).abortSnapshot).toBeUndefined();
   });
 });

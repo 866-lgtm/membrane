@@ -128,9 +128,9 @@ export class YieldingStreamImpl implements YieldingStream {
     this.cancel();
   };
 
-  // What the running loop has received and run so far, built from its state
-  // by the loop's own builder (setAbortSnapshot), so that the aborted event
-  // cancel() emits carries what a provider or deadline abort would.
+  // The running loop's builder for what an aborted event carries
+  // (setAbortSnapshot): what the loop has recorded, built as the loop's own
+  // catch builds it for a provider or deadline abort.
   private abortSnapshot: (() => AbortedSnapshot) | undefined;
 
   constructor(
@@ -217,12 +217,12 @@ export class YieldingStreamImpl implements YieldingStream {
       return; // Already terminated
     }
 
-    // What the loop had when the cancel came. A builder that throws costs
-    // only the partial content: the cancel still ends the stream, with the
-    // bare aborted event.
+    // What the loop had when the cancel came, unless the consumer has left
+    // and nothing will read it. A builder that throws costs the event all
+    // four fields, not the cancel: the event goes out bare, as before.
     let partial: AbortedSnapshot = {};
     try {
-      partial = this.abortSnapshot?.() ?? {};
+      if (!this.consumerDeparted) partial = this.abortSnapshot?.() ?? {};
     } catch {
       // the bare aborted event
     }
@@ -349,6 +349,9 @@ export class YieldingStreamImpl implements YieldingStream {
    */
   markDone(): void {
     this.producerDone = true;
+    // The loop has finished, so let go of its builder: held here, it would
+    // keep the loop's whole state reachable for as long as the stream is.
+    this.abortSnapshot = undefined;
     this.releaseExternalSignal();
     this.notifyEventWaiter();
   }
