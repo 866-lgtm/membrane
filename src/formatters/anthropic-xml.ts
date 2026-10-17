@@ -169,7 +169,9 @@ function holdsImage(block: ToolResultContent): boolean {
  * that many, and the rest are another round's, with the same text, stored
  * beside it. That holds while the parser reads the text as the turn's parse
  * did (see parseAccumulatedIntoBlocks). Infinity when the parser reads none,
- * as for a damaged raw text, so the whole run goes out once, as it always did.
+ * as for a damaged raw text, so the count doesn't divide the run: calls go out
+ * once, as they always did, and results once for each marked result in the
+ * run, or once if none is marked (renderToolResultRun).
  */
 function rawXmlCount(rawXml: string, kind: 'results' | 'calls', memo: Map<string, number>): number {
   let count = memo.get(rawXml);
