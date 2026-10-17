@@ -3645,6 +3645,23 @@ export class Membrane {
       return true;
     };
 
+    // What an aborted event carries: the text so far and the tool rounds run.
+    // One builder for both aborts: the catch below uses it for a provider or
+    // deadline abort, and cancel() for the one it emits. The arrays are
+    // copies, since this loop can still record a round after a cancel.
+    const abortedPartial = () => {
+      const newContent = parser.getAccumulated().slice(initialPrefillLength);
+      return {
+        partialContent: xmlToolProtocol
+          ? parseAccumulatedIntoBlocks(newContent, { tools: request.tools, ...(initialBlockType ? { startInsideBlock: initialBlockType } : {}) }).blocks
+          : streamedThinking.content(newContent, (value, context) => formatter.parseContentBlocks(value, request.tools, context)),
+        rawAssistantText: newContent,
+        toolCalls: [...executedToolCalls],
+        toolResults: [...executedToolResults],
+      };
+    };
+    stream.setAbortSnapshot(abortedPartial);
+
     try {
       // Tool execution loop
       while (toolDepth <= maxToolDepth) {
@@ -4172,18 +4189,7 @@ export class Membrane {
       // Error. Reporting again here would deliver a second aborted.
       if (stream.isCancelled) return;
       if (this.isAbortError(error)) {
-        const fullAccumulated = parser.getAccumulated();
-        const newContent = fullAccumulated.slice(initialPrefillLength);
-        stream.emit({
-          type: 'aborted',
-          reason: this.abortReason(error, stream.signal),
-          partialContent: xmlToolProtocol
-              ? parseAccumulatedIntoBlocks(newContent, { tools: request.tools, ...(initialBlockType ? { startInsideBlock: initialBlockType } : {}) }).blocks
-              : streamedThinking.content(newContent, (value, context) => formatter.parseContentBlocks(value, request.tools, context)),
-          rawAssistantText: newContent,
-          toolCalls: executedToolCalls,
-          toolResults: executedToolResults,
-        });
+        stream.emit({ type: 'aborted', reason: this.abortReason(error, stream.signal), ...abortedPartial() });
       } else {
         throw error;
       }
@@ -4260,6 +4266,17 @@ export class Membrane {
     // come after the provider returns, from a caller's callback.
     let roundReceived: (() => ContentBlock[]) | undefined;
     let markersInLastRequest = 0;
+
+    // What an aborted event carries, from one builder for both aborts, as in
+    // the XML loop: the catch below uses it, and so does cancel(). The arrays
+    // are copies, since this loop can still record a round after a cancel.
+    const abortedPartial = () => ({
+      partialContent: [...allContentBlocks, ...(roundReceived?.() ?? [])],
+      rawAssistantText: allTextAccumulated,
+      toolCalls: [...executedToolCalls],
+      toolResults: [...executedToolResults],
+    });
+    stream.setAbortSnapshot(abortedPartial);
 
     try {
       // Tool execution loop
@@ -4562,14 +4579,7 @@ export class Membrane {
       // As above: a cancelled stream has already reported its abort.
       if (stream.isCancelled) return;
       if (this.isAbortError(error)) {
-        stream.emit({
-          type: 'aborted',
-          reason: this.abortReason(error, stream.signal),
-          partialContent: [...allContentBlocks, ...(roundReceived?.() ?? [])],
-          rawAssistantText: allTextAccumulated,
-          toolCalls: executedToolCalls,
-          toolResults: executedToolResults,
-        });
+        stream.emit({ type: 'aborted', reason: this.abortReason(error, stream.signal), ...abortedPartial() });
       } else {
         throw error;
       }

@@ -6,6 +6,7 @@
  */
 
 import type {
+  AbortedEvent,
   StreamEvent,
   YieldingStream,
   YieldingStreamOptions,
@@ -14,6 +15,9 @@ import type {
   ProvideToolResultsOptions,
 } from './types/yielding-stream.js';
 import type { ToolResult } from './types/tools.js';
+
+/** What an aborted event carries besides its type and reason. */
+type AbortedSnapshot = Omit<AbortedEvent, 'type' | 'reason'>;
 
 /**
  * Payload handed from provideToolResults() to the inference loop awaiting
@@ -124,6 +128,11 @@ export class YieldingStreamImpl implements YieldingStream {
     this.cancel();
   };
 
+  // What the running loop has received and run so far, built from its state
+  // by the loop's own builder (setAbortSnapshot), so that the aborted event
+  // cancel() emits carries what a provider or deadline abort would.
+  private abortSnapshot: (() => AbortedSnapshot) | undefined;
+
   constructor(
     private readonly options: YieldingStreamOptions,
     private readonly runInference: (stream: YieldingStreamImpl) => Promise<void>
@@ -208,6 +217,16 @@ export class YieldingStreamImpl implements YieldingStream {
       return; // Already terminated
     }
 
+    // What the loop had when the cancel came. A builder that throws costs
+    // only the partial content: the cancel still ends the stream, with the
+    // bare aborted event.
+    let partial: AbortedSnapshot = {};
+    try {
+      partial = this.abortSnapshot?.() ?? {};
+    } catch {
+      // the bare aborted event
+    }
+
     this.abortController.abort();
 
     // If waiting for tools, reject the pending promise
@@ -217,7 +236,7 @@ export class YieldingStreamImpl implements YieldingStream {
     }
 
     // Emit aborted event and wake the iterator so it can deliver it
-    this.emit({ type: 'aborted', reason: 'user' });
+    this.emit({ type: 'aborted', reason: 'user', ...partial });
     this.producerDone = true;
     this.state = { status: 'done' };
     this.releaseExternalSignal();
@@ -314,6 +333,15 @@ export class YieldingStreamImpl implements YieldingStream {
     return new Promise<ToolResultsPayload>((resolve, reject) => {
       this.pendingToolResults = { resolve, reject };
     });
+  }
+
+  /**
+   * Give the stream the loop's builder for what an aborted event carries:
+   * cancel() calls it for the aborted event it emits, as the loop's own catch
+   * does for a provider or deadline abort.
+   */
+  setAbortSnapshot(build: () => AbortedSnapshot): void {
+    this.abortSnapshot = build;
   }
 
   /**
