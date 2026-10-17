@@ -43,4 +43,6 @@
   there's no data to show for, a URL image and a base64 source without its
   data among them. Before, `formatToolResults` and the remainder after a
   split threw a TypeError reading such an image's data, and the split sent a
-  base64 source without data, of a type it accepts, as an image.
+  base64 source without data, of a type it accepts, as an image. The XML
+  replay of a split round leaves out the same images, as the split did:
+  media in MCP's form that can't convert, and a base64 source without data.

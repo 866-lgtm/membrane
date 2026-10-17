@@ -285,10 +285,11 @@ describe('every path that builds a request carries MCP\'s form as it carries mem
     if (toolMode === 'native') {
       asMcp.response.toolResults.forEach((result: ToolResult, i: number) => expect(result).toBe(asMcp.given.flat()[i]));
     } else {
-      // An xml turn's response reads its results back out of the document, on main too
-      // (Membrane.buildFinalResponse): the same document, so the same results.
-      const read = (t: Turn) => t.response.toolResults.map((r: ToolResult) => r.content);
-      expect(read(asMcp)).toEqual(read(asOurs));
+      // An xml turn's response reads its results back out of the document
+      // (Membrane.buildFinalResponse), and a result whose images a round split
+      // out gets a copy of its content as the executor returned it
+      // (attachSplitResults): here every round's, in MCP's form as it was.
+      asMcp.response.toolResults.forEach((result: ToolResult, i: number) => expect(result.content).toEqual(asMcp.given.flat()[i]!.content));
     }
   });
 });

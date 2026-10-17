@@ -621,9 +621,11 @@ function renderResultContentString(result: ToolResult): string {
  * An image a result renderer has no data to show or measure: media in MCP's
  * form that didn't convert (utils/mcp-media.ts), a URL source, or a base64
  * source without its data. It gets the stripped-image note, as an image the
- * split can't send does, rather than a TypeError reading its data.
+ * split can't send does, rather than a TypeError reading its data. The XML
+ * replay of a split round (AnthropicXmlFormatter) leaves out the same images,
+ * so it sends what the split sent.
  */
-function hasNoDataToShow(block: { source?: unknown }): boolean {
+export function hasNoDataToShow(block: { source?: unknown }): boolean {
   const source = block.source as { data?: unknown } | null | undefined;
   return typeof source !== 'object' || source === null || typeof source.data !== 'string' || source.data === '';
 }
