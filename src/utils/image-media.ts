@@ -152,10 +152,20 @@ export function shedImagesToFitByteBudget(
  *  must be clearly aware an image was stripped — silence here reads as
  *  "there was no image". Also warns on stderr for ops visibility.
  *
- *  `image` is the block being stripped. One that came without its data gets
- *  a note that says so: its media type isn't why it isn't shown, and no
- *  other format would help. */
+ *  `image` is the block being stripped. One that came as a link, or without
+ *  its data, gets a note that says so: its media type isn't why it isn't
+ *  shown, and no other format would help. */
 export function strippedImagePlaceholder(mediaType: unknown, image: unknown): { type: 'text'; text: string } {
+  if (cameAsLink(image)) {
+    console.warn("[membrane] image block stripped: a URL source, which the XML tool path can't carry");
+    const link = notedLink(image);
+    return {
+      type: 'text',
+      text:
+        `[system: an image that belongs here was NOT shown to you — it came as a link${link ? ` (${link})` : ''}, ` +
+        "which tool results here can't carry. You are not seeing this image.]",
+    };
+  }
   if (cameWithoutData(image)) {
     console.warn('[membrane] image block stripped: no data');
     return {
@@ -177,15 +187,34 @@ export function strippedImagePlaceholder(mediaType: unknown, image: unknown): { 
   };
 }
 
-/** An image block with nothing to show: no URL source, and no base64 data,
- *  in its source or, with no source object, on the block (MCP's form). */
+/** An image block whose source is a URL. The xml tool path's results carry
+ *  no links, so such an image reaches the note there. */
+function cameAsLink(image: unknown): boolean {
+  const source = typeof image === 'object' && image !== null ? (image as { source?: unknown }).source : undefined;
+  return typeof source === 'object' && source !== null && (source as { type?: unknown }).type === 'url';
+}
+
+/** The longest link a note repeats: room for a signed URL, not for a page of
+ *  text. */
+const MAX_NOTED_LINK_CHARS = 2048;
+
+/** A link image's URL for its note, so an agent with a fetch or browser tool
+ *  can open it: an http or https URL, cut to `MAX_NOTED_LINK_CHARS`. Any
+ *  other URL, such as a data URL's payload, isn't repeated. */
+function notedLink(image: unknown): string | undefined {
+  const url = ((image as { source?: { url?: unknown } }).source)?.url;
+  if (typeof url !== 'string' || !/^https?:\/\//i.test(url)) return undefined;
+  return url.length > MAX_NOTED_LINK_CHARS ? `${url.slice(0, MAX_NOTED_LINK_CHARS)}…` : url;
+}
+
+/** An image block with no base64 data, in its source or, with no source
+ *  object, on the block (MCP's form). Asked after `cameAsLink`. */
 function cameWithoutData(image: unknown): boolean {
   if (typeof image !== 'object' || image === null) return true;
   const block = image as { source?: unknown; data?: unknown };
   const source = typeof block.source === 'object' && block.source !== null
-    ? (block.source as { type?: unknown; data?: unknown })
+    ? (block.source as { data?: unknown })
     : undefined;
-  if (source?.type === 'url') return false;
   const data = source ? source.data : block.data;
   return typeof data !== 'string' || data === '';
 }

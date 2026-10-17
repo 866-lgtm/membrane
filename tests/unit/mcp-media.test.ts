@@ -320,6 +320,7 @@ describe('a round with media in MCP\'s form reports what the same round in membr
 describe('a media block with no source object that doesn\'t convert is a source each reader can\'t represent', () => {
   const NO_DATA = '[system: an image that belongs here was NOT shown to you — it came without its data. You are not seeing this image.]';
   const UNDEFINED_TYPE = 'its media type "undefined" is not accepted';
+  const LINK = "[system: an image that belongs here was NOT shown to you — it came as a link (https://example.com/a.png), which tool results here can't carry. You are not seeing this image.]";
   /** No data; data with no mimeType; audio with no mimeType. */
   const unconvertible = () => [{ type: 'image' }, { type: 'image', data: PNG }, { type: 'audio', data: WAV }];
   const holding = (): NormalizedMessage[] => [
@@ -388,8 +389,9 @@ describe('a media block with no source object that doesn\'t convert is a source 
     const xml = render();
     // The block with no data, and the two base64 sources without it.
     expect(count(xml, NO_DATA)).toBe(3);
-    // The block with data and no type, and the URL image.
-    expect(count(xml, UNDEFINED_TYPE)).toBe(2);
+    // The block with data and no type.
+    expect(count(xml, UNDEFINED_TYPE)).toBe(1);
+    expect(count(xml, LINK)).toBe(1);
   });
 });
 
@@ -408,11 +410,24 @@ describe('the note for an image that came without its data', () => {
       '[membrane] image block stripped: no data',
       '[membrane] image block stripped: unsupported media type "undefined"',
     ]);
-    // A URL image an xml result can't send has no data either, but its note stays as it was.
-    const url = formatToolResultsForSplitTurn([
-      { toolUseId: 'u', content: [{ type: 'image', source: { type: 'url', url: 'https://example.com/a.png' } } as any] },
+  });
+
+  it('and one that came as a link, which an xml result can\'t send, says that and gives an http link, cut when long, where the split gave its media type as "undefined"', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const link = (url: unknown) => ({ type: 'image', source: { type: 'url', url } }) as any;
+    const long = `https://example.com/${'a'.repeat(3000)}`;
+    const xml = formatToolResultsForSplitTurn([{ toolUseId: 'u', content: [
+      link('https://example.com/a.png'), link('data:image/png;base64,' + PNG), link(undefined), link(long),
+    ] }]).beforeImageXml;
+    const notes = xml.match(/\[system: an image that belongs here was NOT shown to you[^\]]*\]/g);
+    expect(notes).toEqual([
+      "[system: an image that belongs here was NOT shown to you — it came as a link (https://example.com/a.png), which tool results here can't carry. You are not seeing this image.]",
+      // Only an http or https link is repeated: not a data URL's payload, nor a missing one.
+      "[system: an image that belongs here was NOT shown to you — it came as a link, which tool results here can't carry. You are not seeing this image.]",
+      "[system: an image that belongs here was NOT shown to you — it came as a link, which tool results here can't carry. You are not seeing this image.]",
+      `[system: an image that belongs here was NOT shown to you — it came as a link (${long.slice(0, 2048)}…), which tool results here can't carry. You are not seeing this image.]`,
     ]);
-    expect(url.beforeImageXml).toContain('its media type "undefined" is not accepted');
+    expect(warn.mock.calls.map((call) => call[0])).toEqual(Array(4).fill("[membrane] image block stripped: a URL source, which the XML tool path can't carry"));
   });
 });
 

@@ -15,7 +15,8 @@
  * results (`formatToolResults` and `formatToolResultsForSplitTurn`, which take
  * an xml tool loop's results each round), and the Anthropic adapter's request
  * sanitizer, for a caller that builds a request directly. Three carry the
- * caller's form instead: what a `beforeRequest` hook is handed; a
+ * caller's form instead: the caller's request a `beforeRequest` hook is
+ * handed beside the provider's, which is built from converted content; a
  * continuation's `normalizedMessages`, which no adapter reads for media,
  * since a continuation carries its prompt; and the native loop's prompt
  * messages, which the completions serializer reads for text.
