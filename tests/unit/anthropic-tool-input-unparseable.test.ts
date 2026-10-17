@@ -164,8 +164,8 @@ function createRequest(): NormalizedRequest {
 
 describe('membrane parseProviderContent', () => {
   it('surfaces the unparseable-input marker to the caller', async () => {
-    // The streaming native-tools path is the only one that can carry it: a
-    // non-streamed response never accumulates partial argument JSON.
+    // The streamed native-tools path here; complete() carries it too
+    // (tool-input-object.test.ts).
     const response: any = await new Membrane(new TruncatedToolCallAdapter()).stream(createRequest(), {
       onChunk: () => {},
     });

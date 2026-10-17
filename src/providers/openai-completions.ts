@@ -243,6 +243,9 @@ export class OpenAICompletionsAdapter implements ProviderAdapter {
         // `data: null` carries nothing to read. Other JSON that isn't an
         // object (a number, a string, an array) reads as nothing below.
         if (parsed === null) return;
+        // A parsed provider event is progress (comments never reach here, and
+        // `data: null` is no event).
+        options?.onProgress?.();
 
         throwOnStreamErrorFrame(parsed, this.name, completionsRequest);
 

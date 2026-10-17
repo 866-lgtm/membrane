@@ -31,7 +31,7 @@ import {
   isTypedAbortError,
   withRawRequest,
 } from '../types/index.js';
-import { safeParseJson, textOnlyToolResultContent, createCombinedSignal, SSELineParser, isDeadlineAbort, deadlineTimeoutError, throwOnStreamErrorFrame, assertTerminalEventObserved } from './utils.js';
+import { toolUseInputFromText, textOnlyToolResultContent, createCombinedSignal, SSELineParser, isDeadlineAbort, deadlineTimeoutError, throwOnStreamErrorFrame, assertTerminalEventObserved } from './utils.js';
 
 // ============================================================================
 // Types
@@ -321,6 +321,9 @@ export class OpenAIAdapter implements ProviderAdapter {
         // `data: null` carries nothing to read. Other JSON that isn't an
         // object (a number, a string, an array) reads as nothing below.
         if (parsed === null) return;
+        // A parsed provider event is progress (comments never reach here, and
+        // `data: null` is no event).
+        options?.onProgress?.();
 
         throwOnStreamErrorFrame(parsed, 'OpenAI', openAIRequest);
 
@@ -713,7 +716,7 @@ export class OpenAIAdapter implements ProviderAdapter {
           type: 'tool_use',
           id: tc.id,
           name: tc.function.name,
-          input: safeParseJson(tc.function.arguments),
+          ...toolUseInputFromText(tc.function.arguments),
         });
       }
     }
@@ -787,7 +790,7 @@ export function fromOpenAIContent(message: OpenAIMessage): ContentBlock[] {
         type: 'tool_use',
         id: tc.id,
         name: tc.function.name,
-        input: safeParseJson(tc.function.arguments),
+        ...toolUseInputFromText(tc.function.arguments),
       });
     }
   }
