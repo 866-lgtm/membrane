@@ -549,7 +549,114 @@ describe('the XML replay of a split image round', () => {
     const wire = JSON.stringify(request.messages);
     expect(wire.split(ZZ_RED).length - 1).toBe(1);
     expect(wire.split(ZZ_BLUE).length - 1).toBe(1);
-    expect(census(request).filter((kind) => kind === 'user:[image]')).toHaveLength(2);
+    const imageTurns = (request.messages as Array<{ role: string; content: unknown }>)
+      .filter((m) => Array.isArray(m.content) && JSON.stringify(m.content).includes('"image"'));
+    expect(imageTurns).toHaveLength(2);
+    // Each round's image goes after its own block's text, in the order the rounds were stored.
+    expect(JSON.stringify(imageTurns[0]!.content)).toContain(ZZ_RED);
+    expect(JSON.stringify(imageTurns[1]!.content)).toContain(ZZ_BLUE);
+  });
+
+  /** A turn's text, its calls, then every round's results in one message of their own, as a consumer that keeps results apart stores them. */
+  function storedApart(content: ContentBlock[]): NormalizedRequest['messages'] {
+    const results = content.filter((b) => b.type === 'tool_result');
+    const rest = content.filter((b) => b.type !== 'tool_result');
+    const lastCall = rest.map((b) => b.type).lastIndexOf('tool_use');
+    return [
+      { participant: 'Claude', content: rest.slice(0, lastCall + 1) },
+      { participant: 'Tools', content: results },
+      { participant: 'Claude', content: rest.slice(lastCall + 1) },
+    ];
+  }
+
+  it('replays two rounds with the same text and no image, stored beside each other, as two blocks', async () => {
+    const { response } = await runTurn(
+      [{ text: `zz preamble one\n${CALL_XML}`, ...CALL }, { text: `zz preamble two\n${CALL_XML}`, ...CALL }, { text: 'zz final answer', stopReason: 'end_turn' }],
+      (_round, ids) => [textResult(ids[0]!)],
+    );
+    const results = toolResults(response.content);
+    expect(results).toHaveLength(2);
+    expect(results[0]!.rawXml).toBe(results[1]!.rawXml);
+    const { request } = await replayMessages(storedApart(response.content));
+    expect(JSON.stringify(request.messages).split('zz plain ok').length - 1).toBe(2);
+  });
+
+  it('replays an unmarked round beside a marked one with the same text as two blocks', async () => {
+    const { response } = await runTurn(
+      [{ text: `zz preamble one\n${CALL_XML}`, ...CALL }, { text: `zz preamble two\n${CALL_XML}`, ...CALL }, { text: 'zz final answer', stopReason: 'end_turn' }],
+      (round, ids) => [round === 0 ? textResult(ids[0]!, 'zz shot ok') : imageResult(ids[0]!)],
+    );
+    const results = toolResults(response.content);
+    expect(results[0]!.rawXml).toBe(results[1]!.rawXml);
+    expect(results.map((r) => typeof r.rawXmlImagesAt === 'number')).toEqual([false, true]);
+    const { request } = await replayMessages(storedApart(response.content));
+    const wire = JSON.stringify(request.messages);
+    expect(wire.split('zz shot ok').length - 1).toBe(2);
+    expect(wire.split(ZZ_RED).length - 1).toBe(1);
+  });
+
+  it('replays a block of two results beside its twin from the next round as two blocks, and their calls too', async () => {
+    const twoCalls = `${CALL_XML}\n<invoke name="zz_shot">\n<parameter name="fld1">ite2</parameter>\n</invoke>`;
+    const { response } = await runTurn(
+      [{ text: `zz preamble one\n${twoCalls}`, ...CALL }, { text: `zz preamble two\n${twoCalls}`, ...CALL }, { text: 'zz final answer', stopReason: 'end_turn' }],
+      (_round, ids) => [textResult(ids[0]!), textResult(ids[1]!, 'zz second ok')],
+    );
+    const results = toolResults(response.content);
+    expect(results).toHaveLength(4);
+    expect(new Set(results.map((r) => r.rawXml)).size).toBe(1);
+    const calls = response.content.filter((b) => b.type === 'tool_use');
+    expect(new Set(calls.map((b) => (b as { rawXml?: string }).rawXml)).size).toBe(1);
+    // Both rounds' calls stored side by side, then both rounds' results.
+    const { request } = await replayMessages([
+      { participant: 'Claude', content: calls },
+      { participant: 'Tools', content: results },
+      { participant: 'Claude', content: [{ type: 'text', text: 'zz final answer' }] },
+    ]);
+    const wire = JSON.stringify(request.messages);
+    expect(wire.split('zz plain ok').length - 1).toBe(2);
+    expect(wire.split('zz second ok').length - 1).toBe(2);
+    expect(wire.split('ite2').length - 1).toBe(2);
+  });
+
+  it('reports the message altered when a marked result\'s image is one the split can\'t send, and warns of nothing', async () => {
+    const { response } = await runTurn(
+      [{ text: `zz preamble one\n${CALL_XML}`, ...CALL }, { text: 'zz final answer', stopReason: 'end_turn' }],
+      (_round, ids) => [imageResult(ids[0]!)],
+    );
+    const withImage = (image: Record<string, unknown>) => response.content.map((b) => b.type === 'tool_result'
+      ? { ...b, content: [{ type: 'text' as const, text: 'zz shot ok' }, image as unknown as ToolResultContentBlock] }
+      : b);
+    for (const [label, image] of [
+      ['a url source', { type: 'image', source: { type: 'url', url: 'https://zz.example/shot.png' } }],
+      ['a refused media type', { type: 'image', source: { type: 'base64', data: 'Qk0zz', mediaType: 'image/bmp' } }],
+    ] as const) {
+      const warned: string[] = [];
+      const original = console.warn;
+      console.warn = (...args: unknown[]) => { warned.push(String(args[0])); };
+      try {
+        const { request, rounds } = await replay(withImage(image));
+        expect(census(request), label).toEqual(['user:text', 'assistant:text']);
+        expect(rounds.map((r) => r.altered.messages), label).toEqual([[1]]);
+      } finally {
+        console.warn = original;
+      }
+      expect(warned.filter((w) => w.includes('image block stripped')), label).toEqual([]);
+    }
+  });
+
+  it('sends the raw text whole for a mark before the block\'s start', async () => {
+    const { response } = await runTurn(
+      [{ text: `zz preamble one\n${CALL_XML}`, ...CALL }, { text: 'zz final answer', stopReason: 'end_turn' }],
+      (_round, ids) => [imageResult(ids[0]!)],
+    );
+    // The same place counted from the end, which slice() would read as the split.
+    const negative = response.content.map((b) => b.type === 'tool_result' && b.rawXmlImagesAt !== undefined
+      ? { ...b, rawXmlImagesAt: b.rawXmlImagesAt - b.rawXml!.length }
+      : b);
+    expect(toolResults(negative).some((b) => (b.rawXmlImagesAt ?? 0) < 0)).toBe(true);
+    const { request, rounds } = await replay(negative);
+    expect(census(request)).toEqual(['user:text', 'assistant:text']);
+    expect(rounds.map((r) => r.altered.messages)).toEqual([[1]]);
   });
 });
 

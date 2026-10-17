@@ -30,7 +30,6 @@ import type {
 import {
   parseToolCalls as parseToolCallsXml,
   formatToolResults as formatToolResultsXml,
-  formatToolResultsForSplitTurn,
   parseAccumulatedIntoBlocks,
   formatToolDefinitions,
   toolDefinitionForPrompt,
@@ -127,11 +126,13 @@ interface SentSplit {
  * `rawXmlImagesAt` holds the images it sent, and the raw text splits there,
  * where the live split's second part began with a result's closing text.
  * The stored offset has to fall where a result or error closes, as this
- * version renders the close, and the images are decided again by today's
- * rules for what an XML split sends (formatToolResultsForSplitTurn), so a
- * block whose mark falls elsewhere, or whose images the split wouldn't send,
- * goes out as its raw text whole. Null when no result is marked, the mark doesn't
- * fall where a result or error closes, or no image it holds can be sent.
+ * version renders the close, and the images are decided again by the rule an
+ * XML split sends them by (formatToolResultsForSplitTurn: a base64 image of a
+ * media type the API accepts), so a block whose mark falls elsewhere, or whose
+ * images the split wouldn't send, goes out as its raw text whole. Null when no
+ * result is marked, the mark doesn't fall where a result or error closes, or
+ * no image it holds can be sent. A replay writes no note and no warning for
+ * an image it leaves out: its round report says the message was altered.
  */
 function sentSplit(group: readonly ToolResultContent[]): SentSplit | null {
   const rawXml = group[0]!.rawXml!;
@@ -141,13 +142,36 @@ function sentSplit(group: readonly ToolResultContent[]): SentSplit | null {
   if (at <= 0) return null;
   const after = rawXml.slice(at);
   if (!after.startsWith('\n</stdout>') && !after.startsWith('\n</error>')) return null;
-  const { images } = formatToolResultsForSplitTurn([toToolResult(marked!)]);
+  const images: unknown[] = [];
+  for (const sub of Array.isArray(marked!.content) ? marked!.content : []) {
+    if (sub.type !== 'image' || sub.source.type !== 'base64') continue;
+    const mediaType = resolveImageMediaType(sub.source.data, sub.source.mediaType);
+    if (!isAcceptedImageMediaType(mediaType)) continue;
+    images.push({ type: 'image', source: { type: 'base64', media_type: mediaType, data: sub.source.data } });
+  }
   return images.length > 0 ? { before: rawXml.slice(0, at), images, after } : null;
 }
 
 /** Whether a result holds an image block among its content. */
 function holdsImage(block: ToolResultContent): boolean {
   return Array.isArray(block.content) && block.content.some((sub) => sub.type === 'image');
+}
+
+/**
+ * How many results, or calls, one block's raw text holds, as the parser reads
+ * it: a run of blocks with the same raw text is one block's only up to that
+ * many, and the rest are another round's, with the same text, stored beside
+ * it. Infinity when the parser reads none, as for a damaged raw text, so the
+ * whole run goes out once, as it always did.
+ */
+function rawXmlCount(rawXml: string, kind: 'results' | 'calls', memo: Map<string, number>): number {
+  let count = memo.get(rawXml);
+  if (count === undefined) {
+    const parsed = parseAccumulatedIntoBlocks(rawXml);
+    count = kind === 'results' ? parsed.toolResults.length : parsed.toolCalls.length;
+    memo.set(rawXml, count);
+  }
+  return count > 0 ? count : Infinity;
 }
 
 // ============================================================================
@@ -687,7 +711,9 @@ export class AnthropicXmlFormatter implements PrefillFormatter {
    * IS generated text — replaying anything other than that text rewrites the
    * agent's own past turn and teaches the model a syntax the parser rejects.
    * Blocks carrying `rawXml` are replayed verbatim (deduped: every invoke
-   * parsed from one <function_calls> block shares the same rawXml). Legacy
+   * parsed from one <function_calls> block shares the same rawXml, so its
+   * text goes out once for as many calls as it holds, and more calls with
+   * the same text are another round's block). Legacy
    * blocks stored without rawXml can only be reconstructed — we emit the
    * canonical <function_calls> form, which at least agrees with the parser
    * and the injected instructions.
@@ -696,6 +722,8 @@ export class AnthropicXmlFormatter implements PrefillFormatter {
     const out: string[] = [];
     let legacy: ToolUseContent[] = [];
     let lastRaw: string | undefined;
+    let inBlock = 0;
+    const counts = new Map<string, number>();
 
     const flushLegacy = () => {
       if (legacy.length > 0) {
@@ -707,10 +735,15 @@ export class AnthropicXmlFormatter implements PrefillFormatter {
     for (const block of run) {
       if (block.rawXml) {
         flushLegacy();
-        if (block.rawXml !== lastRaw) {
+        // One block's calls share its text, which goes out once, for as
+        // many calls as the text holds; more calls with the same text are
+        // another round's.
+        if (block.rawXml !== lastRaw || inBlock >= rawXmlCount(block.rawXml, 'calls', counts)) {
           out.push(block.rawXml);
+          inBlock = 0;
         }
         lastRaw = block.rawXml;
+        inBlock++;
       } else {
         lastRaw = undefined;
         legacy.push(block);
@@ -731,6 +764,7 @@ export class AnthropicXmlFormatter implements PrefillFormatter {
   private renderToolResultRun(run: ToolResultContent[], onAltered?: () => void): Array<string | SentSplit> {
     const out: Array<string | SentSplit> = [];
     let legacy: ToolResultContent[] = [];
+    const counts = new Map<string, number>();
 
     const flushLegacy = () => {
       if (legacy.length > 0) {
@@ -749,23 +783,21 @@ export class AnthropicXmlFormatter implements PrefillFormatter {
       }
       flushLegacy();
       // Every result parsed from one <function_results> block carries its
-      // text, which goes out once. A turn marks one result of a block at
-      // most, so a second marked result with the same text is another
-      // round's, stored beside it, and starts a group of its own.
+      // text, which goes out once, for as many results as the text holds.
+      // More results with the same text are another round's, stored beside
+      // it, and start a group of their own.
+      const cap = rawXmlCount(block.rawXml, 'results', counts);
       let end = i + 1;
-      let marked = typeof block.rawXmlImagesAt === 'number';
-      while (end < run.length && run[end]!.rawXml === block.rawXml) {
-        const nextMarked = typeof run[end]!.rawXmlImagesAt === 'number';
-        if (marked && nextMarked) break;
-        marked ||= nextMarked;
-        end++;
-      }
+      while (end < run.length && end - i < cap && run[end]!.rawXml === block.rawXml) end++;
       const group = run.slice(i, end);
       i = end;
       const split = sentSplit(group);
-      // A marked result whose images the turn sent beside its text, and this
-      // request can't send, goes out as the raw text alone: the message is
-      // altered, and its round report says so.
+      // A replay sends what the turn sent: the raw text, and a marked
+      // result's images where the turn split. A marked result that holds an
+      // image goes out as the raw text alone when its mark no longer falls
+      // where a result closes or this replay can't send its images, and then
+      // the message is altered, and its round report says so. An unmarked
+      // result's images were never sent, so its raw text carries it.
       if (!split && group.some((b) => typeof b.rawXmlImagesAt === 'number' && holdsImage(b))) onAltered?.();
       out.push(split ?? block.rawXml);
     }

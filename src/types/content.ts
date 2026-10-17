@@ -202,8 +202,8 @@ export interface ToolResultContent {
    * result, removing an image included, drops this with `rawXml`: the result
    * then renders from `content`, with a note where an image isn't sent.
    * Results with the same `rawXml` replay as one block, its text sent once,
-   * except that a second marked result starts another block, since a turn
-   * marks one result of a block at most.
+   * for as many results as that text holds; more results with the same text
+   * are another round's, and replay as a block of their own.
    */
   rawXmlImagesAt?: number;
   /** See {@link TextContent.rawItem}. */
