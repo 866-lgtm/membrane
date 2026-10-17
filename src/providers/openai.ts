@@ -612,7 +612,10 @@ export class OpenAIAdapter implements ProviderAdapter {
         throw errorFromHttpResponse(this.name, response, await response.text(), request);
       }
 
-      return await response.json() as OpenAIResponse;
+      const body: unknown = await response.json();
+      // A 200 can carry the provider's error, as a stream frame can.
+      throwOnStreamErrorFrame(body, 'OpenAI', request, 'response error');
+      return body as OpenAIResponse;
     } finally {
       cleanup?.();
     }
@@ -710,9 +713,11 @@ export class OpenAIAdapter implements ProviderAdapter {
       case 'content_filter':
         return 'refusal';
       default:
-        // Unrecognized reasons ('error', a compatible server's own token)
-        // travel as the provider's own token, so membrane's mapper discloses
-        // and logs them instead of reading a clean end_turn.
+        // Unrecognized reasons (a compatible server's own token) travel as
+        // the provider's own token: membrane's mapper reads them as end_turn,
+        // but discloses the token in details.stop.providerReason and logs it
+        // once, so the stop isn't taken for a clean one. 'error' never gets
+        // here: throwOnStreamErrorFrame throws on it first.
         return reason;
     }
   }

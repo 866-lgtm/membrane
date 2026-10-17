@@ -10,8 +10,9 @@
   the four default formats, so HEIC and HEIF reach Gemini only from a direct
   adapter call or a hook-replaced request. Tool results in native tool
   requests, every adapter (called directly or through a builder), the XML
-  tool-result notes, and the OpenAI Responses formatter and transport now
-  check it, and the Images adapter leaves such data unattached. A `data:` URL
+  tool-result notes, the XML replay of a split image round, and the OpenAI
+  Responses formatter and transport now check it, and the Images adapter
+  leaves such data unattached. A `data:` URL
   takes the same decision. A native `input_image` part becomes the placeholder
   when its data holds no accepted image, and otherwise replays verbatim, its
   label included. A remote URL goes out as it is, and so does a caller's
