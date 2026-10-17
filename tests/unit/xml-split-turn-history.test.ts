@@ -13,7 +13,7 @@ import { describe, it, expect } from 'vitest';
 import { Membrane } from '../../src/membrane.js';
 import { MockAdapter } from '../../src/providers/mock.js';
 import { TimeoutAbortError } from '../../src/types/errors.js';
-import { attachSplitResults } from '../../src/utils/tool-parser.js';
+import { attachSplitResults, parseAccumulatedIntoBlocks } from '../../src/utils/tool-parser.js';
 import type {
   ContentBlock,
   NormalizedRequest,
@@ -552,9 +552,13 @@ describe('the XML replay of a split image round', () => {
     const imageTurns = (request.messages as Array<{ role: string; content: unknown }>)
       .filter((m) => Array.isArray(m.content) && JSON.stringify(m.content).includes('"image"'));
     expect(imageTurns).toHaveLength(2);
-    // Each round's image goes after its own block's text, in the order the rounds were stored.
     expect(JSON.stringify(imageTurns[0]!.content)).toContain(ZZ_RED);
     expect(JSON.stringify(imageTurns[1]!.content)).toContain(ZZ_BLUE);
+    // Each round's image goes after its own block's text: one block's text
+    // before the first image, both blocks' before the second.
+    const textsBefore = (data: string) => wire.slice(0, wire.indexOf(data)).split('zz shot ok').length - 1;
+    expect(textsBefore(ZZ_RED)).toBe(1);
+    expect(textsBefore(ZZ_BLUE)).toBe(2);
   });
 
   /** A turn's text, its calls, then every round's results in one message of their own, as a consumer that keeps results apart stores them. */
@@ -616,6 +620,69 @@ describe('the XML replay of a split image round', () => {
     expect(wire.split('zz plain ok').length - 1).toBe(2);
     expect(wire.split('zz second ok').length - 1).toBe(2);
     expect(wire.split('ite2').length - 1).toBe(2);
+  });
+
+  it('replays three rounds with the same text, stored side by side, as three blocks, results and calls alike', async () => {
+    const { response } = await runTurn(
+      [
+        { text: `zz preamble one\n${CALL_XML}`, ...CALL },
+        { text: `zz preamble two\n${CALL_XML}`, ...CALL },
+        { text: `zz preamble three\n${CALL_XML}`, ...CALL },
+        { text: 'zz final answer', stopReason: 'end_turn' },
+      ],
+      (_round, ids) => [textResult(ids[0]!)],
+    );
+    const results = toolResults(response.content);
+    const calls = response.content.filter((b) => b.type === 'tool_use');
+    expect(new Set(results.map((r) => r.rawXml)).size, 'the premise: one text for the three rounds\' results').toBe(1);
+    expect(new Set(calls.map((b) => (b as { rawXml?: string }).rawXml)).size, 'and one for their calls').toBe(1);
+    const { request } = await replayMessages([
+      { participant: 'Claude', content: calls },
+      { participant: 'Tools', content: results },
+      { participant: 'Claude', content: [{ type: 'text', text: 'zz final answer' }] },
+    ]);
+    const wire = JSON.stringify(request.messages);
+    expect(wire.split('zz plain ok').length - 1).toBe(3);
+    expect(wire.split('ite1').length - 1).toBe(3);
+  });
+
+  it('replays a round of two results whose second carries the image beside its twin, each round split at its own marked result', async () => {
+    const twoCalls = `${CALL_XML}\n<invoke name="zz_shot">\n<parameter name="fld1">ite2</parameter>\n</invoke>`;
+    const { response } = await runTurn(
+      [{ text: `zz preamble one\n${twoCalls}`, ...CALL }, { text: `zz preamble two\n${twoCalls}`, ...CALL }, { text: 'zz final answer', stopReason: 'end_turn' }],
+      (round, ids) => [textResult(ids[0]!), imageResult(ids[1]!, round === 0 ? ZZ_RED : ZZ_BLUE)],
+    );
+    const results = toolResults(response.content);
+    expect(results.map((r) => typeof r.rawXmlImagesAt === 'number'), 'the premise: each round marked its second result').toEqual([false, true, false, true]);
+    expect(new Set(results.map((r) => r.rawXml)).size, 'with one text for both rounds').toBe(1);
+    const { request } = await replayMessages(storedApart(response.content));
+    const wire = JSON.stringify(request.messages);
+    expect(wire.split(ZZ_RED).length - 1).toBe(1);
+    expect(wire.split(ZZ_BLUE).length - 1).toBe(1);
+    expect(wire.indexOf(ZZ_RED)).toBeLessThan(wire.indexOf(ZZ_BLUE));
+  });
+
+  it('replays two marked rounds whose text the parser reads nothing from as two blocks, each with its own image', async () => {
+    const raw = 'zz RAW-RESULT\n</stdout>\nzz RAW-TAIL';
+    expect(parseAccumulatedIntoBlocks(raw).toolResults, 'the premise: the parser reads no result from the text').toHaveLength(0);
+    const at = raw.indexOf('\n</stdout>');
+    const result = (id: string, data: string) => ({
+      type: 'tool_result',
+      toolUseId: id,
+      rawXml: raw,
+      rawXmlImagesAt: at,
+      content: [{ type: 'text', text: 'zz shot ok' }, { type: 'image', source: { type: 'base64', data, mediaType: 'image/png' } }],
+    }) as ContentBlock;
+    const call = (id: string) => ({ type: 'tool_use', id, name: 'zz_shot', input: {}, rawXml: 'zz RAW-CALL' }) as ContentBlock;
+    const { request } = await replayMessages([
+      { participant: 'Claude', content: [call('zz-a'), call('zz-b')] },
+      { participant: 'Tools', content: [result('zz-a', ZZ_RED), result('zz-b', ZZ_BLUE)] },
+      { participant: 'Claude', content: [{ type: 'text', text: 'zz final answer' }] },
+    ]);
+    const wire = JSON.stringify(request.messages);
+    expect(wire.split(ZZ_RED).length - 1).toBe(1);
+    expect(wire.split(ZZ_BLUE).length - 1).toBe(1);
+    expect(wire.split('zz RAW-TAIL').length - 1).toBe(2);
   });
 
   it('reports the message altered when a marked result\'s image is one the split can\'t send, and warns of nothing', async () => {

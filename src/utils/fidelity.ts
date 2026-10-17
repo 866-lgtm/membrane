@@ -36,7 +36,8 @@ import type { ContentBlock } from '../types/content.js';
  *     `redacted_thinking` block's reasoning `rawItem`, and rebuilds every
  *     other block from its fields;
  *   - the Anthropic XML formatter sends `rawXml` in place of a tool_use's or
- *     tool_result's fields (consecutive blocks sharing it, once). A result
+ *     tool_result's fields (consecutive blocks sharing it, once for as many
+ *     results or calls as the parser reads from it). A result
  *     whose `rawXmlImagesAt` marks where an XML tool loop split its block to
  *     send its images goes out split there, with the images from its content
  *     that a split sends, and the images are carried with the raw text. When

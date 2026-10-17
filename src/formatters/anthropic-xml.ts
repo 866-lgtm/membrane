@@ -126,13 +126,19 @@ interface SentSplit {
  * `rawXmlImagesAt` holds the images it sent, and the raw text splits there,
  * where the live split's second part began with a result's closing text.
  * The stored offset has to fall where a result or error closes, as this
- * version renders the close, and the images are decided again by the rule an
- * XML split sends them by (formatToolResultsForSplitTurn: a base64 image of a
- * media type the API accepts), so a block whose mark falls elsewhere, or whose
- * images the split wouldn't send, goes out as its raw text whole. Null when no
- * result is marked, the mark doesn't fall where a result or error closes, or
- * no image it holds can be sent. A replay writes no note and no warning for
- * an image it leaves out: its round report says the message was altered.
+ * version renders the close, and the images are decided again: a base64
+ * image whose media type resolves to one the API accepts. The live split
+ * (formatToolResultsForSplitTurn) takes an image whose media type resolves to
+ * an accepted one, which a url source never does, so the two pick the same
+ * images; the replay checks the source as well. Null when no result in the
+ * group is marked, the mark doesn't fall where a result or error closes, or
+ * no image it holds can be sent; the block then goes out as its raw text
+ * whole, and when the marked result holds an image, its round report says the
+ * message was altered. A split leaves out the images this rule refuses, with
+ * no note and no warning: under the same rule the turn refused them too, and
+ * wrote their notes into the raw text. Only a rule that changed between
+ * versions can leave out an image the turn sent, and that goes unreported,
+ * since `content` doesn't say which of its images the turn sent.
  */
 function sentSplit(group: readonly ToolResultContent[]): SentSplit | null {
   const rawXml = group[0]!.rawXml!;
@@ -159,10 +165,11 @@ function holdsImage(block: ToolResultContent): boolean {
 
 /**
  * How many results, or calls, one block's raw text holds, as the parser reads
- * it: a run of blocks with the same raw text is one block's only up to that
- * many, and the rest are another round's, with the same text, stored beside
- * it. Infinity when the parser reads none, as for a damaged raw text, so the
- * whole run goes out once, as it always did.
+ * it today: a run of blocks with the same raw text is one block's only up to
+ * that many, and the rest are another round's, with the same text, stored
+ * beside it. That holds while the parser reads the text as the turn's parse
+ * did (see parseAccumulatedIntoBlocks). Infinity when the parser reads none,
+ * as for a damaged raw text, so the whole run goes out once, as it always did.
  */
 function rawXmlCount(rawXml: string, kind: 'results' | 'calls', memo: Map<string, number>): number {
   let count = memo.get(rawXml);
@@ -712,8 +719,9 @@ export class AnthropicXmlFormatter implements PrefillFormatter {
    * agent's own past turn and teaches the model a syntax the parser rejects.
    * Blocks carrying `rawXml` are replayed verbatim (deduped: every invoke
    * parsed from one <function_calls> block shares the same rawXml, so its
-   * text goes out once for as many calls as it holds, and more calls with
-   * the same text are another round's block). Legacy
+   * text goes out once for as many calls as the parser reads from it
+   * (rawXmlCount), and more calls with the same text are another round's
+   * block). Legacy
    * blocks stored without rawXml can only be reconstructed — we emit the
    * canonical <function_calls> form, which at least agrees with the parser
    * and the injected instructions.
@@ -783,12 +791,20 @@ export class AnthropicXmlFormatter implements PrefillFormatter {
       }
       flushLegacy();
       // Every result parsed from one <function_results> block carries its
-      // text, which goes out once, for as many results as the text holds.
-      // More results with the same text are another round's, stored beside
-      // it, and start a group of their own.
-      const cap = rawXmlCount(block.rawXml, 'results', counts);
+      // text, which goes out once, for as many results as the parser reads
+      // from it (rawXmlCount). More results with the same text are another
+      // round's, stored beside it, and start a group of their own, and so does
+      // a second marked result: a mark is its own round's. The count is read
+      // only when the next block shares the text.
+      const cap = run[i + 1]?.rawXml === block.rawXml ? rawXmlCount(block.rawXml, 'results', counts) : 1;
       let end = i + 1;
-      while (end < run.length && end - i < cap && run[end]!.rawXml === block.rawXml) end++;
+      let marked = typeof block.rawXmlImagesAt === 'number';
+      while (end < run.length && end - i < cap && run[end]!.rawXml === block.rawXml) {
+        const nextMarked = typeof run[end]!.rawXmlImagesAt === 'number';
+        if (marked && nextMarked) break;
+        marked ||= nextMarked;
+        end++;
+      }
       const group = run.slice(i, end);
       i = end;
       const split = sentSplit(group);
