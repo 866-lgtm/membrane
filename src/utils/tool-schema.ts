@@ -209,7 +209,14 @@ function kindOfValue(value: unknown): Admitted {
   }
 }
 
-function admittedByTypeKeyword(type: unknown): Admitted {
+/**
+ * What a `type` keyword admits, with OpenAPI's `nullable: true` beside it
+ * adding null. Only the boolean `true` counts, and only beside a `type`, the
+ * one place OpenAPI 3.0.3 gives it effect. A sibling `enum` or `const` isn't
+ * consulted, as for every `type` in this reading, though OpenAPI lets those
+ * disallow null.
+ */
+function admittedByTypeKeyword(type: unknown, nullable: unknown): Admitted {
   const names = typeof type === 'string' ? [type] : Array.isArray(type) ? type : undefined;
   if (names === undefined) return UNREADABLE;
   let admitted: Admitted = NOTHING;
@@ -218,7 +225,7 @@ function admittedByTypeKeyword(type: unknown): Admitted {
     if (kinds === undefined) return UNREADABLE;
     admitted = unionOf(admitted, new Set(kinds));
   }
-  return admitted;
+  return nullable === true ? unionOf(admitted, new Set(['null'])) : admitted;
 }
 
 /** `$ref` spellings resolved against the tool's own inputSchema. */
@@ -265,9 +272,11 @@ function admittedByRef(ref: unknown, context: ReadContext): Admitted {
 /**
  * The kinds one schema node admits.
  *
- * `type`, when present, decides on its own. It is what the XML instructions
- * have always rendered for a parameter, so reading it alone keeps every such
- * rendering byte-identical; the other kind-bearing keywords are read for a
+ * `type`, when present, decides on its own, with OpenAPI's `nullable: true`
+ * beside it adding null; the node's other keywords aren't read then. It is
+ * what the XML instructions have always rendered as a parameter's type, so
+ * reading it alone keeps the type they render as it was (`nullable: true`
+ * adds only the null mark); the other kind-bearing keywords are read for a
  * declaration that has no `type`, and all of them apply at once: `enum` and
  * `const` admit the kinds of their values, `anyOf`/`oneOf` the union of their
  * branches, `allOf` the intersection, and `$ref` its target inside the tool's
@@ -278,7 +287,7 @@ function admittedBy(node: unknown, context: ReadContext): Admitted {
   if (node === false) return NOTHING;
   if (!isPlainObject(node)) return UNREADABLE;
 
-  if (Object.hasOwn(node, 'type')) return admittedByTypeKeyword(node.type);
+  if (Object.hasOwn(node, 'type')) return admittedByTypeKeyword(node.type, ownField(node, 'nullable'));
 
   let admitted: Admitted = ANY;
   if (Object.hasOwn(node, 'enum')) {
@@ -343,7 +352,13 @@ export interface ParameterDeclaration {
   status: 'typed' | 'untyped' | 'unresolved';
   /** The JSON Schema type name, when `status` is `typed`. */
   type?: string;
-  /** The declaration also admits `null`. */
+  /**
+   * The declaration also admits `null`. Set for an `unresolved` declaration
+   * too when what it admits includes null beside several kinds it can read:
+   * a type list such as `["string", "number", "null"]`, `nullable: true`
+   * beside such a list, an `anyOf` or `oneOf` with a null branch, or an
+   * `enum` mixing null with values of several kinds.
+   */
   nullable: boolean;
   /** Unconditionally required, with root-combinator semantics. */
   required: boolean;
@@ -385,7 +400,7 @@ function declaredKind(
     return { status: 'typed', type: nonNull.includes('number') ? 'number' : 'integer', nullable };
   }
   if (nonNull.length === 1) return { status: 'typed', type: nonNull[0], nullable };
-  return { status: 'unresolved', nullable: false };
+  return { status: 'unresolved', nullable };
 }
 
 /**

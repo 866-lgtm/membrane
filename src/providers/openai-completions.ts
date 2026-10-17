@@ -242,6 +242,8 @@ export class OpenAICompletionsAdapter implements ProviderAdapter {
         // A parsed provider event is progress (comments never reach here).
         options?.onProgress?.();
 
+        // A frame that reports an error throws here, before its text, or an
+        // end-of-turn token in it, is read.
         throwOnStreamErrorFrame(parsed, this.name, completionsRequest);
 
         try {
@@ -523,7 +525,10 @@ export class OpenAICompletionsAdapter implements ProviderAdapter {
         throw errorFromHttpResponse(this.name, response, await response.text(), request);
       }
 
-      return await response.json() as CompletionsResponse;
+      const body: unknown = await response.json();
+      // A 200 can carry the provider's error, as a stream frame can.
+      throwOnStreamErrorFrame(body, this.name, request, 'response error');
+      return body as CompletionsResponse;
     } finally {
       cleanup?.();
     }
