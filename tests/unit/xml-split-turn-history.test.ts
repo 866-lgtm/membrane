@@ -644,6 +644,43 @@ describe('the XML replay of a split image round', () => {
     }
   });
 
+  it('splits a marked result holding an accepted and a refused image with the accepted one, and reports nothing altered', async () => {
+    const { response } = await runTurn(
+      [{ text: `zz preamble one\n${CALL_XML}`, ...CALL }, { text: 'zz final answer', stopReason: 'end_turn' }],
+      (_round, ids) => [{
+        toolUseId: ids[0]!,
+        toolName: 'zz_shot',
+        content: [
+          { type: 'text', text: 'zz shot ok' },
+          { type: 'image', source: { type: 'base64', data: ZZ_RED, mediaType: 'image/png' } },
+          { type: 'image', source: { type: 'base64', data: 'Qk0zz', mediaType: 'image/bmp' } },
+        ],
+      }],
+    );
+    expect(toolResults(response.content).filter((b) => typeof b.rawXmlImagesAt === 'number'), 'the premise: the round split and marked its result').toHaveLength(1);
+    const { request, rounds } = await replay(response.content);
+    const imageTurns = (request.messages as Array<{ content: unknown }>).filter((m) => JSON.stringify(m.content).includes('"image"'));
+    expect(imageTurns).toHaveLength(1);
+    expect(JSON.stringify(imageTurns[0]!.content)).toContain(ZZ_RED);
+    expect(JSON.stringify(request.messages)).not.toContain('Qk0zz');
+    // The turn wrote the refused image's note into the text before the split, and the raw text carries it.
+    expect(JSON.stringify(request.messages)).toContain('image/bmp');
+    expect(rounds.map((r) => r.altered.messages)).toEqual([[]]);
+  });
+
+  it('sends a raw text the parser reads nothing from once for its whole run, results and calls alike', async () => {
+    const call = (id: string) => ({ type: 'tool_use', id, name: 'zz_shot', input: {}, rawXml: 'zz RAW-CALL' }) as ContentBlock;
+    const result = (id: string) => ({ type: 'tool_result', toolUseId: id, content: 'zz plain ok', rawXml: 'zz RAW-RESULT' }) as ContentBlock;
+    const { request } = await replayMessages([
+      { participant: 'Claude', content: [call('zz-a'), call('zz-b')] },
+      { participant: 'Tools', content: [result('zz-a'), result('zz-b')] },
+      { participant: 'Claude', content: [{ type: 'text', text: 'zz final answer' }] },
+    ]);
+    const wire = JSON.stringify(request.messages);
+    expect(wire.split('zz RAW-RESULT').length - 1).toBe(1);
+    expect(wire.split('zz RAW-CALL').length - 1).toBe(1);
+  });
+
   it('sends the raw text whole for a mark before the block\'s start', async () => {
     const { response } = await runTurn(
       [{ text: `zz preamble one\n${CALL_XML}`, ...CALL }, { text: 'zz final answer', stopReason: 'end_turn' }],

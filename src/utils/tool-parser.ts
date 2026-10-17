@@ -929,6 +929,11 @@ const LEGACY_ERROR_REGEX = /<error>\n?([\s\S]*?)\n?<\/error>/g;
  * Parse accumulated assistant text into structured ContentBlock[].
  * Extracts thinking blocks, tool calls, tool results, and plain text.
  *
+ * The XML replay groups stored results and calls by how many of them this
+ * parse reads from their raw text (AnthropicXmlFormatter's rawXmlCount), so a
+ * change that reads fewer from a text it once read more from would send that
+ * text more than once.
+ *
  * @param text - The accumulated assistant output text
  * @param options - Optional parsing context
  * @param options.startInsideBlock - Block type we're starting inside (from prefill context)
