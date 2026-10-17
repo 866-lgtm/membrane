@@ -143,10 +143,10 @@ interface SentSplit {
  * wrote imageForRequest's placeholder for each into the raw text. A consumer
  * that removes an image drops the raw text with it (ToolResultContent's
  * rawXmlImagesAt), so only a rule that changed between versions can leave out
- * an image the turn sent: bytes of no known format that an earlier version
- * sent by their label, which the API refuses, so the request that carried
- * them failed. That goes unreported, since `content` doesn't say which of its
- * images the turn sent.
+ * an image the turn sent: data in none of the formats the request carries,
+ * which an earlier version sent by its label and the API refuses, so the
+ * request that carried it failed. That goes unreported, since `content`
+ * doesn't say which of its images the turn sent.
  */
 function sentSplit(group: readonly ToolResultContent[]): SentSplit | null {
   const rawXml = group[0]!.rawXml!;
