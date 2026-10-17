@@ -20,6 +20,7 @@ import type {
 } from '../types/index.js';
 import { createHash } from 'node:crypto';
 import { resolveImageMediaType, isAcceptedImageMediaType, strippedImagePlaceholder } from './image-media.js';
+import { convertMcpMedia } from './mcp-media.js';
 import { readToolSchema, type ParameterDeclaration, type ToolSchemaReading } from './tool-schema.js';
 
 // ============================================================================
@@ -603,6 +604,8 @@ function renderResultContentString(result: ToolResult): string {
   for (const block of result.content) {
     if (block.type === 'text') {
       parts.push(block.text);
+    } else if (block.type === 'image' && hasNoSourceObject(block)) {
+      parts.push(strippedImagePlaceholder(undefined, block).text);
     } else if (block.type === 'image') {
       // For XML mode, we can't embed images directly. The note says the
       // model isn't seeing it, so the size isn't read as its contents.
@@ -611,6 +614,15 @@ function renderResultContentString(result: ToolResult): string {
     }
   }
   return parts.join('\n');
+}
+
+/**
+ * An image a result renderer has no source for: media in MCP's form that
+ * didn't convert (utils/mcp-media.ts), with no media type or no data. It
+ * gets the stripped-image note, as an image the split can't send does.
+ */
+function hasNoSourceObject(block: { source?: unknown }): boolean {
+  return typeof block.source !== 'object' || block.source === null || Array.isArray(block.source);
 }
 
 /**
@@ -630,11 +642,14 @@ function renderResultContentString(result: ToolResult): string {
  * tool_use_id attributes on the wire (a Messages-API concept — the
  * store keeps the linkage on the blocks); content rides raw unless it
  * contains structural tags (then escaped, see STRUCTURAL_TAG_RE).
+ *
+ * Media in MCP's form becomes membrane's here, where the document takes
+ * results (utils/mcp-media.ts); `results` stay as they were handed in.
  */
 export function formatToolResults(results: ToolResult[]): string {
   const parts: string[] = ['<function_results>'];
 
-  for (const result of results) {
+  for (const result of convertMcpMedia(results)) {
     if (result.isError) {
       parts.push('<error>');
       parts.push(guardResultContent(renderResultContentString(result)));
@@ -1334,8 +1349,12 @@ export interface SplitTurnContent {
  * Assistant (prefill): </result>
  *            </function_results>
  * ```
+ *
+ * Media in MCP's form becomes membrane's here, as in formatToolResults;
+ * `handed` stays as it was.
  */
-export function formatToolResultsForSplitTurn(results: ToolResult[]): SplitTurnContent {
+export function formatToolResultsForSplitTurn(handed: ToolResult[]): SplitTurnContent {
+  const results = convertMcpMedia(handed);
   const images: ProviderImageBlock[] = [];
   let beforeImageXml = '<function_results>\n';
   let afterImageXml = '';
@@ -1355,10 +1374,12 @@ export function formatToolResultsForSplitTurn(results: ToolResult[]): SplitTurnC
       for (const block of result.content) {
         if (block.type === 'text') {
           textParts.push(guardResultContent(block.text));
+        } else if (block.type === 'image' && hasNoSourceObject(block)) {
+          textParts.push(strippedImagePlaceholder(undefined, block).text);
         } else if (block.type === 'image') {
           const mediaType = resolveImageMediaType(block.source.data, block.source.mediaType);
           if (!isAcceptedImageMediaType(mediaType)) {
-            textParts.push(strippedImagePlaceholder(mediaType).text);
+            textParts.push(strippedImagePlaceholder(mediaType, block).text);
           } else {
             resultHasImages = true;
             resultImages.push({
@@ -1437,6 +1458,8 @@ function formatSingleResultXml(result: ToolResult): string {
     for (const block of result.content) {
       if (block.type === 'text') {
         xml += guardResultContent(block.text);
+      } else if (block.type === 'image' && hasNoSourceObject(block)) {
+        xml += strippedImagePlaceholder(undefined, block).text;
       } else if (block.type === 'image') {
         // For remaining results after split, images become text placeholders
         const sizeKb = Math.round((block.source.data.length * 0.75) / 1024);

@@ -150,8 +150,21 @@ export function shedImagesToFitByteBudget(
 
 /** Loud agent-facing stand-in for an image the API would reject. The agent
  *  must be clearly aware an image was stripped — silence here reads as
- *  "there was no image". Also warns on stderr for ops visibility. */
-export function strippedImagePlaceholder(mediaType: unknown): { type: 'text'; text: string } {
+ *  "there was no image". Also warns on stderr for ops visibility.
+ *
+ *  `image` is the block being stripped. One that came without its data gets
+ *  a note that says so: its media type isn't why it isn't shown, and no
+ *  other format would help. */
+export function strippedImagePlaceholder(mediaType: unknown, image: unknown): { type: 'text'; text: string } {
+  if (cameWithoutData(image)) {
+    console.warn('[membrane] image block stripped: no data');
+    return {
+      type: 'text',
+      text:
+        '[system: an image that belongs here was NOT shown to you — it came without its data. ' +
+        'You are not seeing this image.]',
+    };
+  }
   console.warn(
     `[membrane] image block stripped: unsupported media type "${String(mediaType)}"`,
   );
@@ -162,4 +175,17 @@ export function strippedImagePlaceholder(mediaType: unknown): { type: 'text'; te
       `"${String(mediaType)}" is not accepted by the model API (only jpeg/png/gif/webp are). ` +
       `You are not seeing this image. If it matters, ask for it in a supported format.]`,
   };
+}
+
+/** An image block with nothing to show: no URL source, and no base64 data,
+ *  in its source or, with no source object, on the block (MCP's form). */
+function cameWithoutData(image: unknown): boolean {
+  if (typeof image !== 'object' || image === null) return true;
+  const block = image as { source?: unknown; data?: unknown };
+  const source = typeof block.source === 'object' && block.source !== null
+    ? (block.source as { type?: unknown; data?: unknown })
+    : undefined;
+  if (source?.type === 'url') return false;
+  const data = source ? source.data : block.data;
+  return typeof data !== 'string' || data === '';
 }

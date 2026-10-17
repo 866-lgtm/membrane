@@ -8,6 +8,7 @@ import { assertMessagePrefillSupported } from './request-capabilities.js';
 import Anthropic, { type ClientOptions } from '@anthropic-ai/sdk';
 import { stripEmptyTextBlocks, stripEmptyTextRequest } from '../utils/empty-text.js';
 import { resolveImageMediaType, isAcceptedImageMediaType, assertWithinByteBudget, shedImagesToFitByteBudget } from '../utils/image-media.js';
+import { convertMcpMedia } from '../utils/mcp-media.js';
 import type {
   ProviderAdapter,
   ProviderInputTransformation,
@@ -771,9 +772,15 @@ export class AnthropicAdapter implements ProviderAdapter {
     // and is silently rejected (the model sees the text label only).
     const sanitizedMessages = (request.messages as any[]).map((msg: any) => {
       if (!Array.isArray(msg.content)) return msg;
+      // Media in MCP's form becomes membrane's first, for a caller that
+      // builds a request directly (Membrane's own builds have converted it
+      // already, utils/mcp-media.ts). A report about a block names the one
+      // the caller handed in.
+      const converted = convertMcpMedia(msg.content as unknown[]);
       return {
         ...msg,
-        content: msg.content.map((block: any) => {
+        content: msg.content.map((original: any, index: number) => {
+          const block = converted[index] as any;
           if (block.type === 'image') {
             const { sourceUrl, ...rest } = block;
             if (block.source?.type !== 'base64') return rest;
@@ -797,7 +804,7 @@ export class AnthropicAdapter implements ProviderAdapter {
             // carried nothing.
             const carried = (block.content as Array<{ type?: string; text?: unknown }>)
               .filter((b) => !(b?.type === 'text' && (typeof b.text !== 'string' || b.text === ''))).length;
-            if (content.length !== carried) onContentAltered?.(block);
+            if (content.length !== carried) onContentAltered?.(original);
             return { ...block, content };
           }
           return block;
@@ -1060,7 +1067,8 @@ export class AnthropicAdapter implements ProviderAdapter {
  * mixed array (text + image). This is what carries an image returned by a tool
  * (e.g. an MCP fetch_attachment result) all the way to the model. Other block
  * types are not valid inside tool_result.content per the Anthropic API and are
- * dropped.
+ * dropped, and so is an image whose source is neither, or that has no source
+ * object (media in MCP's form that didn't convert, utils/mcp-media.ts).
  */
 function toAnthropicToolResultContent(
   blocks: ContentBlock[],
@@ -1070,7 +1078,7 @@ function toAnthropicToolResultContent(
     if (block.type === 'text') {
       out.push({ type: 'text', text: block.text });
     } else if (block.type === 'image') {
-      if (block.source.type === 'base64') {
+      if (block.source?.type === 'base64') {
         out.push({
           type: 'image',
           source: {
@@ -1079,7 +1087,7 @@ function toAnthropicToolResultContent(
             data: block.source.data,
           },
         });
-      } else if (block.source.type === 'url') {
+      } else if (block.source?.type === 'url') {
         out.push({
           type: 'image',
           source: { type: 'url', url: block.source.url },

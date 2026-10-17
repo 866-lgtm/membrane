@@ -98,7 +98,7 @@ function toToolResult(block: ToolResultContent): ToolResult {
     for (const sub of block.content) {
       if (sub.type === 'text') {
         content.push({ type: 'text', text: sub.text });
-      } else if (sub.type === 'image' && sub.source.type === 'base64') {
+      } else if (sub.type === 'image' && sub.source?.type === 'base64') {
         content.push({
           type: 'image',
           source: { type: 'base64', data: sub.source.data, mediaType: sub.source.mediaType },
@@ -557,10 +557,10 @@ export class AnthropicXmlFormatter implements PrefillFormatter {
         // A zero-width carrier's item is its content; the transcript can't carry it.
         if (isRawItemCarrier(block)) onAltered?.();
       } else if (block.type === 'image') {
-        if (block.source.type === 'base64') {
+        if (block.source?.type === 'base64') {
           const mediaType = resolveImageMediaType(block.source.data, block.source.mediaType);
           if (!isAcceptedImageMediaType(mediaType)) {
-            parts.push(strippedImagePlaceholder(mediaType).text);
+            parts.push(strippedImagePlaceholder(mediaType, block).text);
             onAltered?.();
           } else {
             images.push({
@@ -573,7 +573,10 @@ export class AnthropicXmlFormatter implements PrefillFormatter {
             });
           }
         } else {
-          onAltered?.(); // a non-base64 image source has no branch here
+          // A source that isn't base64 has no branch here, and nor does no
+          // source object at all (media in MCP's form that didn't convert,
+          // utils/mcp-media.ts).
+          onAltered?.();
         }
       } else if (block.type === 'tool_use') {
         // Collect the run of consecutive tool_use blocks so calls parsed
