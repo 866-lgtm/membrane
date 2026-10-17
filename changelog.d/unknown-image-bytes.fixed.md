@@ -30,6 +30,7 @@
 - An MCP-shaped image in a tool result (`{ type: 'image', data, mimeType }`)
   is now decided by its data. The native builder gave every such image the
   placeholder, and the XML builder failed on one, so an accepted one now
-  reaches the model as an image. A context that holds such images sends
-  larger requests from the first one after upgrading, and its prompt cache is
-  written again from there once.
+  reaches the model as an image wherever its request carries tool-result
+  images. A context that holds such images sends larger requests from the
+  first one after upgrading, and its prompt cache is written again from there
+  once.
