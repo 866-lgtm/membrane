@@ -9,6 +9,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { Membrane } from '../../src/membrane.js';
 import { MockAdapter } from '../../src/providers/mock.js';
+import { NativeFormatter } from '../../src/formatters/native.js';
 import { GeminiAdapter } from '../../src/providers/gemini.js';
 import { OpenAICompletionsAdapter } from '../../src/providers/openai-completions.js';
 import { OpenAIAdapter } from '../../src/providers/openai.js';
@@ -292,4 +293,65 @@ describe('gemini: a prompt blocked before generation is a refusal whatever the r
       });
     }
   }
+});
+
+/**
+ * A custom adapter's stopReason with no providerStopReason beside it. When
+ * membrane doesn't map the token, it becomes end_turn, so the token itself is
+ * the only sign the stop wasn't a clean end of turn (#154).
+ */
+class BareStopReasonAdapter extends MockAdapter {
+  constructor(private bareStopReason: string, private rawToken?: string) {
+    super();
+  }
+
+  private withStop(response: ProviderResponse): ProviderResponse {
+    return {
+      ...response,
+      stopReason: this.bareStopReason,
+      ...(this.rawToken !== undefined ? { providerStopReason: this.rawToken } : {}),
+    };
+  }
+
+  override async complete(request: ProviderRequest, options?: ProviderRequestOptions): Promise<ProviderResponse> {
+    return this.withStop(await super.complete(request, options));
+  }
+
+  override async stream(request: ProviderRequest, callbacks: StreamCallbacks, options?: ProviderRequestOptions): Promise<ProviderResponse> {
+    return this.withStop(await super.stream(request, callbacks, options));
+  }
+}
+
+async function finished(membrane: Membrane, entry: 'complete' | 'stream' | 'yielding', request: NormalizedRequest): Promise<NormalizedResponse> {
+  if (entry === 'complete') return membrane.complete(request);
+  if (entry === 'stream') return streamed(membrane, request);
+  for await (const event of membrane.streamYielding(request)) {
+    if (event.type === 'error') throw event.error;
+    if (event.type === 'complete') return event.response;
+  }
+  throw new Error('no completion');
+}
+
+describe('an unmapped stop token the adapter gives without providerStopReason', () => {
+  for (const entry of ['complete', 'stream', 'yielding'] as const) {
+    for (const mode of ['native', 'xml'] as const) {
+      it(`${entry}() with ${mode} tools keeps it as providerReason, under end_turn`, async () => {
+        vi.spyOn(console, 'warn').mockImplementation(() => {});
+        const adapter = new BareStopReasonAdapter('error');
+        const membrane = new Membrane(adapter, mode === 'native' ? { formatter: new NativeFormatter() } : {});
+        // The default formatter carries native tools too, so XML tool mode is asked for.
+        const response = await finished(membrane, entry, mode === 'xml' ? { ...zzRequest, toolMode: 'xml' } : zzRequest);
+        expect(response.stopReason).toBe('end_turn');
+        expect(response.details.stop).toMatchObject({ reason: 'end_turn', providerReason: 'error' });
+      });
+    }
+  }
+
+  it("leaves the adapter's providerStopReason as providerReason when it gives one", async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const membrane = new Membrane(new BareStopReasonAdapter('zz_adapter_word', 'zz_provider_token'));
+    const response = await membrane.complete(zzRequest);
+    expect(response.stopReason).toBe('end_turn');
+    expect(response.details.stop.providerReason).toBe('zz_provider_token');
+  });
 });

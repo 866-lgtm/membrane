@@ -1143,7 +1143,7 @@ export class Membrane {
         onResponse?.(rawResponse);
 
         lastStopReason = this.mapStopReason(streamResult.stopReason);
-        lastProviderStopReason = streamResult.providerStopReason;
+        lastProviderStopReason = this.providerReasonFor(streamResult, lastStopReason);
         lastStopSequence = streamResult.stopSequence ?? undefined;
 
         // Accumulate usage (including cache metrics), priced at this round's
@@ -1679,7 +1679,7 @@ export class Membrane {
         onResponse?.(rawResponse);
 
         lastStopReason = this.mapStopReason(streamResult.stopReason);
-        lastProviderStopReason = streamResult.providerStopReason;
+        lastProviderStopReason = this.providerReasonFor(streamResult, lastStopReason);
         lastStopSequence = streamResult.stopSequence ?? undefined;
 
         // Accumulate usage (including cache metrics), priced at this round's
@@ -3009,7 +3009,7 @@ export class Membrane {
       stopReason,
       usage,
       details: {
-        stop: { ...this.buildStopInfo(stopReason, providerResponse.providerStopReason, providerResponse.stopSequence), unclosedToolBlock },
+        stop: { ...this.buildStopInfo(stopReason, this.providerReasonFor(providerResponse, stopReason), providerResponse.stopSequence), unclosedToolBlock },
         usage,
         timing: {
           totalDurationMs: durationMs,
@@ -3263,10 +3263,12 @@ export class Membrane {
       default:
         // Unknown reasons still normalize to end_turn — callers switch on a
         // closed union — but never silently: the raw token is disclosed as
-        // details.stop.providerReason and the mapping is logged, once per
-        // token per process (a compatible server may send its own token on
-        // every response). Provider enums grow, and the last time this
-        // default swallowed a member it hid safety refusals in production.
+        // details.stop.providerReason (the adapter's providerStopReason, or
+        // this token when it gives none; see providerReasonFor) and the
+        // mapping is logged, once per token per process (a compatible server
+        // may send its own token on every response). Provider enums grow, and
+        // the last time this default swallowed a member it hid safety
+        // refusals in production.
         if (!warnedStopReasons.has(adapterReason) && warnedStopReasons.size < MAX_LOGGED_STOP_REASONS) {
           warnedStopReasons.add(adapterReason);
           // The token is the server's own text: printed as a JSON string, so
@@ -3278,7 +3280,7 @@ export class Membrane {
           );
           console.warn(
             `[membrane] Unmapped adapter stop reason ${shown} normalized to end_turn ` +
-              '(details.stop.providerReason is present when the adapter supplies the raw provider token; ' +
+              '(details.stop.providerReason carries the adapter\'s providerStopReason, or this token when it gives none; ' +
               'logged once per reason)'
           );
           if (warnedStopReasons.size === MAX_LOGGED_STOP_REASONS) {
@@ -3290,6 +3292,23 @@ export class Membrane {
         }
         return 'end_turn';
     }
+  }
+
+  /**
+   * The token details.stop.providerReason carries for an adapter's result:
+   * its providerStopReason, the provider's own token, when it gives one.
+   * Otherwise its stopReason when the normalized reason differs from it,
+   * which today is a token mapStopReason doesn't map and turns into end_turn,
+   * so that token isn't lost behind a clean-looking stop. A stopReason that
+   * is the normalized reason, with no providerStopReason, leaves none: it may
+   * already be the adapter's normalization of the provider's word.
+   */
+  private providerReasonFor(
+    result: Pick<ProviderResponse, 'stopReason' | 'providerStopReason'>,
+    reason: StopReason
+  ): string | undefined {
+    if (result.providerStopReason !== undefined) return result.providerStopReason;
+    return result.stopReason !== reason ? result.stopReason : undefined;
   }
 
   private calculateCacheHitRatio(usage: Pick<DetailedUsage, 'inputTokens' | 'cacheCreationTokens' | 'cacheReadTokens'>): number {
@@ -3834,7 +3853,7 @@ export class Membrane {
 
         rawResponse = streamResult.raw;
         lastStopReason = this.mapStopReason(streamResult.stopReason);
-        lastProviderStopReason = streamResult.providerStopReason;
+        lastProviderStopReason = this.providerReasonFor(streamResult, lastStopReason);
         lastStopSequence = streamResult.stopSequence ?? undefined;
 
         // Accumulate usage (including cache metrics), priced at this round's model
@@ -4442,7 +4461,7 @@ export class Membrane {
 
         rawResponse = streamResult.raw;
         lastStopReason = this.mapStopReason(streamResult.stopReason);
-        lastProviderStopReason = streamResult.providerStopReason;
+        lastProviderStopReason = this.providerReasonFor(streamResult, lastStopReason);
         lastStopSequence = streamResult.stopSequence ?? undefined;
 
         // Attempts this round re-issued past a refusal are billed calls whose

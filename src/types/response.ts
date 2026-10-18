@@ -134,7 +134,10 @@ export interface StopInfo {
 
   /**
    * The provider's own stop token, verbatim, from ProviderResponse.providerStopReason.
-   * Omitted when the provider supplied none or a custom adapter did not report it.
+   * When the adapter gives none, its stopReason if the normalized reason
+   * differs from it (today, a token membrane doesn't map, which becomes
+   * end_turn), so that token isn't lost. Omitted otherwise: when the adapter
+   * gives no providerStopReason and its stopReason is the normalized reason.
    * This can differ from the normalized reason (for example, OpenAI's length).
    */
   providerReason?: string;

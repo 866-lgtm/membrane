@@ -398,7 +398,10 @@ export interface ProviderResponse {
   /**
    * Verbatim terminal reason reported by the provider, before normalization.
    * Omit when no reason was reported. Custom adapters opt in by supplying it;
-   * Membrane does not infer it from stopReason or parse adapter-specific raw data.
+   * Membrane does not parse adapter-specific raw data for it. Without it,
+   * details.stop.providerReason carries stopReason when the normalized reason
+   * differs from it (today, a token membrane doesn't map, which becomes
+   * end_turn), and is left unset otherwise.
    */
   providerStopReason?: string;
   
