@@ -21,7 +21,6 @@ import type {
 } from '../types/index.js';
 import { createHash } from 'node:crypto';
 import { imageForRequest, isAcceptedImage, linkImageNote, type RasterImageMediaType } from './image-media.js';
-import { convertMcpMedia } from './mcp-media.js';
 import { readToolSchema, type ParameterDeclaration, type ToolSchemaReading } from './tool-schema.js';
 
 // ============================================================================
@@ -673,14 +672,11 @@ function renderResultContentString(result: ToolResult): string {
  * tool_use_id attributes on the wire (a Messages-API concept — the
  * store keeps the linkage on the blocks); content rides raw unless it
  * contains structural tags (then escaped, see STRUCTURAL_TAG_RE).
- *
- * Media in MCP's form becomes membrane's here, where the document takes
- * results (utils/mcp-media.ts); `results` stay as they were handed in.
  */
 export function formatToolResults(results: ToolResult[]): string {
   const parts: string[] = ['<function_results>'];
 
-  for (const result of convertMcpMedia(results)) {
+  for (const result of results) {
     if (result.isError) {
       parts.push('<error>');
       parts.push(guardResultContent(renderResultContentString(result)));
@@ -1412,12 +1408,8 @@ export interface SplitTurnContent {
  * Assistant (prefill): </result>
  *            </function_results>
  * ```
- *
- * Media in MCP's form becomes membrane's here, as in formatToolResults;
- * `handed` stays as it was.
  */
-export function formatToolResultsForSplitTurn(handed: ToolResult[]): SplitTurnContent {
-  const results = convertMcpMedia(handed);
+export function formatToolResultsForSplitTurn(results: ToolResult[]): SplitTurnContent {
   const images: ProviderImageBlock[] = [];
   let beforeImageXml = '<function_results>\n';
   let afterImageXml = '';

@@ -10,10 +10,12 @@
  * threw on the first. So membrane converts where content enters it, and
  * every request builder after that point reads one form:
  * `Membrane`'s request build (`transformRequest`, which every path's messages
- * go through, the native tool loop's each round), the xml document's tool
- * results (`formatToolResults` and `formatToolResultsForSplitTurn`, which take
- * an xml tool loop's results each round), and the Anthropic adapter's request
- * sanitizer, for a caller that builds a request directly. Three carry the
+ * go through, the native tool loop's each round), and the Anthropic adapter's
+ * request sanitizer, for a caller that builds a request directly. The xml
+ * document's tool results (`formatToolResults` and
+ * `formatToolResultsForSplitTurn`, which take an xml tool loop's results each
+ * round) read their images through `toolResultImage`, which takes MCP's form
+ * by its data, so they need no conversion. Three carry the
  * caller's form instead: the caller's request a `beforeRequest` hook is
  * handed beside the provider's, which is built from converted content; a
  * continuation's `normalizedMessages`, which no adapter reads for media,

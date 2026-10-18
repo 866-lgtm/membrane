@@ -4,19 +4,20 @@
   document, audio clip or video (#139). An image converts without a
   `mimeType` too, with no `mediaType`, and every request decides it by its
   data's header, as it decides any image; other media without a `mimeType`
-  doesn't convert. Membrane converts it where content enters: the messages
-  of `complete()`, `stream()` and `streamYielding()`, rebuilt each round of a
-  native tool loop; an xml tool loop's results, as the document takes them
-  (`formatToolResults` and the split that sends a result's images); and
-  `AnthropicAdapter`'s request built directly. The block keeps its other
-  fields, the caller's messages and the executor's results stay as they
-  were, and a round's report names what it would for the same media in
+  doesn't convert.
+  Membrane converts it where content enters: the messages of `complete()`,
+  `stream()` and `streamYielding()`, rebuilt each round of a native tool loop,
+  and `AnthropicAdapter`'s request built directly. An xml tool loop's results,
+  which `formatToolResults` and the split that sends a result's images render
+  each round, already read an image in MCP's form by its data. The block keeps
+  its other fields, the caller's messages and the executor's results stay as
+  they were, and a round's report names what it would for the same media in
   membrane's form. Carried, an image counts toward the request's byte cap as
   one in membrane's form does: a request it takes over the cap fails at the
-  build, or with `shedOversizeImages`, sheds images to fit. Media whose
-  `data` is empty doesn't convert, since the API refuses an image with none.
-  Inside a `tool_result`, the anthropic-xml and native formatters already
-  read such an image by its data, and send it as before. Before:
+  build, or with `shedOversizeImages`, sheds images to fit. Media whose `data`
+  is empty doesn't convert, since the API refuses an image with none. Inside a
+  `tool_result`, the anthropic-xml and native formatters already read such an
+  image by its data, and send it as before. Before:
   - at the top of a message, the anthropic-xml formatter in either tool mode,
     the native formatter and the Responses formatter threw a TypeError on
     such an image, and the anthropic-xml formatter in native tool mode and

@@ -417,10 +417,10 @@ describe('the XML replay of a split image round', () => {
     expect(rounds.map((r) => [r.altered.messages, r.fidelity])).toEqual([[[], 'established']]);
   });
 
-  it("sends a marked result's images as the live split chose them: media in MCP's form converted, and none it couldn't send", async () => {
-    // Beside its text, the tool returns an image in MCP's form, which converts
-    // and is sent; one in MCP's form with no mimeType, whose header decides it,
-    // so it's sent too; a base64 source with no data, and one whose data is
+  it("sends a marked result's images as the live split chose them: media in MCP's form read by its data, and none it couldn't send", async () => {
+    // Beside its text, the tool returns an image in MCP's form, which is read
+    // by its data and sent; one in MCP's form with no mimeType, whose header
+    // decides it, so it's sent too; a base64 source with no data, and one whose data is
     // empty; a URL image; and a URL source that also carries data, whose image
     // is at its URL, as the native path reads one. The response keeps them as
     // returned.
