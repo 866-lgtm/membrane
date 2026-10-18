@@ -198,10 +198,31 @@ export interface StreamOptions {
   timeoutMs?: number;
 
   /**
-   * Abort a call whose stream goes silent for this many ms. Parity with
-   * YieldingStreamOptions.idleTimeoutMs; the adapter owns the default.
+   * Anthropic idle deadline after the first SDK event (default: 600000 ms).
+   * Nonempty Web response-body bytes, including SSE keepalives, refresh it;
+   * other SDK-supported bodies refresh it on SDK events. This does not bound
+   * total duration or generation progress. Parity with YieldingStreamOptions.
    */
   idleTimeoutMs?: number;
+
+  /**
+   * Progress deadline, per provider call (default: off, as for any value
+   * that isn't a positive number of ms). Every parsed provider event renews
+   * it (an SDK event, an SSE data frame); keepalives, SSE comments and raw
+   * bytes don't, so a connection that stays up while the model sends nothing
+   * still ends. On expiry the call aborts as a `TimeoutAbortError` (type
+   * `timeout`, aborted reason `'timeout'`). It bounds the wait for the first
+   * event too. Time between provider calls, such as tool execution, never
+   * counts. A stretch with no parsed event counts as no progress whatever the
+   * model is doing: reasoning a provider doesn't stream, while it sends only
+   * keepalives, can expire it, so set it above the longest such stretch you
+   * expect (Anthropic thinking with `display: "omitted"` sends no deltas
+   * while it thinks, which can last minutes). An adapter that streams no
+   * events, such as `OpenAIResponsesAdapter` (the Images API), can't renew
+   * it, so for it the deadline bounds the whole call. Parity with
+   * YieldingStreamOptions.
+   */
+  progressTimeoutMs?: number;
 
   /** Request ID for correlation */
   requestId?: string;
@@ -285,6 +306,16 @@ export interface CompleteOptions {
 
   /** Request timeout */
   timeoutMs?: number;
+
+  /**
+   * Progress deadline, per provider call (default: off); see
+   * StreamOptions.progressTimeoutMs. A non-streaming call reports no progress
+   * until its response arrives, so on most adapters it bounds the whole call.
+   * `OpenAIResponsesAPIAdapter` in subscription mode answers `complete()` by
+   * streaming, so there its events renew it. On expiry `complete()` throws a
+   * `TimeoutAbortError`.
+   */
+  progressTimeoutMs?: number;
 
   /** Request ID for correlation */
   requestId?: string;

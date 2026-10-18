@@ -9,6 +9,10 @@
  * - 'multiuser': Multiple participants, names prefixed to content
  */
 
+import { followNormalizedBlocks, isRawItemCarrier, ownBlocks, type FidelityNotes } from '../utils/fidelity.js';
+import { sanitizeToolName } from '../utils/tool-names.js';
+import { unsupportedError } from '../types/errors.js';
+
 import type {
   NormalizedMessage,
   ContentBlock,
@@ -18,6 +22,7 @@ import type {
 } from '../types/index.js';
 import type {
   PrefillFormatter,
+  ContentParseContext,
   StreamParser,
   BuildOptions,
   BuildResult,
@@ -29,13 +34,27 @@ import type {
   StreamEmission,
 } from './types.js';
 import { normalizeToolPairs, mergeConsecutiveRoles } from './normalize-tool-pairs.js';
-import { resolveImageMediaType, isAcceptedImageMediaType, strippedImagePlaceholder } from '../utils/image-media.js';
-import { assertCacheMarkersWithinLimit } from '../utils/cache-marker-budget.js';
+import { imageForRequest, toolResultContentForRequest } from '../utils/image-media.js';
+import { assertCacheMarkersWithinLimit, countWireCacheMarkers } from '../utils/cache-marker-budget.js';
+import { anthropicServerBlockFor, unpairedServerBlocks } from '../utils/anthropic-server-blocks.js';
 
 /** Index of the last content block that can carry cache_control. Anthropic
  *  rejects cache_control on thinking / redacted_thinking blocks, so a cache
  *  breakpoint must attach to the last NON-thinking block. Returns -1 when the
  *  message has only thinking blocks (the breakpoint is then skipped). */
+/**
+ * The system prompt as it goes on the wire: `''` and an array left with no
+ * blocks become undefined, and empty text blocks leave an array.
+ */
+export function withoutEmptySystemText(
+  system: string | ContentBlock[] | undefined,
+): string | ContentBlock[] | undefined {
+  if (typeof system === 'string') return system === '' ? undefined : system;
+  if (!Array.isArray(system)) return system;
+  const blocks = system.filter((block) => !(block.type === 'text' && (block as { text?: unknown }).text === ''));
+  return blocks.length > 0 ? blocks : undefined;
+}
+
 export function lastCacheableBlockIndex(blocks: Array<Record<string, unknown>>): number {
   for (let k = blocks.length - 1; k >= 0; k--) {
     const t = blocks[k]?.type as string | undefined;
@@ -160,8 +179,12 @@ class PassthroughParser implements StreamParser {
 // ============================================================================
 
 export class NativeFormatter implements PrefillFormatter {
+  /** buildMessages records every consumer message it doesn't carry verbatim (utils/fidelity.ts). */
+  readonly reportsAlterations = true;
   readonly name = 'native';
   readonly usesPrefill = false;
+  readonly supportsNativeTools = true;
+  readonly supportsXmlTools = false;
 
   readonly nameFormat: string;
   private config: Required<FormatterConfig>;
@@ -198,15 +221,6 @@ export class NativeFormatter implements PrefillFormatter {
       ? { type: 'ephemeral', ...(cacheTtl ? { ttl: cacheTtl } : {}) }
       : undefined;
 
-    // The system block is cached only as a FALLBACK. When the context strategy
-    // marks any message breakpoint, that breakpoint already caches a prefix
-    // beginning at the front of the request — tools + system included — so a
-    // separate system breakpoint is redundant. Placing it anyway both wastes one
-    // of Anthropic's 4 cache_control slots and can push a 4-marker turn to 5,
-    // which the API hard-rejects. So we only cache the system block when the
-    // caller/strategy marked no breakpoints of its own.
-    let markedBreakpoints = 0;
-
     const providerMessages: ProviderMessage[] = [];
 
     // Add context prefix as first assistant message (for simulacrum seeding)
@@ -214,7 +228,6 @@ export class NativeFormatter implements PrefillFormatter {
       const prefixBlock: Record<string, unknown> = { type: 'text', text: contextPrefix };
       if (promptCaching && cacheControl && cacheMarkers === 'membrane-system') {
         prefixBlock.cache_control = cacheControl;
-        markedBreakpoints++;
       }
       providerMessages.push({
         role: 'assistant',
@@ -246,9 +259,12 @@ export class NativeFormatter implements PrefillFormatter {
 
       const role: 'user' | 'assistant' = isAssistant ? 'assistant' : 'user';
 
-      // Convert content
+      // Convert content (recording alterations against this message's index)
       const content = this.convertContent(message.content, message.participant, {
         includeNames: participantMode === 'multiuser' && !isAssistant,
+        isAssistant,
+        serverBlocks: options.anthropicServerBlocks === true,
+        ...(options.fidelity ? { onAltered: () => options.fidelity!.alter(i) } : {}),
       });
 
       if (
@@ -261,6 +277,8 @@ export class NativeFormatter implements PrefillFormatter {
       if (content.length === 0) {
         continue; // Skip empty messages
       }
+      // An adapter's report about one of these blocks names this message.
+      ownBlocks(options.fidelity, content, i);
 
       // hasCacheMarker: cache boundary is BEFORE this message — tag previous message's last block
       if (hasCacheMarker && hasCacheMarker(message, i) && cacheControl && providerMessages.length > 0) {
@@ -269,7 +287,6 @@ export class NativeFormatter implements PrefillFormatter {
         const prevIdx = lastCacheableBlockIndex(prevContent);
         if (prevIdx >= 0) {
           prevContent[prevIdx]!.cache_control = cacheControl;
-          markedBreakpoints++;
         }
       }
 
@@ -280,20 +297,7 @@ export class NativeFormatter implements PrefillFormatter {
         const bpIdx = lastCacheableBlockIndex(content as Record<string, unknown>[]);
         if (bpIdx >= 0) {
           (content[bpIdx] as Record<string, unknown>).cache_control = cacheControl;
-          markedBreakpoints++;
         }
-      }
-    }
-
-    // Block-level cache_control can also arrive via convertContent passthrough
-    // (stale request-time markers on imported/stored blocks — Arc exports carry
-    // them). Recount ALL message-level cache_control blocks — deliberate marks
-    // and passthroughs alike — so the system fallback below can't stack on top.
-    markedBreakpoints = 0;
-    for (const msg of providerMessages) {
-      if (!Array.isArray(msg.content)) continue;
-      for (const b of msg.content as Record<string, unknown>[]) {
-        if (b.cache_control) markedBreakpoints++;
       }
     }
 
@@ -304,46 +308,72 @@ export class NativeFormatter implements PrefillFormatter {
     const normalized = normalizeToolPairs(providerMessages, {
       pendingToolCallIds: options.pendingToolCallIds,
       onEvent: options.onNormalize,
+      // A tool_result textified as an orphan or a duplicate alters the
+      // message that occurrence came from, and its replacement keeps the owner.
+      ...followNormalizedBlocks(options.fidelity),
+      // The caller's synthetic user text, used where the normalizer decides a
+      // leading user turn is needed: after a contextPrefix, before
+      // assistant-first history, or after role repair moved a block forward.
+      leadingUserText: options.prefillUserMessage,
     });
 
     // Merge consecutive same-role messages (API requires alternating)
-    const mergedMessages = mergeConsecutiveRoles(normalized.messages);
+    let mergedMessages = mergeConsecutiveRoles(normalized.messages);
+    // A server call goes out only with its result in its turn, and a result
+    // only with its call: the API refuses either alone. The request's final
+    // message, if it's the assistant's, keeps its lone calls (a paused turn
+    // is resumed there). The turn is the one sent, after the merge, so a
+    // call and its result stored as two consecutive assistant messages stay
+    // together. With server blocks off, none reached this far.
+    mergedMessages = NativeFormatter.pairServerBlocks(mergedMessages, options.fidelity);
 
-    // Build system content. Cache the system block only as a fallback — when no
-    // message breakpoint was marked (see note above; otherwise a message
-    // breakpoint already caches tools+system as part of its prefix).
-    if (markedBreakpoints > 4) {
-      throw new Error(`cache_control limit exceeded: ${markedBreakpoints} markers (maximum 4)`);
-    }
+    // Build system content. The system block is cached only as a FALLBACK: a
+    // message breakpoint already caches a prefix that begins at the front of
+    // the request, tools and system included, so a separate system marker
+    // would waste one of Anthropic's 4 slots and can push a 4-marker turn to 5,
+    // which the API rejects. The count is of the markers this request already
+    // carries: on the merged messages (this build's own, a contextPrefix's,
+    // and stale ones passed through on stored blocks) and on the caller's
+    // system content, so a caller who marked their own system block gets no
+    // fallback either. The budget check below covers the whole built request;
+    // Membrane defers it (deferCacheBudgetCheck) to after its hooks, which
+    // can still add markers.
+    //
+    // An empty system prompt is no system block. Wrapped for the fallback
+    // marker it became a cache-marked empty text block, which the API doesn't
+    // cache; a caller's empty text blocks are dropped the same way, before the
+    // marker count and before the fallback picks the last block.
+    const system = withoutEmptySystemText(systemPrompt);
+    const markedBreakpoints = countWireCacheMarkers({ messages: mergedMessages, system });
     const cacheSystem =
       cacheMarkers === 'membrane-system' && cacheControl && markedBreakpoints === 0
         ? cacheControl
         : undefined;
     let systemContent: unknown;
-    if (typeof systemPrompt === 'string') {
+    if (typeof system === 'string') {
       if (cacheSystem) {
         // Must use array format for cache_control support
-        systemContent = [{ type: 'text', text: systemPrompt, cache_control: cacheSystem }];
+        systemContent = [{ type: 'text', text: system, cache_control: cacheSystem }];
       } else {
-        systemContent = systemPrompt;
+        systemContent = system;
       }
-    } else if (Array.isArray(systemPrompt)) {
-      if (cacheSystem && systemPrompt.length > 0) {
+    } else if (Array.isArray(system)) {
+      if (cacheSystem) {
         // Add cache_control to the last system block
-        systemContent = systemPrompt.map((block, idx) => {
-          if (idx === systemPrompt.length - 1) {
+        systemContent = system.map((block, idx) => {
+          if (idx === system.length - 1) {
             return { ...block, cache_control: cacheSystem };
           }
           return block;
         });
       } else {
-        systemContent = systemPrompt;
+        systemContent = system;
       }
     }
 
     // Native tools
     const nativeTools = tools?.length ? this.convertToNativeTools(tools) : undefined;
-    if (cacheMarkers === 'cm-owned') {
+    if (cacheMarkers === 'cm-owned' || !options.deferCacheBudgetCheck) {
       assertCacheMarkersWithinLimit(
         { messages: mergedMessages, system: systemContent, tools: nativeTools },
         'native'
@@ -388,9 +418,10 @@ export class NativeFormatter implements PrefillFormatter {
     return false;
   }
 
-  parseContentBlocks(content: string): ContentBlock[] {
-    // Native mode - content is plain text
-    if (!content.trim()) {
+  parseContentBlocks(content: string, _tools?: ToolDefinition[], context?: ContentParseContext): ContentBlock[] {
+    // Only a wholly blank response is omitted. Whitespace-only spans of a
+    // nonblank response are still its text, including before thinking.
+    if (!content || !(context?.visibleText ?? content).trim()) {
       return [];
     }
     return [{ type: 'text', text: content }];
@@ -400,45 +431,79 @@ export class NativeFormatter implements PrefillFormatter {
   // PRIVATE HELPERS
   // ==========================================================================
 
-  /** Replace API-unacceptable image blocks nested in tool_result content with
-   *  text placeholders. Non-array content passes through untouched. */
-  private static sanitizeToolResultContent(content: unknown): unknown {
-    if (!Array.isArray(content)) return content;
-    return content.map((item) => {
-      if (
-        item &&
-        typeof item === 'object' &&
-        (item as { type?: string }).type === 'image'
-      ) {
-        const src = (item as { source?: { type?: string; data?: string; mediaType?: string; media_type?: string } }).source;
-        if (src?.type === 'url') return item;
-        const mediaType = resolveImageMediaType(src?.data, src?.mediaType ?? src?.media_type);
-        if (!isAcceptedImageMediaType(mediaType)) {
-          return strippedImagePlaceholder(mediaType);
-        }
-        const { mediaType: _declared, ...source } = src ?? {};
-        return { ...item, source: { ...source, media_type: mediaType } };
+  /**
+   * Leave out of each assistant turn the server blocks the API refuses there
+   * (unpairedServerBlocks: a lone call or result, a second block with an id,
+   * an id that isn't a string, `container_upload`), reporting each one's
+   * message altered. The final message, if it's the assistant's, keeps its
+   * lone calls: a paused turn is resumed as the request's last message. A
+   * marker the builder put on a block left out moves to the turn's last block
+   * that can hold one, unless a kept block already carries one; with no kept
+   * block that can hold one, it goes. A turn left with nothing is dropped,
+   * its marker with it, and its neighbours merge again.
+   */
+  private static pairServerBlocks(messages: ProviderMessage[], fidelity?: FidelityNotes): ProviderMessage[] {
+    const emptied = new Set<number>();
+    const paired = messages.map((message, index) => {
+      if (message.role !== 'assistant' || !Array.isArray(message.content)) return message;
+      const unpaired = unpairedServerBlocks(message.content, index === messages.length - 1);
+      if (unpaired.size === 0) return message;
+      const blocks = message.content as Record<string, unknown>[];
+      let marker: unknown;
+      const kept = blocks.filter((block) => {
+        if (!unpaired.has(block)) return true;
+        fidelity?.alterBlock(block);
+        if (block.cache_control) marker = block.cache_control;
+        return false;
+      });
+      if (marker !== undefined && !kept.some((block) => block.cache_control)) {
+        const at = lastCacheableBlockIndex(kept);
+        if (at >= 0) kept[at]!.cache_control = marker;
       }
-      return item;
+      if (kept.length === 0) emptied.add(index);
+      return { ...message, content: kept };
     });
+    if (emptied.size === 0) return paired;
+    return mergeConsecutiveRoles(paired.filter((_, index) => !emptied.has(index)));
   }
 
   private convertContent(
     content: ContentBlock[],
     participant: string,
-    options: { includeNames: boolean }
+    options: { includeNames: boolean; isAssistant: boolean; serverBlocks: boolean; onAltered?: () => void }
   ): unknown[] {
     const result: unknown[] = [];
     let hasUnsupportedMedia = false;
     let hasText = false;
+    // Any non-empty block not carried verbatim alters the consumer message.
+    const altered = () => options.onAltered?.();
 
     for (const block of content) {
+      // An Anthropic server-tool block (web search and the like), kept on a
+      // zero-width carrier, goes back as the block itself in the assistant
+      // turn that produced it (see utils/anthropic-server-blocks.ts), when
+      // the build replays them (BuildOptions.anthropicServerBlocks). In a
+      // message sent as a user turn, such as another participant's, it has
+      // no place and is left out. An adapter for another wire leaves out a
+      // block type it has no form for.
+      // Sent, it is carried: the block is the carrier's item, its content.
+      // Left out, the message loses it.
+      const serverBlock = anthropicServerBlockFor(block);
+      if (serverBlock) {
+        if (options.isAssistant && options.serverBlocks) result.push(serverBlock);
+        else altered();
+        continue;
+      }
       if (block.type === 'text') {
-        // Empty text blocks are rejected by the Anthropic API. In particular,
-        // zero-width rawItem carriers (opaque provider-native items smuggled
-        // through normalized history) must not leak here. Filter BEFORE the
-        // name prefix below would make them non-empty.
-        if (block.text === '') continue;
+        // Empty text blocks are rejected by the Anthropic API. Any other
+        // zero-width rawItem carrier (an opaque provider-native item from
+        // another wire) has no form here and must not leak. Filter BEFORE
+        // the name prefix below would make it non-empty. A carrier's item is
+        // its content, and it is not sent here.
+        if (block.text === '') {
+          if (isRawItemCarrier(block)) altered();
+          continue;
+        }
         let text = block.text;
         if (options.includeNames && !hasText) {
           const prefix = this.nameFormat.replace('{name}', () => participant);
@@ -452,11 +517,13 @@ export class NativeFormatter implements PrefillFormatter {
         result.push(textBlock);
       } else if (block.type === 'image') {
         if (block.source.type === 'base64') {
-          const mediaType = resolveImageMediaType(block.source.data, block.source.mediaType);
-          if (!isAcceptedImageMediaType(mediaType)) {
-            // Unacceptable media type (e.g. image/svg): degrade to a text
-            // placeholder instead of poisoning the whole request.
-            result.push(strippedImagePlaceholder(mediaType));
+          const { mediaType, placeholder } = imageForRequest(block.source.data, block.source.mediaType);
+          if (placeholder) {
+            // Not an image the API accepts (an SVG, or data that is no image
+            // at all): degrade to a text placeholder instead of poisoning the
+            // whole request.
+            result.push(placeholder);
+            altered();
           } else {
             const imageBlock: Record<string, unknown> = {
               type: 'image',
@@ -472,6 +539,8 @@ export class NativeFormatter implements PrefillFormatter {
             }
             result.push(imageBlock);
           }
+        } else {
+          altered(); // a non-base64 image source has no branch here
         }
       } else if (block.type === 'audio') {
         // Pass audio through in the same shape as images — the provider
@@ -486,19 +555,21 @@ export class NativeFormatter implements PrefillFormatter {
               data: block.source.data,
             },
           });
+        } else {
+          altered();
         }
       } else if (block.type === 'tool_use') {
         result.push({
           type: 'tool_use',
           id: block.id,
-          name: block.name,
+          name: sanitizeToolName(block.name),
           input: block.input,
         });
       } else if (block.type === 'tool_result') {
         result.push({
           type: 'tool_result',
           tool_use_id: block.toolUseId,
-          content: NativeFormatter.sanitizeToolResultContent(block.content),
+          content: toolResultContentForRequest(block.content, options.onAltered),
           is_error: block.isError,
         });
       } else if (block.type === 'thinking') {
@@ -518,6 +589,10 @@ export class NativeFormatter implements PrefillFormatter {
         result.push({ ...(block as unknown as Record<string, unknown>) });
       } else if (block.type === 'document') {
         hasUnsupportedMedia = true;
+        altered();
+      } else {
+        // A block type this formatter does not convert is left out.
+        altered();
       }
     }
 
@@ -533,10 +608,14 @@ export class NativeFormatter implements PrefillFormatter {
   }
 
   private convertToNativeTools(tools: ToolDefinition[]): unknown[] {
-    return tools.map(tool => ({
-      name: tool.name,
-      description: tool.description,
-      input_schema: tool.inputSchema,
-    }));
+    const names = new Set<string>();
+    return tools.map(tool => {
+      const name = sanitizeToolName(tool.name);
+      if (names.has(name)) {
+        throw unsupportedError('Native tool names collide after colon escaping: "' + name + '". Choose distinct wire names.');
+      }
+      names.add(name);
+      return { name, description: tool.description, input_schema: tool.inputSchema };
+    });
   }
 }

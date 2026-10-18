@@ -10,6 +10,9 @@
  * Serializes conversations to Human:/Assistant: format.
  */
 
+import { unreportedUsage } from '../utils/usage.js';
+import { assertPromptToolSupport } from './request-capabilities.js';
+
 import type {
   ProviderAdapter,
   ProviderRequest,
@@ -20,14 +23,14 @@ import type {
 } from '../types/index.js';
 import {
   MembraneError,
-  rateLimitError,
-  contextLengthError,
-  authError,
-  serverError,
   abortError,
-  networkError,
+  classifyError,
+  errorFromHttpResponse,
+  isTypedAbortError,
+  withRawRequest,
 } from '../types/index.js';
 import { createCombinedSignal, SSELineParser, isDeadlineAbort, deadlineTimeoutError, throwOnStreamErrorFrame, assertTerminalEventObserved } from './utils.js';
+import { isRawItemCarrier } from '../utils/fidelity.js';
 
 // ============================================================================
 // Types
@@ -158,7 +161,7 @@ export class OpenAICompletionsAdapter implements ProviderAdapter {
     request: ProviderRequest,
     options?: ProviderRequestOptions
   ): Promise<ProviderResponse> {
-    const completionsRequest = this.buildRequest(request);
+    const completionsRequest = this.buildRequest(request, options);
     options?.onRequest?.(completionsRequest);
 
     try {
@@ -174,7 +177,7 @@ export class OpenAICompletionsAdapter implements ProviderAdapter {
     callbacks: StreamCallbacks,
     options?: ProviderRequestOptions
   ): Promise<ProviderResponse> {
-    const completionsRequest = this.buildRequest(request);
+    const completionsRequest = this.buildRequest(request, options);
     completionsRequest.stream = true;
     // Ask for usage in the stream — without this the endpoint sends no usage
     // frame at all and every streamed call reports 0/0 tokens.
@@ -191,8 +194,7 @@ export class OpenAICompletionsAdapter implements ProviderAdapter {
       });
 
       if (!response.ok) {
-        const errorText = await response.text();
-        throw new Error(`API error: ${response.status} ${errorText}`);
+        throw errorFromHttpResponse(this.name, response, await response.text(), completionsRequest);
       }
 
       const reader = response.body?.getReader();
@@ -203,7 +205,7 @@ export class OpenAICompletionsAdapter implements ProviderAdapter {
       const decoder = new TextDecoder();
       const sseParser = new SSELineParser();
       let accumulated = '';
-      let finishReason = 'stop';
+      let finishReason: string | undefined;
       let sawTerminalEvent = false;
       let streamUsage: CompletionsResponse['usage'] | undefined;
 
@@ -237,7 +239,11 @@ export class OpenAICompletionsAdapter implements ProviderAdapter {
         } catch {
           return; // Ignore parse errors (partial/keep-alive lines)
         }
+        // A parsed provider event is progress (comments never reach here).
+        options?.onProgress?.();
 
+        // A frame that reports an error throws here, before its text, or an
+        // end-of-turn token in it, is read.
         throwOnStreamErrorFrame(parsed, this.name, completionsRequest);
 
         try {
@@ -245,22 +251,22 @@ export class OpenAICompletionsAdapter implements ProviderAdapter {
 
           if (text) {
             accumulated += text;
-            if (eot) {
-              const idx = accumulated.indexOf(eot);
-              if (idx !== -1) {
-                // Truncate at the token, flush the un-emitted prefix, stop
-                accumulated = accumulated.slice(0, idx);
-                if (accumulated.length > emittedLen) {
-                  callbacks.onChunk(accumulated.slice(emittedLen));
-                }
-                emittedLen = accumulated.length;
-                eotFound = true;
-                // The adapter's own end-of-turn token IS a terminal
-                // observation: the turn ended where this layer said it ends.
-                sawTerminalEvent = true;
-                finishReason = 'stop';
-                return;
+            const idx = eot ? accumulated.indexOf(eot) : -1;
+            if (idx !== -1) {
+              // Truncate at the token, flush the un-emitted prefix, stop
+              accumulated = accumulated.slice(0, idx);
+              if (accumulated.length > emittedLen) {
+                callbacks.onChunk(accumulated.slice(emittedLen));
               }
+              emittedLen = accumulated.length;
+              eotFound = true;
+              // The adapter's own end-of-turn token IS a terminal
+              // observation: the turn ended where this layer said it ends.
+              // The normalized reason is end_turn whatever the provider says;
+              // a finish_reason and usage this same frame carried are still
+              // read below. Later frames are not waited for.
+              sawTerminalEvent = true;
+            } else if (eot) {
               // Emit all but a held-back tail that could be a partial token
               const safeLen = Math.max(emittedLen, accumulated.length - (eot.length - 1));
               if (safeLen > emittedLen) {
@@ -320,7 +326,7 @@ export class OpenAICompletionsAdapter implements ProviderAdapter {
 
       assertTerminalEventObserved(sawTerminalEvent, this.name, completionsRequest);
 
-      return this.buildStreamedResponse(accumulated, finishReason, request.model, streamUsage, completionsRequest);
+      return this.buildStreamedResponse(accumulated, finishReason, request.model, streamUsage, completionsRequest, eotFound);
 
     } catch (error) {
       throw this.handleError(error, completionsRequest);
@@ -404,6 +410,8 @@ export class OpenAICompletionsAdapter implements ProviderAdapter {
 
       for (const block of content) {
         if (block.type === 'text') {
+          // A zero-width carrier holds a block this wire has no form for.
+          if (isRawItemCarrier(block)) continue;
           textParts.push(block.text);
         } else if (block.type === 'image' || block.type === 'image_url') {
           hadImages = true;
@@ -434,21 +442,29 @@ export class OpenAICompletionsAdapter implements ProviderAdapter {
     return headers;
   }
 
-  private buildRequest(request: ProviderRequest): CompletionsRequest {
+  private buildRequest(request: ProviderRequest, options?: ProviderRequestOptions): CompletionsRequest {
     let prompt: string;
     let stopSequences: string[];
 
-    if (typeof request.extra?.prompt === 'string') {
+    // Capture the exact excluded extra fields once, retaining ordinary getter
+    // access and the rest-spread semantics of the native overrides below.
+    const extra = request.extra ?? {};
+    const { messages: _messages, tools: extraTools, normalizedMessages, prompt: explicitPrompt, ...rest } = extra;
+    const hasNormalizedMessages = normalizedMessages !== undefined || 'normalizedMessages' in Object(extra);
+    const promptMessages = hasNormalizedMessages ? normalizedMessages : options?.promptMessages;
+    assertPromptToolSupport(request, options, this.name, { kind: 'xml-prompt', prompt: explicitPrompt, extraTools });
+
+    if (typeof explicitPrompt === 'string') {
       // Continuation path: prompt is already serialized, skip re-serialization.
       // No participant-based stops or eotToken — the prompt already contains them.
-      prompt = request.extra.prompt;
+      prompt = explicitPrompt;
       stopSequences = [
         ...this.extraStopSequences,
         ...(request.stopSequences || []),
       ];
     } else {
       // Normal path: serialize messages into prompt format
-      const messages = (request.extra?.normalizedMessages as any[]) || (request.messages as any[]);
+      const messages = (promptMessages as any[]) || (request.messages as any[]);
       const result = this.serializeToPrompt(messages);
       prompt = result.prompt;
       stopSequences = [
@@ -490,10 +506,7 @@ export class OpenAICompletionsAdapter implements ProviderAdapter {
     }
 
     // Apply extra params (but not messages/tools/normalizedMessages/prompt which don't apply)
-    if (request.extra) {
-      const { messages, tools, normalizedMessages, prompt, ...rest } = request.extra as any;
-      Object.assign(params, rest);
-    }
+    Object.assign(params, rest);
 
     return params;
   }
@@ -509,11 +522,13 @@ export class OpenAICompletionsAdapter implements ProviderAdapter {
       });
 
       if (!response.ok) {
-        const errorText = await response.text();
-        throw new Error(`API error: ${response.status} ${errorText}`);
+        throw errorFromHttpResponse(this.name, response, await response.text(), request);
       }
 
-      return await response.json() as CompletionsResponse;
+      const body: unknown = await response.json();
+      // A 200 can carry the provider's error, as a stream frame can.
+      throwOnStreamErrorFrame(body, this.name, request, 'response error');
+      return body as CompletionsResponse;
     } finally {
       cleanup?.();
     }
@@ -535,11 +550,13 @@ export class OpenAICompletionsAdapter implements ProviderAdapter {
     return {
       content: this.textToContent(text),
       stopReason: this.mapFinishReason(choice?.finish_reason),
+      providerStopReason: choice?.finish_reason ?? undefined,
       stopSequence: undefined,
       usage: {
         inputTokens: response.usage?.prompt_tokens ?? 0,
         outputTokens: response.usage?.completion_tokens ?? 0,
       },
+      ...unreportedUsage(response.usage?.prompt_tokens, response.usage?.completion_tokens),
       model: response.model ?? requestedModel,
       rawRequest,
       raw: response,
@@ -548,14 +565,18 @@ export class OpenAICompletionsAdapter implements ProviderAdapter {
 
   private buildStreamedResponse(
     accumulated: string,
-    finishReason: string,
+    finishReason: string | undefined,
     requestedModel: string,
     streamUsage?: CompletionsResponse['usage'],
-    rawRequest?: unknown
+    rawRequest?: unknown,
+    endedAtEot = false
   ): ProviderResponse {
     return {
       content: this.textToContent(accumulated),
-      stopReason: this.mapFinishReason(finishReason),
+      // The adapter's own end-of-turn token ends the turn whatever the
+      // provider reports; a token it did send is still disclosed beside it.
+      stopReason: endedAtEot ? 'end_turn' : this.mapFinishReason(finishReason),
+      providerStopReason: finishReason,
       stopSequence: undefined,
       usage: {
         // Zeros only as the genuinely-absent fallback: an endpoint that
@@ -563,9 +584,10 @@ export class OpenAICompletionsAdapter implements ProviderAdapter {
         inputTokens: streamUsage?.prompt_tokens ?? 0,
         outputTokens: streamUsage?.completion_tokens ?? 0,
       },
+      ...unreportedUsage(streamUsage?.prompt_tokens, streamUsage?.completion_tokens),
       model: requestedModel,
       rawRequest,
-      raw: { text: accumulated, finish_reason: finishReason, usage: streamUsage },
+      raw: { text: accumulated, finish_reason: finishReason ?? 'stop', usage: streamUsage },
     };
   }
 
@@ -579,59 +601,37 @@ export class OpenAICompletionsAdapter implements ProviderAdapter {
   }
 
   private mapFinishReason(reason: string | undefined): string {
+    // No reason (or a server's null) is a plain end of turn, as in the three
+    // sibling OpenAI-family adapters.
+    if (reason == null) return 'end_turn';
     switch (reason) {
       case 'stop':
         return 'end_turn';
       case 'length':
         return 'max_tokens';
+      case 'content_filter':
+        // Matches the three sibling OpenAI-family adapters; this one alone
+        // reported a filtered completion as a clean finish.
+        return 'refusal';
       default:
-        return 'end_turn';
+        // Unrecognized reasons travel as the provider's own token so
+        // membrane's mapper can disclose and log them.
+        return reason;
     }
   }
 
+  /**
+   * HTTP failures are classified at the fetch boundary, where status,
+   * headers and body are still live; this handles what is left — typed
+   * aborts and non-HTTP throwables — through the shared last-resort table.
+   */
   private handleError(error: unknown, rawRequest?: unknown): MembraneError {
-    // A deadline abort is a timeout and stays one. Collapsing it into a bare
-    // abortError() here is what erased the identity before Membrane's
-    // caller-signal > timeout > error ladder could read it.
     if (isDeadlineAbort(error)) return deadlineTimeoutError(error, rawRequest);
-    // Already-classified failures (e.g. the stream-integrity guards) keep
-    // their type and retryability instead of being re-derived from a string.
-    if (error instanceof MembraneError) return error;
+    if (error instanceof MembraneError) return withRawRequest(error, rawRequest);
+    if (isTypedAbortError(error)) return abortError(undefined, rawRequest);
 
-    if (error instanceof Error) {
-      const message = error.message;
-
-      if (message.includes('429') || message.includes('rate')) {
-        return rateLimitError(message, undefined, error, rawRequest);
-      }
-
-      if (message.includes('401') || message.includes('auth') || message.includes('Unauthorized')) {
-        return authError(message, error, rawRequest);
-      }
-
-      if (message.includes('context') || message.includes('too long') || message.includes('maximum context')) {
-        return contextLengthError(message, error, rawRequest);
-      }
-
-      if (message.includes('500') || message.includes('502') || message.includes('503')) {
-        return serverError(message, undefined, error, rawRequest);
-      }
-
-      if (error.name === 'AbortError') {
-        return abortError(undefined, rawRequest);
-      }
-
-      if (message.includes('network') || message.includes('fetch') || message.includes('ECONNREFUSED')) {
-        return networkError(message, error, rawRequest);
-      }
-    }
-
-    return new MembraneError({
-      type: 'unknown',
-      message: error instanceof Error ? error.message : String(error),
-      retryable: false,
-      rawError: error,
-      rawRequest,
-    });
+    const info = classifyError(error);
+    info.rawRequest = rawRequest;
+    return new MembraneError(info);
   }
 }

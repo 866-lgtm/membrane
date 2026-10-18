@@ -14,6 +14,8 @@ export type StopReason =
   | 'max_tokens'     // Hit token limit
   | 'stop_sequence'  // Hit stop sequence
   | 'tool_use'       // Stopped for tool use
+  | 'pause_turn'     // Provider paused a long-running turn; the caller is
+                     // expected to resume it (Anthropic pause_turn)
   | 'refusal'        // Content refused by safety
   | 'abort'          // Request was aborted
   | 'no_progress'    // Stall guard ended the turn (issue #39): consecutive
@@ -129,6 +131,19 @@ export interface StopInfo {
   
   /** Whether output was truncated */
   wasTruncated: boolean;
+
+  /**
+   * The provider's own stop token, verbatim, as the adapter reports it in
+   * ProviderResponse.providerStopReason. When the adapter reports none, its
+   * stopReason if membrane doesn't map that token, so the token isn't lost
+   * behind the end_turn it becomes; that may be the adapter's own word rather
+   * than the provider's. Omitted when the adapter reports no providerStopReason
+   * and its stopReason is a token membrane maps. A null or empty value counts
+   * as none in either field.
+   * This can differ from the normalized reason (for example, OpenAI's length,
+   * or a provider's token beside a stop sequence membrane found itself).
+   */
+  providerReason?: string;
 
   /**
    * XML tool mode: the turn ended with a tool block still open — a

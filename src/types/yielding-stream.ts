@@ -47,10 +47,156 @@ export interface ToolCallsEvent {
 
 /**
  * Usage update event - token counts updated.
+ *
+ * On the yielding paths it is emitted once per provider round whose response
+ * stands (after any refusal retries), and then carries `round`: that round's
+ * own report. Streams created with `emitUsage: false` emit no usage events,
+ * so no round reports either. A round whose response arrives after the
+ * stream was cancelled isn't reported: the stream ended at its aborted event.
+ * Nor is a round the cancel aborts in flight, since no response arrives.
  */
 export interface UsageEvent {
   type: 'usage';
+  /** Turn total so far (cumulative across rounds). */
   usage: DetailedUsage;
+  /** The round that just stood (yielding paths). */
+  round?: RoundReport;
+}
+
+/**
+ * A round's token counts, each present only when the provider reported it (a
+ * reported 0 is 0). Counts only: accounting's estimates (estimatedCost) are
+ * not part of the evidence, since a default-derived count would price to a
+ * claimed zero.
+ */
+export interface RoundUsage {
+  inputTokens?: number;
+  outputTokens?: number;
+  cacheCreationTokens?: number;
+  cacheReadTokens?: number;
+  /** Thinking tokens, already inside outputTokens (see DetailedUsage.thinkingTokens). */
+  thinkingTokens?: number;
+}
+
+/**
+ * One provider round whose response stands, as its producer saw it.
+ *
+ * Coordinates: `altered.messages` indexes the `NormalizedRequest.messages`
+ * the consumer submitted. Injected messages are addressed as `[batch, index]`:
+ * a batch is one non-empty `injectedMessages` array supplied to
+ * `provideToolResults`, numbered from 0 in supply order within the stream;
+ * `index` is the position within that array. Every batch still retained in
+ * the round's request is reported, not only the newest.
+ */
+export interface RoundReport {
+  /** Zero-based index of this returned round (refusal re-issues within a round are not rounds). */
+  index: number;
+  /**
+   * Mapped stop reason of the attempt that stands. 'refusal' means the
+   * provider refused the round (its own stop reason), which is unrelated to
+   * tool invocations a parser declined.
+   */
+  stopReason: StopReason;
+  /**
+   * This round's own usage, only what the provider reported: a count it did
+   * not report is absent, not 0 (even where accounting keeps a 0 default),
+   * and a reported 0 is 0. An adapter that declares its cache convention has
+   * its counts in membrane's one convention: `inputTokens` excludes the cached
+   * span, so a cache-inclusive provider's input count is restated without its
+   * cache reads and writes (`normalizeUsageToCacheExcluded`), and
+   * `inputTokens + cacheCreationTokens + cacheReadTokens` is the prompt the
+   * provider counted. An adapter whose convention is `'unknown'` passes its
+   * counts through as the provider gave them.
+   */
+  usage: RoundUsage;
+  /**
+   * The newest injected batch, and how many of its supplied positions, as an
+   * ordered prefix, this round's request accounts for. With established
+   * fidelity, each of those was carried verbatim unless `altered.injected`
+   * names it. A message whose tool blocks were stripped is named there even
+   * when nothing else of it was left to send, while one supplied empty
+   * carried nothing and is not.
+   * The native path accounts for the whole batch (`applied` is its supplied
+   * size); the XML prefill path carries none (`applied` is 0).
+   */
+  injectedBatch?: { batch: number; applied: number };
+  /**
+   * Consumer messages this round's request did not carry verbatim (known
+   * alterations). Where a path sends a provider-native raw form in place of
+   * the fields it stands in for (on the OpenAI Responses formatter, a
+   * block's `rawItem` and a message's `openaiResponsesItems`; in the
+   * Responses API adapter, a `redacted_thinking` block's reasoning
+   * `rawItem`; on the XML prefill path, `rawXml`), "verbatim" means that raw
+   * form: content a consumer edited without dropping its raw form isn't
+   * named, because the edit never reaches the wire (utils/fidelity.ts). A
+   * zero-width carrier (`''` text holding an object `rawItem`) that a path
+   * leaves out is named. Membrane's own messages (each assistant round, and
+   * the tool_result envelopes it builds from `provideToolResults`) aren't the
+   * consumer's and have no address here, so their alterations aren't
+   * reported and don't touch `fidelity`, which speaks for the consumer's
+   * messages.
+   */
+  altered: { messages: number[]; injected: Array<[number, number]> };
+  /**
+   * 'established' when every step of the build and transport reports its
+   * alterations and none was unattributable; 'unknown' otherwise (an
+   * uninstrumented path, an image opt-in shedding replaced, a beforeRequest
+   * hook that changed either of its arguments, or an earlier round's hook
+   * that changed one in place). With 'unknown', an empty `altered` proves
+   * nothing.
+   */
+  fidelity: 'established' | 'unknown';
+  /**
+   * The signed thinking this round's request sent back that failed the
+   * provider's binding check, as the provider reported it: Anthropic's
+   * `input_transformations`, which come back when `thinking.blockBinding` is
+   * set. Absent when the response carried no report; both lists empty when
+   * it reported that nothing failed. This is the provider's account, beside
+   * `altered`, which is membrane's: a dropped block was carried on the
+   * request verbatim and removed before the model saw it. Entries of a type
+   * membrane doesn't know are left out.
+   */
+  thinking?: {
+    /** Blocks the provider removed before the model saw them (`thinking_dropped`). */
+    dropped: ThinkingBindingEntry[];
+    /**
+     * Blocks that failed the check and were shown to the model anyway,
+     * because the check isn't enforced for this request
+     * (`thinking_mismatch_allowed`). Where it is enforced they would have been
+     * dropped, or the request refused. The provider lists these block by
+     * block while a drop can take more, so they are a lower bound on what
+     * enforcement would remove.
+     */
+    mismatchAllowed: ThinkingBindingEntry[];
+  };
+}
+
+/**
+ * One signed thinking block that failed a provider's binding check
+ * (RoundReport.thinking).
+ */
+export interface ThinkingBindingEntry {
+  /**
+   * Which check it failed, as the provider names it:
+   * 'prefix_binding_mismatch' (the conversation before it differs from the
+   * one it was minted in), 'model_binding_mismatch',
+   * 'organization_binding_mismatch' or 'end_user_binding_mismatch'.
+   */
+  reason: string;
+  /**
+   * Where it was in the request the provider received,
+   * `messages.{i}.content.{j}`. Membrane's build merges and adds messages,
+   * so these are the request's coordinates, not the consumer's.
+   */
+  path: string;
+  /** The consumer message it came from, in `altered.messages`' coordinates, when membrane can say. */
+  message?: number;
+  /** The injected message it came from, in `altered.injected`'s coordinates. */
+  injected?: [number, number];
+  /** The earlier round of this stream whose content it was (`ToolContext.roundContent`). */
+  round?: number;
+  /** Its index in that message's content (or that round's), when exactly one block there is it. */
+  block?: number;
 }
 
 /**
@@ -99,7 +245,11 @@ export interface RetryingEvent {
 }
 
 /**
- * Aborted event - stream was cancelled.
+ * Aborted event: the stream ended before the turn finished. It carries what
+ * the turn had recorded by then: the text so far (`rawAssistantText`, and as
+ * blocks in `partialContent`) and the tool rounds run (`toolCalls`,
+ * `toolResults`). A round whose tools were still running shows its calls with
+ * no results.
  */
 export interface AbortedEvent {
   type: 'aborted';
@@ -172,9 +322,13 @@ export type StreamEvent =
  * the generic user participant. Non-assistant participants get the standard
  * "Name: " text prefix when rendered to the provider. Content must be
  * user-side blocks only (text/image); tool blocks are stripped with a
- * warning. NOTE: a participant equal to the request's assistantParticipant
- * would render as an ASSISTANT turn (a prefill) — callers should not inject
- * messages named as the assistant.
+ * warning. On the native path, which carries injected messages, round
+ * reports name such a message altered at the position it was supplied at,
+ * even if nothing else of it was left to send; the XML prefill path carries
+ * none (`RoundReport.injectedBatch.applied` is 0). NOTE: a
+ * participant equal to the request's assistantParticipant would render as
+ * an ASSISTANT turn (a prefill) — callers should not inject messages named
+ * as the assistant.
  */
 export type InjectedMessage =
   Omit<NormalizedMessage, 'participant' | 'cacheBreakpoint'> & {
@@ -213,7 +367,13 @@ export interface YieldingStream extends AsyncIterable<StreamEvent> {
 
   /**
    * Cancel the stream. Any in-flight requests will be aborted.
-   * The iterator will yield an 'aborted' event and then complete.
+   * The iterator will yield an 'aborted' event and then complete, with
+   * nothing after it. The event carries what the turn had recorded when
+   * cancel() was called (see AbortedEvent). Results passed to
+   * provideToolResults() just before it aren't recorded yet, so their calls
+   * show no results. If the stream has already queued or delivered its
+   * complete, error or aborted event, cancel() adds no event of its own, and
+   * that event stays the stream's last.
    */
   cancel(): void;
 
@@ -249,8 +409,30 @@ export interface YieldingStreamOptions {
   /** Request timeout (per API call, not total) */
   timeoutMs?: number;
 
-  /** Abort if no SSE event arrives within this many ms (default: 120000) */
+  /** Anthropic idle deadline after the first SDK event (default: 600000 ms).
+   * Nonempty Web response-body bytes, including SSE keepalives, refresh it;
+   * other SDK-supported bodies refresh it on SDK events. This does not bound
+   * total duration or generation progress. */
   idleTimeoutMs?: number;
+
+  /**
+   * Progress deadline, per provider call (default: off, as for any value
+   * that isn't a positive number of ms). Every parsed provider event renews
+   * it (an SDK event, an SSE data frame); keepalives, SSE comments and raw
+   * bytes don't, so a connection that stays up while the model sends nothing
+   * still ends. On expiry the stream ends with an `aborted` event whose reason
+   * is `'timeout'`, carrying what arrived. It bounds the wait for the first
+   * event too. Time between provider calls, such as waiting for
+   * `provideToolResults()`, never counts. A stretch with no parsed event
+   * counts as no progress whatever the model is doing: reasoning a provider
+   * doesn't stream, while it sends only keepalives, can expire it, so set it
+   * above the longest such stretch you expect (Anthropic thinking with
+   * `display: "omitted"` sends no deltas while it thinks, which can last
+   * minutes). An adapter that streams no events, such as
+   * `OpenAIResponsesAdapter` (the Images API), can't renew it, so for it the
+   * deadline bounds the whole call.
+   */
+  progressTimeoutMs?: number;
 
   /** Request ID for correlation/logging */
   requestId?: string;
@@ -311,8 +493,8 @@ export interface YieldingStreamOptions {
   emitBlocks?: boolean;
 
   /**
-   * Whether to emit 'usage' events.
-   * Default: true
+   * Whether to emit 'usage' events, and with them the per-round reports
+   * (`UsageEvent.round`). Default: true
    */
   emitUsage?: boolean;
 }

@@ -1,4 +1,5 @@
-import { TimeoutAbortError, authError, networkError, rateLimitError, serverError } from '../types/errors.js';
+import { TimeoutAbortError, errorFromProviderStatus, networkError } from '../types/errors.js';
+import { imageForRequest, urlImageForRequest } from '../utils/image-media.js';
 
 interface StreamErrorFrameFields {
   code?: unknown;
@@ -71,20 +72,24 @@ function frameTokensMatch(tokens: string[], needles: string[]): boolean {
 }
 
 /**
- * Throw when an SSE data frame carries a provider `error` payload.
+ * Throw when an SSE data frame, or a non-streaming response body, reports a
+ * provider failure inside an HTTP 200: an `error` object at its top level or
+ * on its first choice, whatever the finish reason, or a first choice that
+ * ends with `finish_reason: "error"`.
  *
- * Every provider delivers mid-stream failures (upstream 429s, capacity loss,
- * safety aborts) as a data line with an `error` object inside an HTTP-200
- * stream. A loop that only looks for `choices`/`candidates` drops that frame,
- * reaches EOF, and builds a well-formed success out of whatever arrived first:
- * partial content, the initialised default finish reason, zero usage. Nothing
- * distinguishes it from the model choosing to stop, so the truncated turn is
- * persisted as a real one.
+ * Providers deliver mid-stream failures (upstream 429s, capacity loss,
+ * safety aborts) inside an HTTP-200 stream, usually as a data line with an
+ * `error` object. A loop that only looks for `choices`/`candidates` drops that
+ * frame, reaches EOF, and builds a well-formed success out of whatever arrived
+ * first: partial content, the initialised default finish reason, zero usage.
+ * Nothing distinguishes it from the model choosing to stop, so the truncated
+ * turn is persisted as a real one.
  *
  * The house ruled this a bug twice before it was hoisted here — once in
  * openrouter.ts (tests/unit/openrouter-stream-error.test.ts) and once in
  * openai-responses-api.ts — and both times the fix stayed in the one adapter
- * that was being touched. This is the single site every SSE adapter calls.
+ * that was being touched. Every adapter that parses SSE data frames itself
+ * calls this one function; Anthropic's and Bedrock's read their own events.
  *
  * The frame is CLASSIFIED here rather than downstream. Throwing a bare
  * `Error(string)` left `code`/`type`/`status` as prose, and each adapter's
@@ -92,18 +97,29 @@ function frameTokensMatch(tokens: string[], needles: string[]): boolean {
  * so a mid-stream 429 arriving as `status: 429` (no literal "429" in the
  * message) normalized to `unknown, retryable: false` and suppressed the retry
  * the provider was explicitly asking for. Classified failures reach the caller
- * intact because every adapter's `handleError` returns a MembraneError
- * unchanged. Mapping, using the structured fields only:
- *   - 429, or a rate-limit-shaped token  -> rate_limit (retryable), carrying
- *     the frame's retry hint when it has one
- *   - 5xx, or an overloaded/server-shaped token -> server (retryable);
- *     overloaded-without-a-status takes 529 so it lands on the capacity
- *     backoff schedule, matching how anthropic.ts recovers the same shape
- *   - 401/403, or an auth-shaped token   -> auth (non-retryable)
- *   - anything else -> the previous bare Error, so the adapter's own
- *     provider-specific fallbacks still get their swing at it
- * The provider's message text is never dropped, and the raw frame plus the
- * request ride along on the classified error.
+ * intact because every adapter's handleError preserves a MembraneError. The
+ * same errorFromProviderStatus classifier serves HTTP failures and these
+ * HTTP-200 error payloads. Only HTTP-shaped error statuses (400..599) count
+ * as explicit statuses here; a transport 200 or provider-local numeric code
+ * leaves symbolic-code classification available. Existing structured-token
+ * aliases supply a fallback after the status and recognized provider code.
+ * The provider message, raw frame, retry hint and request remain attached,
+ * including for an unclassified payload. Explicit 400 frames are typed
+ * invalid_request errors rather than bare Error objects.
+ *
+ * OpenRouter documents its mid-stream failure as an `error` object at the
+ * top level beside `finish_reason: "error"`, and a non-streaming response
+ * whose generation failed with the `error` object on its choice, beside that
+ * finish reason and the partial content. An `error` object classifies the
+ * failure by its own fields, wherever it sits and whatever the finish reason.
+ * A first choice that ends with `finish_reason: "error"` and comes with no
+ * `error` object either way is a shape OpenRouter doesn't document, and it
+ * carries nothing of its own to classify. Read as a finish reason alone, it
+ * would end the turn as end_turn over the partial content, since membrane's
+ * mapper normalizes a token it doesn't know to end_turn. So it takes the
+ * class of the failures partway that OpenRouter does document, a
+ * `server_error` mid-stream and a 502 on the choice: a retryable server
+ * error, with the httpStatus 500 the `server_error` frame gets from its code.
  *
  * `errorNoun` names what carried the payload. It defaults to the SSE case, and
  * exists because the same `{ error: { code, message } }` object also arrives on
@@ -118,37 +134,52 @@ export function throwOnStreamErrorFrame(
   errorNoun: string = 'stream error'
 ): void {
   if (typeof parsed !== 'object' || parsed === null) return;
-  const streamError = (parsed as { error?: unknown }).error;
-  if (!streamError) return;
+  // The first choice is the one every adapter reads.
+  const choice = (parsed as { choices?: Array<{ finish_reason?: unknown; error?: unknown } | null> }).choices?.[0];
+  const topLevelError = (parsed as { error?: unknown }).error;
+  const streamError = topLevelError || choice?.error;
+  if (!streamError && choice?.finish_reason !== 'error') return;
 
   const fields: StreamErrorFrameFields =
-    typeof streamError === 'object' ? (streamError as StreamErrorFrameFields) : {};
-  const httpStatus = readNumericField(fields.code, fields.status);
+    streamError && typeof streamError === 'object' ? (streamError as StreamErrorFrameFields) : {};
+  // A successful transport status or arbitrary provider-local number is not
+  // an HTTP error status. Neither may suppress a usable symbolic error code.
+  const httpStatus = [fields.status, fields.code].map(value => readNumericField(value))
+    .find(value => value !== undefined && Number.isInteger(value) && value >= 400 && value <= 599);
   const tokens = readFrameClassificationTokens(fields);
   const providerMessage =
-    typeof fields.message === 'string' && fields.message !== ''
-      ? fields.message
-      : JSON.stringify(streamError);
+    !streamError ? 'the provider ended the response with finish_reason "error" and sent no error object saying why'
+    : typeof fields.message === 'string' && fields.message !== '' ? fields.message
+    : JSON.stringify(streamError);
 
   const description =
     `${providerLabel} ${errorNoun}` +
     `${httpStatus !== undefined ? ` (${httpStatus})` : ''}` +
     `${tokens.length > 0 ? ` [${tokens.join(' ')}]` : ''}: ${providerMessage}`;
 
-  if (httpStatus === 429 || frameTokensMatch(tokens, RATE_LIMIT_FRAME_TOKENS)) {
-    throw rateLimitError(description, readFrameRetryAfterMs(fields), parsed, rawRequest);
-  }
-
-  if (httpStatus === 401 || httpStatus === 403 || frameTokensMatch(tokens, AUTH_FRAME_TOKENS)) {
-    throw authError(description, parsed, rawRequest);
-  }
-
+  // Retain the adapters' established structured-token spellings as a fallback.
+  // The shared classifier gives an explicit status or known provider code priority,
+  // and owns terminal-quota versus transient-rate-limit retryability in either transport.
+  // finish_reason "error" with no error object takes the server_error frame's
+  // 500 (see above).
   const overloadedShaped = frameTokensMatch(tokens, OVERLOADED_FRAME_TOKENS);
-  if ((httpStatus !== undefined && httpStatus >= 500) || overloadedShaped || frameTokensMatch(tokens, SERVER_FRAME_TOKENS)) {
-    throw serverError(description, httpStatus ?? (overloadedShaped ? 529 : undefined), parsed, rawRequest);
-  }
-
-  throw new Error(description);
+  const fallbackStatus = !streamError ? 500
+    : frameTokensMatch(tokens, RATE_LIMIT_FRAME_TOKENS) ? 429
+    : frameTokensMatch(tokens, AUTH_FRAME_TOKENS) ? 401
+    : overloadedShaped ? 529
+    : frameTokensMatch(tokens, SERVER_FRAME_TOKENS) ? 500
+    : undefined;
+  throw errorFromProviderStatus({
+    provider: providerLabel,
+    status: httpStatus,
+    fallbackStatus,
+    // The classifier reads an error body's top-level `error`.
+    body: !streamError ? undefined : topLevelError ? parsed : { error: streamError },
+    message: description,
+    retryAfterMs: readFrameRetryAfterMs(fields),
+    rawError: parsed,
+    rawRequest,
+  });
 }
 
 /**
@@ -175,17 +206,56 @@ export function assertTerminalEventObserved(
   );
 }
 
+/** A tool_use block's `input`, and its `unparseableInput` when it has one. */
+export type ToolUseInput = { input: Record<string, unknown>; unparseableInput?: string };
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function notAnObject(raw: string, value: unknown): ToolUseInput {
+  const kind = value === null ? 'null' : Array.isArray(value) ? 'an array' : `a ${typeof value}`;
+  console.warn(`[membrane] Tool arguments are ${kind}, not an object; input is {} and unparseableInput keeps them`);
+  return { input: {}, unparseableInput: raw };
+}
+
 /**
- * Safely parse a JSON string, returning an empty object on failure.
- * Used for tool call arguments which may be malformed from streaming.
+ * A tool call's `input` from the argument text a provider sent (OpenAI-family
+ * `function.arguments`, Anthropic and Bedrock `input_json_delta`
+ * accumulations). `input` is always a plain object, as ToolUseContent types
+ * it. Text that doesn't parse, or parses to anything but an object (null, a
+ * number, a string, a boolean or an array), isn't the model's arguments as an
+ * object: `input` is then `{}`, and `unparseableInput` keeps the text as it
+ * came. No text (the field absent or null), or text that is empty or only
+ * JSON whitespace, is a call with no arguments: `{}`, unmarked. An arguments
+ * field that isn't text at all, outside its wire's spec, is read as
+ * toolUseInputFromValue reads a value, so the marker is always text.
  */
-export function safeParseJson(str: string | undefined): Record<string, unknown> {
+export function toolUseInputFromText(text: unknown): ToolUseInput {
+  if (text === undefined || text === null) return { input: {} };
+  if (typeof text !== 'string') return toolUseInputFromValue(text);
+  if (/^[ \t\n\r]*$/.test(text)) return { input: {} };
+  let parsed: unknown;
   try {
-    return JSON.parse(str || '{}');
-  } catch (e) {
-    console.warn('[membrane] Failed to parse tool arguments JSON:', e);
-    return {};
+    parsed = JSON.parse(text);
+  } catch {
+    // Not the SyntaxError: its message quotes the text.
+    console.warn("[membrane] Tool arguments aren't valid JSON; input is {} and unparseableInput keeps them (not logged: tool arguments can carry secrets)");
+    return { input: {}, unparseableInput: text };
   }
+  return isPlainObject(parsed) ? { input: parsed } : notAnObject(text, parsed);
+}
+
+/**
+ * As toolUseInputFromText, for arguments sent as a value: Gemini's
+ * `functionCall.args`, Anthropic's and Bedrock's `input`, and the `input` an
+ * adapter hands Membrane. No value is a call with no arguments. A value that
+ * isn't an object, `null` included, is kept, as JSON, in `unparseableInput`;
+ * a wire that means "unset" by null says so where it calls this (Gemini).
+ */
+export function toolUseInputFromValue(value: unknown): ToolUseInput {
+  if (value === undefined) return { input: {} };
+  return isPlainObject(value) ? { input: value } : notAnObject(JSON.stringify(value), value);
 }
 
 /**
@@ -221,6 +291,28 @@ function carriesInlineImageData(block: unknown): boolean {
   return !!source && typeof source === 'object' && typeof source.data === 'string';
 }
 
+/**
+ * An image block as an OpenAI-style chat content part (OpenAI, OpenAI-compatible
+ * and OpenRouter): an image_url for an image these APIs accept, base64 data
+ * as a data: URL labelled by its header and a remote URL as it is, or
+ * imageForRequest's placeholder as a text part. Undefined for a block with no
+ * usable source.
+ */
+export function openAIImagePart(source: { type?: string; data?: unknown; media_type?: unknown; mediaType?: unknown; url?: unknown } | undefined):
+  { type: 'image_url'; image_url: { url: string } } | { type: 'text'; text: string } | undefined {
+  if (source?.type === 'base64') {
+    const { mediaType, placeholder } = imageForRequest(source.data, source.media_type ?? source.mediaType);
+    return placeholder
+      ? { type: 'text', text: placeholder.text }
+      : { type: 'image_url', image_url: { url: `data:${mediaType};base64,${source.data as string}` } };
+  }
+  if (source?.type === 'url') {
+    const image = urlImageForRequest(source.url as string);
+    return image.placeholder ? { type: 'text', text: image.placeholder.text } : { type: 'image_url', image_url: { url: image.url } };
+  }
+  return undefined;
+}
+
 export function textOnlyToolResultContent(content: unknown): string {
   if (typeof content === 'string') return content;
   if (!Array.isArray(content)) return JSON.stringify(content);
@@ -249,8 +341,8 @@ export function textOnlyToolResultContent(content: unknown): string {
  */
 const DEADLINE_ABORT = Symbol.for('membrane.deadlineAbort');
 
-function deadlineAbortReason(): DOMException {
-  const reason = new DOMException('Request timed out', 'AbortError');
+function deadlineAbortReason(message = 'Request timed out'): DOMException {
+  const reason = new DOMException(message, 'AbortError');
   Object.defineProperty(reason, DEADLINE_ABORT, { value: true, enumerable: false });
   return reason;
 }
@@ -278,7 +370,35 @@ export function isDeadlineAbort(error: unknown): boolean {
  * caller-signal > timeout > error ladder could read it.
  */
 export function deadlineTimeoutError(error: unknown, rawRequest?: unknown): TimeoutAbortError {
-  return new TimeoutAbortError('Request timed out', error, rawRequest);
+  // The marked reason names its deadline (see createProgressDeadline).
+  const message = isDeadlineAbort(error) ? (error as { message?: unknown }).message : undefined;
+  return new TimeoutAbortError(
+    typeof message === 'string' && message ? message : 'Request timed out',
+    error,
+    rawRequest,
+  );
+}
+
+/**
+ * The longest delay a platform timer holds. Node and browsers run a timer
+ * whose delay is longer, Infinity included, after 1 ms.
+ */
+const MAX_TIMER_DELAY_MS = 2_147_483_647;
+
+/**
+ * `setTimeout` for any delay: one past the platform's limit (about 24.8
+ * days) is armed in steps no longer than it, so it fires on time, and
+ * Infinity never fires. Returns its cancel.
+ */
+function setLongTimeout(fire: () => void, delayMs: number): () => void {
+  let timer: ReturnType<typeof setTimeout>;
+  const arm = (left: number): void => {
+    timer = left > MAX_TIMER_DELAY_MS
+      ? setTimeout(() => arm(left - MAX_TIMER_DELAY_MS), MAX_TIMER_DELAY_MS)
+      : setTimeout(fire, left);
+  };
+  arm(delayMs);
+  return () => clearTimeout(timer);
 }
 
 /**
@@ -300,10 +420,10 @@ export function createCombinedSignal(
   if (signal && !timeoutMs) return { signal };
 
   const controller = new AbortController();
-  let timeoutId: ReturnType<typeof setTimeout> | undefined;
+  let cancelTimeout: (() => void) | undefined;
 
   if (timeoutMs) {
-    timeoutId = setTimeout(() => controller.abort(deadlineAbortReason()), timeoutMs);
+    cancelTimeout = setLongTimeout(() => controller.abort(deadlineAbortReason()), timeoutMs);
   }
 
   const onAbort = () => controller.abort(signal!.reason);
@@ -318,8 +438,77 @@ export function createCombinedSignal(
   return {
     signal: controller.signal,
     cleanup: () => {
-      if (timeoutId) clearTimeout(timeoutId);
+      cancelTimeout?.();
       if (signal) signal.removeEventListener('abort', onAbort);
+    },
+  };
+}
+
+/**
+ * A deadline that stream progress renews, for one provider call: it aborts
+ * when `timeoutMs` passes with no call to `renew`, combined with the caller's
+ * signal. Membrane core owns it (`progressTimeoutMs`); adapters renew it
+ * through `ProviderRequestOptions.onProgress` once per parsed provider event.
+ *
+ * Expiry aborts with the same mark as `createCombinedSignal`'s deadline, so
+ * every adapter's `isDeadlineAbort` → `deadlineTimeoutError` path turns it
+ * into a TimeoutAbortError: a timeout by type, an abort by provenance. Its
+ * message names this deadline and says when the call began, how many provider
+ * events it had and when the last came, so a call log that keeps only an
+ * error's message still tells a call that never produced an event from one
+ * that stopped partway.
+ *
+ * Silence is measured on the monotonic clock (`performance.now()`), as the
+ * timers run, so a step of the system clock moves no expiry; the message's
+ * times are wall-clock. `renew` only records the time and counts the event,
+ * so calling it per event costs nothing; the one timer re-arms itself for
+ * whatever is left when it fires early. Without a positive `timeoutMs`
+ * (unset, zero, negative or NaN) the caller's signal passes through and there
+ * is no `renew`. `cleanup` MUST run in a `finally`.
+ */
+export function createProgressDeadline(
+  signal: AbortSignal | undefined,
+  timeoutMs: number | undefined,
+): { signal?: AbortSignal; renew?: () => void; cleanup: () => void } {
+  if (!timeoutMs || timeoutMs <= 0) return { signal, cleanup: () => {} };
+
+  const controller = new AbortController();
+  const beganAt = Date.now();
+  let lastAt = beganAt;
+  let last = performance.now();
+  let events = 0;
+  let cancelTimer: (() => void) | undefined;
+  const check = (): void => {
+    const quiet = performance.now() - last;
+    if (quiet >= timeoutMs) {
+      cancelTimer = undefined;
+      controller.abort(deadlineAbortReason(
+        `No provider progress within ${timeoutMs}ms: the call began at ${new Date(beganAt).toISOString()}, ` +
+        `provider events: ${events}${events > 0 ? `, the last at ${new Date(lastAt).toISOString()}` : ''}`,
+      ));
+    } else {
+      cancelTimer = setLongTimeout(check, timeoutMs - quiet);
+    }
+  };
+  cancelTimer = setLongTimeout(check, timeoutMs);
+
+  const onAbort = (): void => {
+    cancelTimer?.();
+    cancelTimer = undefined;
+    controller.abort(signal!.reason);
+  };
+  if (signal) {
+    if (signal.aborted) onAbort();
+    else signal.addEventListener('abort', onAbort, { once: true });
+  }
+
+  return {
+    signal: controller.signal,
+    renew: () => { last = performance.now(); lastAt = Date.now(); events++; },
+    cleanup: () => {
+      cancelTimer?.();
+      cancelTimer = undefined;
+      signal?.removeEventListener('abort', onAbort);
     },
   };
 }

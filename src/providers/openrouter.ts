@@ -4,6 +4,9 @@
  * Handles OpenAI-compatible API with tool_calls format
  */
 
+import { unreportedUsage } from '../utils/usage.js';
+import { assertMessagePrefillSupported } from './request-capabilities.js';
+
 import type {
   ProviderAdapter,
   ProviderRequest,
@@ -16,14 +19,14 @@ import type {
 } from '../types/index.js';
 import {
   MembraneError,
-  rateLimitError,
-  contextLengthError,
-  authError,
-  serverError,
   abortError,
-  networkError,
+  classifyError,
+  errorFromHttpResponse,
+  isTypedAbortError,
+  withRawRequest,
 } from '../types/index.js';
-import { safeParseJson, textOnlyToolResultContent, createCombinedSignal, SSELineParser, isDeadlineAbort, deadlineTimeoutError, throwOnStreamErrorFrame, assertTerminalEventObserved } from './utils.js';
+import { isRawItemCarrier } from '../utils/fidelity.js';
+import { toolUseInputFromText, textOnlyToolResultContent, openAIImagePart, createCombinedSignal, SSELineParser, isDeadlineAbort, deadlineTimeoutError, throwOnStreamErrorFrame, assertTerminalEventObserved } from './utils.js';
 
 // ============================================================================
 // Types
@@ -150,16 +153,20 @@ export interface OpenRouterAdapterConfig {
 /**
  * Which convention the tokens OpenRouter just handed back are in. OpenRouter
  * passes the routed provider's usage payload through, so an Anthropic-routed
- * call reports `cache_read_input_tokens` (disjoint from prompt_tokens) while an
- * OpenAI-routed one reports `prompt_tokens_details.cached_tokens` (a subset of
- * it). The field that carried the number therefore identifies the convention.
+ * call reports `cache_read_input_tokens` and `cache_creation_input_tokens`
+ * (disjoint from prompt_tokens) while an OpenAI-routed one reports
+ * `prompt_tokens_details.cached_tokens` (a subset of it). The field that
+ * carried a number therefore identifies the convention: an Anthropic-shaped
+ * field, read or write, makes the response cache-excluded, so Anthropic's
+ * writes are never subtracted from prompt_tokens as an inclusive count's are.
  */
 function resolveRoutedCacheConvention(
   anthropicShapedCacheRead: number | undefined,
+  anthropicShapedCacheWrite: number | undefined,
   resolvedCacheRead: number | undefined,
 ): UsageCacheConvention | undefined {
-  if (resolvedCacheRead == null) return undefined;
-  return anthropicShapedCacheRead != null ? 'cache-excluded' : 'cache-inclusive';
+  if (anthropicShapedCacheRead != null || anthropicShapedCacheWrite != null) return 'cache-excluded';
+  return resolvedCacheRead != null ? 'cache-inclusive' : undefined;
 }
 
 export class OpenRouterAdapter implements ProviderAdapter {
@@ -167,11 +174,12 @@ export class OpenRouterAdapter implements ProviderAdapter {
 
   /**
    * OpenRouter fronts BOTH conventions: it passes through Anthropic's
-   * `cache_read_input_tokens` (cache-excluded) or OpenAI's
-   * `prompt_tokens_details.cached_tokens` (cache-inclusive) depending on which
-   * provider it routed to. The convention is therefore a per-response fact —
-   * each parse sets `usage.cacheConvention` from the field it actually read,
-   * and this adapter-level value is only the no-cache-tokens fallback.
+   * `cache_read_input_tokens` and `cache_creation_input_tokens`
+   * (cache-excluded) or OpenAI's `prompt_tokens_details.cached_tokens`
+   * (cache-inclusive) depending on which provider it routed to. The
+   * convention is therefore a per-response fact — each parse sets
+   * `usage.cacheConvention` from the fields it actually read, and this
+   * adapter-level value is only the no-cache-tokens fallback.
    */
   readonly usageCacheConvention = 'unknown' as const;
   private apiKey: string;
@@ -202,6 +210,7 @@ export class OpenRouterAdapter implements ProviderAdapter {
     options?: ProviderRequestOptions
   ): Promise<ProviderResponse> {
     const openRouterRequest = this.buildRequest(request);
+    assertMessagePrefillSupported(openRouterRequest.model, openRouterRequest.messages, options, this.name, openRouterRequest);
     options?.onRequest?.(openRouterRequest);
 
     try {
@@ -221,6 +230,7 @@ export class OpenRouterAdapter implements ProviderAdapter {
     openRouterRequest.stream = true;
     // Request usage data in stream for cache metrics
     openRouterRequest.stream_options = { include_usage: true };
+    assertMessagePrefillSupported(openRouterRequest.model, openRouterRequest.messages, options, this.name, openRouterRequest);
     options?.onRequest?.(openRouterRequest);
 
     const { signal: combinedSignal, cleanup } = createCombinedSignal(options?.signal, options?.timeoutMs);
@@ -233,8 +243,7 @@ export class OpenRouterAdapter implements ProviderAdapter {
       });
 
       if (!response.ok) {
-        const errorText = await response.text();
-        throw new Error(`OpenRouter error: ${response.status} ${errorText}`);
+        throw errorFromHttpResponse(this.name, response, await response.text(), openRouterRequest);
       }
 
       const reader = response.body?.getReader();
@@ -246,7 +255,7 @@ export class OpenRouterAdapter implements ProviderAdapter {
       const sseParser = new SSELineParser();
       const contentParts: OpenRouterContentBlock[] = [];
       const readImageUrl = createImageUrlReader();
-      let finishReason = 'stop';
+      let finishReason: string | undefined;
       let sawTerminalEvent = false;
       let toolCalls: OpenRouterToolCall[] = [];
       let streamUsage: OpenRouterResponse['usage'] | undefined;
@@ -271,6 +280,8 @@ export class OpenRouterAdapter implements ProviderAdapter {
         } catch {
           return; // Ignore parse errors (partial/keep-alive lines)
         }
+        // A parsed provider event is progress (comments never reach here).
+        options?.onProgress?.();
 
         // OpenRouter delivers mid-stream failures (e.g. upstream 429s) as an
         // SSE data line with an `error` payload. Silently ignoring it would
@@ -507,6 +518,10 @@ export class OpenRouterAdapter implements ProviderAdapter {
 
         for (const block of msg.content) {
           if (block.type === 'text') {
+            // A zero-width carrier (a provider item with no normalized form,
+            // such as an Anthropic server-tool block) has no text and no form
+            // on this wire: an empty part would only add a blank line.
+            if (isRawItemCarrier(block)) continue;
             if (hasCache || hasImages || hasAudio) {
               const contentBlock: OpenRouterContentBlock = {
                 type: 'text',
@@ -528,18 +543,10 @@ export class OpenRouterAdapter implements ProviderAdapter {
             }
             textParts.length = 0;
 
-            if (block.source?.type === 'base64') {
-              const mediaType = block.source.media_type ?? block.source.mediaType ?? 'image/png';
-              contentBlocks.push({
-                type: 'image_url',
-                image_url: { url: `data:${mediaType};base64,${block.source.data}` },
-              });
-            } else if (block.source?.type === 'url') {
-              contentBlocks.push({
-                type: 'image_url',
-                image_url: { url: block.source.url },
-              });
-            }
+            // An image_url, or the placeholder for data OpenRouter's
+            // providers don't accept as an image
+            const part = openAIImagePart(block.source);
+            if (part) contentBlocks.push(part);
           } else if (block.type === 'audio') {
             // Audio input → OpenAI-style `input_audio` content part (sibling to
             // the Gemini inlineData path). Like images, this forces the array
@@ -660,11 +667,13 @@ export class OpenRouterAdapter implements ProviderAdapter {
       });
 
       if (!response.ok) {
-        const errorText = await response.text();
-        throw new Error(`OpenRouter error: ${response.status} ${errorText}`);
+        throw errorFromHttpResponse(this.name, response, await response.text(), request);
       }
 
-      return await response.json() as OpenRouterResponse;
+      const body: unknown = await response.json();
+      // A 200 can carry the provider's error, as a stream frame can.
+      throwOnStreamErrorFrame(body, 'OpenRouter', request, 'response error');
+      return body as OpenRouterResponse;
     } finally {
       cleanup?.();
     }
@@ -681,11 +690,12 @@ export class OpenRouterAdapter implements ProviderAdapter {
     const anthropicShapedCacheRead = response.usage?.cache_read_input_tokens;
     const cacheReadTokens = anthropicShapedCacheRead
       ?? response.usage?.prompt_tokens_details?.cached_tokens;
-    const cacheConvention = resolveRoutedCacheConvention(anthropicShapedCacheRead, cacheReadTokens);
+    const cacheConvention = resolveRoutedCacheConvention(anthropicShapedCacheRead, cacheCreationTokens, cacheReadTokens);
 
     return {
       content: this.messageToContent(message),
       stopReason: this.mapFinishReason(choice?.finish_reason),
+      providerStopReason: choice?.finish_reason ?? undefined,
       stopSequence: undefined,
       usage: {
         inputTokens: response.usage?.prompt_tokens ?? 0,
@@ -694,6 +704,7 @@ export class OpenRouterAdapter implements ProviderAdapter {
         cacheReadTokens: cacheReadTokens ?? undefined,
         cacheConvention,
       },
+      ...unreportedUsage(response.usage?.prompt_tokens, response.usage?.completion_tokens),
       model: response.model ?? requestedModel,
       rawRequest,
       raw: response,
@@ -702,7 +713,7 @@ export class OpenRouterAdapter implements ProviderAdapter {
 
   private parseStreamedResponse(
     message: OpenRouterMessage,
-    finishReason: string,
+    finishReason: string | undefined,
     requestedModel: string,
     streamUsage?: OpenRouterResponse['usage'],
     rawRequest?: unknown
@@ -712,11 +723,12 @@ export class OpenRouterAdapter implements ProviderAdapter {
     const anthropicShapedCacheRead = streamUsage?.cache_read_input_tokens;
     const cacheReadTokens = anthropicShapedCacheRead
       ?? streamUsage?.prompt_tokens_details?.cached_tokens;
-    const cacheConvention = resolveRoutedCacheConvention(anthropicShapedCacheRead, cacheReadTokens);
+    const cacheConvention = resolveRoutedCacheConvention(anthropicShapedCacheRead, cacheCreationTokens, cacheReadTokens);
 
     return {
       content: this.messageToContent(message),
       stopReason: this.mapFinishReason(finishReason),
+      providerStopReason: finishReason,
       stopSequence: undefined,
       usage: {
         inputTokens: streamUsage?.prompt_tokens ?? 0,
@@ -725,9 +737,10 @@ export class OpenRouterAdapter implements ProviderAdapter {
         cacheReadTokens: cacheReadTokens ?? undefined,
         cacheConvention,
       },
+      ...unreportedUsage(streamUsage?.prompt_tokens, streamUsage?.completion_tokens),
       model: requestedModel,
       rawRequest,
-      raw: { message, finish_reason: finishReason, usage: streamUsage },
+      raw: { message, finish_reason: finishReason ?? 'stop', usage: streamUsage },
     };
   }
 
@@ -736,6 +749,8 @@ export class OpenRouterAdapter implements ProviderAdapter {
   }
 
   private mapFinishReason(reason: string | undefined): string {
+    // No reason (or a server's null) is a plain end of turn.
+    if (reason == null) return 'end_turn';
     switch (reason) {
       case 'stop':
         return 'end_turn';
@@ -746,54 +761,28 @@ export class OpenRouterAdapter implements ProviderAdapter {
       case 'content_filter':
         return 'refusal';
       default:
-        return 'end_turn';
+        // Unrecognized reasons (a compatible server's own token) travel as
+        // the provider's own token: membrane's mapper reads them as end_turn,
+        // but discloses the token in details.stop.providerReason and logs it
+        // once, so the stop isn't taken for a clean one. 'error' never gets
+        // here: throwOnStreamErrorFrame throws on it first.
+        return reason;
     }
   }
 
+  /**
+   * HTTP failures are classified at the fetch boundary, where status,
+   * headers and body are still live; this handles what is left — typed
+   * aborts and non-HTTP throwables — through the shared last-resort table.
+   */
   private handleError(error: unknown, rawRequest?: unknown): MembraneError {
-    // A deadline abort is a timeout and stays one. Collapsing it into a bare
-    // abortError() here is what erased the identity before Membrane's
-    // caller-signal > timeout > error ladder could read it.
     if (isDeadlineAbort(error)) return deadlineTimeoutError(error, rawRequest);
-    // Already-classified failures (e.g. the stream-integrity guards) keep
-    // their type and retryability instead of being re-derived from a string.
-    if (error instanceof MembraneError) return error;
+    if (error instanceof MembraneError) return withRawRequest(error, rawRequest);
+    if (isTypedAbortError(error)) return abortError(undefined, rawRequest);
 
-    if (error instanceof Error) {
-      const message = error.message;
-
-      if (message.includes('429') || message.includes('rate')) {
-        return rateLimitError(message, undefined, error, rawRequest);
-      }
-
-      if (message.includes('401') || message.includes('auth')) {
-        return authError(message, error, rawRequest);
-      }
-
-      if (message.includes('context') || message.includes('too long')) {
-        return contextLengthError(message, error, rawRequest);
-      }
-
-      if (message.includes('500') || message.includes('502') || message.includes('503')) {
-        return serverError(message, undefined, error, rawRequest);
-      }
-
-      if (error.name === 'AbortError') {
-        return abortError(undefined, rawRequest);
-      }
-
-      if (message.includes('network') || message.includes('fetch')) {
-        return networkError(message, error, rawRequest);
-      }
-    }
-
-    return new MembraneError({
-      type: 'unknown',
-      message: error instanceof Error ? error.message : String(error),
-      retryable: false,
-      rawError: error,
-      rawRequest,
-    });
+    const info = classifyError(error);
+    info.rawRequest = rawRequest;
+    return new MembraneError(info);
   }
 }
 
@@ -816,6 +805,8 @@ export function toOpenRouterMessages(
     
     for (const block of msg.content) {
       if (block.type === 'text') {
+        // A zero-width carrier holds a block this wire has no form for.
+        if (isRawItemCarrier(block)) continue;
         textParts.push(block.text);
       } else if (block.type === 'tool_use') {
         toolCalls.push({
@@ -924,7 +915,7 @@ export function fromOpenRouterMessage(message: OpenRouterMessage): ContentBlock[
         type: 'tool_use',
         id: tc.id,
         name: tc.function.name,
-        input: safeParseJson(tc.function.arguments),
+        ...toolUseInputFromText(tc.function.arguments),
       });
     }
   }

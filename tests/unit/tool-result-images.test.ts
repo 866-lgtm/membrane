@@ -42,7 +42,7 @@ function createMultiImageResult(toolUseId: string, text: string, imageCount: num
 }
 
 describe('hasImageInToolResults', () => {
-  it('detects images across result shapes', () => {
+  it('detects images the request will send, across result shapes', () => {
     expect(hasImageInToolResults([createTextResult('tool_1', 'Hello world')])).toBe(false);
     expect(hasImageInToolResults([createImageResult('tool_1', 'Image result')])).toBe(true);
     expect(
@@ -52,6 +52,13 @@ describe('hasImageInToolResults', () => {
       ]),
     ).toBe(true);
     expect(hasImageInToolResults([{ toolUseId: 'tool_1', content: [] }])).toBe(false);
+    // Only an image the request will send counts: data that is no image
+    // becomes the placeholder, which goes as text.
+    const notAnImage = Buffer.from('not an image').toString('base64');
+    expect(hasImageInToolResults([{
+      toolUseId: 'tool_1',
+      content: [{ type: 'image', source: { type: 'base64', data: notAnImage, mediaType: 'image/png' } }],
+    }])).toBe(false);
   });
 });
 
@@ -60,7 +67,7 @@ describe('formatToolResults image placeholder mode', () => {
     const xml = formatToolResults([createImageResult('tool_1', 'Screenshot taken')]);
     expect(xml).toContain('<function_results>');
     expect(xml).toContain('Screenshot taken');
-    expect(xml).toContain('[Image: image/png');
+    expect(xml).toMatch(/\[Image: image\/png, ~\d+KB, not shown to you\]/);
     expect(xml).toContain('</function_results>');
   });
 });
@@ -94,6 +101,18 @@ describe('formatToolResultsForSplitTurn', () => {
     expect(img?.type).toBe('image');
     expect(img?.source.type).toBe('base64');
     expect(img?.source.media_type).toBe('image/png');
+  });
+
+  it('a result after the split point renders its image as the note, which says it is not shown', () => {
+    const split = formatToolResultsForSplitTurn([
+      createImageResult('tool_1', 'First result with image'),
+      createImageResult('tool_2', 'Second result with image'),
+    ]);
+    // Only the first image goes out as an image; the second result is rendered after the split.
+    expect(split.images).toHaveLength(1);
+    expect(split.afterImageXml).toContain('<tool_name>name_tool_2</tool_name>');
+    expect(split.afterImageXml).toMatch(/\[Image: image\/png, ~\d+KB, not shown to you\]/);
+    expect(split.beforeImageXml).not.toContain('not shown to you');
   });
 
   it('splits at the first image when the FIRST of two results carries it', () => {

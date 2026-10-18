@@ -6,14 +6,20 @@ import type { ModelRegistry } from './provider.js';
 import type { ErrorInfo } from './errors.js';
 import type { NormalizedRequest } from './request.js';
 import type { NormalizedResponse } from './response.js';
-import type { PrefillFormatter } from '../formatters/types.js';
+import type { NormalizeEvent, PrefillFormatter } from '../formatters/types.js';
 
 // ============================================================================
 // Retry Config
 // ============================================================================
 
 export interface RetryConfig {
-  /** Maximum number of retry attempts (default: 3) */
+  /**
+   * Bound on TOTAL attempts for a retryable error, the first included: 3
+   * means one try and up to two retries; 0 or 1 means no retries
+   * (default: 0). A retryable rate limit (429) gets at least 5 attempts
+   * whatever this says, and a provider capacity error (529) gets the larger
+   * of this and `overloaded.maxRetries`, on the `overloaded` schedule.
+   */
   maxRetries: number;
 
   /** Initial retry delay in milliseconds (default: 1000) */
@@ -113,6 +119,16 @@ export interface MembraneHooks {
    * automatic-continuation rounds. It does not accumulate generated content
    * or tool results. `rawRequest` describes the current provider round; use
    * that argument to inspect or modify the conversation actually being sent.
+   *
+   * Changing `request` in place reaches whatever is built or read from it
+   * after the hook: the native tool loop builds each later round from it
+   * (its messages are the same objects), XML continuations reuse its config
+   * and provider params, and an adapter that serializes
+   * `extra.normalizedMessages` at send time (the completions adapter, on a
+   * turn's first request) sends this round with the change. On a yielding
+   * stream, a round whose hook changed either argument, and every later
+   * round after an in-place change, reports `fidelity: 'unknown'`
+   * (`RoundReport`).
    */
   beforeRequest?: (
     request: NormalizedRequest,
@@ -136,6 +152,21 @@ export interface MembraneHooks {
     error: ErrorInfo,
     attempt: number
   ) => 'retry' | 'abort' | Promise<'retry' | 'abort'>;
+
+  /**
+   * Called with each repair the formatter's tool-pair normalization makes
+   * while building a request (see `NormalizeEvent`), including a stray or
+   * duplicate tool result turned into text, whose `recoveredChars` says how
+   * much of it the model now reads as text. It runs synchronously inside the
+   * build, once per event of every build: each attempt and each tool-loop
+   * round rebuilds, so a repair the history keeps needing is reported each
+   * time. A hook that throws fails the build, before anything is sent. A
+   * promise it returns isn't awaited, so its rejection is the caller's to
+   * handle. Only NativeFormatter's builds normalize, AnthropicXmlFormatter's
+   * native mode included; the XML, completions and Responses builds report
+   * none.
+   */
+  onNormalize?: (event: NormalizeEvent) => void;
 }
 
 // ============================================================================
