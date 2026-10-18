@@ -348,6 +348,169 @@ describe('nullable declarations', () => {
   });
 });
 
+describe("OpenAPI's nullable: true beside a type (#143)", () => {
+  // OpenAPI 3.0 and Gemini's dialect say a parameter may be null with
+  // `nullable: true` beside its `type`, where JSON Schema names null in the
+  // type itself. Main read the type alone, so `{type: "string", nullable:
+  // true}` read as a plain string: the instructions didn't say it admits
+  // null, and a written null reached the tool as the four-character text
+  // "null".
+  const tool = toolWith('zz_openapi_nullable_tool', {
+    type: 'object',
+    properties: {
+      fld1: { type: 'string', nullable: true } as never,
+      fld2: { type: ['string', 'null'] },
+      fld3: { type: 'integer', nullable: true } as never,
+      fld4: { type: 'object', nullable: true } as never,
+      fld5: { $ref: '#/$defs/zz1' },
+      fld6: { type: 'string', nullable: false } as never,
+      fld7: { type: 'string', nullable: 'true' } as never,
+      fld8: { type: 'string', nullable: true, enum: ['zz-a', 'zz-b'] } as never,
+      fld9: { allOf: [{ type: 'string', nullable: true }, { type: 'string' }] } as never,
+    },
+    $defs: { zz1: { type: 'string', nullable: true } as never },
+  });
+
+  it('reads both spellings of a nullable string the same', () => {
+    for (const fld of ['fld1', 'fld2']) {
+      expect(parseParam(tool, fld, 'null')).toBeNull();
+      expect(parseParam(tool, fld, '  {"ite1": 1}  ')).toBe('  {"ite1": 1}  ');
+    }
+    const doc = renderedTools(tool);
+    expect(doc).toContain('<parameter name="fld1" type="string" nullable="true">');
+    expect(doc).toContain('<parameter name="fld2" type="string" nullable="true">');
+  });
+
+  const writtenNulls = (...flds: string[]) =>
+    captureWarnings(() => {
+      const parsed = parseToolCalls(
+        '<function_calls>\n<invoke name="zz_openapi_nullable_tool">\n' +
+          flds.map(fld => `<parameter name="${fld}">\nnull\n</parameter>\n`).join('') +
+          '</invoke>\n</function_calls>',
+        { tools: [tool] }
+      );
+      return parsed!.calls[0]!.input;
+    });
+
+  it('delivers null, not the text "null", for a string, through a $ref too', () => {
+    const { result, messages } = writtenNulls('fld1', 'fld5');
+    expect(result).toEqual({ fld1: null, fld5: null });
+    expect(messages).toHaveLength(0);
+  });
+
+  it('delivers null for an integer or an object without a type-mismatch warning', () => {
+    // Main parsed these as JSON, so the null arrived, but each warned that
+    // the value wasn't the declared type.
+    const { result, messages } = writtenNulls('fld3', 'fld4');
+    expect(messages).toEqual([]);
+    expect(result).toEqual({ fld3: null, fld4: null });
+  });
+
+  it('keeps every other value by the declared type', () => {
+    expect(parseParam(tool, 'fld1', '  nullish  ')).toBe('  nullish  ');
+    expect(parseParam(tool, 'fld3', ' 17 ')).toBe(17);
+    expect(parseParam(tool, 'fld4', '{"ite1": 1}')).toEqual({ ite1: 1 });
+    expect(parseParam(tool, 'fld5', '  zz-spaced-text  ')).toBe('  zz-spaced-text  ');
+  });
+
+  it('tells the model which parameters admit null, through a $ref too', () => {
+    const doc = renderedTools(tool);
+    expect(doc).toContain('<parameter name="fld3" type="integer" nullable="true">');
+    expect(doc).toContain('<parameter name="fld4" type="object" nullable="true">');
+    expect(doc).toContain('<parameter name="fld5" type="string" nullable="true">');
+  });
+
+  it('reads only `nullable: true` itself: false, or the text "true", does not admit null', () => {
+    expect(parseParam(tool, 'fld6', 'null')).toBe('null');
+    expect(parseParam(tool, 'fld7', 'null')).toBe('null');
+    const doc = renderedTools(tool);
+    expect(doc).toContain('<parameter name="fld6" type="string">');
+    expect(doc).toContain('<parameter name="fld7" type="string">');
+  });
+
+  it('reads `nullable: true` beside an enum without consulting the enum', () => {
+    // As for every `type` here, the enum beside it isn't read for what the
+    // parameter admits, so null is admitted though the enum doesn't list it,
+    // as it already was for `{type: ['string', 'null'], enum: [...]}`.
+    expect(parseParam(tool, 'fld8', 'null')).toBeNull();
+    expect(renderedTools(tool)).toContain(
+      '<parameter name="fld8" type="string" nullable="true" enum="zz-a,zz-b">'
+    );
+  });
+
+  it('admits null through allOf only when every branch admits it', () => {
+    expect(parseParam(tool, 'fld9', 'null')).toBe('null');
+    expect(renderedTools(tool)).toContain('<parameter name="fld9" type="string">');
+  });
+
+  it('reads `nullable` only beside a type, where OpenAPI 3.0.3 gives it effect', () => {
+    // Without a `type`, the declaration is read from its other keywords, as
+    // before: here an enum of strings, and OpenAPI's wrapper of a $ref in an
+    // allOf, so a written null stays text.
+    const untyped = toolWith('zz_nullable_without_type_tool', {
+      type: 'object',
+      properties: {
+        fld1: { nullable: true, enum: ['zz-a', 'zz-b'] } as never,
+        fld2: { nullable: true } as never,
+        fld3: { nullable: true, allOf: [{ $ref: '#/$defs/zz1' }] } as never,
+      },
+      $defs: { zz1: { type: 'string' } },
+    });
+    expect(parseParam(untyped, 'fld1', 'null')).toBe('null');
+    expect(parseParam(untyped, 'fld3', 'null')).toBe('null');
+    // fld2 constrains nothing, so it keeps the legacy guess: null, as before.
+    expect(parseParam(untyped, 'fld2', 'null')).toBeNull();
+    const doc = renderedTools(untyped);
+    expect(doc).toContain('<parameter name="fld1" type="string" enum="zz-a,zz-b">');
+    expect(doc).toContain('<parameter name="fld2">');
+    expect(doc).toContain('<parameter name="fld3" type="string">');
+  });
+});
+
+describe('null beside several types, and declarations membrane cannot type (#143)', () => {
+  // A list of several types it can read has no one type, so it keeps the
+  // legacy guess; main gave it no null mark in the instructions, whether the
+  // list names null or `nullable: true` sits beside it.
+  // A declaration with a type name membrane doesn't know (Gemini's upper-case
+  // `STRING`), or an alternative it can't read, is left as it was: no type
+  // and no null mark. Both kinds keep the legacy guess, which reads a written
+  // null as null.
+  const tool = toolWith('zz_unresolved_nullable_tool', {
+    type: 'object',
+    properties: {
+      fld1: { type: ['STRING', 'null'] } as never,
+      fld2: { type: 'STRING', nullable: true } as never,
+      fld3: { type: ['string', 'number', 'null'] } as never,
+      fld4: { anyOf: [{ type: 'STRING' }, { type: 'null' }] } as never,
+      fld5: { anyOf: [{ type: 'string', nullable: true }, { type: 'number' }] } as never,
+      fld6: { type: 'STRING' } as never,
+      fld7: { allOf: [{ type: 'STRING' }, { type: ['string', 'null'] }] } as never,
+      fld8: { type: ['string', 'number'], nullable: true } as never,
+    },
+  });
+
+  it('tells the model null is admitted where it can read every type named', () => {
+    const doc = renderedTools(tool);
+    expect(doc).toContain('<parameter name="fld3" nullable="true">');
+    expect(doc).toContain('<parameter name="fld5" nullable="true">');
+    expect(doc).toContain('<parameter name="fld8" nullable="true">');
+  });
+
+  it('leaves a declaration it cannot read as it was, with no type and no mark', () => {
+    const doc = renderedTools(tool);
+    for (const fld of ['fld1', 'fld2', 'fld4', 'fld6', 'fld7']) {
+      expect(doc).toContain(`<parameter name="${fld}">`);
+    }
+  });
+
+  it('keeps the legacy guess for them, which reads a written null as null', () => {
+    const { result } = captureWarnings(() =>
+      ['fld1', 'fld2', 'fld3', 'fld4', 'fld5', 'fld8'].map(fld => parseParam(tool, fld, 'null'))
+    );
+    expect(result).toEqual([null, null, null, null, null, null]);
+  });
+});
+
 describe('enum and const without a type', () => {
   it('reads the type of the listed values', () => {
     const tool = toolWith('zz_untyped_enum_tool', {

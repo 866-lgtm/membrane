@@ -42,7 +42,7 @@ function createMultiImageResult(toolUseId: string, text: string, imageCount: num
 }
 
 describe('hasImageInToolResults', () => {
-  it('detects images across result shapes', () => {
+  it('detects images the request will send, across result shapes', () => {
     expect(hasImageInToolResults([createTextResult('tool_1', 'Hello world')])).toBe(false);
     expect(hasImageInToolResults([createImageResult('tool_1', 'Image result')])).toBe(true);
     expect(
@@ -52,6 +52,13 @@ describe('hasImageInToolResults', () => {
       ]),
     ).toBe(true);
     expect(hasImageInToolResults([{ toolUseId: 'tool_1', content: [] }])).toBe(false);
+    // Only an image the request will send counts: data that is no image
+    // becomes the placeholder, which goes as text.
+    const notAnImage = Buffer.from('not an image').toString('base64');
+    expect(hasImageInToolResults([{
+      toolUseId: 'tool_1',
+      content: [{ type: 'image', source: { type: 'base64', data: notAnImage, mediaType: 'image/png' } }],
+    }])).toBe(false);
   });
 });
 

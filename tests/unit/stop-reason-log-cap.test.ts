@@ -40,7 +40,11 @@ describe('the unmapped stop-reason log is bounded', () => {
     }
     const lines = warn.mock.calls.map(args => String(args[0]));
     expect(lines.filter(line => line.includes('Unmapped adapter stop reason'))).toHaveLength(64);
-    expect(lines.filter(line => line.includes('distinct unmapped stop reasons logged'))).toHaveLength(1);
+    expect(lines.filter(line => line.includes('distinct unmapped stop reasons logged'))).toEqual([
+      '[membrane] 64 distinct unmapped stop reasons logged; further ones are not ' +
+        "(details.stop.providerReason still carries the adapter's providerStopReason if that's a non-empty " +
+        "string, else the stop reason if it's one)",
+    ]);
     expect(lines.some(line => line.includes('"zz_fresh_reason_63"'))).toBe(true);
     expect(lines.some(line => line.includes('"zz_fresh_reason_64"'))).toBe(false);
   });

@@ -9,7 +9,7 @@
  * - 'multiuser': Multiple participants, names prefixed to content
  */
 
-import { followNormalizedBlocks, isRawItemCarrier, ownBlocks } from '../utils/fidelity.js';
+import { followNormalizedBlocks, isRawItemCarrier, ownBlocks, type FidelityNotes } from '../utils/fidelity.js';
 import { sanitizeToolName } from '../utils/tool-names.js';
 import { unsupportedError } from '../types/errors.js';
 
@@ -34,13 +34,27 @@ import type {
   StreamEmission,
 } from './types.js';
 import { normalizeToolPairs, mergeConsecutiveRoles } from './normalize-tool-pairs.js';
-import { resolveImageMediaType, isAcceptedImageMediaType, strippedImagePlaceholder } from '../utils/image-media.js';
+import { imageForRequest, toolResultContentForRequest } from '../utils/image-media.js';
 import { assertCacheMarkersWithinLimit, countWireCacheMarkers } from '../utils/cache-marker-budget.js';
+import { anthropicServerBlockFor, unpairedServerBlocks } from '../utils/anthropic-server-blocks.js';
 
 /** Index of the last content block that can carry cache_control. Anthropic
  *  rejects cache_control on thinking / redacted_thinking blocks, so a cache
  *  breakpoint must attach to the last NON-thinking block. Returns -1 when the
  *  message has only thinking blocks (the breakpoint is then skipped). */
+/**
+ * The system prompt as it goes on the wire: `''` and an array left with no
+ * blocks become undefined, and empty text blocks leave an array.
+ */
+export function withoutEmptySystemText(
+  system: string | ContentBlock[] | undefined,
+): string | ContentBlock[] | undefined {
+  if (typeof system === 'string') return system === '' ? undefined : system;
+  if (!Array.isArray(system)) return system;
+  const blocks = system.filter((block) => !(block.type === 'text' && (block as { text?: unknown }).text === ''));
+  return blocks.length > 0 ? blocks : undefined;
+}
+
 export function lastCacheableBlockIndex(blocks: Array<Record<string, unknown>>): number {
   for (let k = blocks.length - 1; k >= 0; k--) {
     const t = blocks[k]?.type as string | undefined;
@@ -248,6 +262,8 @@ export class NativeFormatter implements PrefillFormatter {
       // Convert content (recording alterations against this message's index)
       const content = this.convertContent(message.content, message.participant, {
         includeNames: participantMode === 'multiuser' && !isAssistant,
+        isAssistant,
+        serverBlocks: options.anthropicServerBlocks === true,
         ...(options.fidelity ? { onAltered: () => options.fidelity!.alter(i) } : {}),
       });
 
@@ -302,7 +318,14 @@ export class NativeFormatter implements PrefillFormatter {
     });
 
     // Merge consecutive same-role messages (API requires alternating)
-    const mergedMessages = mergeConsecutiveRoles(normalized.messages);
+    let mergedMessages = mergeConsecutiveRoles(normalized.messages);
+    // A server call goes out only with its result in its turn, and a result
+    // only with its call: the API refuses either alone. The request's final
+    // message, if it's the assistant's, keeps its lone calls (a paused turn
+    // is resumed there). The turn is the one sent, after the merge, so a
+    // call and its result stored as two consecutive assistant messages stay
+    // together. With server blocks off, none reached this far.
+    mergedMessages = NativeFormatter.pairServerBlocks(mergedMessages, options.fidelity);
 
     // Build system content. The system block is cached only as a FALLBACK: a
     // message breakpoint already caches a prefix that begins at the front of
@@ -315,30 +338,36 @@ export class NativeFormatter implements PrefillFormatter {
     // fallback either. The budget check below covers the whole built request;
     // Membrane defers it (deferCacheBudgetCheck) to after its hooks, which
     // can still add markers.
-    const markedBreakpoints = countWireCacheMarkers({ messages: mergedMessages, system: systemPrompt });
+    //
+    // An empty system prompt is no system block. Wrapped for the fallback
+    // marker it became a cache-marked empty text block, which the API doesn't
+    // cache; a caller's empty text blocks are dropped the same way, before the
+    // marker count and before the fallback picks the last block.
+    const system = withoutEmptySystemText(systemPrompt);
+    const markedBreakpoints = countWireCacheMarkers({ messages: mergedMessages, system });
     const cacheSystem =
       cacheMarkers === 'membrane-system' && cacheControl && markedBreakpoints === 0
         ? cacheControl
         : undefined;
     let systemContent: unknown;
-    if (typeof systemPrompt === 'string') {
+    if (typeof system === 'string') {
       if (cacheSystem) {
         // Must use array format for cache_control support
-        systemContent = [{ type: 'text', text: systemPrompt, cache_control: cacheSystem }];
+        systemContent = [{ type: 'text', text: system, cache_control: cacheSystem }];
       } else {
-        systemContent = systemPrompt;
+        systemContent = system;
       }
-    } else if (Array.isArray(systemPrompt)) {
-      if (cacheSystem && systemPrompt.length > 0) {
+    } else if (Array.isArray(system)) {
+      if (cacheSystem) {
         // Add cache_control to the last system block
-        systemContent = systemPrompt.map((block, idx) => {
-          if (idx === systemPrompt.length - 1) {
+        systemContent = system.map((block, idx) => {
+          if (idx === system.length - 1) {
             return { ...block, cache_control: cacheSystem };
           }
           return block;
         });
       } else {
-        systemContent = systemPrompt;
+        systemContent = system;
       }
     }
 
@@ -402,36 +431,46 @@ export class NativeFormatter implements PrefillFormatter {
   // PRIVATE HELPERS
   // ==========================================================================
 
-  /** Replace API-unacceptable image blocks nested in tool_result content with
-   *  text placeholders. Non-array content passes through untouched.
-   *  `onAltered` hears each placeholder substitution. */
-  private static sanitizeToolResultContent(content: unknown, onAltered?: () => void): unknown {
-    if (!Array.isArray(content)) return content;
-    return content.map((item) => {
-      if (
-        item &&
-        typeof item === 'object' &&
-        (item as { type?: string }).type === 'image'
-      ) {
-        const src = (item as { source?: { type?: string; data?: string; mediaType?: string; media_type?: string } }).source;
-        if (src?.type === 'url') return { ...item };
-        const mediaType = resolveImageMediaType(src?.data, src?.mediaType ?? src?.media_type);
-        if (!isAcceptedImageMediaType(mediaType)) {
-          onAltered?.();
-          return strippedImagePlaceholder(mediaType);
-        }
-        const { mediaType: _declared, ...source } = src ?? {};
-        return { ...item, source: { ...source, media_type: mediaType } };
+  /**
+   * Leave out of each assistant turn the server blocks the API refuses there
+   * (unpairedServerBlocks: a lone call or result, a second block with an id,
+   * an id that isn't a string, `container_upload`), reporting each one's
+   * message altered. The final message, if it's the assistant's, keeps its
+   * lone calls: a paused turn is resumed as the request's last message. A
+   * marker the builder put on a block left out moves to the turn's last block
+   * that can hold one, unless a kept block already carries one; with no kept
+   * block that can hold one, it goes. A turn left with nothing is dropped,
+   * its marker with it, and its neighbours merge again.
+   */
+  private static pairServerBlocks(messages: ProviderMessage[], fidelity?: FidelityNotes): ProviderMessage[] {
+    const emptied = new Set<number>();
+    const paired = messages.map((message, index) => {
+      if (message.role !== 'assistant' || !Array.isArray(message.content)) return message;
+      const unpaired = unpairedServerBlocks(message.content, index === messages.length - 1);
+      if (unpaired.size === 0) return message;
+      const blocks = message.content as Record<string, unknown>[];
+      let marker: unknown;
+      const kept = blocks.filter((block) => {
+        if (!unpaired.has(block)) return true;
+        fidelity?.alterBlock(block);
+        if (block.cache_control) marker = block.cache_control;
+        return false;
+      });
+      if (marker !== undefined && !kept.some((block) => block.cache_control)) {
+        const at = lastCacheableBlockIndex(kept);
+        if (at >= 0) kept[at]!.cache_control = marker;
       }
-      // Its own object per occurrence, so an adapter's report names one.
-      return item !== null && typeof item === 'object' ? { ...item } : item;
+      if (kept.length === 0) emptied.add(index);
+      return { ...message, content: kept };
     });
+    if (emptied.size === 0) return paired;
+    return mergeConsecutiveRoles(paired.filter((_, index) => !emptied.has(index)));
   }
 
   private convertContent(
     content: ContentBlock[],
     participant: string,
-    options: { includeNames: boolean; onAltered?: () => void }
+    options: { includeNames: boolean; isAssistant: boolean; serverBlocks: boolean; onAltered?: () => void }
   ): unknown[] {
     const result: unknown[] = [];
     let hasUnsupportedMedia = false;
@@ -440,11 +479,26 @@ export class NativeFormatter implements PrefillFormatter {
     const altered = () => options.onAltered?.();
 
     for (const block of content) {
+      // An Anthropic server-tool block (web search and the like), kept on a
+      // zero-width carrier, goes back as the block itself in the assistant
+      // turn that produced it (see utils/anthropic-server-blocks.ts), when
+      // the build replays them (BuildOptions.anthropicServerBlocks). In a
+      // message sent as a user turn, such as another participant's, it has
+      // no place and is left out. An adapter for another wire leaves out a
+      // block type it has no form for.
+      // Sent, it is carried: the block is the carrier's item, its content.
+      // Left out, the message loses it.
+      const serverBlock = anthropicServerBlockFor(block);
+      if (serverBlock) {
+        if (options.isAssistant && options.serverBlocks) result.push(serverBlock);
+        else altered();
+        continue;
+      }
       if (block.type === 'text') {
-        // Empty text blocks are rejected by the Anthropic API. In particular,
-        // zero-width rawItem carriers (opaque provider-native items smuggled
-        // through normalized history) must not leak here. Filter BEFORE the
-        // name prefix below would make them non-empty. A carrier's item is
+        // Empty text blocks are rejected by the Anthropic API. Any other
+        // zero-width rawItem carrier (an opaque provider-native item from
+        // another wire) has no form here and must not leak. Filter BEFORE
+        // the name prefix below would make it non-empty. A carrier's item is
         // its content, and it is not sent here.
         if (block.text === '') {
           if (isRawItemCarrier(block)) altered();
@@ -463,11 +517,12 @@ export class NativeFormatter implements PrefillFormatter {
         result.push(textBlock);
       } else if (block.type === 'image') {
         if (block.source.type === 'base64') {
-          const mediaType = resolveImageMediaType(block.source.data, block.source.mediaType);
-          if (!isAcceptedImageMediaType(mediaType)) {
-            // Unacceptable media type (e.g. image/svg): degrade to a text
-            // placeholder instead of poisoning the whole request.
-            result.push(strippedImagePlaceholder(mediaType));
+          const { mediaType, placeholder } = imageForRequest(block.source.data, block.source.mediaType);
+          if (placeholder) {
+            // Not an image the API accepts (an SVG, or data that is no image
+            // at all): degrade to a text placeholder instead of poisoning the
+            // whole request.
+            result.push(placeholder);
             altered();
           } else {
             const imageBlock: Record<string, unknown> = {
@@ -514,7 +569,7 @@ export class NativeFormatter implements PrefillFormatter {
         result.push({
           type: 'tool_result',
           tool_use_id: block.toolUseId,
-          content: NativeFormatter.sanitizeToolResultContent(block.content, options.onAltered),
+          content: toolResultContentForRequest(block.content, options.onAltered),
           is_error: block.isError,
         });
       } else if (block.type === 'thinking') {

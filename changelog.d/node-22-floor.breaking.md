@@ -1,4 +1,0 @@
-- **Anyone running membrane on a Node before 22.12:** membrane now declares `engines.node` `>=22.12.0`, where it declared `>=20.0.0`, and CI tests at Node 22.12.0 exactly, at 24 and at the newest Node, where it tested the newest 20.x and 24. Node 20 reached end of life on 2026-04-30. npm warns when it installs membrane on an older Node, and refuses only with `engine-strict` set. Nothing in membrane's code changes with this; older Node versions are simply no longer tested.
-  - **Migration:** run Node 22.12 or later.
-  - **Siblings:** no released sibling's range admits this release: context-manager 0.14.1 depends on `^0.5.69`, and agent-framework 0.22.1 and connectome-host 0.10.2 on `^0.5.87`, so their installs keep getting 0.5.x. A sibling takes on this floor when it raises its range.
-  - **Unchanged:** membrane's API, its output, and what it sends to providers.

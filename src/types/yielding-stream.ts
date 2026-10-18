@@ -99,12 +99,13 @@ export interface RoundReport {
   /**
    * This round's own usage, only what the provider reported: a count it did
    * not report is absent, not 0 (even where accounting keeps a 0 default),
-   * and a reported 0 is 0. Counts are in membrane's one convention, as every
-   * usage it reports is: `inputTokens` excludes cache reads, so a
-   * cache-inclusive provider's input count is restated without them
-   * (`normalizeUsageToCacheExcluded`), and `inputTokens + cacheReadTokens` is
-   * the prompt the provider counted. An adapter whose convention is
-   * `'unknown'` passes its counts through as the provider gave them.
+   * and a reported 0 is 0. An adapter that declares its cache convention has
+   * its counts in membrane's one convention: `inputTokens` excludes the cached
+   * span, so a cache-inclusive provider's input count is restated without its
+   * cache reads and writes (`normalizeUsageToCacheExcluded`), and
+   * `inputTokens + cacheCreationTokens + cacheReadTokens` is the prompt the
+   * provider counted. An adapter whose convention is `'unknown'` passes its
+   * counts through as the provider gave them.
    */
   usage: RoundUsage;
   /**
@@ -407,7 +408,10 @@ export interface YieldingStreamOptions {
   /** Request timeout (per API call, not total) */
   timeoutMs?: number;
 
-  /** Abort if no SSE event arrives within this many ms (default: 120000) */
+  /** Anthropic idle deadline after the first SDK event (default: 600000 ms).
+   * Nonempty Web response-body bytes, including SSE keepalives, refresh it;
+   * other SDK-supported bodies refresh it on SDK events. This does not bound
+   * total duration or generation progress. */
   idleTimeoutMs?: number;
 
   /**
