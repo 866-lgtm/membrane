@@ -33,12 +33,12 @@ import {
   parseAccumulatedIntoBlocks,
   formatToolDefinitions,
   toolDefinitionForPrompt,
-  hasNoDataToShow,
+  toolResultImage,
 } from '../utils/tool-parser.js';
 import { IncrementalXmlParser } from '../utils/stream-parser.js';
 import { assertCacheMarkersWithinLimit, clampCacheMarkers } from '../utils/cache-marker-budget.js';
 import { lastCacheableBlockIndex } from './native.js';
-import { resolveImageMediaType, isAcceptedImageMediaType, strippedImagePlaceholder } from '../utils/image-media.js';
+import { imageForRequest, isAcceptedImage } from '../utils/image-media.js';
 import { holdsContent, isRawItemCarrier } from '../utils/fidelity.js';
 
 // ============================================================================
@@ -87,8 +87,12 @@ export interface AnthropicXmlFormatterConfig extends FormatterConfig {
 
 /**
  * Convert a stored tool_result content block into a ToolResult for XML
- * re-rendering (legacy path — blocks without rawXml). Only text and base64
- * image sub-blocks survive; other block types have no XML representation.
+ * re-rendering (legacy path — blocks without rawXml). Only text and image
+ * sub-blocks survive, an image as it was stored, so its note reads it as the
+ * live notes read one (toolResultImage): a base64 source, or MCP-style `data`
+ * and `mimeType`, which is how a split stores the image a tool returned that
+ * way. An image with a url source, and other block types, have no XML
+ * representation.
  */
 function toToolResult(block: ToolResultContent): ToolResult {
   let content: string | ToolResultContentBlock[];
@@ -99,11 +103,9 @@ function toToolResult(block: ToolResultContent): ToolResult {
     for (const sub of block.content) {
       if (sub.type === 'text') {
         content.push({ type: 'text', text: sub.text });
-      } else if (sub.type === 'image' && sub.source?.type === 'base64') {
-        content.push({
-          type: 'image',
-          source: { type: 'base64', data: sub.source.data, mediaType: sub.source.mediaType },
-        });
+      } else if (sub.type === 'image' && (!sub.source || sub.source.type === 'base64')) {
+        // Typed as a source image; an MCP-style one comes untyped, as the tool returned it.
+        content.push(sub as ToolResultContentBlock);
       }
     }
   }
@@ -127,21 +129,24 @@ interface SentSplit {
  * `rawXmlImagesAt` holds the images it sent, and the raw text splits there,
  * where the live split's second part began with a result's closing text.
  * The stored offset has to fall where a result or error closes, as this
- * version renders the close, and the images are decided again: a base64
- * image with data to show whose media type resolves to one the API accepts.
- * The live split (formatToolResultsForSplitTurn) takes an image with data to
- * show (hasNoDataToShow) whose media type resolves to an accepted one, so the
- * two pick the same images; the replay checks the source as well, and media
- * with no source object, in MCP's form that didn't convert, is left out like
- * a URL image. Null when no result in the group is marked, the mark doesn't
- * fall where a result or error closes, or no image it holds can be sent; the
- * block then goes out as its raw text whole, and when the marked result holds
- * an image, its round report says the message was altered. A split leaves out
- * the images this rule refuses, with no note and no warning: under the same
- * rule the turn refused them too, and wrote their notes into the raw text.
- * Only a rule that changed between versions can leave out an image the turn
- * sent, and that goes unreported, since `content` doesn't say which of its
- * images the turn sent.
+ * version renders the close, and the images are decided again, as the live
+ * split (formatToolResultsForSplitTurn) decides them: each image block read
+ * as the split reads one (toolResultImage), sent when its data's header shows
+ * a format the request carries (isAcceptedImage, imageForRequest's test) and
+ * labelled by what the header shows, whatever label it came with. A url
+ * source holds no data, so neither sends it. Null when no result in the group
+ * is marked, the mark doesn't fall where a result or error closes, or no
+ * image it holds can be sent; the block then goes out as its raw text whole,
+ * and when the marked result holds an image, its round report says the
+ * message was altered. A split leaves out the images this rule refuses, with
+ * no note and no warning: under the same rule the turn refused them too, and
+ * wrote imageForRequest's placeholder for each into the raw text. A consumer
+ * that removes an image drops the raw text with it (ToolResultContent's
+ * rawXmlImagesAt), so only a rule that changed between versions can leave out
+ * an image the turn sent: data in none of the formats the request carries,
+ * which an earlier version sent by its label and the API refuses, so the
+ * request that carried it failed. That goes unreported, since `content`
+ * doesn't say which of its images the turn sent.
  */
 function sentSplit(group: readonly ToolResultContent[]): SentSplit | null {
   const rawXml = group[0]!.rawXml!;
@@ -153,10 +158,13 @@ function sentSplit(group: readonly ToolResultContent[]): SentSplit | null {
   if (!after.startsWith('\n</stdout>') && !after.startsWith('\n</error>')) return null;
   const images: unknown[] = [];
   for (const sub of Array.isArray(marked!.content) ? marked!.content : []) {
-    if (sub.type !== 'image' || hasNoDataToShow(sub) || sub.source.type !== 'base64') continue;
-    const mediaType = resolveImageMediaType(sub.source.data, sub.source.mediaType);
-    if (!isAcceptedImageMediaType(mediaType)) continue;
-    images.push({ type: 'image', source: { type: 'base64', media_type: mediaType, data: sub.source.data } });
+    if (sub.type !== 'image') continue;
+    const { data, declared } = toolResultImage(sub);
+    // The test without imageForRequest's warning: the turn warned of a
+    // refused image when it wrote its placeholder.
+    if (!isAcceptedImage(data)) continue;
+    const { mediaType } = imageForRequest(data, declared);
+    images.push({ type: 'image', source: { type: 'base64', media_type: mediaType, data } });
   }
   return images.length > 0 ? { before: rawXml.slice(0, at), images, after } : null;
 }
@@ -311,9 +319,11 @@ export class AnthropicXmlFormatter implements PrefillFormatter {
     let systemContent: unknown;
     if (systemBlocks) {
       // The caller's own markers are authoritative: adding one beside them
-      // spends a slot the caller already allocated.
+      // spends a slot the caller already allocated. Under `cm-owned` the
+      // caller owns every slot, so the formatter adds none, as for a system
+      // string and in the native formatter.
       const callerMarkedAny = systemBlocks.some((b) => b.cache_control);
-      if (promptCaching && !callerMarkedAny) {
+      if (promptCaching && cacheMarkers === 'membrane-system' && !callerMarkedAny) {
         const bpIdx = lastCacheableBlockIndex(systemBlocks);
         if (bpIdx >= 0) systemBlocks[bpIdx]!.cache_control = cacheControl;
       }
@@ -573,13 +583,18 @@ export class AnthropicXmlFormatter implements PrefillFormatter {
       ? this.convertToNativeTools(tools)
       : undefined;
 
-    // Budget. Five sites above attach cache_control (system, contextPrefix,
-    // hasCacheMarker flush, cacheBreakpoint flush, CLI-simulation system) and
-    // multiple cacheBreakpoints are documented input, so a prefill turn with
-    // three marked messages reaches five markers — one over Anthropic's hard
-    // limit, which rejects the request outright. Clamping here, once, on the
-    // finished artifacts is the only count that can see all five sites; the
-    // reported tally is that same recount, so it can never drift from the wire.
+    // Budget. Under membrane-system five sites above can attach cache_control
+    // (system, contextPrefix, hasCacheMarker flush, cacheBreakpoint flush,
+    // CLI-simulation system) and multiple cacheBreakpoints are documented
+    // input, so a prefill turn with three marked messages reaches five
+    // markers — one over Anthropic's hard limit, which rejects the request
+    // outright. Clamping here, once, on the finished artifacts is the only
+    // count that can see all five sites; the reported tally is that same
+    // recount, so it can never drift from the wire. Under cm-owned the
+    // formatter adds no marker of its own, so every marker here is one the
+    // caller asked for (its breakpoints, its hasCacheMarker boundaries, the
+    // markers on its own system blocks), and the build asserts they fit
+    // rather than dropping any.
     const cacheSurfaces = { messages: providerMessages, system: systemContent, tools: nativeTools };
     const budget = cacheMarkers === 'cm-owned'
       ? { total: assertCacheMarkersWithinLimit(cacheSurfaces, 'anthropic-xml') }
@@ -653,14 +668,20 @@ export class AnthropicXmlFormatter implements PrefillFormatter {
     for (let i = 0; i < content.length; i++) {
       const block = content[i]!;
       if (block.type === 'text') {
+        // A zero-width carrier (a provider item with no normalized form, such
+        // as an Anthropic server-tool block) has no text: an empty part would
+        // only add a line to the document. Its item is its content, and the
+        // transcript can't carry it.
+        if (isRawItemCarrier(block)) {
+          onAltered?.();
+          continue;
+        }
         parts.push(block.text);
-        // A zero-width carrier's item is its content; the transcript can't carry it.
-        if (isRawItemCarrier(block)) onAltered?.();
       } else if (block.type === 'image') {
         if (block.source?.type === 'base64') {
-          const mediaType = resolveImageMediaType(block.source.data, block.source.mediaType);
-          if (!isAcceptedImageMediaType(mediaType)) {
-            parts.push(strippedImagePlaceholder(mediaType, block).text);
+          const { mediaType, placeholder } = imageForRequest(block.source.data, block.source.mediaType);
+          if (placeholder) {
+            parts.push(placeholder.text);
             onAltered?.();
           } else {
             images.push({

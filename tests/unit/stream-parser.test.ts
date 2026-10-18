@@ -561,6 +561,37 @@ describe('IncrementalXmlParser', () => {
       expect(parser.getDepths().thinking).toBe(1);
     });
   });
+
+  describe('a closing tag with no block in progress', () => {
+    // A closing tag completes the block in progress, if there is one, and
+    // its depth stops at 0. After a flush, or on a fresh parser, there's no
+    // block to complete.
+    const tags = [
+      ['thinking', 'thinking'],
+      ['function_calls', 'tool_call'],
+      ['function_results', 'tool_result'],
+    ] as const;
+    const zero = { functionCalls: 0, functionResults: 0, thinking: 0 };
+
+    it.each(tags)('</%s> on a fresh parser sends nothing, leaves every depth at 0, and takes no index', (tag, type) => {
+      expect(parser.processChunk(`</${tag}>`).blockEvents).toEqual([]);
+      expect(parser.getDepths()).toEqual(zero);
+      expect(parser.processChunk(`<${tag}>x</${tag}>y`).blockEvents).toEqual([
+        { event: 'block_start', index: 0, block: { type } },
+        { event: 'block_complete', index: 0, block: { type, content: 'x' } },
+        { event: 'block_start', index: 1, block: { type: 'text' } },
+      ]);
+      expect(parser.getDepths()).toEqual(zero);
+    });
+
+    it.each(tags)('</%s> after its block was flushed sends nothing, and leaves every depth at 0', (tag, type) => {
+      parser.processChunk(`<${tag}>x`);
+      expect(parser.flush().blockEvents).toEqual([{ event: 'block_complete', index: 0, block: { type, content: 'x' } }]);
+      expect(parser.processChunk(`</${tag}>`).blockEvents).toEqual([]);
+      expect(parser.getDepths()).toEqual(zero);
+    });
+  });
+
   // Coverage folded in from the legacy tsx script test/stream-parser.test.ts
   // (pre-vitest layout, never ran in CI) — only the cases this suite lacked.
   describe('antml: tag prefix', () => {

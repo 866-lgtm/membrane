@@ -100,6 +100,7 @@ import {
 } from './formatters/normalize-tool-pairs.js';
 import { YieldingStreamImpl } from './yielding-stream.js';
 import { calculateCost, warnUnpricedModel } from './utils/cost.js';
+import { isAnthropicServerBlock } from './utils/anthropic-server-blocks.js';
 import {
   TurnUsageAccumulator,
   calculateCacheHitRatio,
@@ -107,14 +108,11 @@ import {
   warnUnconvertibleProviderItem,
 } from './utils/usage.js';
 import {
-  resolveImageMediaType,
-  isAcceptedImageMediaType,
-  strippedImagePlaceholder,
   shedImagesToFitByteBudget, assertWithinByteBudget,
 } from './utils/image-media.js';
 import { convertMcpMedia } from './utils/mcp-media.js';
 import { getDefaultPricing } from './registry/default-pricing.js';
-import { FidelityNotes, requestFingerprint, type MessageOrigin } from './utils/fidelity.js';
+import { FidelityNotes, isRawItemCarrier, requestFingerprint, type MessageOrigin } from './utils/fidelity.js';
 
 /** Anthropic's thinking-binding controls, as a thinking config carries them. */
 type BlockBindingParam = { prefix_mismatch_behavior: 'error' | 'drop_block' };
@@ -338,6 +336,42 @@ const MAX_LOGGED_STOP_REASONS = 64;
 /** Longest stop-reason token printed whole; real tokens are short. */
 const MAX_LOGGED_STOP_REASON_CHARS = 128;
 
+/** A stop token an adapter reported: a non-empty string. */
+function isStopToken(value: unknown): value is string {
+  return typeof value === 'string' && value !== '';
+}
+
+/**
+ * Feed a provider chunk to an XML loop's parser, up to the first stop.
+ *
+ * The stop that ends first in the round's text so far, from `checkFrom`, is
+ * found before the parser sees the chunk, and the parser takes only the text
+ * before it. So what goes out up to a stop is the parser's own emissions,
+ * each labelled by the block it belongs to, as on every other chunk: a chunk
+ * that closes a <thinking> block before the stop, or holds the end of a tool
+ * call before its own `</function_calls>` stop, doesn't go out as visible
+ * text. A chunk with nothing before the stop, as when the stop began in an
+ * earlier chunk, gives nothing, not even the empty piece a plain parser would
+ * send. `head` is the round's accepted text when a stop was found.
+ */
+function parseUpToStop(
+  parser: StreamParser,
+  chunk: string,
+  checkFrom: number,
+  stops: readonly string[],
+): { found: { stop: string; at: number } | undefined; head: string; emissions: ProcessChunkResult['emissions'] } {
+  const before = parser.getAccumulated();
+  const text = before + chunk;
+  // The stop that ends first, where a provider applying the request's stops
+  // would end, whatever order they're listed in.
+  const found = firstStop(text.slice(checkFrom), stops);
+  if (!found) return { found, head: text, emissions: parser.processChunk(chunk).emissions };
+  // Where the accepted text ends and the stop begins.
+  const cut = checkFrom + found.at;
+  const taken = chunk.slice(0, Math.max(0, cut - before.length));
+  return { found, head: text.slice(0, cut), emissions: taken ? parser.processChunk(taken).emissions : [] };
+}
+
 export class Membrane {
   private adapter: ProviderAdapter;
   private registry?: ModelRegistry;
@@ -448,9 +482,11 @@ export class Membrane {
         } finally {
           progress.cleanup();
         }
-        // Restate usage in the one convention before any ratio or price sees it.
+        // Restate usage in the one convention before any ratio or price sees it,
+        // and the stop token as membrane carries it (see providerReasonFor).
         const providerResponse: ProviderResponse = {
           ...rawProviderResponse,
+          providerStopReason: this.providerReasonFor(rawProviderResponse),
           usage: normalizeUsageToCacheExcluded(
             rawProviderResponse.usage,
             this.adapter.name,
@@ -989,6 +1025,28 @@ export class Membrane {
         const textStarts = new Map<number, number>();
         streamedThinking.beginRound(parser.getAccumulated().length - initialPrefillLength);
         const tracker = new NativeBlockTracker((event) => { if (typedCallbacks) onBlock?.(event); });
+        // The parser's emissions go out in order: its block events unless the
+        // provider's typed blocks report them, and its text with its block's
+        // label.
+        const forward = (emissions: ProcessChunkResult['emissions']) => {
+          for (const emission of emissions) {
+            if (emission.kind === 'blockEvent') {
+              if (!typedCallbacks) onBlock?.(emission.event);
+            } else {
+              onChunk?.(emission.text, typedCallbacks ? { ...emission.meta, blockIndex: tracker.blockIndex } : emission.meta);
+            }
+          }
+        };
+        // Under typed blocks the stream carries the provider's blocks, and by
+        // a round's end the provider's last block has completed, so what the
+        // parser held back then isn't streamed, as on main, though the
+        // provider's block and the content keep it. Neither is what a flush
+        // before a break sends: the stream carries none of the parser's block
+        // events under typed blocks, and a put-back stop has already gone out
+        // whole (below).
+        const forwardOwn = (emissions: ProcessChunkResult['emissions']) => {
+          if (!typedCallbacks) forward(emissions);
+        };
         const onProviderBlock = (index: number, block: unknown) => {
           if (!xmlToolProtocol && (!detectedStopSequence || textStarts.has(index))) {
             const type = (block as { type?: string } | undefined)?.type;
@@ -1026,44 +1084,16 @@ export class Membrane {
                 onChunk?.(chunk, { type: 'thinking', visible: false, blockIndex: tracker.blockIndex });
                 return;
               }
-              // Only visible text enters a plain formatter's parser.
-              const { emissions } = parser.processChunk(chunk);
-
-              // Check for stop sequences only in NEW content (not already-processed)
-              const accumulated = parser.getAccumulated();
-              const newContent = accumulated.slice(checkFromIndex);
-
-              // The stop that ends first, where a provider applying the
-              // request's stops would end, whatever order they're listed in.
-              const found = firstStop(newContent, prefillResult.stopSequences);
+              // Only visible text enters a plain formatter's parser, and only
+              // the text before a stop: the stop is found in the round's new
+              // text first, so what goes out up to it is labelled by the block
+              // each piece belongs to, as on every other chunk.
+              const { found, head, emissions } = parseUpToStop(parser, chunk, checkFromIndex, prefillResult.stopSequences);
               if (found) {
-                // Found stop sequence - mark it and truncate
-                const absoluteIdx = checkFromIndex + found.at;
                 detectedStopSequence = found.stop;
-                truncatedAccumulated = accumulated.slice(0, absoluteIdx);
-
-                // Emit only the portion up to stop sequence with metadata
-                const alreadyEmitted = accumulated.length - chunk.length;
-                if (absoluteIdx > alreadyEmitted) {
-                  const truncatedChunk = accumulated.slice(alreadyEmitted, absoluteIdx);
-                  const meta: ChunkMeta = {
-                    type: parser.getCurrentBlockType(),
-                    visible: parser.getCurrentBlockType() === 'text',
-                    blockIndex: 0, // Approximate
-                  };
-                  onChunk?.(truncatedChunk, meta);
-                }
-                return;
+                truncatedAccumulated = head;
               }
-
-              // Emit in correct interleaved order using emissions array
-              for (const emission of emissions) {
-                if (emission.kind === 'blockEvent') {
-                  if (!typedCallbacks) onBlock?.(emission.event);
-                } else {
-                  onChunk?.(emission.text, typedCallbacks ? { ...emission.meta, blockIndex: tracker.blockIndex } : emission.meta);
-                }
-              }
+              forward(emissions);
             },
             onContentBlock: onProviderBlock,
             // Only a thinking span already recorded takes it (see onProviderBlock).
@@ -1093,10 +1123,15 @@ export class Membrane {
         rounds++;
         providerCalls += streamResult.providerCalls;
 
-        // If we detected stop sequence manually, fix up the parser and result
+        // A stop found here ends the round at the text before it. The parser
+        // took only that text, so it ends the round as it would a round the
+        // provider stopped, unless the stop began in an earlier chunk, which
+        // it took whole: then it starts again from the accepted text.
         if (detectedStopSequence && truncatedAccumulated !== null) {
-          parser.reset();
-          parser.push(truncatedAccumulated);
+          if (parser.getAccumulated() !== truncatedAccumulated) {
+            parser.reset();
+            parser.push(truncatedAccumulated);
+          }
           streamResult.stopReason = 'stop_sequence';
           streamResult.stopSequence = detectedStopSequence;
         }
@@ -1126,13 +1161,10 @@ export class Membrane {
         const usageSoFar = turnUsage.addRound(streamResult.model, streamResult.usage);
         onUsage?.(usageSoFar);
 
-        // Flush the parser to complete any in-progress streaming block
-        const flushResult = parser.flush();
-        for (const emission of flushResult.emissions) {
-          if (emission.kind === 'blockEvent' && !typedCallbacks) {
-            onBlock?.(emission.event);
-          }
-        }
+        // Flush the parser: the block in progress completes, and the text it
+        // held back at the round's end (a possible tag's start) goes out with
+        // it. Under typed blocks neither is streamed (forwardOwn).
+        forwardOwn(parser.flush().emissions);
 
         // Get accumulated text from parser
         const accumulated = parser.getAccumulated();
@@ -1250,9 +1282,12 @@ export class Membrane {
             // Track the tool results
             executedToolResults.push(...results);
 
-            // A result's sendable images need split-turn injection. With none
-            // to send (every image a media type the API refuses), the block goes
-            // in as text, with the notes written where those images were.
+            // Check if results contain images (requires split-turn injection).
+            // The split is for images that will be sent: when every image
+            // would become a placeholder, there is nothing to put in the user
+            // turn, and the standard path carries the placeholders as text.
+            // The check doesn't decide, so each image is decided once, on
+            // whichever path carries it.
             const splitContent = hasImageInToolResults(results) ? formatToolResultsForSplitTurn(results) : null;
             if (splitContent?.hasImages) {
               splitRounds.push({
@@ -1404,24 +1439,37 @@ export class Membrane {
 
         if (lastStopReason === 'stop_sequence' && modelOpenedNewBlock) {
           // False positive! The stop sequence (e.g., "\nUser:") appeared inside XML content
-          // Re-add the consumed stop sequence and resume streaming
+          // Re-add the consumed stop sequence and resume streaming. It's the
+          // model's text, inside the block it opened, so it goes through the
+          // parser as a chunk does. No block is in progress after the round's
+          // flush, so text starts a new block of its type, and a closing tag,
+          // such as a </function_calls> stop with no call run, sends no block
+          // event.
           if (streamResult.stopSequence) {
-            parser.push(streamResult.stopSequence);
-            const meta: ChunkMeta = {
-              type: parser.getCurrentBlockType(),
-              visible: parser.getCurrentBlockType() === 'text',
-              blockIndex: 0,
-            };
-            onChunk?.(streamResult.stopSequence, meta);
+            // Under typed blocks the stop's text goes out as one piece at
+            // index 0, as main sent it, labelled with the block it sits in,
+            // read before the parser takes it, so a closing tag is labelled
+            // with the block it closes.
+            const type = parser.getCurrentBlockType();
+            const putBack = parser.processChunk(streamResult.stopSequence).emissions;
+            if (typedCallbacks) {
+              onChunk?.(streamResult.stopSequence, { type, visible: type === 'text', blockIndex: 0 });
+            } else {
+              forward(putBack);
+            }
           }
 
-          // Resume streaming - but limit resumptions to prevent infinite loops
+          // Resume streaming - but limit resumptions to prevent infinite loops.
+          // A turn that ends at either break below completes the block the
+          // stop's text opened, streamed unless under typed blocks.
           toolDepth++; // Count this as a "depth" to limit iterations
           if (toolDepth > maxToolDepth) {
+            forwardOwn(parser.flush().emissions);
             break;
           }
           if (!registerResumptionRound()) {
             lastStopReason = 'round_limit';
+            forwardOwn(parser.flush().emissions);
             break;
           }
           enteredViaResumption = true;
@@ -1431,8 +1479,8 @@ export class Membrane {
             prefillResult,
             parser.getAccumulated()
           );
-          // Reset parser state for new streaming iteration
-          parser.resetForNewIteration();
+          // The parser isn't reset for the next round, so a block the stop's
+          // text started goes on there.
           continue;
         }
 
@@ -1968,18 +2016,19 @@ export class Membrane {
           // tool records have no normalized ContentBlock equivalent. Retain a
           // zero-width carrier so Chronicle and the Responses formatter can
           // replay the raw item without surfacing synthetic prompt text.
-          // Anthropic-bound conversion paths filter these out (empty text
-          // blocks are a 400 there); the Responses formatter replays rawItem.
+          // The Responses formatter replays a Responses item; Anthropic-shaped
+          // requests send an Anthropic server-tool block back as itself and
+          // filter any other carrier out (empty text blocks are a 400 there).
           //
           // An item with a `type` this switch does not know (server_tool_use,
           // web_search_tool_result, search_result, mcp_tool_use, or whatever a
           // provider adds next) used to fall out of this chain and vanish. It
-          // gets the same carrier treatment, holding the item itself, plus a
-          // one-time warning so the gap surfaces instead of being inferred
-          // later from missing content.
-          const carriedRawItem = item.rawItem ?? item;
-          if (!item.rawItem) warnUnconvertibleProviderItem(item.type);
-          blocks.push({ type: 'text', text: '', rawItem: carriedRawItem });
+          // gets the same carrier treatment, holding the item itself. An
+          // Anthropic server-tool block is a known type there (a build that
+          // replays them sends it back as itself), so only another type gets
+          // a one-time warning, which surfaces the gap instead of leaving it
+          // to be inferred later from missing content.
+          blocks.push(providerItemCarrier(item));
         }
       }
       return blocks;
@@ -2341,6 +2390,7 @@ export class Membrane {
       maxParticipantsForStop,
       contextPrefix: request.contextPrefix,
       prefillUserMessage: request.prefillUserMessage,
+      anthropicServerBlocks: this.adapter.replaysAnthropicServerBlocks === true,
       ...(fidelity ? { fidelity } : {}),
     });
 
@@ -2683,8 +2733,11 @@ export class Membrane {
       const rawResult = localStops ? localStops.finish(attemptResult) : attemptResult;
       // Restate usage in the one convention before any accumulator, ratio or
       // price sees it — this is the only door streamed usage enters through.
+      // The stop token is settled here too, from the adapter's own stop, before
+      // a local stop sequence, or the XML loop's, replaces its stopReason.
       const result: ProviderResponse = {
         ...rawResult,
+        providerStopReason: this.providerReasonFor(attemptResult),
         usage: normalizeUsageToCacheExcluded(rawResult.usage, this.adapter.name, this.adapter.usageCacheConvention),
       };
       if (result.stopReason !== 'refusal' || retried >= maxAttempts) {
@@ -2913,6 +2966,12 @@ export class Membrane {
             data: block.data,
             mimeType: block.mimeType,
           });
+        } else if (block && (block.rawItem || block.type)) {
+          // A provider block with no normalized form (an Anthropic server-tool
+          // block, an opaque Responses item) used to vanish here, so a turn
+          // that used a server tool reached the history without it. Keep it
+          // as the tool loops do.
+          content.push(providerItemCarrier(block));
         }
       }
     } else if (typeof providerResponse.content === 'string') {
@@ -2926,10 +2985,12 @@ export class Membrane {
       providerResponse.stopSequence?.startsWith('</');
     if (stoppedOnClosingTag && providerResponse.stopSequence) {
       rawAssistantText += providerResponse.stopSequence;
-      // Update the last text content block if it exists
+      // Update the last text content block if it exists. A zero-width
+      // carrier is a text block holding a provider item, not text, so it keeps
+      // its empty text and stays a carrier.
       for (let i = content.length - 1; i >= 0; i--) {
         const block = content[i]!;
-        if (block.type === 'text') {
+        if (block.type === 'text' && !isRawItemCarrier(block)) {
           (block as { type: 'text'; text: string }).text += providerResponse.stopSequence;
           break;
         }
@@ -3229,10 +3290,12 @@ export class Membrane {
       default:
         // Unknown reasons still normalize to end_turn — callers switch on a
         // closed union — but never silently: the raw token is disclosed as
-        // details.stop.providerReason and the mapping is logged, once per
-        // token per process (a compatible server may send its own token on
-        // every response). Provider enums grow, and the last time this
-        // default swallowed a member it hid safety refusals in production.
+        // details.stop.providerReason (the adapter's providerStopReason, or
+        // this token when it gives none; see providerReasonFor) and the
+        // mapping is logged, once per token per process (a compatible server
+        // may send its own token on every response). Provider enums grow, and
+        // the last time this default swallowed a member it hid safety
+        // refusals in production.
         if (!warnedStopReasons.has(adapterReason) && warnedStopReasons.size < MAX_LOGGED_STOP_REASONS) {
           warnedStopReasons.add(adapterReason);
           // The token is the server's own text: printed as a JSON string, so
@@ -3244,13 +3307,13 @@ export class Membrane {
           );
           console.warn(
             `[membrane] Unmapped adapter stop reason ${shown} normalized to end_turn ` +
-              '(details.stop.providerReason is present when the adapter supplies the raw provider token; ' +
+              '(details.stop.providerReason carries the adapter\'s providerStopReason, or this token when it gives none; ' +
               'logged once per reason)'
           );
           if (warnedStopReasons.size === MAX_LOGGED_STOP_REASONS) {
             console.warn(
               `[membrane] ${MAX_LOGGED_STOP_REASONS} distinct unmapped stop reasons logged; further ones are not ` +
-                '(details.stop.providerReason still carries each)'
+                '(details.stop.providerReason still carries each one an adapter gives without a providerStopReason)'
             );
           }
         }
@@ -3258,7 +3321,30 @@ export class Membrane {
     }
   }
 
-  private calculateCacheHitRatio(usage: Pick<DetailedUsage, 'inputTokens' | 'cacheReadTokens'>): number {
+  /**
+   * The stop token details.stop.providerReason carries for an adapter's
+   * result: its providerStopReason, the provider's own word, when it gives
+   * one. Otherwise its stopReason when membrane doesn't map that token, so the
+   * token isn't lost behind the end_turn it becomes; that may be the adapter's
+   * own word rather than the provider's. A token membrane maps, given alone,
+   * leaves none: it may already be the adapter's normalization. Only a
+   * non-empty string counts as a token, in either field.
+   *
+   * mapStopReason maps each token it knows to itself, so a token it changes is
+   * one it doesn't map; reading it here logs that token, once per process.
+   * Both doors an adapter's result enters by, complete()'s and streamOnce,
+   * settle the token here, before membrane's own stop, a stop sequence the
+   * XML loop or LocalStopSequences finds, replaces the adapter's stopReason.
+   */
+  private providerReasonFor(
+    result: Pick<ProviderResponse, 'stopReason' | 'providerStopReason'>
+  ): string | undefined {
+    if (isStopToken(result.providerStopReason)) return result.providerStopReason;
+    const token: unknown = result.stopReason;
+    return isStopToken(token) && this.mapStopReason(token) !== token ? token : undefined;
+  }
+
+  private calculateCacheHitRatio(usage: Pick<DetailedUsage, 'inputTokens' | 'cacheCreationTokens' | 'cacheReadTokens'>): number {
     return calculateCacheHitRatio(usage);
   }
 
@@ -3693,6 +3779,21 @@ export class Membrane {
         const textStarts = new Map<number, number>();
         streamedThinking.beginRound(parser.getAccumulated().length - initialPrefillLength);
         const tracker = new NativeBlockTracker((event) => { if (typedCallbacks && emitBlocks) stream.emit({ type: 'block', event }); });
+        // The parser's emissions go out in order (see streamWithXmlTools).
+        const forward = (emissions: ProcessChunkResult['emissions']) => {
+          for (const emission of emissions) {
+            if (emission.kind === 'blockEvent') {
+              if (emitBlocks && !typedCallbacks) stream.emit({ type: 'block', event: emission.event });
+            } else if (emitTokens) {
+              stream.emit({ type: 'tokens', content: emission.text, meta: typedCallbacks ? { ...emission.meta, blockIndex: tracker.blockIndex } : emission.meta });
+            }
+          }
+        };
+        // Under typed blocks, what the parser held back at a round's end
+        // isn't streamed, as on main (see streamWithXmlTools).
+        const forwardOwn = (emissions: ProcessChunkResult['emissions']) => {
+          if (!typedCallbacks) forward(emissions);
+        };
         const onProviderBlock = (index: number, block: unknown) => {
           if (!xmlToolProtocol && (!detectedStopSequence || textStarts.has(index))) {
             const type = (block as { type?: string } | undefined)?.type;
@@ -3728,46 +3829,14 @@ export class Membrane {
                 if (emitTokens) stream.emit({ type: 'tokens', content: chunk, meta: { type: 'thinking', visible: false, blockIndex: tracker.blockIndex } });
                 return;
               }
-              // Only visible text enters a plain formatter's parser.
-              const { emissions } = parser.processChunk(chunk);
-
-              // Check for stop sequences only in NEW content
-              const accumulated = parser.getAccumulated();
-              const newContent = accumulated.slice(checkFromIndex);
-
-              // The stop that ends first (see streamWithXmlTools).
-              const found = firstStop(newContent, prefillResult.stopSequences);
+              // Only visible text enters a plain formatter's parser, and only
+              // the text before a stop (see streamWithXmlTools).
+              const { found, head, emissions } = parseUpToStop(parser, chunk, checkFromIndex, prefillResult.stopSequences);
               if (found) {
-                const absoluteIdx = checkFromIndex + found.at;
                 detectedStopSequence = found.stop;
-                truncatedAccumulated = accumulated.slice(0, absoluteIdx);
-
-                // Emit only the portion up to stop sequence
-                const alreadyEmitted = accumulated.length - chunk.length;
-                if (emitTokens && absoluteIdx > alreadyEmitted) {
-                  const truncatedChunk = accumulated.slice(alreadyEmitted, absoluteIdx);
-                  const meta: ChunkMeta = {
-                    type: parser.getCurrentBlockType(),
-                    visible: parser.getCurrentBlockType() === 'text',
-                    blockIndex: 0,
-                  };
-                  stream.emit({ type: 'tokens', content: truncatedChunk, meta });
-                }
-                return;
+                truncatedAccumulated = head;
               }
-
-              // Emit in correct interleaved order
-              for (const emission of emissions) {
-                if (emission.kind === 'blockEvent') {
-                  if (emitBlocks && !typedCallbacks) {
-                    stream.emit({ type: 'block', event: emission.event });
-                  }
-                } else {
-                  if (emitTokens) {
-                    stream.emit({ type: 'tokens', content: emission.text, meta: typedCallbacks ? { ...emission.meta, blockIndex: tracker.blockIndex } : emission.meta });
-                  }
-                }
-              }
+              forward(emissions);
             },
             onContentBlock: onProviderBlock,
             // Only a thinking span already recorded takes it (see onProviderBlock).
@@ -3796,10 +3865,14 @@ export class Membrane {
         rounds++;
         providerCalls += streamResult.providerCalls;
 
-        // If we detected stop sequence manually, fix up the parser and result
+        // A stop found here ends the round at the text before it (see
+        // streamWithXmlTools): the parser starts again from the accepted text
+        // only when the stop began in an earlier chunk, which it took whole.
         if (detectedStopSequence && truncatedAccumulated !== null) {
-          parser.reset();
-          parser.push(truncatedAccumulated);
+          if (parser.getAccumulated() !== truncatedAccumulated) {
+            parser.reset();
+            parser.push(truncatedAccumulated);
+          }
           streamResult.stopReason = 'stop_sequence';
           streamResult.stopSequence = detectedStopSequence;
         }
@@ -3839,13 +3912,10 @@ export class Membrane {
           });
         }
 
-        // Flush the parser
-        const flushResult = parser.flush();
-        for (const emission of flushResult.emissions) {
-          if (emission.kind === 'blockEvent' && emitBlocks && !typedCallbacks) {
-            stream.emit({ type: 'block', event: emission.event });
-          }
-        }
+        // Flush the parser: the block in progress completes, and the text it
+        // held back at the round's end goes out with it. Under typed blocks
+        // neither is streamed (forwardOwn).
+        forwardOwn(parser.flush().emissions);
 
         // Stall accounting (issue #39): only rounds ENTERED via automatic
         // resumption can stall; the turn ends only after several consecutive
@@ -3976,9 +4046,9 @@ export class Membrane {
             // Track the tool results
             executedToolResults.push(...results);
 
-            // A result's sendable images need split-turn injection. With none
-            // to send (every image a media type the API refuses), the block goes
-            // in as text, with the notes written where those images were.
+            // Check if results contain images that will be sent (see the
+            // streaming path: an all-placeholder result takes the standard
+            // path, and each image is decided once)
             const splitContent = hasImageInToolResults(results) ? formatToolResultsForSplitTurn(results) : null;
             if (splitContent?.hasImages) {
               splitRounds.push({
@@ -4138,24 +4208,34 @@ export class Membrane {
           currentDepths.thinking > prefillDepths.thinking;
 
         if (lastStopReason === 'stop_sequence' && modelOpenedNewBlock) {
+          // The stop's text is the model's, inside the block it opened: it
+          // goes through the parser as a chunk does. No block is in progress
+          // after the round's flush, so text starts a new block of its type,
+          // and a closing tag sends no block event.
           if (streamResult.stopSequence) {
-            parser.push(streamResult.stopSequence);
-            if (emitTokens) {
-              const meta: ChunkMeta = {
-                type: parser.getCurrentBlockType(),
-                visible: parser.getCurrentBlockType() === 'text',
-                blockIndex: 0,
-              };
-              stream.emit({ type: 'tokens', content: streamResult.stopSequence, meta });
+            // Under typed blocks the stop's text goes out as one piece,
+            // labelled with the block it sits in (see streamWithXmlTools).
+            const type = parser.getCurrentBlockType();
+            const putBack = parser.processChunk(streamResult.stopSequence).emissions;
+            if (typedCallbacks) {
+              if (emitTokens) {
+                stream.emit({ type: 'tokens', content: streamResult.stopSequence, meta: { type, visible: type === 'text', blockIndex: 0 } });
+              }
+            } else {
+              forward(putBack);
             }
           }
 
+          // A turn that ends at either break below completes the block the
+          // stop's text opened, streamed unless under typed blocks.
           toolDepth++;
           if (toolDepth > maxToolDepth) {
+            forwardOwn(parser.flush().emissions);
             break;
           }
           if (!registerResumptionRound()) {
             lastStopReason = 'round_limit';
+            forwardOwn(parser.flush().emissions);
             break;
           }
           enteredViaResumption = true;
@@ -4165,7 +4245,7 @@ export class Membrane {
             prefillResult,
             parser.getAccumulated()
           );
-          parser.resetForNewIteration();
+          // A block the stop's text started goes on in the next round.
           continue;
         }
 
@@ -4614,4 +4694,18 @@ export class Membrane {
       }
     }
   }
+}
+
+/**
+ * The zero-width carrier for a provider item no normalized ContentBlock
+ * represents (an Anthropic server-tool block, an opaque Responses item): the
+ * item rides on it as `rawItem`, so a formatter for its wire can send it back,
+ * and normalized consumers see no text. An item that already holds its native
+ * form as `rawItem` is carried as that form, and so is an Anthropic server-tool
+ * block, which is its own native form; any other is new to this module, and
+ * warns once per type.
+ */
+function providerItemCarrier(item: { type?: unknown; rawItem?: unknown }): ContentBlock {
+  if (!item.rawItem && !isAnthropicServerBlock(item)) warnUnconvertibleProviderItem(String(item.type));
+  return { type: 'text', text: '', rawItem: item.rawItem ?? item };
 }

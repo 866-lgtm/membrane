@@ -1,4 +1,5 @@
 import { TimeoutAbortError, errorFromProviderStatus, networkError } from '../types/errors.js';
+import { imageForRequest, urlImageForRequest } from '../utils/image-media.js';
 
 interface StreamErrorFrameFields {
   code?: unknown;
@@ -288,6 +289,28 @@ function carriesInlineImageData(block: unknown): boolean {
   if (typeof b.data === 'string') return true; // MCP-shaped image content
   const source = b.source as { data?: unknown } | null | undefined;
   return !!source && typeof source === 'object' && typeof source.data === 'string';
+}
+
+/**
+ * An image block as an OpenAI-style chat content part (OpenAI, OpenAI-compatible
+ * and OpenRouter): an image_url for an image these APIs accept, base64 data
+ * as a data: URL labelled by its header and a remote URL as it is, or
+ * imageForRequest's placeholder as a text part. Undefined for a block with no
+ * usable source.
+ */
+export function openAIImagePart(source: { type?: string; data?: unknown; media_type?: unknown; mediaType?: unknown; url?: unknown } | undefined):
+  { type: 'image_url'; image_url: { url: string } } | { type: 'text'; text: string } | undefined {
+  if (source?.type === 'base64') {
+    const { mediaType, placeholder } = imageForRequest(source.data, source.media_type ?? source.mediaType);
+    return placeholder
+      ? { type: 'text', text: placeholder.text }
+      : { type: 'image_url', image_url: { url: `data:${mediaType};base64,${source.data as string}` } };
+  }
+  if (source?.type === 'url') {
+    const image = urlImageForRequest(source.url as string);
+    return image.placeholder ? { type: 'text', text: image.placeholder.text } : { type: 'image_url', image_url: { url: image.url } };
+  }
+  return undefined;
 }
 
 export function textOnlyToolResultContent(content: unknown): string {

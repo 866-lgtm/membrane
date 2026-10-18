@@ -32,7 +32,8 @@ import {
   isTypedAbortError,
   withRawRequest,
 } from '../types/index.js';
-import { toolUseInputFromText, textOnlyToolResultContent, createCombinedSignal, SSELineParser, isDeadlineAbort, deadlineTimeoutError, throwOnStreamErrorFrame, assertTerminalEventObserved } from './utils.js';
+import { isRawItemCarrier } from '../utils/fidelity.js';
+import { toolUseInputFromText, textOnlyToolResultContent, openAIImagePart, createCombinedSignal, SSELineParser, isDeadlineAbort, deadlineTimeoutError, throwOnStreamErrorFrame, assertTerminalEventObserved } from './utils.js';
 import { requiresCompletionTokens, noTemperatureSupport, noStopSupport } from './openai.js';
 
 // ============================================================================
@@ -449,6 +450,10 @@ export class OpenAICompatibleAdapter implements ProviderAdapter {
 
         for (const block of msg.content) {
           if (block.type === 'text') {
+            // A zero-width carrier (a provider item with no normalized form,
+            // such as an Anthropic server-tool block) has no text and no form
+            // on this wire: an empty part would only add a blank line.
+            if (isRawItemCarrier(block)) continue;
             contentParts.push({ type: 'text', text: block.text });
           } else if (block.type === 'thinking') {
             // Round-trip the reasoning trace back to the provider (OpenRouter
@@ -458,19 +463,10 @@ export class OpenAICompatibleAdapter implements ProviderAdapter {
               reasoningText += (reasoningText ? '\n' : '') + block.thinking;
             }
           } else if (block.type === 'image') {
-            // Convert Anthropic-style image to OpenAI image_url with data URI
-            if (block.source?.type === 'base64') {
-              const mediaType = block.source.media_type ?? block.source.mediaType ?? 'image/png';
-              contentParts.push({
-                type: 'image_url',
-                image_url: { url: `data:${mediaType};base64,${block.source.data}` },
-              });
-            } else if (block.source?.type === 'url') {
-              contentParts.push({
-                type: 'image_url',
-                image_url: { url: block.source.url },
-              });
-            }
+            // Convert Anthropic-style image to OpenAI image_url with data URI,
+            // or to the placeholder for data these APIs don't accept
+            const part = openAIImagePart(block.source);
+            if (part) contentParts.push(part);
           } else if (block.type === 'tool_use') {
             toolCalls.push({
               id: block.id,
@@ -717,6 +713,8 @@ export function toOpenAIMessages(
 
     for (const block of msg.content) {
       if (block.type === 'text') {
+        // A zero-width carrier holds a block this wire has no form for.
+        if (isRawItemCarrier(block)) continue;
         textParts.push(block.text);
       } else if (block.type === 'thinking') {
         if (typeof (block as { thinking?: string }).thinking === 'string') {

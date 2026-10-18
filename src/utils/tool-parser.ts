@@ -20,7 +20,7 @@ import type {
   ToolDefinition,
 } from '../types/index.js';
 import { createHash } from 'node:crypto';
-import { resolveImageMediaType, isAcceptedImageMediaType, strippedImagePlaceholder } from './image-media.js';
+import { imageForRequest, isAcceptedImage, linkImageNote, type RasterImageMediaType } from './image-media.js';
 import { convertMcpMedia } from './mcp-media.js';
 import { readToolSchema, type ParameterDeclaration, type ToolSchemaReading } from './tool-schema.js';
 
@@ -597,6 +597,48 @@ export function endsWithPartialToolBlock(text: string): boolean {
 const STRUCTURAL_TAG_RE =
   /<\/?(?:antml:)?(?:function_calls|function_results|invoke|result|stdout|error|tool_name)\b/;
 
+/** A tool-result image's data and the label it came with, whether it carries
+ *  them in a `source` or MCP-style as `data` and `mimeType`. A url source's
+ *  image is at its URL, so data the source also carries isn't read as it, as
+ *  the native path reads one (toolResultContentForRequest). The XML replay of
+ *  a split (anthropic-xml's sentSplit) reads a stored result's images with it
+ *  too, so the two read the same blocks as images. */
+export function toolResultImage(block: unknown): { data: unknown; declared: unknown } {
+  const b = block as { source?: { type?: unknown; data?: unknown; mediaType?: unknown; media_type?: unknown }; data?: unknown; mimeType?: unknown };
+  if (!b.source) return { data: b.data, declared: b.mimeType };
+  if (b.source.type === 'url') return { data: undefined, declared: undefined };
+  return { data: b.source.data, declared: b.source.mediaType ?? b.source.media_type };
+}
+
+/** A tool-result image as an xml tool loop takes it: its media type and
+ *  data when the request can send it, or the note that stands in its place.
+ *  One that came as a link gets the link's note, since these results carry
+ *  no links; any other is imageForRequest's decision, which also notes an
+ *  image that came without its data. */
+function xmlResultImage(
+  block: unknown,
+): { mediaType: RasterImageMediaType; data: string; note?: undefined } | { note: { type: 'text'; text: string } } {
+  const source = (block as { source?: unknown }).source;
+  if (typeof source === 'object' && source !== null && (source as { type?: unknown }).type === 'url') {
+    return { note: linkImageNote((source as { url?: unknown }).url) };
+  }
+  const { data, declared } = toolResultImage(block);
+  const image = imageForRequest(data, declared);
+  return image.placeholder ? { note: image.placeholder } : { mediaType: image.mediaType, data: data as string };
+}
+
+/** The text that stands for a tool-result image where XML can't carry it:
+ *  the format and size of an image the request would send, saying the model
+ *  isn't seeing it, or the note for one it wouldn't send. A note can quote
+ *  what the caller gave (a link, a label), so callers guard it as they guard
+ *  the result's own text. */
+function imageNote(block: Extract<ToolResultContentBlock, { type: 'image' }>): string {
+  const image = xmlResultImage(block);
+  if (image.note) return image.note.text;
+  const sizeKb = Math.round((image.data.length * 0.75) / 1024);
+  return `[Image: ${image.mediaType}, ~${sizeKb}KB, not shown to you]`;
+}
+
 function renderResultContentString(result: ToolResult): string {
   if (typeof result.content === 'string') {
     return result.content;
@@ -605,31 +647,13 @@ function renderResultContentString(result: ToolResult): string {
   for (const block of result.content) {
     if (block.type === 'text') {
       parts.push(block.text);
-    } else if (block.type === 'image' && hasNoDataToShow(block)) {
-      parts.push(strippedImagePlaceholder(undefined, block).text);
     } else if (block.type === 'image') {
       // For XML mode, we can't embed images directly. The note says the
       // model isn't seeing it, so the size isn't read as its contents.
-      const sizeKb = Math.round((block.source.data.length * 0.75) / 1024);
-      parts.push(`[Image: ${block.source.mediaType}, ~${sizeKb}KB, not shown to you]`);
+      parts.push(imageNote(block));
     }
   }
   return parts.join('\n');
-}
-
-/**
- * An image a result renderer has no data to show or measure: media in MCP's
- * form that didn't convert (utils/mcp-media.ts), a source that isn't base64,
- * such as a URL, or a base64 source without its data. It gets the
- * stripped-image note, as an image the split can't send does, rather than a
- * TypeError reading its data. The XML replay of a split round
- * (AnthropicXmlFormatter) leaves out the same images, so it sends what the
- * split sent.
- */
-export function hasNoDataToShow(block: { source?: unknown }): boolean {
-  const source = block.source as { type?: unknown; data?: unknown } | null | undefined;
-  return typeof source !== 'object' || source === null || source.type !== 'base64'
-    || typeof source.data !== 'string' || source.data === '';
 }
 
 /**
@@ -1336,17 +1360,13 @@ export interface ProviderImageBlock {
 }
 
 /**
- * Check if any tool result contains image content
+ * Whether any tool result holds an image the request will send as an image:
+ * one whose data is an accepted format. It asks without deciding, so the
+ * placeholder's warning prints once, where the chosen path decides the image.
  */
 export function hasImageInToolResults(results: ToolResult[]): boolean {
-  for (const result of results) {
-    if (Array.isArray(result.content)) {
-      if (result.content.some(block => block.type === 'image')) {
-        return true;
-      }
-    }
-  }
-  return false;
+  return results.some((result) => Array.isArray(result.content)
+    && result.content.some((block) => block.type === 'image' && isAcceptedImage(toolResultImage(block).data)));
 }
 
 /**
@@ -1417,22 +1437,20 @@ export function formatToolResultsForSplitTurn(handed: ToolResult[]): SplitTurnCo
       for (const block of result.content) {
         if (block.type === 'text') {
           textParts.push(guardResultContent(block.text));
-        } else if (block.type === 'image' && hasNoDataToShow(block)) {
-          // A note carries the caller's text (a link, a declared media type), so it
-          // passes the guard the result's own text does.
-          textParts.push(guardResultContent(strippedImagePlaceholder(undefined, block).text));
         } else if (block.type === 'image') {
-          const mediaType = resolveImageMediaType(block.source.data, block.source.mediaType);
-          if (!isAcceptedImageMediaType(mediaType)) {
-            textParts.push(guardResultContent(strippedImagePlaceholder(mediaType, block).text));
+          const image = xmlResultImage(block);
+          if (image.note) {
+            // A note can quote the caller's text (a link, a label), so it
+            // passes the guard the result's own text does.
+            textParts.push(guardResultContent(image.note.text));
           } else {
             resultHasImages = true;
             resultImages.push({
               type: 'image',
               source: {
                 type: 'base64',
-                media_type: mediaType!,
-                data: block.source.data,
+                media_type: image.mediaType,
+                data: image.data,
               },
             });
           }
@@ -1505,13 +1523,9 @@ function formatSingleResultXml(result: ToolResult): string {
     for (const block of result.content) {
       if (block.type === 'text') {
         xml += guardResultContent(block.text);
-      } else if (block.type === 'image' && hasNoDataToShow(block)) {
-        // Notes carry the caller's text, as the split's do.
-        xml += guardResultContent(strippedImagePlaceholder(undefined, block).text);
       } else if (block.type === 'image') {
         // For remaining results after split, images become text placeholders
-        const sizeKb = Math.round((block.source.data.length * 0.75) / 1024);
-        xml += guardResultContent(`[Image: ${block.source.mediaType}, ~${sizeKb}KB, not shown to you]`);
+        xml += guardResultContent(imageNote(block));
       }
     }
   }

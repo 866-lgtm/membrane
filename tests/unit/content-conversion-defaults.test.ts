@@ -61,12 +61,14 @@ describe('toAnthropicContent: the request path refuses to drop content', () => {
   });
 
   it('carries a generated_image back as an image block rather than dropping it', () => {
+    // A real PNG header: data that is no image becomes a placeholder instead.
+    const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]).toString('base64');
     const result = toAnthropicContent([
-      { type: 'generated_image', data: 'SU1HAA==', mimeType: 'image/png' },
+      { type: 'generated_image', data: png, mimeType: 'image/png' },
     ] as ContentBlock[]);
 
     expect(result).toEqual([
-      { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'SU1HAA==' } },
+      { type: 'image', source: { type: 'base64', media_type: 'image/png', data: png } },
     ]);
   });
 
@@ -97,17 +99,18 @@ describe('toAnthropicContent: the request path refuses to drop content', () => {
 describe('fromAnthropicContent: the response path preserves what it cannot normalize', () => {
   it('keeps an unrecognised provider block as a rawItem carrier and warns once', () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => { /* silence */ });
-    const serverToolUse = { type: 'server_tool_use', id: 'ite1', name: 'zz_search_1', input: {} };
+    // A type membrane doesn't know (an Anthropic server-tool block is a known one).
+    const unknownBlock = { type: 'zz_new_block', id: 'ite1', payload: {} };
 
-    const first = fromAnthropicContent([serverToolUse] as never);
-    const second = fromAnthropicContent([serverToolUse] as never);
+    const first = fromAnthropicContent([unknownBlock] as never);
+    const second = fromAnthropicContent([unknownBlock] as never);
 
     expect(first).toHaveLength(1);
-    expect(first[0]).toEqual({ type: 'text', text: '', rawItem: serverToolUse });
+    expect(first[0]).toEqual({ type: 'text', text: '', rawItem: unknownBlock });
     expect(second).toHaveLength(1);
     // Warned about this block type once, not once per conversion.
     expect(warn).toHaveBeenCalledTimes(1);
-    expect(String(warn.mock.calls[0]?.[0])).toContain('server_tool_use');
+    expect(String(warn.mock.calls[0]?.[0])).toContain('zz_new_block');
   });
 
   it('still round-trips the recognised block types (regression)', () => {

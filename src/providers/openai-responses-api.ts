@@ -11,7 +11,7 @@
 
 import { unreportedUsage } from '../utils/usage.js';
 import { createHash, randomUUID } from 'node:crypto';
-import { normalizeResponsesInput } from './responses-input.js';
+import { nativeInputForRequest, normalizeResponsesInput } from './responses-input.js';
 import { fetchWithCredentials, type CredentialResolver } from './credentials.js';
 import { assertMessagePrefillSupported } from './request-capabilities.js';
 
@@ -165,7 +165,12 @@ function headerSafeSessionId(key: string): string {
 
 export class OpenAIResponsesAPIAdapter implements ProviderAdapter {
   readonly name: string = 'openai-responses-api';
-  /** Carries native input items verbatim, and reports what subscription-mode normalization leaves out. */
+  /**
+   * Carries native input items verbatim, and reports what it can't: what
+   * subscription-mode normalization leaves out or changes, and, in either
+   * mode, a native input_image whose data: URL holds no image the API
+   * accepts, which goes as the placeholder.
+   */
   readonly reportsContentAlterations = true;
 
   /**
@@ -457,9 +462,12 @@ export class OpenAIResponsesAPIAdapter implements ProviderAdapter {
 
     // These invariants define the adapter's stateless native-item contract and
     // cannot be overridden through provider params.
+    // The API takes native items as they are, but an input_image whose data:
+    // URL holds no image would be refused on every request, so it goes as the
+    // placeholder in either mode.
     responsesRequest.input = this.subscription
       ? normalizeResponsesInput(request.messages, onContentAltered)
-      : request.messages as OpenAIResponsesInputItem[];
+      : nativeInputForRequest(request.messages, onContentAltered);
     responsesRequest.store = false;
     responsesRequest.include = this.mergeEncryptedReasoningInclude(responsesRequest.include);
     if (this.subscription) {

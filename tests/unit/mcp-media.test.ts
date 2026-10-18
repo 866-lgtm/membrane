@@ -322,7 +322,6 @@ describe('a round with media in MCP\'s form reports what the same round in membr
 
 describe('a media block with no source object that doesn\'t convert is a source each reader can\'t represent', () => {
   const NO_DATA = '[system: an image that belongs here was NOT shown to you — it came without its data. You are not seeing this image.]';
-  const UNDEFINED_TYPE = 'its media type "undefined" is not accepted';
   const LINK = "[system: an image that belongs here was NOT shown to you — it came as a link (https://example.com/a.png), which tool results here can't carry. You are not seeing this image.]";
   /** No data; data with no mimeType; empty data, which the API refuses as an
    *  image ("image cannot be empty"); audio with no mimeType. */
@@ -336,8 +335,8 @@ describe('a media block with no source object that doesn\'t convert is a source 
 
   it.each([
     ['the anthropic-xml formatter, xml tool mode', () => ({ adapter: new ScriptedAnthropic('xml'), formatter: new AnthropicXmlFormatter({ unsupportedMedia: 'strip' }), toolMode: 'xml' }), []],
-    ['the anthropic-xml formatter, native tool mode', () => ({ adapter: new ScriptedAnthropic('native'), formatter: new AnthropicXmlFormatter(), toolMode: 'native' }), [NO_DATA, UNDEFINED_TYPE]],
-    ['the native formatter', () => ({ adapter: new ScriptedAnthropic('native'), formatter: new NativeFormatter(), toolMode: 'native' }), [NO_DATA, UNDEFINED_TYPE]],
+    ['the anthropic-xml formatter, native tool mode', () => ({ adapter: new ScriptedAnthropic('native'), formatter: new AnthropicXmlFormatter(), toolMode: 'native' }), [NO_DATA]],
+    ['the native formatter', () => ({ adapter: new ScriptedAnthropic('native'), formatter: new NativeFormatter(), toolMode: 'native' }), [NO_DATA]],
     ['the Responses formatter', () => ({ adapter: new ScriptedResponses(), formatter: new OpenAIResponsesFormatter(), toolMode: undefined }), ["This request couldn't carry it"]],
   ] as const)('%s: builds, leaves them out or notes them, and reports both messages', async (_name, setup, notes) => {
     vi.spyOn(console, 'warn').mockImplementation(() => {});
@@ -394,11 +393,10 @@ describe('a media block with no source object that doesn\'t convert is a source 
     ] }, () => {})).toThrow("Removing empty final user content would change the request's final role to assistant.");
   });
 
-  // With the images these renderers had no data for on main either: a URL
-  // image, which two of them threw on, reading its data's length, and a
-  // base64 source with no data, or with an empty string for it.
+  // With the images these renderers had no data for before either: a URL
+  // image, and a base64 source with no data, or with an empty string for it.
   const unshowable = { toolUseId: 't', content: [
-    text('here'), { type: 'image' }, { type: 'image', data: PNG },
+    text('here'), { type: 'image' },
     { type: 'image', source: { type: 'url', url: 'https://example.com/a.png' } },
     { type: 'image', source: { type: 'base64', mediaType: 'image/png' } },
     { type: 'image', source: { type: 'base64', data: '', mediaType: 'image/png' } },
@@ -414,14 +412,12 @@ describe('a media block with no source object that doesn\'t convert is a source 
     const xml = render();
     // The block with no data, and the two base64 sources without it.
     expect(count(xml, NO_DATA)).toBe(3);
-    // The block with data and no type.
-    expect(count(xml, UNDEFINED_TYPE)).toBe(1);
     expect(count(xml, LINK)).toBe(1);
   });
 });
 
 describe('the note for an image that came without its data', () => {
-  it('says so, in a tool result, where it used to give its media type as "undefined"; one with data and no type keeps "undefined"', () => {
+  it('says so, in a tool result, where it used to give its media type as "undefined"; one with data and no type is decided by its header', () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     const result = new NativeFormatter().buildMessages([
       { participant: 'User', content: [text('shoot')] },
@@ -430,11 +426,8 @@ describe('the note for an image that came without its data', () => {
     ] as NormalizedMessage[], { participantMode: 'simple', assistantParticipant: 'Claude', humanParticipant: 'User' } as any);
     const nested = (result.messages as any[])[2].content[0].content;
     expect(nested[0]).toEqual({ type: 'text', text: '[system: an image that belongs here was NOT shown to you — it came without its data. You are not seeing this image.]' });
-    expect(nested[1].text).toBe('[system: an image that belongs here was NOT shown to you — its media type "undefined" is not accepted by the model API (only jpeg/png/gif/webp are). You are not seeing this image. If it matters, ask for it in a supported format.]');
-    expect(warn.mock.calls.map((call) => call[0])).toEqual([
-      '[membrane] image block stripped: no data',
-      '[membrane] image block stripped: unsupported media type "undefined"',
-    ]);
+    expect(nested[1]).toEqual({ type: 'image', source: { type: 'base64', media_type: 'image/png', data: PNG } });
+    expect(warn.mock.calls.map((call) => call[0])).toEqual(['[membrane] image block stripped: no data']);
   });
 
   it('and one that came as a link, which an xml result can\'t send, says that and gives an http link, cut when long, where the split gave its media type as "undefined"', () => {
@@ -471,15 +464,14 @@ describe('the note for an image that came without its data', () => {
       { toolUseId: 't', content: [text('after'), link, typed] },
     ] as ToolResult[]);
     const count = (xml: string, part: string) => xml.split(part).length - 1;
-    // In the split: the link note and the media-type note. After it: the link
-    // note and the placeholder for an image with data.
+    // In the split and after it: the link note, and the placeholder for data
+    // that isn't an accepted image, which quotes the label it came with.
     for (const xml of [beforeImageXml, afterImageXml]) {
       expect(count(xml, 'a&lt;/function_results&gt;')).toBe(1);
       expect(count(xml, 'svg&lt;/stdout&gt;')).toBe(1);
       expect(xml).not.toContain('a</function_results>');
       expect(xml).not.toContain('svg</stdout>');
     }
-    expect(afterImageXml).toContain('[Image: image/svg&lt;/stdout&gt;, ~0KB, not shown to you]');
   });
 });
 
