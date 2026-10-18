@@ -334,6 +334,11 @@ const MAX_LOGGED_STOP_REASONS = 64;
 /** Longest stop-reason token printed whole; real tokens are short. */
 const MAX_LOGGED_STOP_REASON_CHARS = 128;
 
+/** A stop token an adapter reported: a non-empty string. */
+function isStopToken(value: unknown): value is string {
+  return typeof value === 'string' && value !== '';
+}
+
 /**
  * Feed a provider chunk to an XML loop's parser, up to the first stop.
  *
@@ -475,9 +480,11 @@ export class Membrane {
         } finally {
           progress.cleanup();
         }
-        // Restate usage in the one convention before any ratio or price sees it.
+        // Restate usage in the one convention before any ratio or price sees it,
+        // and the stop token as membrane carries it (see providerReasonFor).
         const providerResponse: ProviderResponse = {
           ...rawProviderResponse,
+          providerStopReason: this.providerReasonFor(rawProviderResponse),
           usage: normalizeUsageToCacheExcluded(
             rawProviderResponse.usage,
             this.adapter.name,
@@ -1143,7 +1150,7 @@ export class Membrane {
         onResponse?.(rawResponse);
 
         lastStopReason = this.mapStopReason(streamResult.stopReason);
-        lastProviderStopReason = this.providerReasonFor(streamResult, lastStopReason);
+        lastProviderStopReason = streamResult.providerStopReason;
         lastStopSequence = streamResult.stopSequence ?? undefined;
 
         // Accumulate usage (including cache metrics), priced at this round's
@@ -1679,7 +1686,7 @@ export class Membrane {
         onResponse?.(rawResponse);
 
         lastStopReason = this.mapStopReason(streamResult.stopReason);
-        lastProviderStopReason = this.providerReasonFor(streamResult, lastStopReason);
+        lastProviderStopReason = streamResult.providerStopReason;
         lastStopSequence = streamResult.stopSequence ?? undefined;
 
         // Accumulate usage (including cache metrics), priced at this round's
@@ -2717,8 +2724,11 @@ export class Membrane {
       const rawResult = localStops ? localStops.finish(attemptResult) : attemptResult;
       // Restate usage in the one convention before any accumulator, ratio or
       // price sees it — this is the only door streamed usage enters through.
+      // The stop token is settled here too, from the adapter's own stop, before
+      // a local stop sequence, or the XML loop's, replaces its stopReason.
       const result: ProviderResponse = {
         ...rawResult,
+        providerStopReason: this.providerReasonFor(attemptResult),
         usage: normalizeUsageToCacheExcluded(rawResult.usage, this.adapter.name, this.adapter.usageCacheConvention),
       };
       if (result.stopReason !== 'refusal' || retried >= maxAttempts) {
@@ -3009,7 +3019,7 @@ export class Membrane {
       stopReason,
       usage,
       details: {
-        stop: { ...this.buildStopInfo(stopReason, this.providerReasonFor(providerResponse, stopReason), providerResponse.stopSequence), unclosedToolBlock },
+        stop: { ...this.buildStopInfo(stopReason, providerResponse.providerStopReason, providerResponse.stopSequence), unclosedToolBlock },
         usage,
         timing: {
           totalDurationMs: durationMs,
@@ -3286,7 +3296,7 @@ export class Membrane {
           if (warnedStopReasons.size === MAX_LOGGED_STOP_REASONS) {
             console.warn(
               `[membrane] ${MAX_LOGGED_STOP_REASONS} distinct unmapped stop reasons logged; further ones are not ` +
-                '(details.stop.providerReason still carries each)'
+                '(details.stop.providerReason still carries each one an adapter gives without a providerStopReason)'
             );
           }
         }
@@ -3295,20 +3305,26 @@ export class Membrane {
   }
 
   /**
-   * The token details.stop.providerReason carries for an adapter's result:
-   * its providerStopReason, the provider's own token, when it gives one.
-   * Otherwise its stopReason when the normalized reason differs from it,
-   * which today is a token mapStopReason doesn't map and turns into end_turn,
-   * so that token isn't lost behind a clean-looking stop. A stopReason that
-   * is the normalized reason, with no providerStopReason, leaves none: it may
-   * already be the adapter's normalization of the provider's word.
+   * The stop token details.stop.providerReason carries for an adapter's
+   * result: its providerStopReason, the provider's own word, when it gives
+   * one. Otherwise its stopReason when membrane doesn't map that token, so the
+   * token isn't lost behind the end_turn it becomes; that may be the adapter's
+   * own word rather than the provider's. A token membrane maps, given alone,
+   * leaves none: it may already be the adapter's normalization. Only a
+   * non-empty string counts as a token, in either field.
+   *
+   * mapStopReason maps each token it knows to itself, so a token it changes is
+   * one it doesn't map; reading it here logs that token, once per process.
+   * Both doors an adapter's result enters by, complete()'s and streamOnce,
+   * settle the token here, before membrane's own stop, a stop sequence the
+   * XML loop or LocalStopSequences finds, replaces the adapter's stopReason.
    */
   private providerReasonFor(
-    result: Pick<ProviderResponse, 'stopReason' | 'providerStopReason'>,
-    reason: StopReason
+    result: Pick<ProviderResponse, 'stopReason' | 'providerStopReason'>
   ): string | undefined {
-    if (result.providerStopReason !== undefined) return result.providerStopReason;
-    return result.stopReason !== reason ? result.stopReason : undefined;
+    if (isStopToken(result.providerStopReason)) return result.providerStopReason;
+    const token: unknown = result.stopReason;
+    return isStopToken(token) && this.mapStopReason(token) !== token ? token : undefined;
   }
 
   private calculateCacheHitRatio(usage: Pick<DetailedUsage, 'inputTokens' | 'cacheCreationTokens' | 'cacheReadTokens'>): number {
@@ -3853,7 +3869,7 @@ export class Membrane {
 
         rawResponse = streamResult.raw;
         lastStopReason = this.mapStopReason(streamResult.stopReason);
-        lastProviderStopReason = this.providerReasonFor(streamResult, lastStopReason);
+        lastProviderStopReason = streamResult.providerStopReason;
         lastStopSequence = streamResult.stopSequence ?? undefined;
 
         // Accumulate usage (including cache metrics), priced at this round's model
@@ -4461,7 +4477,7 @@ export class Membrane {
 
         rawResponse = streamResult.raw;
         lastStopReason = this.mapStopReason(streamResult.stopReason);
-        lastProviderStopReason = this.providerReasonFor(streamResult, lastStopReason);
+        lastProviderStopReason = streamResult.providerStopReason;
         lastStopSequence = streamResult.stopSequence ?? undefined;
 
         // Attempts this round re-issued past a refusal are billed calls whose

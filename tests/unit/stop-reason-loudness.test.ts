@@ -301,15 +301,15 @@ describe('gemini: a prompt blocked before generation is a refusal whatever the r
  * the only sign the stop wasn't a clean end of turn (#154).
  */
 class BareStopReasonAdapter extends MockAdapter {
-  constructor(private bareStopReason: string, private rawToken?: string) {
-    super();
+  constructor(private bareStopReason: unknown, private rawToken?: unknown, text?: string) {
+    super(text === undefined ? {} : { defaultResponse: text });
   }
 
   private withStop(response: ProviderResponse): ProviderResponse {
     return {
       ...response,
-      stopReason: this.bareStopReason,
-      ...(this.rawToken !== undefined ? { providerStopReason: this.rawToken } : {}),
+      stopReason: this.bareStopReason as string,
+      ...(this.rawToken !== undefined ? { providerStopReason: this.rawToken as string } : {}),
     };
   }
 
@@ -322,7 +322,9 @@ class BareStopReasonAdapter extends MockAdapter {
   }
 }
 
-async function finished(membrane: Membrane, entry: 'complete' | 'stream' | 'yielding', request: NormalizedRequest): Promise<NormalizedResponse> {
+type Entry = 'complete' | 'stream' | 'yielding';
+
+async function finished(membrane: Membrane, entry: Entry, request: NormalizedRequest): Promise<NormalizedResponse> {
   if (entry === 'complete') return membrane.complete(request);
   if (entry === 'stream') return streamed(membrane, request);
   for await (const event of membrane.streamYielding(request)) {
@@ -332,26 +334,73 @@ async function finished(membrane: Membrane, entry: 'complete' | 'stream' | 'yiel
   throw new Error('no completion');
 }
 
+/** The default formatter carries native tools too, so XML tool mode is asked for. */
+function inMode(mode: 'native' | 'xml', adapter: MockAdapter, request: NormalizedRequest = zzRequest) {
+  return {
+    membrane: new Membrane(adapter, mode === 'native' ? { formatter: new NativeFormatter() } : {}),
+    request: mode === 'xml' ? { ...request, toolMode: 'xml' as const } : request,
+  };
+}
+
 describe('an unmapped stop token the adapter gives without providerStopReason', () => {
   for (const entry of ['complete', 'stream', 'yielding'] as const) {
     for (const mode of ['native', 'xml'] as const) {
       it(`${entry}() with ${mode} tools keeps it as providerReason, under end_turn`, async () => {
         vi.spyOn(console, 'warn').mockImplementation(() => {});
-        const adapter = new BareStopReasonAdapter('error');
-        const membrane = new Membrane(adapter, mode === 'native' ? { formatter: new NativeFormatter() } : {});
-        // The default formatter carries native tools too, so XML tool mode is asked for.
-        const response = await finished(membrane, entry, mode === 'xml' ? { ...zzRequest, toolMode: 'xml' } : zzRequest);
+        const { membrane, request } = inMode(mode, new BareStopReasonAdapter('error'));
+        const response = await finished(membrane, entry, request);
         expect(response.stopReason).toBe('end_turn');
         expect(response.details.stop).toMatchObject({ reason: 'end_turn', providerReason: 'error' });
       });
     }
   }
 
-  it("leaves the adapter's providerStopReason as providerReason when it gives one", async () => {
+  // The XML loop finds a stop sequence in the streamed text, and a native
+  // stream's LocalStopSequences finds one, after the adapter has returned:
+  // each replaces the adapter's stopReason with stop_sequence.
+  for (const entry of ['stream', 'yielding'] as const) {
+    for (const mode of ['native', 'xml'] as const) {
+      it(`${entry}() with ${mode} tools keeps it beside a stop sequence membrane finds itself`, async () => {
+        vi.spyOn(console, 'warn').mockImplementation(() => {});
+        const adapter = new BareStopReasonAdapter('error', undefined, 'zz before ZZSTOP zz after');
+        const { membrane, request } = inMode(mode, adapter, { ...zzRequest, stopSequences: ['ZZSTOP'] });
+        const response = await finished(membrane, entry, request);
+        expect(response.stopReason).toBe('stop_sequence');
+        expect(response.details.stop).toMatchObject({ reason: 'stop_sequence', triggeredSequence: 'ZZSTOP', providerReason: 'error' });
+      });
+    }
+  }
+
+  for (const entry of ['complete', 'stream', 'yielding'] as const) {
+    it(`${entry}() leaves the adapter's providerStopReason as providerReason when it gives one`, async () => {
+      vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const membrane = new Membrane(new BareStopReasonAdapter('zz_adapter_word', 'zz_provider_token'));
+      const response = await finished(membrane, entry, zzRequest);
+      expect(response.stopReason).toBe('end_turn');
+      expect(response.details.stop.providerReason).toBe('zz_provider_token');
+    });
+  }
+
+  it('counts a null providerStopReason as none, so the unmapped token is kept', async () => {
     vi.spyOn(console, 'warn').mockImplementation(() => {});
-    const membrane = new Membrane(new BareStopReasonAdapter('zz_adapter_word', 'zz_provider_token'));
-    const response = await membrane.complete(zzRequest);
-    expect(response.stopReason).toBe('end_turn');
-    expect(response.details.stop.providerReason).toBe('zz_provider_token');
+    const response = await new Membrane(new BareStopReasonAdapter('error', null)).complete(zzRequest);
+    expect(response.details.stop.providerReason).toBe('error');
   });
+
+  for (const [name, token] of [['an empty', ''], ['a number as a', 7]] as const) {
+    it(`keeps no providerReason for ${name} stopReason`, async () => {
+      vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const response = await new Membrane(new BareStopReasonAdapter(token)).complete(zzRequest);
+      expect(response.stopReason).toBe('end_turn');
+      expect(response.details.stop.providerReason).toBeUndefined();
+    });
+  }
+
+  for (const token of ['max_tokens', 'stop_sequence', 'tool_use', 'pause_turn', 'refusal'] as const) {
+    it(`keeps no providerReason for ${token}, a token membrane maps, given alone`, async () => {
+      const response = await new Membrane(new BareStopReasonAdapter(token)).complete(zzRequest);
+      expect(response.details.stop.reason).toBe(token);
+      expect(response.details.stop.providerReason).toBeUndefined();
+    });
+  }
 });

@@ -133,12 +133,15 @@ export interface StopInfo {
   wasTruncated: boolean;
 
   /**
-   * The provider's own stop token, verbatim, from ProviderResponse.providerStopReason.
-   * When the adapter gives none, its stopReason if the normalized reason
-   * differs from it (today, a token membrane doesn't map, which becomes
-   * end_turn), so that token isn't lost. Omitted otherwise: when the adapter
-   * gives no providerStopReason and its stopReason is the normalized reason.
-   * This can differ from the normalized reason (for example, OpenAI's length).
+   * The provider's own stop token, verbatim, as the adapter reports it in
+   * ProviderResponse.providerStopReason. When the adapter reports none, its
+   * stopReason if membrane doesn't map that token, so the token isn't lost
+   * behind the end_turn it becomes; that may be the adapter's own word rather
+   * than the provider's. Omitted when the adapter reports no providerStopReason
+   * and its stopReason is a token membrane maps. A null or empty value counts
+   * as none in either field.
+   * This can differ from the normalized reason (for example, OpenAI's length,
+   * or a provider's token beside a stop sequence membrane found itself).
    */
   providerReason?: string;
 
