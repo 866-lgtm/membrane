@@ -422,6 +422,7 @@ describe('the Anthropic adapter\'s stream', () => {
   it('assembles a server tool call\'s input from its input_json_delta fragments', async () => {
     const adapter = new AnthropicAdapter({ apiKey: 'zz-key', cacheKeepalive: { enabled: false } });
     (adapter as any).client = {
+      withOptions() { return this; },
       messages: {
         stream: async () => fakeStream([
           { type: 'message_start', message: { model: 'claude-zz-1', usage: { input_tokens: 10 } } },
@@ -447,7 +448,7 @@ describe('the Anthropic adapter\'s stream', () => {
 
   async function streamed(events: unknown[]): Promise<any> {
     const adapter = new AnthropicAdapter({ apiKey: 'zz-key', cacheKeepalive: { enabled: false } });
-    (adapter as any).client = { messages: { stream: async () => fakeStream(events) } };
+    (adapter as any).client = { withOptions() { return this; }, messages: { stream: async () => fakeStream(events) } };
     return adapter.stream(
       { model: 'claude-zz-1', maxTokens: 64, messages: [{ role: 'user', content: [{ type: 'text', text: 'zz ask' }] }] } as any,
       { onChunk: () => {} } as any,
