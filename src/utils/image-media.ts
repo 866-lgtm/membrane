@@ -12,7 +12,9 @@
  * recognizes each format by its header: an accepted image is labelled by
  * what its header shows, and anything else becomes a text placeholder the
  * agent can see. A header is not proof the rest decodes. A remote image URL
- * goes out as it is, for the provider to fetch.
+ * goes out as it is, for the provider to fetch, where the request can carry
+ * one; an xml tool loop's results can't, and give the link note instead
+ * (linkImageNote).
  */
 
 export type RasterImageMediaType = 'image/jpeg' | 'image/png' | 'image/gif' | 'image/webp';

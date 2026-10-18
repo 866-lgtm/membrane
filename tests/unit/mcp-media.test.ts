@@ -491,6 +491,8 @@ describe('a media block with no source object that doesn\'t convert is a source 
     for (const formatter of [new AnthropicXmlFormatter(), new NativeFormatter(), new OpenAIResponsesFormatter()]) {
       const sent = JSON.stringify(formatter.buildMessages(messages, { participantMode: 'simple', assistantParticipant: 'Claude', humanParticipant: 'User' } as any).messages);
       expect(sent).toContain('look');
+      // Left out: no image of any provider's shape, nor the block as it came.
+      expect(sent).not.toMatch(/"type":"(image|input_image|image_url)"/);
       expect(sent).not.toContain(PNG);
     }
   });

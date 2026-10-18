@@ -26,13 +26,14 @@
  * object becomes `{ ...rest, source: { type: 'base64', data, mediaType } }`,
  * keeping its other fields, its `mimeType` as the `mediaType` where that's a
  * string that isn't empty. An image converts whatever its data and label:
- * every request builder decides an image's data through imageForRequest,
- * which sends what the data's header shows, whatever label it came with, and
- * notes data that is missing, empty or no image it can carry. Nothing decides
- * a document, audio or video that way, since their builders send the source
- * as it is, so one of those converts only with data that isn't empty and a
- * `mimeType`. One that doesn't is left as it is, and each reader treats it as
- * a source it can't represent.
+ * every request builder that sends an image decides its data through
+ * imageForRequest, which sends what the data's header shows, whatever label
+ * it came with, and notes data that is missing, empty or no image it can
+ * carry. Nothing decides a document, audio or video that way, since their
+ * builders send the source as it is, so one of those converts only with data
+ * that isn't empty and a `mimeType`. One that doesn't is left as it is, and
+ * the readers membrane runs after the conversion treat it as a source they
+ * can't represent.
  */
 
 const MEDIA_TYPES: ReadonlySet<unknown> = new Set(['image', 'document', 'audio', 'video']);

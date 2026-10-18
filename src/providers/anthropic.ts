@@ -1192,9 +1192,7 @@ export class AnthropicAdapter implements ProviderAdapter {
  * mixed array (text + image). This is what carries an image returned by a tool
  * (e.g. an MCP fetch_attachment result) all the way to the model. Other block
  * types are not valid inside tool_result.content per the Anthropic API and are
- * dropped, and so is an image whose source is neither, or that has no source
- * object (media in MCP's form that didn't convert, utils/mcp-media.ts).
- * `onPlaceholder` hears each image that goes as the placeholder.
+ * dropped. `onPlaceholder` hears each image that goes as the placeholder.
  */
 function toAnthropicToolResultContent(
   blocks: ContentBlock[],

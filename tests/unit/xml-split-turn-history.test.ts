@@ -449,6 +449,21 @@ describe('the XML replay of a split image round', () => {
     expect(sent(request)).toEqual([ZZ_RED, ZZ_BLUE, ZZ_GREEN]);
   });
 
+  it('splits a round whose only image is a data: URL, and replays it so, as the native path sends one', async () => {
+    const { adapter, response } = await runTurn(
+      [{ text: `zz preamble one\n${CALL_XML}`, ...CALL }, { text: 'zz final answer', stopReason: 'end_turn' }],
+      (_round, ids) => [{ toolUseId: ids[0]!, toolName: 'zz_shot', content: [
+        { type: 'text', text: 'zz shot ok' },
+        { type: 'image', source: { type: 'url', url: `data:image/png;base64,${ZZ_RED}` } },
+      ] as unknown as ToolResultContentBlock[] }],
+    );
+    expect(census(adapter.requests[1]!)).toEqual(['user:text', 'assistant:text', 'user:[image]', 'assistant:text']);
+    expect(JSON.stringify(adapter.requests[1]!.messages)).toContain(ZZ_RED);
+    const { request } = await replay(response.content);
+    expect(census(request)).toEqual(['user:text', 'assistant:text', 'user:[image]', 'assistant:text']);
+    expect(JSON.stringify(request.messages)).toContain(ZZ_RED);
+  });
+
   it('replays two image rounds of one turn, each split where it was sent', async () => {
     const { response } = await runTurn(
       [{ text: `zz preamble one\n${CALL_XML}`, ...CALL }, { text: `zz preamble two\n${CALL_XML}`, ...CALL }, { text: 'zz final answer', stopReason: 'end_turn' }],
