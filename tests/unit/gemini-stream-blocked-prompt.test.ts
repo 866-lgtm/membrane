@@ -110,3 +110,45 @@ describe('gemini streaming surfaces a prompt blocked before generation', () => {
     expect(response.stopReason).toBe('end_turn');
   });
 });
+
+// Gemini's API speaks proto3's JSON mapping, where a null field is unset. A
+// null blockReason blocks nothing, and a candidate whose content and
+// finishReason are null or absent carries no data, on either path.
+describe('gemini reads a null blockReason and a candidate with no data as unset', () => {
+  it('complete(): a null blockReason with no candidates is no block, so the empty response ends end_turn', async () => {
+    const response = await completePayload({ promptFeedback: { blockReason: null }, usageMetadata: { promptTokenCount: 4 } });
+    expect(response.stopReason).toBe('end_turn');
+    expect(response.providerStopReason).toBeUndefined();
+  });
+
+  it('stream(): a null blockReason with no candidates ends no stream, which fails as one cut short', async () => {
+    await expect(streamFrames([{ promptFeedback: { blockReason: null }, usageMetadata: { promptTokenCount: 4 } }]))
+      .rejects.toThrow('Gemini stream ended before a terminal event');
+  });
+
+  it('complete(): a candidate with no data beside a block is a refusal, as the stream reads it', async () => {
+    for (const candidate of [{}, { finishReason: null }, { content: null, finishReason: null }]) {
+      const response = await completePayload({ candidates: [candidate], promptFeedback: { blockReason: 'SAFETY' } });
+      expect(response.stopReason, JSON.stringify(candidate)).toBe('refusal');
+      expect(response.providerStopReason, JSON.stringify(candidate)).toBe('SAFETY');
+    }
+  });
+
+  it('stream(): a candidate with a null finishReason beside a block is a refusal', async () => {
+    const { response } = await streamFrames([
+      { candidates: [{ finishReason: null }], promptFeedback: { blockReason: 'SAFETY' }, usageMetadata: { promptTokenCount: 4 } },
+    ]);
+    expect(response.stopReason).toBe('refusal');
+    expect(response.providerStopReason).toBe('SAFETY');
+  });
+
+  it('stream(): a later frame with a null blockReason keeps the block an earlier frame gave', async () => {
+    const { response } = await streamFrames([
+      { promptFeedback: { blockReason: 'SAFETY' } },
+      { promptFeedback: { blockReason: null }, usageMetadata: { promptTokenCount: 4 } },
+    ]);
+    expect(response.stopReason).toBe('refusal');
+    expect(response.providerStopReason).toBe('SAFETY');
+    expect(response.raw).toMatchObject({ promptFeedback: { blockReason: 'SAFETY' } });
+  });
+});
