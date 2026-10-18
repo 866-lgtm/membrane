@@ -38,17 +38,21 @@
   Bedrock's included, in the build itself, before it places cache markers
   and merges turns, so those requests are what they were before: a provider
   adapter declares `replaysAnthropicServerBlocks`, and NativeFormatter takes
-  `anthropicServerBlocks`, off by default, so a caller that builds with
-  NativeFormatter itself for the Anthropic API, such as a token count,
-  passes `true`. Whether Bedrock accepts them is unknown, and a refusal
-  there would fail every request carrying the conversation. In XML tool
-  mode the turn is text, so these blocks still aren't sent there.
+  `anthropicServerBlocks`, off by default. Whether Bedrock accepts them is
+  unknown, and a refusal there would fail every request carrying the
+  conversation. In XML tool mode the turn is text, so these blocks still
+  aren't sent there.
 - Anthropic API requests for a stored history with such a turn change from
   that turn on: a prompt-cache prefix written before upgrading that reaches
   past the turn no longer matches, and the search results are input tokens on
   every later request. A turn stored through `complete()` before this release
   has no carrier to send, so a model that refuses it with signed thinking
   still refuses it: an upgrade can't restore what was never kept.
+- A caller that builds a request with NativeFormatter itself for the
+  Anthropic API passes `anthropicServerBlocks: true`, or what it builds
+  leaves out the server blocks that inference sends. A host's token count is
+  the usual such caller, connectome-host's `buildCountTokensPayload` among
+  them: without the option its count runs low from a server-tool turn on.
 - Streaming: a server tool's call (`server_tool_use`, `mcp_tool_use`) kept
   the empty `input` of its `content_block_start`, because only a `tool_use`
   assembled its `input_json_delta` fragments. It now holds the input the
