@@ -168,10 +168,21 @@ describe('the rule: what converts, and what stays as it was', () => {
     expect(convertMcpMedia([{ toolUseId: 't', content: [block] }])).toEqual([{ toolUseId: 't', content: [converted] }]);
   });
 
+  it('an image in MCP\'s form with no mimeType becomes membrane\'s with no mediaType, at any depth, since every request decides an image by its header', () => {
+    const block = { type: 'image', data: PNG, annotations: { audience: ['user'] } };
+    const converted = { type: 'image', annotations: { audience: ['user'] }, source: { type: 'base64', data: PNG } };
+    const nested = (inner: unknown) => ({ type: 'tool_result', toolUseId: 't', content: [text('t'), inner] });
+    expect(convertMcpMedia([block])).toStrictEqual([converted]);
+    expect(convertMcpMedia([nested(block)])).toStrictEqual([nested(converted)]);
+  });
+
   it('leaves what doesn\'t fit; gives back the same array when nothing converts, and changes nothing it\'s handed', () => {
     const left = [
       text('t'),
-      { type: 'image', data: PNG }, // no mimeType
+      // No mimeType: nothing decides audio, a document or video by its header.
+      { type: 'audio', data: WAV },
+      { type: 'document', data: PNG },
+      { type: 'video', data: PNG },
       { type: 'image', mimeType: 'image/png' }, // no data
       { type: 'image', data: '', mimeType: 'image/png' }, // empty data, which the API refuses as an image
       { type: 'image', data: 7, mimeType: 'image/png' },
@@ -296,6 +307,51 @@ describe('every path that builds a request carries MCP\'s form as it carries mem
   });
 });
 
+describe('an image in MCP\'s form with no mimeType is sent as the same image with one, since every request decides an image by its header', () => {
+  const png = (labelled: boolean) => (labelled ? mcp('image', PNG, 'image/png') : { type: 'image', data: PNG });
+  /** A PNG at the top of a message and inside a tool_result. */
+  const holding = (labelled: boolean): NormalizedMessage[] => [
+    { participant: 'User', content: [text('look'), png(labelled)] },
+    { participant: 'Claude', content: [{ type: 'tool_use', id: 'shot', name: 'noop', input: {} }] },
+    { participant: 'User', content: [{ type: 'tool_result', toolUseId: 'shot', content: [text('here'), png(labelled)] }] },
+    { participant: 'User', content: [text('go on')] },
+  ] as NormalizedMessage[];
+
+  it.each([
+    ['the anthropic-xml formatter, xml tool mode', () => ({ adapter: new ScriptedAnthropic('xml'), formatter: new AnthropicXmlFormatter(), toolMode: 'xml' })],
+    ['the anthropic-xml formatter, native tool mode', () => ({ adapter: new ScriptedAnthropic('native'), formatter: new AnthropicXmlFormatter(), toolMode: 'native' })],
+    ['the native formatter', () => ({ adapter: new ScriptedAnthropic('native'), formatter: new NativeFormatter(), toolMode: 'native' })],
+    ['the Responses formatter', () => ({ adapter: new ScriptedResponses(), formatter: new OpenAIResponsesFormatter(), toolMode: undefined })],
+  ] as const)('through %s', async (_name, setup) => {
+    const run = async (labelled: boolean) => {
+      const { adapter, formatter, toolMode } = setup();
+      const request = { messages: holding(labelled), config, promptCaching: false, ...(toolMode ? { toolMode, tools: [noop] } : {}) } as NormalizedRequest;
+      const { rounds } = await turn('streamYielding', new Membrane(adapter as ProviderAdapter, { formatter }), request);
+      return { rounds, sent: adapter.sent };
+    };
+    const unlabelled = await run(false);
+    expect(unlabelled).toEqual(await run(true));
+    expect(JSON.stringify(unlabelled.sent)).toContain(PNG);
+  });
+
+  it('the Anthropic adapter\'s request built directly, and the xml result renderers', () => {
+    const adapter = new AnthropicAdapter({ apiKey: 'test', cacheKeepalive: { enabled: false } }) as any;
+    const built = (labelled: boolean) => adapter.buildRequest({ model: 'claude-sonnet-4-5', maxTokens: 64, messages: [
+      { role: 'user', content: [text('look'), png(labelled)] },
+      { role: 'assistant', content: [{ type: 'tool_use', id: 'shot', name: 'noop', input: {} }] },
+      { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'shot', content: [text('here'), png(labelled)] }] },
+    ] }).messages;
+    const image = { type: 'image', source: { type: 'base64', media_type: 'image/png', data: PNG } };
+    expect(built(false)).toEqual(built(true));
+    expect(built(false)[0].content[1]).toEqual(image);
+    expect(built(false)[2].content[0].content[1]).toEqual(image);
+    const results = (labelled: boolean) => [{ toolUseId: 'a', toolName: 'noop', content: [text('shot'), png(labelled)] }] as ToolResult[];
+    expect(formatToolResults(results(false))).toBe(formatToolResults(results(true)));
+    expect(formatToolResultsForSplitTurn(results(false))).toEqual(formatToolResultsForSplitTurn(results(true)));
+    expect(formatToolResultsForSplitTurn(results(false)).images).toEqual([image]);
+  });
+});
+
 describe('a round with media in MCP\'s form reports what the same round in membrane\'s form reports', () => {
   it.each([
     ['the anthropic-xml formatter, xml tool mode', () => ({ adapter: new ScriptedAnthropic('xml'), formatter: new AnthropicXmlFormatter(), toolMode: 'xml' })],
@@ -323,9 +379,9 @@ describe('a round with media in MCP\'s form reports what the same round in membr
 describe('a media block with no source object that doesn\'t convert is a source each reader can\'t represent', () => {
   const NO_DATA = '[system: an image that belongs here was NOT shown to you — it came without its data. You are not seeing this image.]';
   const LINK = "[system: an image that belongs here was NOT shown to you — it came as a link (https://example.com/a.png), which tool results here can't carry. You are not seeing this image.]";
-  /** No data; data with no mimeType; empty data, which the API refuses as an
-   *  image ("image cannot be empty"); audio with no mimeType. */
-  const unconvertible = () => [{ type: 'image' }, { type: 'image', data: PNG }, { type: 'image', data: '', mimeType: 'image/png' }, { type: 'audio', data: WAV }];
+  /** No data; empty data, which the API refuses as an image ("image cannot
+   *  be empty"); audio with no mimeType. */
+  const unconvertible = () => [{ type: 'image' }, { type: 'image', data: '', mimeType: 'image/png' }, { type: 'audio', data: WAV }];
   const holding = (): NormalizedMessage[] => [
     { participant: 'User', content: [text('look'), ...unconvertible()] },
     { participant: 'Claude', content: [{ type: 'tool_use', id: 'shot', name: 'noop', input: {} }] },
@@ -376,7 +432,7 @@ describe('a media block with no source object that doesn\'t convert is a source 
   it('the Anthropic adapter built directly drops a message it left empty, and refuses when that message was the last, since the final role would change', () => {
     vi.spyOn(console, 'warn').mockImplementation(() => {});
     const adapter = new AnthropicAdapter({ apiKey: 'test', cacheKeepalive: { enabled: false } }) as any;
-    const lone = { type: 'image', data: PNG }; // no mimeType: can't convert
+    const lone = { type: 'image' }; // no data: can't convert
     const reported: unknown[] = [];
     const built = adapter.buildRequest({ model: 'claude-sonnet-4-5', maxTokens: 64, messages: [
       { role: 'user', content: [lone] },
@@ -389,7 +445,7 @@ describe('a media block with no source object that doesn\'t convert is a source 
     expect(() => adapter.buildRequest({ model: 'claude-sonnet-4-5', maxTokens: 64, messages: [
       { role: 'user', content: [text('look')] },
       { role: 'assistant', content: [text('ok')] },
-      { role: 'user', content: [{ type: 'image', data: PNG }] },
+      { role: 'user', content: [{ type: 'image' }] },
     ] }, () => {})).toThrow("Removing empty final user content would change the request's final role to assistant.");
   });
 
