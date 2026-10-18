@@ -1205,9 +1205,9 @@ function toAnthropicToolResultContent(
     if (block.type === 'text') {
       out.push({ type: 'text', text: block.text });
     } else if (block.type === 'image') {
-      const image = block.source?.type === 'base64'
+      const image = block.source.type === 'base64'
         ? anthropicImage(block.source.data, block.source.mediaType ?? (block.source as { media_type?: string }).media_type)
-        : block.source?.type === 'url' ? anthropicUrlImage(block.source.url) : undefined;
+        : block.source.type === 'url' ? anthropicUrlImage(block.source.url) : undefined;
       if (image?.type === 'text') onPlaceholder?.();
       if (image) out.push(image);
     }

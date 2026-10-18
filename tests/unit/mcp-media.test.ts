@@ -486,6 +486,15 @@ describe('a media block with no source object that doesn\'t convert is a source 
     expect(sent).not.toContain('"data":""');
   });
 
+  it('a formatter called directly, past the conversion, takes an image with no source object at the top of a message as such a source too', () => {
+    const messages = [{ participant: 'User', content: [text('look'), mcp('image', PNG, 'image/png')] }] as NormalizedMessage[];
+    for (const formatter of [new AnthropicXmlFormatter(), new NativeFormatter(), new OpenAIResponsesFormatter()]) {
+      const sent = JSON.stringify(formatter.buildMessages(messages, { participantMode: 'simple', assistantParticipant: 'Claude', humanParticipant: 'User' } as any).messages);
+      expect(sent).toContain('look');
+      expect(sent).not.toContain(PNG);
+    }
+  });
+
   it('the Anthropic adapter built directly leaves them out, at the top of a message and in a tool_result, and reports each block it was handed', () => {
     const adapter = new AnthropicAdapter({ apiKey: 'test', cacheKeepalive: { enabled: false } }) as any;
     const top = unconvertible();
