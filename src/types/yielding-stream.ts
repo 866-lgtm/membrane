@@ -53,6 +53,7 @@ export interface ToolCallsEvent {
  * own report. Streams created with `emitUsage: false` emit no usage events,
  * so no round reports either. A round whose response arrives after the
  * stream was cancelled isn't reported: the stream ended at its aborted event.
+ * Nor is a round the cancel aborts in flight, since no response arrives.
  */
 export interface UsageEvent {
   type: 'usage';
