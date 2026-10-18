@@ -198,6 +198,13 @@ describe.each(Object.entries(MODES))('Responses function-tool strictness, %s', (
     ]));
 
     await expect(sending).rejects.toThrow('the function tool at tools[1], which has no name, has strict set to "yes";');
+    // An empty name is no name, on a flat function, and a Chat-style one has none of its own.
+    for (const nameless of [
+      { type: 'function', name: '', parameters: SCHEMA, strict: 'yes' },
+      { type: 'function', function: { parameters: SCHEMA, strict: 'yes' } },
+    ]) {
+      await expect(mode.adapter().complete(request([nameless]))).rejects.toThrow('the function tool at tools[0], which has no name, has strict set to "yes";');
+    }
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
@@ -390,6 +397,43 @@ describe('save_recent_image through Membrane', () => {
       expect(fetchMock).not.toHaveBeenCalled();
     },
   );
+
+  it('refuses on a retry with the retry\'s own request, not the attempt sent before it', async () => {
+    // The first attempt is sent and answered 500, which Membrane retries; a
+    // beforeRequest hook gives the retry a tool whose strict is refused. The
+    // refusal must carry the retry's request, though Membrane holds the first.
+    const fetchMock = vi.fn()
+      .mockImplementationOnce(async () => new Response(JSON.stringify({ error: { message: 'boom', type: 'server_error' } }), {
+        status: 500,
+        headers: { 'Content-Type': 'application/json' },
+      }))
+      .mockImplementation(async () => completedJson());
+    vi.stubGlobal('fetch', fetchMock);
+    const refusedTools = frozen([{ type: 'function', name: 'save_recent_image', parameters: SAVE_RECENT_IMAGE.inputSchema, strict: 'yes' }]);
+    let attempt = 0;
+    const membrane = new Membrane(new OpenAIResponsesAPIAdapter({ apiKey: 'sk-test' }), {
+      formatter: new OpenAIResponsesFormatter(),
+      assistantParticipant: 'Astra',
+      retry: { maxRetries: 2, retryDelayMs: 1 },
+      hooks: {
+        beforeRequest: (_request, providerRequest) =>
+          (++attempt === 2 ? { ...(providerRequest as object), tools: refusedTools } : providerRequest),
+      },
+    });
+
+    const error = await membrane.complete({
+      messages: [{ participant: 'nissa', content: [{ type: 'text', text: 'Keep that screenshot.' }] }],
+      config: { model: 'gpt-5.6', maxTokens: 100 },
+      tools: [SAVE_RECENT_IMAGE],
+    }).catch((caught: unknown) => caught);
+
+    expect(attempt).toBe(2);
+    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(error).toMatchObject({ type: 'invalid_request', retryable: false });
+    const sent = JSON.parse(String((fetchMock.mock.calls[0]![1] as RequestInit).body)) as { tools: unknown };
+    expect(sent.tools).toEqual([expect.objectContaining({ name: 'save_recent_image', strict: false })]);
+    expect(((error as MembraneError).rawRequest as { tools?: unknown }).tools).toEqual(refusedTools);
+  });
 
   it('reaches the subscription wire with strict:false from an Anthropic-shaped input_schema (native formatter)', async () => {
     const fetchMock = stubFetch(completedSse);

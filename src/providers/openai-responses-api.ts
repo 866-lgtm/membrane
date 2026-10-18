@@ -155,11 +155,14 @@ export interface OpenAIResponsesAPIAdapterConfig {
 /**
  * The `strict` a function tool is sent with: an explicit boolean as given,
  * `false` when omitted or null (see {@link OpenAIResponsesAPIAdapter.convertTools}),
- * and a refusal naming the tool for anything else. The refusal says what kind
- * of value it found, quoting only a short string, so a caller's value isn't
- * copied into logs whole. It carries `rawRequest`, the request as built when
- * it was refused, holding the tool: an error without one would be given the
- * last request sent before it, which isn't the one refused.
+ * and a refusal naming the tool for anything else. The refusal's message says
+ * what kind of value it found, quoting only a short string, so the message
+ * doesn't copy a caller's value whole. The refusal carries `rawRequest`, the
+ * request as far as it was built when refused: provider params merged, and
+ * the tools and input as the caller gave them, the refused tool among them.
+ * It's evidence of what was refused, not a body to send. Without it, Membrane
+ * would give the error the last request it sent in the turn, where there was
+ * one, which isn't the one refused.
  */
 function functionToolStrictness(toolName: unknown, strict: unknown, position: number, rawRequest: unknown): boolean {
   if (strict === undefined || strict === null) return false;
@@ -573,7 +576,7 @@ export class OpenAIResponsesAPIAdapter implements ProviderAdapter {
    * Responses namespace tool, whose member functions keep whatever `strict`
    * they were given. Membrane builds no container tools, so one arrives only
    * as a caller wrote it, in the API's own shape. A refusal carries
-   * `rawRequest`, the request being built, as its own.
+   * `rawRequest`, the request as far as it was built, as its own.
    */
   private convertTools(tools: unknown[], rawRequest: unknown): unknown[] {
     return tools.map((rawTool: any, position) => {
