@@ -3282,12 +3282,18 @@ export class Membrane {
         if (!warnedStopReasons.has(adapterReason) && warnedStopReasons.size < MAX_LOGGED_STOP_REASONS) {
           warnedStopReasons.add(adapterReason);
           // The token is the server's own text: printed as a JSON string, so
-          // a newline can't forge a log line, and cut to a token's length.
-          const shown = JSON.stringify(
-            adapterReason.length > MAX_LOGGED_STOP_REASON_CHARS
-              ? `${adapterReason.slice(0, MAX_LOGGED_STOP_REASON_CHARS)}…`
-              : adapterReason
-          );
+          // a newline can't forge a log line, and cut to a token's length. A
+          // JavaScript adapter can return one that isn't a string, outside its
+          // type; that is named by its kind and never read, so the log line
+          // can't throw and fail the call.
+          const token: unknown = adapterReason;
+          const shown = typeof token === 'string'
+            ? JSON.stringify(
+              token.length > MAX_LOGGED_STOP_REASON_CHARS
+                ? `${token.slice(0, MAX_LOGGED_STOP_REASON_CHARS)}…`
+                : token
+            )
+            : `${token === null ? 'null' : typeof token} (not a string)`;
           console.warn(
             `[membrane] Unmapped adapter stop reason ${shown} normalized to end_turn ` +
               '(details.stop.providerReason carries the adapter\'s providerStopReason, or this token when it gives none; ' +
