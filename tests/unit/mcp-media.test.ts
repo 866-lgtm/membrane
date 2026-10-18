@@ -473,7 +473,7 @@ describe('a media block with no source object that doesn\'t convert is a source 
 });
 
 describe('the note for an image that came without its data', () => {
-  it('says so, in a tool result, where it used to give its media type as "undefined"; one with data and no type is decided by its header', () => {
+  it('says so, in a tool result, where it gave the note for data that is no accepted image; one with data and no type is decided by its header', () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     const result = new NativeFormatter().buildMessages([
       { participant: 'User', content: [text('shoot')] },
@@ -486,7 +486,7 @@ describe('the note for an image that came without its data', () => {
     expect(warn.mock.calls.map((call) => call[0])).toEqual(['[membrane] image block stripped: no data']);
   });
 
-  it('and one that came as a link, which an xml result can\'t send, says that and gives an http link, cut when long, where the split gave its media type as "undefined"', () => {
+  it('and one that came as a link, which an xml result can\'t send, says that and gives an http link, cut when long, where the split gave the note for data that is no accepted image', () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     const link = (url: unknown) => ({ type: 'image', source: { type: 'url', url } }) as any;
     const long = `https://example.com/${'a'.repeat(3000)}`;
