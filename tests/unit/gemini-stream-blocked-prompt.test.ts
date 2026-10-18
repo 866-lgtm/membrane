@@ -126,20 +126,39 @@ describe('gemini reads a null blockReason and a candidate with no data as unset'
       .rejects.toThrow('Gemini stream ended before a terminal event');
   });
 
-  it('complete(): a candidate with no data beside a block is a refusal, as the stream reads it', async () => {
-    for (const candidate of [{}, { finishReason: null }, { content: null, finishReason: null }]) {
-      const response = await completePayload({ candidates: [candidate], promptFeedback: { blockReason: 'SAFETY' } });
-      expect(response.stopReason, JSON.stringify(candidate)).toBe('refusal');
-      expect(response.providerStopReason, JSON.stringify(candidate)).toBe('SAFETY');
+  it('a candidate with no data beside a block is a refusal on both paths', async () => {
+    for (const candidate of [{}, { finishReason: null }, { content: null }, { content: null, finishReason: null }]) {
+      const payload = { candidates: [candidate], promptFeedback: { blockReason: 'SAFETY' }, usageMetadata: { promptTokenCount: 4 } };
+      const completed = await completePayload(payload);
+      const { response: streamed } = await streamFrames([payload]);
+      for (const [path, response] of [['complete()', completed], ['stream()', streamed]] as const) {
+        expect(response.stopReason, `${path} ${JSON.stringify(candidate)}`).toBe('refusal');
+        expect(response.providerStopReason, `${path} ${JSON.stringify(candidate)}`).toBe('SAFETY');
+      }
     }
   });
 
-  it('stream(): a candidate with a null finishReason beside a block is a refusal', async () => {
-    const { response } = await streamFrames([
-      { candidates: [{ finishReason: null }], promptFeedback: { blockReason: 'SAFETY' }, usageMetadata: { promptTokenCount: 4 } },
-    ]);
-    expect(response.stopReason).toBe('refusal');
-    expect(response.providerStopReason).toBe('SAFETY');
+  it('a candidate with a finish reason beside a block wins over it on both paths', async () => {
+    const payload = { candidates: [{ finishReason: 'STOP' }], promptFeedback: { blockReason: 'SAFETY' }, usageMetadata: { promptTokenCount: 4 } };
+    const completed = await completePayload(payload);
+    const { response: streamed } = await streamFrames([payload]);
+    for (const [path, response] of [['complete()', completed], ['stream()', streamed]] as const) {
+      expect(response.stopReason, path).toBe('end_turn');
+      expect(response.providerStopReason, path).toBe('STOP');
+    }
+  });
+
+  it('a candidate with content and no finish reason beside a block wins over it, and a stream still needs its terminal event', async () => {
+    const payload = {
+      candidates: [{ content: { parts: [{ text: 'zz-answer' }] } }],
+      promptFeedback: { blockReason: 'SAFETY' },
+      usageMetadata: { promptTokenCount: 4 },
+    };
+    const completed = await completePayload(payload);
+    expect(completed.stopReason).toBe('end_turn');
+    expect(completed.content).toEqual([{ type: 'text', text: 'zz-answer' }]);
+    expect(completed.providerStopReason).toBeUndefined();
+    await expect(streamFrames([payload])).rejects.toThrow('Gemini stream ended before a terminal event');
   });
 
   it('stream(): a later frame with a null blockReason keeps the block an earlier frame gave', async () => {
