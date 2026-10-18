@@ -15,6 +15,7 @@ import { MockAdapter } from '../../src/providers/mock.js';
 import { GeminiAdapter } from '../../src/providers/gemini.js';
 import { OpenAICompletionsAdapter } from '../../src/providers/openai-completions.js';
 import { isAbortedResponse } from '../../src/types/index.js';
+import { MembraneError } from '../../src/types/errors.js';
 import type { NormalizedRequest, NormalizedResponse } from '../../src/types/index.js';
 import type { ProviderRequest, ProviderRequestOptions, ProviderResponse, StreamCallbacks } from '../../src/types/provider.js';
 
@@ -55,7 +56,7 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-describe('a null finish reason is a plain end of turn', () => {
+describe('a null finish reason is no finish reason', () => {
   it('openai-completions complete()', async () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     vi.stubGlobal('fetch', json({
@@ -106,8 +107,6 @@ describe('a null finish reason is a plain end of turn', () => {
   // A control: the stream reads a finish reason only when it's truthy, so a
   // null one never reached the mapper there. After [DONE] the mapper reads the
   // missing one, which pins the guard's undefined half for this adapter.
-  // (Gemini's stream reads one the same way. There a finish reason is what
-  // ends the stream, and one that never comes is a dropped connection.)
   it('openai-completions stream()', async () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     vi.stubGlobal('fetch', sse([
@@ -117,6 +116,22 @@ describe('a null finish reason is a plain end of turn', () => {
     const response = await streamed(new Membrane(completions()));
     expect(response.stopReason).toBe('end_turn');
     expect(unmappedWarnings(warn)).toEqual([]);
+  });
+
+  // Gemini's stream reads a finish reason the same way, and there a finish
+  // reason is what ends the stream: one that gives only null ones never ended.
+  it('gemini stream() whose frames give only a null finish reason fails as a dropped connection', async () => {
+    vi.stubGlobal('fetch', sse([
+      { candidates: [{ content: { parts: [{ text: 'zz-half' }] }, finishReason: null }] },
+      { candidates: [{ content: { parts: [{ text: ' a turn' }] }, finishReason: null }] },
+    ]));
+    const failure = await gemini().stream(adapterRequest, { onChunk: () => {} } as unknown as StreamCallbacks).then(
+      (value) => { throw new Error(`expected a dropped connection, resolved with ${JSON.stringify(value)}`); },
+      (error: unknown) => error,
+    );
+    expect(failure).toBeInstanceOf(MembraneError);
+    expect((failure as MembraneError).message).toMatch(/stream ended before a terminal event/);
+    expect((failure as MembraneError).retryable).toBe(true);
   });
 });
 
@@ -139,13 +154,14 @@ function adapterGiving(stopReason: () => unknown) {
   })();
 }
 
-const notCarried = "details.stop.providerReason carries only the adapter's providerStopReason, if it gives one, " +
-  "since this isn't a non-empty string; logged once per reason)";
+/** What the line says details.stop.providerReason carries, the same for every stop reason. */
+const disclosed = "details.stop.providerReason carries the adapter's providerStopReason if that's a non-empty string, " +
+  "else this stop reason if it's one; logged once per reason)";
 
 // Each case prints its stop reason differently, so each is the first time this
 // file's process logs it.
 describe("membrane's log of an unmapped stop reason", () => {
-  it('prints null rather than failing the call, once, and says providerReason does not carry it', async () => {
+  it('prints null rather than failing the call, once, and leaves providerReason unset', async () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     const membrane = new Membrane(adapterGiving(() => null));
     const first = await membrane.complete(zzRequest);
@@ -154,7 +170,7 @@ describe("membrane's log of an unmapped stop reason", () => {
     expect(second.stopReason).toBe('end_turn');
     expect(first.details.stop.providerReason).toBeUndefined();
     expect(unmappedWarnings(warn)).toEqual([
-      `[membrane] Unmapped adapter stop reason null (not a string) normalized to end_turn (${notCarried}`,
+      `[membrane] Unmapped adapter stop reason null (not a string) normalized to end_turn (${disclosed}`,
     ]);
   });
 
@@ -163,7 +179,7 @@ describe("membrane's log of an unmapped stop reason", () => {
     const response = await streamed(new Membrane(adapterGiving(() => undefined)));
     expect(response.stopReason).toBe('end_turn');
     expect(unmappedWarnings(warn)).toEqual([
-      `[membrane] Unmapped adapter stop reason undefined (not a string) normalized to end_turn (${notCarried}`,
+      `[membrane] Unmapped adapter stop reason undefined (not a string) normalized to end_turn (${disclosed}`,
     ]);
   });
 
@@ -172,7 +188,16 @@ describe("membrane's log of an unmapped stop reason", () => {
     const response = await new Membrane(adapterGiving(() => 5)).complete(zzRequest);
     expect(response.stopReason).toBe('end_turn');
     expect(unmappedWarnings(warn)).toEqual([
-      `[membrane] Unmapped adapter stop reason 5 (not a string) normalized to end_turn (${notCarried}`,
+      `[membrane] Unmapped adapter stop reason 5 (not a string) normalized to end_turn (${disclosed}`,
+    ]);
+  });
+
+  it('prints a bigint by its kind rather than failing the call', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const response = await new Membrane(adapterGiving(() => 5n)).complete(zzRequest);
+    expect(response.stopReason).toBe('end_turn');
+    expect(unmappedWarnings(warn)).toEqual([
+      `[membrane] Unmapped adapter stop reason bigint (not a string) normalized to end_turn (${disclosed}`,
     ]);
   });
 
@@ -183,19 +208,17 @@ describe("membrane's log of an unmapped stop reason", () => {
       expect((await membrane.complete(zzRequest)).stopReason).toBe('end_turn');
     }
     expect(unmappedWarnings(warn)).toEqual([
-      `[membrane] Unmapped adapter stop reason object (not a string) normalized to end_turn (${notCarried}`,
+      `[membrane] Unmapped adapter stop reason object (not a string) normalized to end_turn (${disclosed}`,
     ]);
   });
 
-  it('says providerReason carries a token the adapter gives without a providerStopReason', async () => {
+  it('prints a token as a JSON string, which providerReason carries when the adapter gives no providerStopReason', async () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     const response = await new Membrane(adapterGiving(() => 'zz_unmapped_token')).complete(zzRequest);
     expect(response.stopReason).toBe('end_turn');
     expect(response.details.stop.providerReason).toBe('zz_unmapped_token');
     expect(unmappedWarnings(warn)).toEqual([
-      '[membrane] Unmapped adapter stop reason "zz_unmapped_token" normalized to end_turn ' +
-        "(details.stop.providerReason carries the adapter's providerStopReason, or this token when it gives none; " +
-        'logged once per reason)',
+      `[membrane] Unmapped adapter stop reason "zz_unmapped_token" normalized to end_turn (${disclosed}`,
     ]);
   });
 });

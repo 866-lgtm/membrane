@@ -3304,18 +3304,16 @@ export class Membrane {
         const shown = shownStopReason(adapterReason);
         if (!warnedStopReasons.has(shown) && warnedStopReasons.size < MAX_LOGGED_STOP_REASONS) {
           warnedStopReasons.add(shown);
-          const disclosed = isStopToken(adapterReason)
-            ? 'details.stop.providerReason carries the adapter\'s providerStopReason, or this token when it gives none'
-            : 'details.stop.providerReason carries only the adapter\'s providerStopReason, if it gives one, ' +
-              'since this isn\'t a non-empty string';
           console.warn(
-            `[membrane] Unmapped adapter stop reason ${shown} normalized to end_turn (${disclosed}; logged once per reason)`
+            `[membrane] Unmapped adapter stop reason ${shown} normalized to end_turn ` +
+              '(details.stop.providerReason carries the adapter\'s providerStopReason if that\'s a non-empty string, ' +
+              'else this stop reason if it\'s one; logged once per reason)'
           );
           if (warnedStopReasons.size === MAX_LOGGED_STOP_REASONS) {
             console.warn(
               `[membrane] ${MAX_LOGGED_STOP_REASONS} distinct unmapped stop reasons logged; further ones are not ` +
-                '(details.stop.providerReason still carries the adapter\'s providerStopReason, or else an unmapped ' +
-                'stop reason that is a non-empty string)'
+                '(details.stop.providerReason still carries the adapter\'s providerStopReason if that\'s a non-empty ' +
+                'string, else the stop reason if it\'s one)'
             );
           }
         }
