@@ -830,6 +830,8 @@ export class GeminiAdapter implements ProviderAdapter {
   }
 
   private mapFinishReason(reason: string | undefined): string {
+    // No reason (or a null one) is a plain end of turn.
+    if (reason == null) return 'end_turn';
     switch (reason) {
       case 'STOP':
         return 'end_turn';
@@ -847,8 +849,6 @@ export class GeminiAdapter implements ProviderAdapter {
       case 'TOOL_CALLS':
       case 'FUNCTION_CALL':
         return 'tool_use';
-      case undefined:
-        return 'end_turn';
       // MALFORMED_FUNCTION_CALL, LANGUAGE, OTHER and anything Google adds
       // next have no membrane member; they travel as the provider's own
       // token. Membrane normalizes it to end_turn, since callers switch on a

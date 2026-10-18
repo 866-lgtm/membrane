@@ -326,14 +326,36 @@ function isBuildRefusal(error: unknown): error is MembraneError {
 }
 
 /**
- * Stop reasons membrane has already logged as unmapped (see mapStopReason).
- * A server can send a fresh token on every response (one carrying an id, say),
- * so the set stops growing at MAX_LOGGED_STOP_REASONS.
+ * Stop reasons membrane has already logged as unmapped (see mapStopReason),
+ * as the log line printed them (see shownStopReason). A server can send a
+ * fresh token on every response (one carrying an id, say), so the set stops
+ * growing at MAX_LOGGED_STOP_REASONS.
  */
 const warnedStopReasons = new Set<string>();
 const MAX_LOGGED_STOP_REASONS = 64;
 /** Longest stop-reason token printed whole; real tokens are short. */
 const MAX_LOGGED_STOP_REASON_CHARS = 128;
+
+/**
+ * A stop reason as the unmapped-reason log line prints it, which is also the
+ * key it's logged once by. A string is printed as a JSON string, so a newline
+ * can't forge a log line, cut to a token's length. An adapter can return a
+ * stop reason outside its type, passing on a server's value or written in
+ * JavaScript. A number, null or undefined is then printed by its value, which
+ * is short and holds no quote or line break, and anything else by its kind,
+ * each marked as not a string. Such a value is never read as a string, so
+ * printing it can't throw and fail the call, and a fresh object on every
+ * response is one reason rather than a new one each time.
+ */
+function shownStopReason(reason: unknown): string {
+  if (typeof reason === 'string') {
+    return JSON.stringify(
+      reason.length > MAX_LOGGED_STOP_REASON_CHARS ? `${reason.slice(0, MAX_LOGGED_STOP_REASON_CHARS)}…` : reason
+    );
+  }
+  const byValue = reason == null || typeof reason === 'number';
+  return `${byValue ? String(reason) : typeof reason} (not a string)`;
+}
 
 /** A stop token an adapter reported: a non-empty string. */
 function isStopToken(value: unknown): value is string {
@@ -3281,37 +3303,33 @@ export class Membrane {
         // mapping — downstream consumers react to refusals (chapterx adds a
         // Discord reaction). Defaulting this to end_turn silently hid them.
         return 'refusal';
-      default:
+      default: {
         // Unknown reasons still normalize to end_turn — callers switch on a
         // closed union — but never silently: the raw token is disclosed as
-        // details.stop.providerReason (the adapter's providerStopReason, or
-        // this token when it gives none; see providerReasonFor) and the
-        // mapping is logged, once per token per process (a compatible server
-        // may send its own token on every response). Provider enums grow, and
-        // the last time this default swallowed a member it hid safety
-        // refusals in production.
-        if (!warnedStopReasons.has(adapterReason) && warnedStopReasons.size < MAX_LOGGED_STOP_REASONS) {
-          warnedStopReasons.add(adapterReason);
-          // The token is the server's own text: printed as a JSON string, so
-          // a newline can't forge a log line, and cut to a token's length.
-          const shown = JSON.stringify(
-            adapterReason.length > MAX_LOGGED_STOP_REASON_CHARS
-              ? `${adapterReason.slice(0, MAX_LOGGED_STOP_REASON_CHARS)}…`
-              : adapterReason
-          );
+        // details.stop.providerReason (the adapter's providerStopReason when
+        // it's a non-empty string, or else this stop reason when it is one;
+        // see providerReasonFor) and the mapping is logged, once per reason
+        // per process (a compatible server may send its own token on every
+        // response). Provider enums grow, and the last time this default
+        // swallowed a member it hid safety refusals in production.
+        const shown = shownStopReason(adapterReason);
+        if (!warnedStopReasons.has(shown) && warnedStopReasons.size < MAX_LOGGED_STOP_REASONS) {
+          warnedStopReasons.add(shown);
           console.warn(
             `[membrane] Unmapped adapter stop reason ${shown} normalized to end_turn ` +
-              '(details.stop.providerReason carries the adapter\'s providerStopReason, or this token when it gives none; ' +
-              'logged once per reason)'
+              '(details.stop.providerReason carries the adapter\'s providerStopReason if that\'s a non-empty string, ' +
+              'else this stop reason if it\'s one; logged once per reason)'
           );
           if (warnedStopReasons.size === MAX_LOGGED_STOP_REASONS) {
             console.warn(
               `[membrane] ${MAX_LOGGED_STOP_REASONS} distinct unmapped stop reasons logged; further ones are not ` +
-                '(details.stop.providerReason still carries each one an adapter gives without a providerStopReason)'
+                '(details.stop.providerReason still carries the adapter\'s providerStopReason if that\'s a non-empty ' +
+                'string, else the stop reason if it\'s one)'
             );
           }
         }
         return 'end_turn';
+      }
     }
   }
 
