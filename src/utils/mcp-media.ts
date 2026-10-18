@@ -23,18 +23,16 @@
  * messages, which the completions serializer reads for text.
  *
  * The rule: a media block (image, document, audio or video) with no `source`
- * object whose `data` is a string that isn't empty and whose `mimeType` is a
- * string becomes
- * `{ ...rest, source: { type: 'base64', data, mediaType: mimeType } }`,
- * keeping its other fields. An image converts without a `mimeType` too, with
- * no `mediaType` in its source: every request decides an image by its data's
- * header, whatever label it came with (imageForRequest). Nothing decides a
- * document, audio or video that way, so one of those without a `mimeType`
- * stays as it is. Empty data stays as it is too, since the API refuses an
- * image whose data is empty, so a block with no data to send gets each
- * reader's note instead. A media block without a `source` object that
- * doesn't fit is left as it is, and each reader treats it as a source it
- * can't represent.
+ * object becomes `{ ...rest, source: { type: 'base64', data, mediaType } }`,
+ * keeping its other fields, its `mimeType` as the `mediaType` where that's a
+ * string that isn't empty. An image converts whatever its data and label:
+ * every request builder decides an image's data through imageForRequest,
+ * which sends what the data's header shows, whatever label it came with, and
+ * notes data that is missing, empty or no image it can carry. Nothing decides
+ * a document, audio or video that way, since their builders send the source
+ * as it is, so one of those converts only with data that isn't empty and a
+ * `mimeType`. One that doesn't is left as it is, and each reader treats it as
+ * a source it can't represent.
  */
 
 const MEDIA_TYPES: ReadonlySet<unknown> = new Set(['image', 'document', 'audio', 'video']);
@@ -79,9 +77,9 @@ function convertedItem(item: unknown): unknown {
   }
   if (!MEDIA_TYPES.has(item.type) || isRecord(item.source)) return item;
   const { data, mimeType, ...rest } = item;
-  if (typeof data !== 'string' || data === '') return item;
-  if (typeof mimeType === 'string') return { ...rest, source: { type: 'base64', data, mediaType: mimeType } };
-  // An image's header decides it wherever a request carries it; nothing
-  // decides other media that way.
-  return item.type === 'image' ? { ...rest, source: { type: 'base64', data } } : item;
+  const mediaType = typeof mimeType === 'string' && mimeType !== '' ? mimeType : undefined;
+  // imageForRequest decides an image's data wherever a request carries it;
+  // other media go with their source as it is.
+  if (item.type !== 'image' && (typeof data !== 'string' || data === '' || mediaType === undefined)) return item;
+  return { ...rest, source: { type: 'base64', data, ...(mediaType === undefined ? {} : { mediaType }) } };
 }

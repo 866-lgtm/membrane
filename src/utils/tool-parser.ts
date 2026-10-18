@@ -20,7 +20,7 @@ import type {
   ToolDefinition,
 } from '../types/index.js';
 import { createHash } from 'node:crypto';
-import { imageForRequest, isAcceptedImage, linkImageNote, type RasterImageMediaType } from './image-media.js';
+import { dataUrlImage, imageForRequest, isAcceptedImage, linkImageNote, type RasterImageMediaType } from './image-media.js';
 import { readToolSchema, type ParameterDeclaration, type ToolSchemaReading } from './tool-schema.js';
 
 // ============================================================================
@@ -597,31 +597,38 @@ const STRUCTURAL_TAG_RE =
   /<\/?(?:antml:)?(?:function_calls|function_results|invoke|result|stdout|error|tool_name)\b/;
 
 /** A tool-result image's data and the label it came with, whether it carries
- *  them in a `source` or MCP-style as `data` and `mimeType`. A url source's
- *  image is at its URL, so data the source also carries isn't read as it, as
- *  the native path reads one (toolResultContentForRequest). The XML replay of
- *  a split (anthropic-xml's sentSplit) reads a stored result's images with it
- *  too, so the two read the same blocks as images. */
+ *  them in a `source` or MCP-style as `data` and `mimeType`. A `data:` URL
+ *  holds its image inline, so its bytes and label are read from it; any other
+ *  url source's image is at its URL, so none is read, not even data the
+ *  source also carries, as the native path reads one
+ *  (toolResultContentForRequest). The XML replay of a split (anthropic-xml's
+ *  sentSplit) reads a stored result's images with it too, so the two read the
+ *  same blocks as images. */
 export function toolResultImage(block: unknown): { data: unknown; declared: unknown } {
-  const b = block as { source?: { type?: unknown; data?: unknown; mediaType?: unknown; media_type?: unknown }; data?: unknown; mimeType?: unknown };
+  const b = block as { source?: { type?: unknown; url?: unknown; data?: unknown; mediaType?: unknown; media_type?: unknown }; data?: unknown; mimeType?: unknown };
   if (!b.source) return { data: b.data, declared: b.mimeType };
-  if (b.source.type === 'url') return { data: undefined, declared: undefined };
+  if (b.source.type === 'url') {
+    const inline = dataUrlImage(b.source.url);
+    return { data: inline?.data, declared: inline?.declared };
+  }
   return { data: b.source.data, declared: b.source.mediaType ?? b.source.media_type };
 }
 
 /** A tool-result image as an xml tool loop takes it: its media type and
  *  data when the request can send it, or the note that stands in its place.
- *  One that came as a link gets the link's note, since these results carry
- *  no links; any other is imageForRequest's decision, which also notes an
- *  image that came without its data. */
+ *  One at a URL a provider would fetch gets the link's note, since these
+ *  results carry no links; any other, a `data:` URL's among them, is
+ *  imageForRequest's decision, which also notes an image that came without
+ *  its data. */
 function xmlResultImage(
   block: unknown,
 ): { mediaType: RasterImageMediaType; data: string; note?: undefined } | { note: { type: 'text'; text: string } } {
+  const { data, declared } = toolResultImage(block);
   const source = (block as { source?: unknown }).source;
-  if (typeof source === 'object' && source !== null && (source as { type?: unknown }).type === 'url') {
+  // toolResultImage reads no data from a url source only when it isn't a data: URL.
+  if (data === undefined && typeof source === 'object' && source !== null && (source as { type?: unknown }).type === 'url') {
     return { note: linkImageNote((source as { url?: unknown }).url) };
   }
-  const { data, declared } = toolResultImage(block);
   const image = imageForRequest(data, declared);
   return image.placeholder ? { note: image.placeholder } : { mediaType: image.mediaType, data: data as string };
 }
