@@ -126,10 +126,10 @@ describe('OpenRouterAdapter audio input', () => {
 
   it('still converts image blocks (regression)', async () => {
     const req = await buildRequest([
-      { type: 'image', source: { type: 'base64', data: 'SU1HAA==', media_type: 'image/png' } },
+      { type: 'image', source: { type: 'base64', data: 'iVBORw0KGgo=', media_type: 'image/png' } },
     ]);
     expect(req.messages[0].content).toContainEqual({
-      type: 'image_url', image_url: { url: 'data:image/png;base64,SU1HAA==' },
+      type: 'image_url', image_url: { url: 'data:image/png;base64,iVBORw0KGgo=' },
     });
   });
 });

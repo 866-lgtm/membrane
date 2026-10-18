@@ -34,13 +34,26 @@ import type {
   StreamEmission,
 } from './types.js';
 import { normalizeToolPairs, mergeConsecutiveRoles } from './normalize-tool-pairs.js';
-import { resolveImageMediaType, isAcceptedImageMediaType, strippedImagePlaceholder } from '../utils/image-media.js';
+import { imageForRequest, toolResultContentForRequest } from '../utils/image-media.js';
 import { assertCacheMarkersWithinLimit, countWireCacheMarkers } from '../utils/cache-marker-budget.js';
 
 /** Index of the last content block that can carry cache_control. Anthropic
  *  rejects cache_control on thinking / redacted_thinking blocks, so a cache
  *  breakpoint must attach to the last NON-thinking block. Returns -1 when the
  *  message has only thinking blocks (the breakpoint is then skipped). */
+/**
+ * The system prompt as it goes on the wire: `''` and an array left with no
+ * blocks become undefined, and empty text blocks leave an array.
+ */
+export function withoutEmptySystemText(
+  system: string | ContentBlock[] | undefined,
+): string | ContentBlock[] | undefined {
+  if (typeof system === 'string') return system === '' ? undefined : system;
+  if (!Array.isArray(system)) return system;
+  const blocks = system.filter((block) => !(block.type === 'text' && (block as { text?: unknown }).text === ''));
+  return blocks.length > 0 ? blocks : undefined;
+}
+
 export function lastCacheableBlockIndex(blocks: Array<Record<string, unknown>>): number {
   for (let k = blocks.length - 1; k >= 0; k--) {
     const t = blocks[k]?.type as string | undefined;
@@ -315,30 +328,36 @@ export class NativeFormatter implements PrefillFormatter {
     // fallback either. The budget check below covers the whole built request;
     // Membrane defers it (deferCacheBudgetCheck) to after its hooks, which
     // can still add markers.
-    const markedBreakpoints = countWireCacheMarkers({ messages: mergedMessages, system: systemPrompt });
+    //
+    // An empty system prompt is no system block. Wrapped for the fallback
+    // marker it became a cache-marked empty text block, which the API doesn't
+    // cache; a caller's empty text blocks are dropped the same way, before the
+    // marker count and before the fallback picks the last block.
+    const system = withoutEmptySystemText(systemPrompt);
+    const markedBreakpoints = countWireCacheMarkers({ messages: mergedMessages, system });
     const cacheSystem =
       cacheMarkers === 'membrane-system' && cacheControl && markedBreakpoints === 0
         ? cacheControl
         : undefined;
     let systemContent: unknown;
-    if (typeof systemPrompt === 'string') {
+    if (typeof system === 'string') {
       if (cacheSystem) {
         // Must use array format for cache_control support
-        systemContent = [{ type: 'text', text: systemPrompt, cache_control: cacheSystem }];
+        systemContent = [{ type: 'text', text: system, cache_control: cacheSystem }];
       } else {
-        systemContent = systemPrompt;
+        systemContent = system;
       }
-    } else if (Array.isArray(systemPrompt)) {
-      if (cacheSystem && systemPrompt.length > 0) {
+    } else if (Array.isArray(system)) {
+      if (cacheSystem) {
         // Add cache_control to the last system block
-        systemContent = systemPrompt.map((block, idx) => {
-          if (idx === systemPrompt.length - 1) {
+        systemContent = system.map((block, idx) => {
+          if (idx === system.length - 1) {
             return { ...block, cache_control: cacheSystem };
           }
           return block;
         });
       } else {
-        systemContent = systemPrompt;
+        systemContent = system;
       }
     }
 
@@ -402,32 +421,6 @@ export class NativeFormatter implements PrefillFormatter {
   // PRIVATE HELPERS
   // ==========================================================================
 
-  /** Replace API-unacceptable image blocks nested in tool_result content with
-   *  text placeholders. Non-array content passes through untouched.
-   *  `onAltered` hears each placeholder substitution. */
-  private static sanitizeToolResultContent(content: unknown, onAltered?: () => void): unknown {
-    if (!Array.isArray(content)) return content;
-    return content.map((item) => {
-      if (
-        item &&
-        typeof item === 'object' &&
-        (item as { type?: string }).type === 'image'
-      ) {
-        const src = (item as { source?: { type?: string; data?: string; mediaType?: string; media_type?: string } }).source;
-        if (src?.type === 'url') return { ...item };
-        const mediaType = resolveImageMediaType(src?.data, src?.mediaType ?? src?.media_type);
-        if (!isAcceptedImageMediaType(mediaType)) {
-          onAltered?.();
-          return strippedImagePlaceholder(mediaType);
-        }
-        const { mediaType: _declared, ...source } = src ?? {};
-        return { ...item, source: { ...source, media_type: mediaType } };
-      }
-      // Its own object per occurrence, so an adapter's report names one.
-      return item !== null && typeof item === 'object' ? { ...item } : item;
-    });
-  }
-
   private convertContent(
     content: ContentBlock[],
     participant: string,
@@ -463,11 +456,12 @@ export class NativeFormatter implements PrefillFormatter {
         result.push(textBlock);
       } else if (block.type === 'image') {
         if (block.source.type === 'base64') {
-          const mediaType = resolveImageMediaType(block.source.data, block.source.mediaType);
-          if (!isAcceptedImageMediaType(mediaType)) {
-            // Unacceptable media type (e.g. image/svg): degrade to a text
-            // placeholder instead of poisoning the whole request.
-            result.push(strippedImagePlaceholder(mediaType));
+          const { mediaType, placeholder } = imageForRequest(block.source.data, block.source.mediaType);
+          if (placeholder) {
+            // Not an image the API accepts (an SVG, or data that is no image
+            // at all): degrade to a text placeholder instead of poisoning the
+            // whole request.
+            result.push(placeholder);
             altered();
           } else {
             const imageBlock: Record<string, unknown> = {
@@ -514,7 +508,7 @@ export class NativeFormatter implements PrefillFormatter {
         result.push({
           type: 'tool_result',
           tool_use_id: block.toolUseId,
-          content: NativeFormatter.sanitizeToolResultContent(block.content, options.onAltered),
+          content: toolResultContentForRequest(block.content, options.onAltered),
           is_error: block.isError,
         });
       } else if (block.type === 'thinking') {

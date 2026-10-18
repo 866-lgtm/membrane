@@ -29,9 +29,9 @@ import type {
   StreamEmission,
   StreamParser,
 } from './types.js';
-import { responsesToolOutputLoses, responsesToolOutputParts } from '../providers/responses-input.js';
+import { responsesToolOutput } from '../providers/responses-input.js';
 
-import { resolveImageMediaType } from '../utils/image-media.js';
+import { imageForRequest, urlImageForRequest } from '../utils/image-media.js';
 
 export const OPENAI_RESPONSES_ITEMS_METADATA_KEY = 'openaiResponsesItems';
 
@@ -207,9 +207,21 @@ export class OpenAIResponsesFormatter implements PrefillFormatter {
         });
       } else if (block.type === 'image' && !isAssistant) {
         const source = block.source;
-        messageParts.push(source.type === 'url'
-          ? { type: 'input_image', image_url: source.url }
-          : { type: 'input_image', image_url: `data:${resolveImageMediaType(source.data, source.mediaType)};base64,${source.data}` });
+        if (source.type === 'url') {
+          // A data: URL holds its image inline and takes the same decision;
+          // any other URL is the API's to fetch.
+          const image = urlImageForRequest(source.url);
+          messageParts.push(image.placeholder
+            ? { type: 'input_text', text: image.placeholder.text }
+            : { type: 'input_image', image_url: image.url });
+          if (image.placeholder) onAltered?.();
+        } else {
+          const { mediaType, placeholder } = imageForRequest(source.data, source.mediaType);
+          messageParts.push(placeholder
+            ? { type: 'input_text', text: placeholder.text }
+            : { type: 'input_image', image_url: `data:${mediaType};base64,${source.data}` });
+          if (placeholder) onAltered?.();
+        }
       } else if (block.type === 'tool_use') {
         flushMessage();
         out.push({
@@ -220,18 +232,16 @@ export class OpenAIResponsesFormatter implements PrefillFormatter {
         });
       } else if (block.type === 'tool_result') {
         flushMessage();
-        // A function_call_output has no error flag, so a failed result reads
-        // as a plain one.
-        if (responsesToolOutputLoses(block.content) || block.isError) onAltered?.();
+        // Image-bearing results go out as native input_text/input_image
+        // parts, image-free ones in the legacy string form (see
+        // responsesToolOutput). A function_call_output has no error flag, so
+        // a failed result reads as a plain one.
+        const { output, loses } = responsesToolOutput(block.content);
+        if (loses || block.isError) onAltered?.();
         out.push({
           type: 'function_call_output',
           call_id: block.toolUseId,
-          // Image-bearing results go out as native input_text/input_image
-          // parts (see responsesToolOutputParts); image-free ones keep the
-          // legacy string form.
-          output: typeof block.content === 'string'
-            ? block.content
-            : responsesToolOutputParts(block.content) ?? JSON.stringify(block.content),
+          output,
         });
       } else if (block.type === 'redacted_thinking') {
         flushMessage();

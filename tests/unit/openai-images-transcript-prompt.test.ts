@@ -6,6 +6,10 @@ import {
 import type { ProviderRequest } from '../../src/types/index.js';
 
 const PNG = 'iVBORw0KGgo=';
+/** Distinct data per tag that still starts with a PNG signature: the adapter
+ *  attaches only data that is an image. */
+const png = (tag: string) =>
+  Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), Buffer.from(tag)]).toString('base64');
 
 function img(data = PNG) {
   return { type: 'image', source: { type: 'base64', media_type: 'image/png', data } };
@@ -55,8 +59,8 @@ describe('OpenAIResponsesAdapter promptFormat', () => {
     { role: 'user', content: [{ type: 'text', text: 'alice: draw a red teapot' }] },
     // A previous generation: image-only assistant message, exactly what the
     // bot's own posted image looks like when history is rebuilt.
-    { role: 'assistant', content: [img('AAAA')] },
-    { role: 'user', content: [{ type: 'text', text: 'bob: make it blue' }, img('BBBB')] },
+    { role: 'assistant', content: [img(png('A'))] },
+    { role: 'user', content: [{ type: 'text', text: 'bob: make it blue' }, img(png('B'))] },
   ];
 
   it('legacy (default) keeps the historical prompt shape and never mentions images', async () => {
@@ -111,9 +115,9 @@ describe('OpenAIResponsesAdapter promptFormat', () => {
 
   it('transcript keeps the most recent images under the cap and marks the rest omitted; legacy keeps the first', async () => {
     const messages = [
-      { role: 'user', content: [{ type: 'text', text: 'first' }, img('1111')] },
-      { role: 'assistant', content: [img('2222')] },
-      { role: 'user', content: [{ type: 'text', text: 'third' }, img('3333')] },
+      { role: 'user', content: [{ type: 'text', text: 'first' }, img(png('1'))] },
+      { role: 'assistant', content: [img(png('2'))] },
+      { role: 'user', content: [{ type: 'text', text: 'third' }, img(png('3'))] },
     ];
 
     const transcript = new OpenAIResponsesAdapter({ apiKey: 'sk-test', promptFormat: 'transcript', maxInputImages: 2, transcriptPreamble: '' });
@@ -128,15 +132,15 @@ describe('OpenAIResponsesAdapter promptFormat', () => {
     const form = (legacyFetch.mock.calls[0] as [string, RequestInit])[1].body as FormData;
     const blobs = form.getAll('image[]') as Blob[];
     expect(blobs.length).toBe(2);
-    expect(Buffer.from(await blobs[0]!.arrayBuffer()).toString('base64')).toBe('1111');
-    expect(Buffer.from(await blobs[1]!.arrayBuffer()).toString('base64')).toBe('2222');
+    expect(Buffer.from(await blobs[0]!.arrayBuffer()).toString('base64')).toBe(png('1'));
+    expect(Buffer.from(await blobs[1]!.arrayBuffer()).toString('base64')).toBe(png('2'));
   });
 
   it('attaches and references a prior output carried forward as a generated_image block', async () => {
     const messages = [
       { role: 'user', content: [{ type: 'text', text: 'alice: draw a red teapot' }] },
       // This adapter's own earlier ProviderResponse content, kept verbatim.
-      { role: 'assistant', content: [{ type: 'generated_image', data: 'GGGG', mimeType: 'image/png' }] },
+      { role: 'assistant', content: [{ type: 'generated_image', data: png('G'), mimeType: 'image/png' }] },
       { role: 'user', content: [{ type: 'text', text: 'bob: make it blue' }] },
     ];
 
@@ -153,12 +157,12 @@ describe('OpenAIResponsesAdapter promptFormat', () => {
     expect(url).toMatch(/images\/edits$/);
     const blobs = (init.body as FormData).getAll('image[]') as Blob[];
     expect(blobs.length).toBe(1);
-    expect(Buffer.from(await blobs[0]!.arrayBuffer()).toString('base64')).toBe('GGGG');
+    expect(Buffer.from(await blobs[0]!.arrayBuffer()).toString('base64')).toBe(png('G'));
   });
 
   it('clamps maxInputImages to the API cap of 16', async () => {
     const adapter = new OpenAIResponsesAdapter({ apiKey: 'sk-test', promptFormat: 'transcript', maxInputImages: 99 });
-    const messages = Array.from({ length: 20 }, (_, i) => ({ role: 'user', content: [img(`${i}`.padStart(4, 'A'))] }));
+    const messages = Array.from({ length: 20 }, (_, i) => ({ role: 'user', content: [img(png(String(i)))] }));
     const { images, prompt } = await capture(adapter, request(messages));
     expect(images).toBe(16);
     expect((prompt.match(/\[Image omitted\]/g) ?? []).length).toBe(4);

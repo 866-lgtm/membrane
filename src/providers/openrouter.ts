@@ -25,7 +25,7 @@ import {
   withRawRequest,
 } from '../types/index.js';
 import { errorFromThrown } from '../types/errors.js';
-import { toolUseInputFromText, textOnlyToolResultContent, createCombinedSignal, SSELineParser, isDeadlineAbort, deadlineTimeoutError, throwOnStreamErrorFrame, assertTerminalEventObserved } from './utils.js';
+import { toolUseInputFromText, textOnlyToolResultContent, openAIImagePart, createCombinedSignal, SSELineParser, isDeadlineAbort, deadlineTimeoutError, throwOnStreamErrorFrame, assertTerminalEventObserved } from './utils.js';
 
 // ============================================================================
 // Types
@@ -152,16 +152,20 @@ export interface OpenRouterAdapterConfig {
 /**
  * Which convention the tokens OpenRouter just handed back are in. OpenRouter
  * passes the routed provider's usage payload through, so an Anthropic-routed
- * call reports `cache_read_input_tokens` (disjoint from prompt_tokens) while an
- * OpenAI-routed one reports `prompt_tokens_details.cached_tokens` (a subset of
- * it). The field that carried the number therefore identifies the convention.
+ * call reports `cache_read_input_tokens` and `cache_creation_input_tokens`
+ * (disjoint from prompt_tokens) while an OpenAI-routed one reports
+ * `prompt_tokens_details.cached_tokens` (a subset of it). The field that
+ * carried a number therefore identifies the convention: an Anthropic-shaped
+ * field, read or write, makes the response cache-excluded, so Anthropic's
+ * writes are never subtracted from prompt_tokens as an inclusive count's are.
  */
 function resolveRoutedCacheConvention(
   anthropicShapedCacheRead: number | undefined,
+  anthropicShapedCacheWrite: number | undefined,
   resolvedCacheRead: number | undefined,
 ): UsageCacheConvention | undefined {
-  if (resolvedCacheRead == null) return undefined;
-  return anthropicShapedCacheRead != null ? 'cache-excluded' : 'cache-inclusive';
+  if (anthropicShapedCacheRead != null || anthropicShapedCacheWrite != null) return 'cache-excluded';
+  return resolvedCacheRead != null ? 'cache-inclusive' : undefined;
 }
 
 export class OpenRouterAdapter implements ProviderAdapter {
@@ -169,11 +173,12 @@ export class OpenRouterAdapter implements ProviderAdapter {
 
   /**
    * OpenRouter fronts BOTH conventions: it passes through Anthropic's
-   * `cache_read_input_tokens` (cache-excluded) or OpenAI's
-   * `prompt_tokens_details.cached_tokens` (cache-inclusive) depending on which
-   * provider it routed to. The convention is therefore a per-response fact —
-   * each parse sets `usage.cacheConvention` from the field it actually read,
-   * and this adapter-level value is only the no-cache-tokens fallback.
+   * `cache_read_input_tokens` and `cache_creation_input_tokens`
+   * (cache-excluded) or OpenAI's `prompt_tokens_details.cached_tokens`
+   * (cache-inclusive) depending on which provider it routed to. The
+   * convention is therefore a per-response fact — each parse sets
+   * `usage.cacheConvention` from the fields it actually read, and this
+   * adapter-level value is only the no-cache-tokens fallback.
    */
   readonly usageCacheConvention = 'unknown' as const;
   private apiKey: string;
@@ -533,18 +538,10 @@ export class OpenRouterAdapter implements ProviderAdapter {
             }
             textParts.length = 0;
 
-            if (block.source?.type === 'base64') {
-              const mediaType = block.source.media_type ?? block.source.mediaType ?? 'image/png';
-              contentBlocks.push({
-                type: 'image_url',
-                image_url: { url: `data:${mediaType};base64,${block.source.data}` },
-              });
-            } else if (block.source?.type === 'url') {
-              contentBlocks.push({
-                type: 'image_url',
-                image_url: { url: block.source.url },
-              });
-            }
+            // An image_url, or the placeholder for data OpenRouter's
+            // providers don't accept as an image
+            const part = openAIImagePart(block.source);
+            if (part) contentBlocks.push(part);
           } else if (block.type === 'audio') {
             // Audio input → OpenAI-style `input_audio` content part (sibling to
             // the Gemini inlineData path). Like images, this forces the array
@@ -668,7 +665,10 @@ export class OpenRouterAdapter implements ProviderAdapter {
         throw errorFromHttpResponse(this.name, response, await response.text(), request);
       }
 
-      return await response.json() as OpenRouterResponse;
+      const body: unknown = await response.json();
+      // A 200 can carry the provider's error, as a stream frame can.
+      throwOnStreamErrorFrame(body, 'OpenRouter', request, 'response error');
+      return body as OpenRouterResponse;
     } finally {
       cleanup?.();
     }
@@ -685,7 +685,7 @@ export class OpenRouterAdapter implements ProviderAdapter {
     const anthropicShapedCacheRead = response.usage?.cache_read_input_tokens;
     const cacheReadTokens = anthropicShapedCacheRead
       ?? response.usage?.prompt_tokens_details?.cached_tokens;
-    const cacheConvention = resolveRoutedCacheConvention(anthropicShapedCacheRead, cacheReadTokens);
+    const cacheConvention = resolveRoutedCacheConvention(anthropicShapedCacheRead, cacheCreationTokens, cacheReadTokens);
 
     return {
       content: this.messageToContent(message),
@@ -718,7 +718,7 @@ export class OpenRouterAdapter implements ProviderAdapter {
     const anthropicShapedCacheRead = streamUsage?.cache_read_input_tokens;
     const cacheReadTokens = anthropicShapedCacheRead
       ?? streamUsage?.prompt_tokens_details?.cached_tokens;
-    const cacheConvention = resolveRoutedCacheConvention(anthropicShapedCacheRead, cacheReadTokens);
+    const cacheConvention = resolveRoutedCacheConvention(anthropicShapedCacheRead, cacheCreationTokens, cacheReadTokens);
 
     return {
       content: this.messageToContent(message),
@@ -756,9 +756,11 @@ export class OpenRouterAdapter implements ProviderAdapter {
       case 'content_filter':
         return 'refusal';
       default:
-        // Unrecognized reasons ('error', a compatible server's own token)
-        // travel as the provider's own token, so membrane's mapper discloses
-        // and logs them instead of reading a clean end_turn.
+        // Unrecognized reasons (a compatible server's own token) travel as
+        // the provider's own token: membrane's mapper reads them as end_turn,
+        // but discloses the token in details.stop.providerReason and logs it
+        // once, so the stop isn't taken for a clean one. 'error' never gets
+        // here: throwOnStreamErrorFrame throws on it first.
         return reason;
     }
   }

@@ -171,9 +171,14 @@ it.each(['stream', 'yielding'])('a local text stop in plain %s also bounds block
   const wire = events().map(event => event.delta?.type === 'text_delta'
     ? { ...event, delta: { ...event.delta, text: 'KEEP STOP AFTER' } } : event);
   const blocks: any[] = [];
-  const response: any = await run(path, setup('anthropic', 'plain', 'success', false, wire), 'plain', [], blocks, { stopSequences: ['STOP'] });
+  const chunks: any[] = [];
+  const response: any = await run(path, setup('anthropic', 'plain', 'success', false, wire), 'plain', chunks, blocks, { stopSequences: ['STOP'] });
   expect(response.content).toEqual([{ type: 'thinking', thinking: thought, signature: 'signature' }, text('KEEP ')]);
-  expect(blocks.filter(event => event.event === 'block_complete' && event.block.type === 'text').map(event => event.block.content)).toEqual(['KEEP ']);
+  const texts = blocks.filter(event => event.block.type === 'text');
+  expect(texts.filter(event => event.event === 'block_complete').map(event => event.block.content)).toEqual(['KEEP ']);
+  // The stop chunk's text goes out labelled by the provider's text block, the index its block events carry.
+  expect(chunks.filter(c => c.meta.type === 'text')).toEqual([{ chunk: 'KEEP ', meta: expect.objectContaining({ visible: true, blockIndex: texts[0].index }) }]);
+  expect(texts.map(event => event.index)).toEqual([texts[0].index, texts[0].index]);
 });
 for (const provider of ['anthropic', 'bedrock']) {
   it.each(['stream', 'yielding'])(provider + ' redacted thinking is retained in partial plain %s', async path => {
