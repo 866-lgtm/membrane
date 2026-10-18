@@ -14,6 +14,7 @@ import type {
   InjectedMessage,
   ProvideToolResultsOptions,
 } from './types/yielding-stream.js';
+import { isTerminalEvent } from './types/yielding-stream.js';
 import type { ToolResult } from './types/tools.js';
 
 /** What an aborted event carries besides its type and reason. */
@@ -120,6 +121,11 @@ export class YieldingStreamImpl implements YieldingStream {
   // iterator.throw. Nobody will read this stream again, so queued events are
   // dropped rather than accumulated for a reader that is never coming back.
   private consumerDeparted = false;
+
+  // Set once a terminal event (complete, error or aborted) is queued. The
+  // stream ends there: emit() queues nothing after it, a later cancel()'s
+  // aborted event included.
+  private terminalQueued = false;
 
   // Held so the listener can be removed at terminal: a long-lived caller
   // signal shared across many streams otherwise accumulates one closure per
@@ -256,12 +262,7 @@ export class YieldingStreamImpl implements YieldingStream {
           // Check for queued events
           const event = this.eventQueue.shift();
           if (event) {
-            // Check if this is a terminal event
-            if (
-              event.type === 'complete' ||
-              event.type === 'error' ||
-              event.type === 'aborted'
-            ) {
+            if (isTerminalEvent(event)) {
               this.state = { status: 'done' };
             }
             return { value: event, done: false };
@@ -311,6 +312,12 @@ export class YieldingStreamImpl implements YieldingStream {
     // The consumer has left for good; queueing here would grow without bound
     // for a reader that cannot observe it.
     if (this.consumerDeparted) return;
+    // The stream has ended, and nothing belongs after its terminal event: not
+    // what a loop emits as it runs on to its next check after a cancel (its
+    // wait had resolved before the abort reached it), nor the aborted event
+    // of a cancel() that came after the loop's own terminal.
+    if (this.terminalQueued) return;
+    if (isTerminalEvent(event)) this.terminalQueued = true;
     this.eventQueue.push(event);
     this.notifyEventWaiter();
   }
@@ -320,6 +327,13 @@ export class YieldingStreamImpl implements YieldingStream {
    * Called by the inference loop when tool calls are detected.
    */
   async requestToolExecution(event: ToolCallsEvent): Promise<ToolResultsPayload> {
+    // A cancelled stream has no one to run the tools: refuse at once, as
+    // cancel() refuses a wait already pending, so the loop unwinds through its
+    // catch rather than parking on a wait nothing will settle.
+    if (this.isCancelled) {
+      throw new Error('Stream cancelled');
+    }
+
     // Emit the tool calls event
     this.emit(event);
 
