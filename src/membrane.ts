@@ -3292,7 +3292,7 @@ export class Membrane {
     }
   }
 
-  private calculateCacheHitRatio(usage: Pick<DetailedUsage, 'inputTokens' | 'cacheReadTokens'>): number {
+  private calculateCacheHitRatio(usage: Pick<DetailedUsage, 'inputTokens' | 'cacheCreationTokens' | 'cacheReadTokens'>): number {
     return calculateCacheHitRatio(usage);
   }
 
