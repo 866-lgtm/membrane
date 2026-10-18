@@ -29,3 +29,4 @@
     functions included. Flat Responses functions that already carried a
     boolean `strict` serialize as before. The Chat Completions and
     openai-compatible adapters are unchanged.
+  - Thanks to `@HO-git`, whose #105 found the same bug and verified it live.
