@@ -68,8 +68,11 @@ const ACCEPTED: Array<[string, StrictField, boolean]> = [
 /** Each refused value, and how the refusal spells it: a short string quoted, anything else by its kind. */
 const REFUSED: Array<[string, unknown, string]> = [
   ['the string "true"', 'true', '"true"'],
+  ['an empty string', '', '""'],
+  ['a string of 40 characters, the longest quoted', 'x'.repeat(40), JSON.stringify('x'.repeat(40))],
   ['a string too long to quote', 'x'.repeat(41), 'a 41-character string'],
   ['the number 1', 1, 'number 1'],
+  ['the number 0', 0, 'number 0'],
   ['an object', {}, 'an object'],
   ['an array', [], 'an array'],
   ['a function', () => true, 'a function'],
@@ -128,12 +131,26 @@ const MODES = {
   },
 };
 
+/**
+ * A caller's tools, frozen all the way down. Callers send the same tool
+ * objects again on later requests, so the adapter must leave them as they
+ * are: a write to one throws here, where a copy that only checks the body
+ * sent would let it pass.
+ */
+function frozen<T>(value: T): T {
+  if (value !== null && (typeof value === 'object' || typeof value === 'function') && !Object.isFrozen(value)) {
+    Object.freeze(value);
+    for (const key of Reflect.ownKeys(value as object)) frozen((value as Record<PropertyKey, unknown>)[key]);
+  }
+  return value;
+}
+
 function request(tools: unknown[]): ProviderRequest {
   return {
     model: 'gpt-5.4',
     messages: [{ type: 'message', role: 'user', content: 'Hello' }],
     maxTokens: 1024,
-    tools,
+    tools: frozen(tools),
   };
 }
 
@@ -160,11 +177,15 @@ describe.each(Object.entries(MODES))('Responses function-tool strictness, %s', (
 
     it.each(REFUSED)('refuses strict set to %s, naming the tool, before sending', async (_case, value, spelled) => {
       const fetchMock = stubFetch(mode.response);
-      const sending = mode.adapter().complete(request([spelling.tool({ strict: value })]));
+      const refused = request([spelling.tool({ strict: value })]);
+      const sending = mode.adapter().complete(refused);
 
       await expect(sending).rejects.toBeInstanceOf(MembraneError);
       await expect(sending).rejects.toMatchObject({ type: 'invalid_request', retryable: false });
       await expect(sending).rejects.toThrow(`function tool "probe" has strict set to ${spelled}; strict must be true, false, null or omitted`);
+      // It carries the request it refused, holding the tool as the caller wrote it.
+      const error = await sending.catch((caught: unknown) => caught);
+      expect((error as MembraneError).rawRequest).toMatchObject({ model: refused.model, tools: refused.tools });
       expect(fetchMock).not.toHaveBeenCalled();
     });
   });
@@ -216,7 +237,7 @@ describe.each(Object.entries(MODES))('Responses function-tool strictness, %s', (
     const fetchMock = stubFetch(mode.response);
     const overridden: ProviderRequest = {
       ...request([SPELLINGS['a tool definition']!.tool({})]),
-      extra: { tools: [SPELLINGS['a flat Responses function']!.tool({}), { type: 'web_search' }] },
+      extra: { tools: frozen([SPELLINGS['a flat Responses function']!.tool({}), { type: 'web_search' }]) },
     };
     await mode.adapter().complete(overridden);
 
@@ -227,11 +248,21 @@ describe.each(Object.entries(MODES))('Responses function-tool strictness, %s', (
     ]);
   });
 
+  it('converts the override alone, so request.tools it replaces is never refused', async () => {
+    const fetchMock = stubFetch(mode.response);
+    await mode.adapter().complete({
+      ...request([SPELLINGS['a tool definition']!.tool({ strict: 'yes' })]),
+      extra: { tools: frozen([SPELLINGS['a flat Responses function']!.tool({})]) },
+    });
+
+    expect(sentTools(fetchMock)).toEqual([SPELLINGS['a flat Responses function']!.wire(false)]);
+  });
+
   it('refuses a non-boolean strict in a provider-params override before sending', async () => {
     const fetchMock = stubFetch(mode.response);
     const sending = mode.adapter().complete({
       ...request([]),
-      extra: { tools: [SPELLINGS['a nested Chat-style function']!.tool({ strict: 'yes' })] },
+      extra: { tools: frozen([SPELLINGS['a nested Chat-style function']!.tool({ strict: 'yes' })]) },
     });
 
     await expect(sending).rejects.toMatchObject({ type: 'invalid_request', retryable: false });
@@ -253,7 +284,7 @@ describe.each(Object.entries(MODES))('Responses function-tool strictness, %s', (
   it('passes a container tool through as the caller wrote it, member functions included', async () => {
     const fetchMock = stubFetch(mode.response);
     const namespace = { type: 'namespace', name: 'files', tools: [{ type: 'function', name: 'read', parameters: SCHEMA }] };
-    await mode.adapter().complete({ ...request([]), extra: { tools: [namespace] } });
+    await mode.adapter().complete({ ...request([]), extra: { tools: frozen([namespace]) } });
 
     expect(sentTools(fetchMock)).toEqual([namespace]);
   });
@@ -266,7 +297,7 @@ describe.each(Object.entries(MODES))('Responses function-tool strictness, %s', (
  * the wire unchanged, beside `strict: false` — which holds for any revision of
  * the definition.
  */
-const SAVE_RECENT_IMAGE: ToolDefinition = {
+const SAVE_RECENT_IMAGE: ToolDefinition = frozen({
   name: 'save_recent_image',
   description: 'Save one or more recent images from your own context to workspace files.',
   inputSchema: {
@@ -279,7 +310,7 @@ const SAVE_RECENT_IMAGE: ToolDefinition = {
     },
     required: ['path'],
   },
-};
+});
 
 describe('save_recent_image through Membrane', () => {
   it('reaches the Responses wire with strict:false and its own required list (API key, Responses formatter)', async () => {
@@ -317,7 +348,7 @@ describe('save_recent_image through Membrane', () => {
       messages: [{ participant: 'nissa', content: [{ type: 'text', text: 'Keep that screenshot.' }] }],
       config: { model: 'gpt-5.6', maxTokens: 100 },
       providerParams: {
-        tools: [{ type: 'function', name: 'save_recent_image', parameters: SAVE_RECENT_IMAGE.inputSchema }],
+        tools: frozen([{ type: 'function', name: 'save_recent_image', parameters: SAVE_RECENT_IMAGE.inputSchema }]),
       },
     });
 
@@ -325,6 +356,40 @@ describe('save_recent_image through Membrane', () => {
       { type: 'function', name: 'save_recent_image', parameters: SAVE_RECENT_IMAGE.inputSchema, strict: false },
     ]);
   });
+
+  // A caller's strict reaches the adapter through Membrane in providerParams.tools,
+  // since ToolDefinition has none. Membrane fills a refusal's missing rawRequest
+  // from the last request it sent, so the refusal brings its own.
+  it.each(['complete', 'stream'] as const)(
+    'refuses a non-boolean strict from %s() once, unretried, with no onError, carrying the request it refused',
+    async (call) => {
+      const fetchMock = stubFetch(completedJson);
+      const adapter = new OpenAIResponsesAPIAdapter({ apiKey: 'sk-test' });
+      const adapterCalls = vi.spyOn(adapter, call);
+      const onError = vi.fn(() => 'retry' as const);
+      const membrane = new Membrane(adapter, {
+        formatter: new OpenAIResponsesFormatter(),
+        assistantParticipant: 'Astra',
+        retry: { maxRetries: 3 },
+        hooks: { onError },
+      });
+      const tools = frozen([{ type: 'function', name: 'save_recent_image', parameters: SAVE_RECENT_IMAGE.inputSchema, strict: 'yes' }]);
+
+      const error = await membrane[call]({
+        messages: [{ participant: 'nissa', content: [{ type: 'text', text: 'Keep that screenshot.' }] }],
+        config: { model: 'gpt-5.6', maxTokens: 100 },
+        providerParams: { tools },
+      }).catch((caught: unknown) => caught);
+
+      expect(error).toBeInstanceOf(MembraneError);
+      expect(error).toMatchObject({ type: 'invalid_request', retryable: false });
+      expect((error as Error).message).toContain('function tool "save_recent_image" has strict set to "yes";');
+      expect((error as MembraneError).rawRequest).toMatchObject({ model: 'gpt-5.6', tools });
+      expect(adapterCalls).toHaveBeenCalledOnce();
+      expect(onError).not.toHaveBeenCalled();
+      expect(fetchMock).not.toHaveBeenCalled();
+    },
+  );
 
   it('reaches the subscription wire with strict:false from an Anthropic-shaped input_schema (native formatter)', async () => {
     const fetchMock = stubFetch(completedSse);

@@ -157,9 +157,11 @@ export interface OpenAIResponsesAPIAdapterConfig {
  * `false` when omitted or null (see {@link OpenAIResponsesAPIAdapter.convertTools}),
  * and a refusal naming the tool for anything else. The refusal says what kind
  * of value it found, quoting only a short string, so a caller's value isn't
- * copied into logs whole.
+ * copied into logs whole. It carries `rawRequest`, the request as built when
+ * it was refused, holding the tool: an error without one would be given the
+ * last request sent before it, which isn't the one refused.
  */
-function functionToolStrictness(toolName: unknown, strict: unknown, position: number): boolean {
+function functionToolStrictness(toolName: unknown, strict: unknown, position: number, rawRequest: unknown): boolean {
   if (strict === undefined || strict === null) return false;
   if (typeof strict === 'boolean') return strict;
   const spelled = typeof strict === 'string'
@@ -176,7 +178,9 @@ function functionToolStrictness(toolName: unknown, strict: unknown, position: nu
     : `the function tool at tools[${position}], which has no name,`;
   throw invalidRequestError(
     `OpenAI Responses API: ${tool} has strict set to ` +
-      `${spelled}; strict must be true, false, null or omitted (omitted and null are sent as false).`
+      `${spelled}; strict must be true, false, null or omitted (omitted and null are sent as false).`,
+    undefined,
+    rawRequest,
   );
 }
 
@@ -495,7 +499,7 @@ export class OpenAIResponsesAPIAdapter implements ProviderAdapter {
     // Strictness is a property of the tools that reach the wire, whether they
     // came as request.tools or as a provider-params override of them.
     if (Array.isArray(responsesRequest.tools)) {
-      responsesRequest.tools = this.convertTools(responsesRequest.tools);
+      responsesRequest.tools = this.convertTools(responsesRequest.tools, responsesRequest);
     }
 
     // These invariants define the adapter's stateless native-item contract and
@@ -568,20 +572,21 @@ export class OpenAIResponsesAPIAdapter implements ProviderAdapter {
    * non-function tool, which has no such field, and a container such as a
    * Responses namespace tool, whose member functions keep whatever `strict`
    * they were given. Membrane builds no container tools, so one arrives only
-   * as a caller wrote it, in the API's own shape.
+   * as a caller wrote it, in the API's own shape. A refusal carries
+   * `rawRequest`, the request being built, as its own.
    */
-  private convertTools(tools: unknown[]): unknown[] {
+  private convertTools(tools: unknown[], rawRequest: unknown): unknown[] {
     return tools.map((rawTool: any, position) => {
       if (rawTool?.type && rawTool.type !== 'function') return rawTool;
 
       // Responses function definitions are flat: kept as given, apart from
       // strict. Membrane and Chat Completions function schemas are adapted.
       if (rawTool?.type === 'function' && rawTool.name) {
-        return { ...rawTool, strict: functionToolStrictness(rawTool.name, rawTool.strict, position) };
+        return { ...rawTool, strict: functionToolStrictness(rawTool.name, rawTool.strict, position, rawRequest) };
       }
       if (rawTool?.type === 'function' && rawTool.function) {
         const fn = rawTool.function;
-        return { type: 'function', ...fn, strict: functionToolStrictness(fn.name, fn.strict ?? rawTool.strict, position) };
+        return { type: 'function', ...fn, strict: functionToolStrictness(fn.name, fn.strict ?? rawTool.strict, position, rawRequest) };
       }
       return {
         type: 'function',
@@ -592,7 +597,7 @@ export class OpenAIResponsesAPIAdapter implements ProviderAdapter {
           rawTool?.inputSchema ??
           rawTool?.input_schema ??
           { type: 'object', properties: {} },
-        strict: functionToolStrictness(rawTool?.name, rawTool?.strict, position),
+        strict: functionToolStrictness(rawTool?.name, rawTool?.strict, position, rawRequest),
       };
     });
   }

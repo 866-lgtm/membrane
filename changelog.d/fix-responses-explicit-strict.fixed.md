@@ -15,15 +15,18 @@
   `inputSchema`/`input_schema`/`parameters`, whether they came as
   `request.tools` or as a `providerParams.tools` override of them. A
   `strict` that is not a boolean, `null` or absent (such as the string
-  `'true'`, `1` or an object) used to be forwarded to the provider as given;
-  it is now refused with an `invalid_request` error naming the tool, before
-  any request is sent.
+  `'true'`, `1` or an object) used to be forwarded to the provider as given,
+  or dropped where a Chat-style tool wrote it beside `function`; it is now
+  refused with an `invalid_request` error naming the tool, before any request
+  is sent.
   - **What changes on the wire:** a function tool that lacked a boolean
-    `strict` now carries `strict: false`, so the serialized tools change, and
-    a prompt prefix cached before the upgrade that includes them no longer
-    matches. A `providerParams.tools` entry in a membrane or Chat shape
-    is now converted to a flat Responses tool, so its bytes change too; it
-    wasn't a valid Responses tool before.
+    `strict` now carries `strict: false`, or, for a Chat-style tool whose
+    wrapper carries a boolean `strict`, which used to be dropped, that
+    boolean. So the serialized tools change, and a prompt prefix cached
+    before the upgrade that includes them no longer matches. A
+    `providerParams.tools` entry in a membrane or Chat shape is now
+    converted to a flat Responses tool, so its bytes change too; it wasn't a
+    valid Responses tool before.
   - **Unchanged:** non-function tools, and container tools such as a
     Responses namespace tool, pass through as the caller wrote them, member
     functions included. Flat Responses functions that already carried a
