@@ -9,10 +9,10 @@
   `providerStopReason`, `providerReason` still carries that, and a
   `stopReason` membrane maps, returned alone, still leaves `providerReason`
   unset.
-  - A `null` or empty `providerStopReason` now counts as none, as the field's
-    contract asks an adapter to omit it when no reason was reported. It was
-    reported as `providerReason: null` or `''`, so where a built-in adapter
-    passes on a server's empty stop token, `providerReason` is now unset. An
-    empty or non-string `stopReason` isn't carried either.
+  - A `providerStopReason` that isn't a non-empty string, such as `null` or
+    `''`, now counts as none: the field is a string, omitted when no reason
+    was reported. It was reported as `providerReason` as it came, so where a
+    built-in adapter passes on a server's empty stop token, `providerReason`
+    is now unset. An empty or non-string `stopReason` isn't carried either.
   - Otherwise the built-in adapters' responses don't change: they return
     `providerStopReason` beside any token membrane doesn't map.
