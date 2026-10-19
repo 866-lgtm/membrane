@@ -36,3 +36,11 @@
   (the field missing or empty), which was skipped silently, and one that
   decodes to other JSON that isn't an object, which was read as nothing, are
   now skipped with the warning too.
+- **Provider adapters:** `onProgress`'s doc now says a streaming adapter calls
+  it for an SSE data frame only when the frame parses to a JSON object, and
+  for an event-stream message only when it decodes to one. A custom adapter
+  that follows 0.6.0's wording, each SSE data frame that parses and each
+  decoded event-stream message, still renews the progress deadline on a frame
+  or message whose JSON is `null`, a number, a string or an array. To match
+  the built-in adapters, drop such a frame or message before calling
+  `onProgress`.
