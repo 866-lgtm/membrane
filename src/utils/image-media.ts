@@ -12,7 +12,9 @@
  * recognizes each format by its header: an accepted image is labelled by
  * what its header shows, and anything else becomes a text placeholder the
  * agent can see. A header is not proof the rest decodes. A remote image URL
- * goes out as it is, for the provider to fetch.
+ * goes out as it is, for the provider to fetch, where the request can carry
+ * one; an xml tool loop's results can't, and give the link note instead
+ * (linkImageNote).
  */
 
 export type RasterImageMediaType = 'image/jpeg' | 'image/png' | 'image/gif' | 'image/webp';
@@ -81,8 +83,11 @@ export type ImageForRequest<T extends ImageMediaType = RasterImageMediaType> =
 /**
  * What a request carries for base64 image data: the media type its header
  * shows, whatever label it arrived with, when that format is one `accepted`
- * holds; otherwise a text placeholder in its place. `accepted` is what the
- * destination takes, the four raster formats unless it documents otherwise.
+ * holds; otherwise a text placeholder in its place. An image whose data is
+ * missing, empty or not a string gets a note that says it came without its
+ * data; any other gets one naming the formats the request can carry.
+ * `accepted` is what the destination takes, the four raster formats unless
+ * it documents otherwise.
  * `declared` is the label the data arrived with; it only goes into the
  * placeholder and the warning.
  *
@@ -95,6 +100,19 @@ export function imageForRequest<T extends ImageMediaType = RasterImageMediaType>
   declared: unknown,
   accepted: ReadonlySet<T> = RASTER_IMAGE_TYPES as ReadonlySet<ImageMediaType> as ReadonlySet<T>,
 ): ImageForRequest<T> {
+  // An image that came without its data: no format would help, so the note
+  // says what happened instead of naming formats.
+  if (typeof data !== 'string' || data === '') {
+    console.warn('[membrane] image block stripped: no data');
+    return {
+      placeholder: {
+        type: 'text',
+        text:
+          '[system: an image that belongs here was NOT shown to you — it came without its data. ' +
+          'You are not seeing this image.]',
+      },
+    };
+  }
   const format = formatOf(data);
   if (format && (accepted as ReadonlySet<ImageMediaType>).has(format)) return { mediaType: format as T };
   // The label comes from ingest and goes into a system note, so it is quoted
@@ -128,6 +146,27 @@ export type UrlImageForRequest =
   | { placeholder: { type: 'text'; text: string }; url?: undefined; mediaType?: undefined; data?: undefined };
 
 /**
+ * The image a `data:` URL holds inline: its bytes as base64 data, the type it
+ * was labelled with, and whether its bytes came as base64 (the alternative is
+ * percent-encoded). Undefined for any other URL, whose image is at the URL.
+ * A `data:` URL without the comma that starts its data holds none: its data
+ * is empty. The payload is percent-decoded first, a base64 one too, as the
+ * fetch spec's `data:` URL processor decodes it: a URL may escape base64's
+ * padding as `%3D`. Valid base64 holds no `%`, so it comes through as it is.
+ */
+export function dataUrlImage(url: unknown): { data: string; declared: string | undefined; base64: boolean } | undefined {
+  if (typeof url !== 'string' || !/^data:/i.test(url)) return undefined;
+  const head = DATA_URL.exec(url);
+  if (!head) return { data: '', declared: url.slice(5).split(';')[0] || undefined, base64: false };
+  const [type = '', ...params] = head[1]!.split(';');
+  const payload = url.slice(head[0].length)
+    .replace(/%([0-9a-f]{2})/gi, (_, hex: string) => String.fromCharCode(parseInt(hex, 16)));
+  const base64 = params.some((param) => param.trim().toLowerCase() === 'base64');
+  const data = base64 ? payload : Buffer.from(payload, 'latin1').toString('base64');
+  return { data, declared: type || undefined, base64 };
+}
+
+/**
  * What a request carries for an image given by URL. A `data:` URL holds its
  * image inline, so its bytes take `imageForRequest`'s decision: an accepted
  * image comes back with its media type, its base64 data and a `data:` URL
@@ -136,28 +175,16 @@ export type UrlImageForRequest =
  * for the provider to fetch.
  */
 export function urlImageForRequest(url: string): UrlImageForRequest {
-  const head = typeof url === 'string' ? DATA_URL.exec(url) : null;
-  if (!head) {
-    // A data: URL without the comma that starts its data holds no image.
-    if (typeof url === 'string' && /^data:/i.test(url)) {
-      return { placeholder: imageForRequest('', url.slice(5).split(';')[0] || undefined).placeholder! };
-    }
-    return { url };
-  }
-  const [type = '', ...params] = head[1]!.split(';');
-  const payload = url.slice(head[0].length);
-  // A data: URL without ;base64 holds its bytes percent-encoded.
-  const base64 = params.some((param) => param.trim().toLowerCase() === 'base64');
-  const data = base64
-    ? payload
-    : Buffer.from(payload.replace(/%([0-9a-f]{2})/gi, (_, hex: string) => String.fromCharCode(parseInt(hex, 16))), 'latin1')
-      .toString('base64');
-  const image = imageForRequest(data, type || undefined);
+  const inline = dataUrlImage(url);
+  if (!inline) return { url };
+  const image = imageForRequest(inline.data, inline.declared);
   if (image.placeholder) return { placeholder: image.placeholder };
   // A URL already labelled by its header goes out as it came; only one whose
-  // label disagrees, or whose bytes are percent-encoded, is rewritten.
-  const labelled = base64 && type.trim().toLowerCase() === image.mediaType;
-  return { url: labelled ? url : `data:${image.mediaType};base64,${data}`, mediaType: image.mediaType, data };
+  // label disagrees, or whose bytes are percent-encoded, base64 ones with an
+  // escape among them included, is rewritten.
+  const labelled = inline.base64 && inline.declared?.trim().toLowerCase() === image.mediaType
+    && url.endsWith(`,${inline.data}`);
+  return { url: labelled ? url : `data:${image.mediaType};base64,${inline.data}`, mediaType: image.mediaType, data: inline.data };
 }
 
 /** Tool-result content as a request carries it, under the builders' formats:
@@ -312,4 +339,36 @@ export function shedImagesToFitByteBudget(
       `the upstream compile exceeded the byte wall — check maxLiveImageBytes / image policy.`,
   );
   return shed;
+}
+/** The note for an image that came as a link where the request can't carry
+ *  one, as in an xml tool loop's results: it says so and gives the link, so
+ *  an agent with a fetch or browser tool can open it. The image's format
+ *  isn't why it isn't shown, so the note names none. A `data:` URL isn't a
+ *  link: its bytes decide it (dataUrlImage). */
+export function linkImageNote(url: unknown): { type: 'text'; text: string } {
+  console.warn("[membrane] image block stripped: a URL source, which the XML tool path can't carry");
+  const link = notedLink(url);
+  return {
+    type: 'text',
+    text:
+      `[system: an image that belongs here was NOT shown to you — it came as a link${link ? ` (${link})` : ''}, ` +
+      "which tool results here can't carry. You are not seeing this image.]",
+  };
+}
+
+/** The longest link a note repeats: room for a signed URL, not for a page of
+ *  text. */
+const MAX_NOTED_LINK_CHARS = 2048;
+
+/** Half of a UTF-16 surrogate pair, which a request's JSON can't carry. */
+const LONE_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
+
+/** A link for a note: an http or https URL, cut to `MAX_NOTED_LINK_CHARS`
+ *  between code points. Any other URL isn't repeated, and nor is one holding
+ *  half a surrogate pair, since the API refuses the request's JSON then. */
+function notedLink(url: unknown): string | undefined {
+  if (typeof url !== 'string' || !/^https?:\/\//i.test(url) || LONE_SURROGATE.test(url)) return undefined;
+  if (url.length <= MAX_NOTED_LINK_CHARS) return url;
+  const end = /[\uD800-\uDBFF]/.test(url.charAt(MAX_NOTED_LINK_CHARS - 1)) ? MAX_NOTED_LINK_CHARS - 1 : MAX_NOTED_LINK_CHARS;
+  return `${url.slice(0, end)}…`;
 }

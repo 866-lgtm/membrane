@@ -12,6 +12,7 @@
 import { unreportedUsage } from '../utils/usage.js';
 import { createHash, randomUUID } from 'node:crypto';
 import { nativeInputForRequest, normalizeResponsesInput } from './responses-input.js';
+import { blockHandedIn, convertMcpMedia } from '../utils/mcp-media.js';
 import { fetchWithCredentials, type CredentialResolver } from './credentials.js';
 import { assertMessagePrefillSupported } from './request-capabilities.js';
 
@@ -462,6 +463,26 @@ export class OpenAIResponsesAPIAdapter implements ProviderAdapter {
     }, this.credentials ?? { token: this.apiKey });
   }
 
+  /**
+   * Subscription mode's input, built from membrane's content blocks. Media in
+   * MCP's form becomes membrane's first, for a caller that builds a request
+   * directly (Membrane's own builds have converted it already,
+   * utils/mcp-media.ts), and a report about a block names the one the caller
+   * handed in. API mode takes native items as they are, so it converts
+   * nothing.
+   */
+  private subscriptionInput(
+    messages: ProviderRequest['messages'],
+    onContentAltered?: (block?: unknown) => void,
+  ): ReturnType<typeof normalizeResponsesInput> {
+    const converted = convertMcpMedia(messages as unknown[]) as ProviderRequest['messages'];
+    const handedIn = blockHandedIn(messages as unknown[], converted as unknown[]);
+    return normalizeResponsesInput(
+      converted,
+      onContentAltered && ((block?: unknown) => onContentAltered(handedIn(block))),
+    );
+  }
+
   private buildRequest(request: ProviderRequest, onContentAltered?: (block?: unknown) => void): OpenAIResponsesAPIRequest {
     if (!Array.isArray(request.messages)) {
       throw new Error('OpenAI Responses API input must be a provider-native input-item array');
@@ -514,7 +535,7 @@ export class OpenAIResponsesAPIAdapter implements ProviderAdapter {
     // URL holds no image would be refused on every request, so it goes as the
     // placeholder in either mode.
     responsesRequest.input = this.subscription
-      ? normalizeResponsesInput(request.messages, onContentAltered)
+      ? this.subscriptionInput(request.messages, onContentAltered)
       : nativeInputForRequest(request.messages, onContentAltered);
     responsesRequest.store = false;
     responsesRequest.include = this.mergeEncryptedReasoningInclude(responsesRequest.include);

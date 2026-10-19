@@ -39,6 +39,7 @@ import { IncrementalXmlParser } from '../utils/stream-parser.js';
 import { assertCacheMarkersWithinLimit, clampCacheMarkers } from '../utils/cache-marker-budget.js';
 import { lastCacheableBlockIndex } from './native.js';
 import { imageForRequest, isAcceptedImage } from '../utils/image-media.js';
+import { convertMcpMedia } from '../utils/mcp-media.js';
 import { holdsContent, isRawItemCarrier } from '../utils/fidelity.js';
 
 // ============================================================================
@@ -89,10 +90,9 @@ export interface AnthropicXmlFormatterConfig extends FormatterConfig {
  * Convert a stored tool_result content block into a ToolResult for XML
  * re-rendering (legacy path — blocks without rawXml). Only text and image
  * sub-blocks survive, an image as it was stored, so its note reads it as the
- * live notes read one (toolResultImage): a base64 source, or MCP-style `data`
- * and `mimeType`, which is how a split stores the image a tool returned that
- * way. An image with a url source, and other block types, have no XML
- * representation.
+ * live notes read one (toolResultImage): a base64 or url source, or MCP-style
+ * `data` and `mimeType`, which is how a split stores the image a tool returned
+ * that way. Other sources, and other block types, have no XML representation.
  */
 function toToolResult(block: ToolResultContent): ToolResult {
   let content: string | ToolResultContentBlock[];
@@ -103,7 +103,7 @@ function toToolResult(block: ToolResultContent): ToolResult {
     for (const sub of block.content) {
       if (sub.type === 'text') {
         content.push({ type: 'text', text: sub.text });
-      } else if (sub.type === 'image' && (!sub.source || sub.source.type === 'base64')) {
+      } else if (sub.type === 'image' && (!sub.source || sub.source.type === 'base64' || sub.source.type === 'url')) {
         // Typed as a source image; an MCP-style one comes untyped, as the tool returned it.
         content.push(sub as ToolResultContentBlock);
       }
@@ -133,20 +133,28 @@ interface SentSplit {
  * split (formatToolResultsForSplitTurn) decides them: each image block read
  * as the split reads one (toolResultImage), sent when its data's header shows
  * a format the request carries (isAcceptedImage, imageForRequest's test) and
- * labelled by what the header shows, whatever label it came with. A url
- * source holds no data, so neither sends it. Null when no result in the group
- * is marked, the mark doesn't fall where a result or error closes, or no
- * image it holds can be sent; the block then goes out as its raw text whole,
- * and when the marked result holds an image, its round report says the
- * message was altered. A split leaves out the images this rule refuses, with
- * no note and no warning: under the same rule the turn refused them too, and
- * wrote imageForRequest's placeholder for each into the raw text. A consumer
- * that removes an image drops the raw text with it (ToolResultContent's
- * rawXmlImagesAt), so only a rule that changed between versions can leave out
- * an image the turn sent: data in none of the formats the request carries,
- * which an earlier version sent by its label and the API refuses, so the
- * request that carried it failed. That goes unreported, since `content`
- * doesn't say which of its images the turn sent.
+ * labelled by what the header shows, whatever label it came with. An image at
+ * a URL a provider would fetch holds no data, so neither sends it; a `data:`
+ * URL holds its image inline, and both read its bytes. Null when no result in
+ * the group is marked, the mark doesn't fall where a result or error closes,
+ * or no image it holds can be sent; the block then goes out as its raw text
+ * whole, and when the marked result holds an image, its round report says
+ * the message was altered. A split leaves out the images this rule refuses,
+ * with no note and no warning: under the same rule the turn refused them too,
+ * and wrote its note for each into the raw text (imageForRequest's
+ * placeholder, or the link note). A consumer that removes an image drops the
+ * raw text with it (ToolResultContent's rawXmlImagesAt), so only a rule that
+ * changed between versions can leave out an image the turn sent, or send one
+ * it left out:
+ * - data in none of the formats the request carries, which an earlier
+ *   version sent by its label and the API refuses, so the request that
+ *   carried it failed;
+ * - data a url source also carries, which an earlier version's split sent as
+ *   an image and this one doesn't read;
+ * - a `data:` URL's image, which an earlier version's split refused, and
+ *   which this one sends beside the note that turn wrote.
+ * Where the split still sends another image, that goes unreported, since
+ * `content` doesn't say which of its images the turn sent.
  */
 function sentSplit(group: readonly ToolResultContent[]): SentSplit | null {
   const rawXml = group[0]!.rawXml!;
@@ -229,6 +237,10 @@ export class AnthropicXmlFormatter implements PrefillFormatter {
   // ==========================================================================
 
   buildMessages(messages: NormalizedMessage[], options: BuildOptions): BuildResult {
+    // Media in MCP's form becomes membrane's first, for a caller that builds
+    // messages directly. Membrane's own builds have converted it already and
+    // get the same array back (utils/mcp-media.ts).
+    messages = convertMcpMedia(messages);
     // Native mode is a native conversation, not an XML transcript with a tools
     // array attached. Keep explicit XML's prefill/continuation protocol separate.
     if ((options.toolMode ?? this.config.toolMode) === 'native') {
@@ -678,7 +690,7 @@ export class AnthropicXmlFormatter implements PrefillFormatter {
         }
         parts.push(block.text);
       } else if (block.type === 'image') {
-        if (block.source.type === 'base64') {
+        if (block.source?.type === 'base64') {
           const { mediaType, placeholder } = imageForRequest(block.source.data, block.source.mediaType);
           if (placeholder) {
             parts.push(placeholder.text);
@@ -694,7 +706,10 @@ export class AnthropicXmlFormatter implements PrefillFormatter {
             });
           }
         } else {
-          onAltered?.(); // a non-base64 image source has no branch here
+          // A source that isn't base64 has no branch here, and nor does no
+          // source object at all (media in MCP's form that didn't convert,
+          // utils/mcp-media.ts).
+          onAltered?.();
         }
       } else if (block.type === 'tool_use') {
         // Collect the run of consecutive tool_use blocks so calls parsed

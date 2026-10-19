@@ -30,6 +30,7 @@ import {
 } from '../types/index.js';
 import { isRawItemCarrier } from '../utils/fidelity.js';
 import { imageForRequest, GEMINI_IMAGE_TYPES } from '../utils/image-media.js';
+import { convertMcpMedia } from '../utils/mcp-media.js';
 import { createCombinedSignal, textOnlyToolResultContent, toolUseInputFromValue, isDeadlineAbort, deadlineTimeoutError, throwOnStreamErrorFrame, assertTerminalEventObserved, isEventObject } from './utils.js';
 
 // ============================================================================
@@ -541,7 +542,10 @@ export class GeminiAdapter implements ProviderAdapter {
   // --------------------------------------------------------------------------
 
   private buildRequest(request: ProviderRequest): GeminiRequest {
-    const contents = this.convertMessages(request.messages as any[], request.model);
+    // Media in MCP's form becomes membrane's first, for a caller that builds
+    // a request directly (Membrane's own builds have converted it already,
+    // utils/mcp-media.ts).
+    const contents = this.convertMessages(convertMcpMedia(request.messages as any[]), request.model);
     const maxTokens = request.maxTokens || this.defaultMaxTokens;
 
     const geminiRequest: GeminiRequest = { contents };
