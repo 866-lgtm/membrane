@@ -527,9 +527,9 @@ describe('Membrane core: one renewable deadline per provider call', () => {
     await vi.advanceTimersByTimeAsync(2000);
     const events = await collecting;
     expect(viaYielding.calls).toBe(2);
-    expect(events.filter((e) => e.type === 'backoff').map((e) => (e as { delayMs: number }).delayMs)).toEqual([400]);
     expect(events.filter((e) => e.type === 'aborted')).toEqual([]);
-    expect(events.some((e) => e.type === 'complete')).toBe(true);
+    const complete = events.find((e) => e.type === 'complete') as { response: { details: { timing: { retryDelaysMs?: number[] } } } } | undefined;
+    expect(complete?.response.details.timing.retryDelaysMs).toEqual([400]);
     expect(viaYielding.signals[0]).not.toBe(viaYielding.signals[1]);
   });
 
@@ -545,7 +545,6 @@ describe('Membrane core: one renewable deadline per provider call', () => {
     await vi.advanceTimersByTimeAsync(1500);
     const error = await settled;
     expect(error).toBeInstanceOf(TimeoutAbortError);
-    expect((error as TimeoutAbortError).attempts).toBe(1);
     expect(viaComplete.calls).toBe(1);
 
     const viaStream = silentFirst();
@@ -561,7 +560,6 @@ describe('Membrane core: one renewable deadline per provider call', () => {
     await vi.advanceTimersByTimeAsync(1500);
     const events = await collecting;
     expect(viaYielding.calls).toBe(1);
-    expect(events.filter((e) => e.type === 'backoff')).toEqual([]);
     expect(events.find((e) => e.type === 'aborted')).toMatchObject({ reason: 'timeout' });
   });
 

@@ -65,7 +65,7 @@ import {
   isAbortedResponse,
   unsupportedError,
 } from './types/index.js';
-import { withAttempts, isDeadlineExpiry, errorFromThrown } from './types/errors.js';
+import { isDeadlineExpiry, errorFromThrown } from './types/errors.js';
 import type { BuildResult } from './formatters/types.js';
 import { computeCacheWireReceipt } from './cache-wire-receipt.js';
 import { createProgressDeadline } from './providers/utils.js';
@@ -87,7 +87,6 @@ import type {
   YieldingStreamOptions,
   StreamEvent,
   ToolCallsEvent,
-  BackoffEvent,
   RoundReport,
   RoundUsage,
   ThinkingBindingEntry,
@@ -406,9 +405,6 @@ export class Membrane {
     // The transport-error budget's count: passes since the last refusal
     // re-issue, which starts it again.
     let tries = 0;
-    // Sends since the last refusal re-issue, for the error this call may end
-    // with (`tries` also counts a pass that failed before its send).
-    let sends = 0;
     let rawRequest: unknown;
     // Counted separately from `tries` (the transport-error budget): a
     // refusal is a successful HTTP call with an unwanted verdict, and letting
@@ -461,7 +457,6 @@ export class Membrane {
         );
         let rawProviderResponse: ProviderResponse;
         try {
-          sends++;
           const adapterCall = this.adapter.complete(finalRequest, {
             requestContext: {
               formatterName: activeFormatter.name,
@@ -522,7 +517,6 @@ export class Membrane {
         ) {
           refusalRetriesUsed++;
           tries = 0;
-          sends = 0;
           discardedUsage = this.mergeDiscardedAttempts(
             discardedUsage,
             this.discardedAttemptFrom(response.usage)
@@ -560,7 +554,7 @@ export class Membrane {
                 rawError: error,
                 rawRequest,
               });
-          throw sends > 0 ? withAttempts(cancelled, sends) : cancelled;
+          throw cancelled;
         }
         // A receipt consumer that threw stopped the call before its request
         // went out: its error, typed as before, is the answer, never retried.
@@ -579,14 +573,14 @@ export class Membrane {
         // the last word), and a deadline on a sent request is the caller's.
         const plan = isDeadlineExpiry(classifiedError)
           ? undefined
-          : this.retryPlan(errorInfo, tries, { retryRateLimits: options.retryRateLimits });
+          : this.retryPlan(errorInfo, tries, { retry: options.retry });
 
         if (plan) {
           // Check hook for retry decision
           if (this.config.hooks?.onError) {
             const decision = await this.config.hooks.onError(errorInfo, tries);
             if (decision === 'abort') {
-              throw sends > 0 ? withAttempts(classifiedError, sends) : classifiedError;
+              throw classifiedError;
             }
           }
 
@@ -610,12 +604,12 @@ export class Membrane {
                   rawRequest,
                 })
               : this.attachRawRequest(sleepError, rawRequest);
-            throw sends > 0 ? withAttempts(ended, sends) : ended;
+            throw ended;
           }
           continue;
         }
 
-        throw sends > 0 ? withAttempts(classifiedError, sends) : classifiedError;
+        throw classifiedError;
       }
     }
   }
@@ -800,7 +794,7 @@ export class Membrane {
       timeoutMs,
       idleTimeoutMs,
       progressTimeoutMs,
-      retryRateLimits,
+      retry,
     } = options;
 
     // The formatter stream() selected: the same instance that resolved the
@@ -1027,7 +1021,7 @@ export class Membrane {
             timeoutMs,
             idleTimeoutMs,
             progressTimeoutMs,
-            retryRateLimits,
+            retry,
             normalizedRequest: request,
             formatterName: formatter.name,
             requiresAssistantPrefill: true,
@@ -1496,7 +1490,7 @@ export class Membrane {
       timeoutMs,
       idleTimeoutMs,
       progressTimeoutMs,
-      retryRateLimits,
+      retry,
     } = options;
 
     let toolDepth = 0;
@@ -1581,7 +1575,7 @@ export class Membrane {
             timeoutMs,
             idleTimeoutMs,
             progressTimeoutMs,
-            retryRateLimits,
+            retry,
             normalizedRequest: request,
             formatterName: activeFormatter.name,
             requiresAssistantPrefill: false,
@@ -2530,14 +2524,8 @@ export class Membrane {
        * is sent again without it, since there is nothing to discard.
        */
       onRetrying?: (info: { attempt: number; maxAttempts: number; category?: string }) => void;
-      /** See StreamOptions.retryRateLimits: false leaves a 429 to the caller. */
-      retryRateLimits?: boolean;
-      /**
-       * Called before each wait to send a call again that failed before it
-       * delivered anything (see retryPlan). Nothing reached the callbacks from
-       * the failed call, so there is nothing to discard.
-       */
-      onBackoff?: (info: Omit<BackoffEvent, 'type'>) => void;
+      /** See StreamOptions.retry: false sends the call once, whatever fails. */
+      retry?: boolean;
       /**
        * Starts with the post-hook/post-clamp input count. Wire-request
        * adapters update it from onRequest; default adapters retain the
@@ -2571,7 +2559,7 @@ export class Membrane {
     // compatibility won't catch the excess field (checked only on object
     // literals, not on variables). Leaving it in would silently leak the
     // normalized form into every adapter's options.
-    const { normalizedRequest, formatterName, requiresAssistantPrefill, refusalRetries, onRetrying, retryRateLimits, onBackoff, onWireCacheMarkers, progressTimeoutMs, fidelity, ...adapterOptions } = options;
+    const { normalizedRequest, formatterName, requiresAssistantPrefill, refusalRetries, onRetrying, retry, onWireCacheMarkers, progressTimeoutMs, fidelity, ...adapterOptions } = options;
     // Fingerprint around the hook only when both a hook and a reader exist
     // (the yielding loops pass notes only when they emit usage events, which
     // carry the round report): an observer or a no-op hook keeps fidelity
@@ -2700,41 +2688,31 @@ export class Membrane {
       if (failure) {
         // Typed once, as every path's caller gets it: a failure that isn't a
         // MembraneError yet is typed by errorFromThrown, so the retry is
-        // decided on that type and `attempts` stays on what is thrown.
+        // decided on the type that is thrown.
         const typed = errorFromThrown(failure.error);
         // A receipt consumer that threw stopped the call before its request
         // went out: its error is the answer, never retried.
         if (receiptGuard?.failure) throw typed;
-        // A call that delivered anything can't be sent again, and it starts
-        // the count again: membrane hasn't retried this failure.
-        if (delivered) throw withAttempts(typed, 1);
+        // A call that delivered anything can't be sent again.
+        if (delivered) throw typed;
         // The call's signal first, as complete() reads the caller's: a
         // cancellation plans no retry and asks onError nothing, and each path
         // reports it as the cancellation it is.
-        if (adapterOptions.signal?.aborted) throw withAttempts(typed, tries);
+        if (adapterOptions.signal?.aborted) throw typed;
         const errorInfo = classifyError(typed);
-        const plan = isDeadlineExpiry(typed) ? undefined : this.retryPlan(errorInfo, tries, { retryRateLimits });
-        if (!plan) throw withAttempts(typed, tries);
+        const plan = isDeadlineExpiry(typed) ? undefined : this.retryPlan(errorInfo, tries, { retry });
+        if (!plan) throw typed;
         // The same pre-retry hook contract as complete(): hosts use onError
         // for circuit-breaking, and its 'abort' decision ends the call here.
         if (this.config.hooks?.onError) {
           const decision = await this.config.hooks.onError(errorInfo, tries);
-          if (decision === 'abort') throw withAttempts(typed, tries);
+          if (decision === 'abort') throw typed;
         }
         const delayMs = this.calculateRetryDelay(tries, plan.overloaded, errorInfo);
-        // A cancellation can land while onError decides. Then the sleep below
-        // rejects at once, and no wait is announced or reported that won't
-        // happen (an aborted stream's last event stays `aborted`).
-        if (!adapterOptions.signal?.aborted) {
-          retryDelaysMs.push(delayMs);
-          onBackoff?.({
-            schedule: plan.overloaded ? 'overloaded' : 'base',
-            attempt: tries,
-            maxAttempts: plan.maxAttempts - 1,
-            delayMs,
-            error: withAttempts(typed, tries),
-          });
-        }
+        // Reported only with a response this helper returns: a cancellation,
+        // even one that landed while onError decided, ends the wait below by
+        // throwing, so a wait that didn't happen is never reported.
+        retryDelaysMs.push(delayMs);
         // The call's signal ends the wait: the caller's, or on streamYielding
         // the stream's own, which cancel() aborts. Each path reports that as
         // the cancellation it is (an AbortedResponse, an aborted event), with
@@ -3427,18 +3405,18 @@ export class Membrane {
    * code says the account is out of quota is not a rate limit in that sense:
    * it is classified non-retryable at the boundary, and gets no floor.
    *
-   * With `retryRateLimits: false` a 429 belongs to the caller: it isn't retried.
-   * Nor is an error whose stated wait is longer than its schedule's
-   * maxRetryDelayMs.
+   * With the call's `retry: false` nothing is sent again, these floors
+   * included: the error goes to the caller. Nor is an error whose stated
+   * wait is longer than its schedule's maxRetryDelayMs.
    */
   private retryPlan(
     errorInfo: ErrorInfo,
     attempt: number,
-    options: { retryRateLimits?: boolean },
+    options: { retry?: boolean },
   ): { overloaded: boolean; maxAttempts: number } | undefined {
+    if (options.retry === false) return undefined;
     if (!errorInfo.retryable) return undefined;
     const isRateLimit = errorInfo.type === 'rate_limit';
-    if (isRateLimit && options.retryRateLimits === false) return undefined;
     const overloaded =
       isOverloadedError(errorInfo) && this.retryConfig.overloaded.maxRetries > 0;
     const maxAttempts = isRateLimit
@@ -3847,8 +3825,7 @@ export class Membrane {
             timeoutMs: options.timeoutMs,
             idleTimeoutMs: options.idleTimeoutMs,
             progressTimeoutMs: options.progressTimeoutMs,
-            retryRateLimits: options.retryRateLimits,
-            onBackoff: (info) => stream.emit({ type: 'backoff', ...info }),
+            retry: options.retry,
             normalizedRequest: request,
             formatterName: formatter.name,
             requiresAssistantPrefill: true,
@@ -4452,8 +4429,7 @@ export class Membrane {
             timeoutMs: options.timeoutMs,
             idleTimeoutMs: options.idleTimeoutMs,
             progressTimeoutMs: options.progressTimeoutMs,
-            retryRateLimits: options.retryRateLimits,
-            onBackoff: (info) => stream.emit({ type: 'backoff', ...info }),
+            retry: options.retry,
             normalizedRequest: request,
             formatterName: activeFormatter.name,
             requiresAssistantPrefill: false,

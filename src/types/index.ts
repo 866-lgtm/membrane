@@ -137,7 +137,6 @@ export type {
   ThinkingBindingEntry,
   CompleteEvent,
   ErrorEvent,
-  BackoffEvent,
   AbortedEvent,
   StreamEvent,
   YieldingStream,

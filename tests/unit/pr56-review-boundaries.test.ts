@@ -31,7 +31,7 @@ const factories = [
 async function invokeAdapter(adapter: ProviderAdapter, entry: string, options = {}) {
   return entry === 'complete' ? adapter.complete(wire, options) : adapter.stream(wire, { onChunk() {} }, options);
 }
-async function invoke(membrane: Membrane, entry: string, options: { retryRateLimits?: boolean } = {}) {
+async function invoke(membrane: Membrane, entry: string, options: { retry?: boolean } = {}) {
   if (entry === 'complete') return membrane.complete(request, options);
   if (entry === 'stream') return membrane.stream(request, options);
   for await (const event of membrane.streamYielding(request, options)) {
@@ -299,15 +299,15 @@ describe('SSE payload classification shares HTTP-boundary semantics', () => {
       await invoke(membrane, entry);
       expect(sends).toBe(2);
     });
-    it(entry + ' leaves the rate limit to a caller that sets retryRateLimits: false', async () => {
+    it(entry + ' leaves the rate limit to a caller that sets retry: false', async () => {
       let sends = 0;
       const fetch = vi.fn(async () => ++sends === 1
         ? sse([{ error: { status: 429, code: 'rate_limit_exceeded', message: 'wait', retry_after_ms: 1 } }])
         : sse([{ choices: [{ delta: { content: 'done' }, finish_reason: 'stop' }] }, '[DONE]']));
       vi.stubGlobal('fetch', fetch);
       const membrane = new Membrane(new OpenAIAdapter({ apiKey: 'zz-key' }), { formatter: new NativeFormatter(), retry: { retryDelayMs: 1 } });
-      await expect(invoke(membrane, entry, { retryRateLimits: false })).rejects.toMatchObject({
-        type: 'rate_limit', retryable: true, providerErrorCode: 'rate_limit_exceeded', retryAfterMs: 1, attempts: 1,
+      await expect(invoke(membrane, entry, { retry: false })).rejects.toMatchObject({
+        type: 'rate_limit', retryable: true, providerErrorCode: 'rate_limit_exceeded', retryAfterMs: 1,
       });
       expect(sends).toBe(1);
     });

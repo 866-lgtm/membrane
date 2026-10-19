@@ -89,7 +89,7 @@ describe('calculateRetryDelay honors retry-after (MAJOR-2)', () => {
 
     const startedAt = Date.now();
     await expect(membrane.complete(zzRequest)).rejects.toMatchObject({
-      type: 'rate_limit', retryAfterMs: 60_000, attempts: 1,
+      type: 'rate_limit', retryAfterMs: 60_000,
     });
     // Not parked on the stated wait, and not sent back inside it.
     expect(Date.now() - startedAt).toBeLessThan(2_000);

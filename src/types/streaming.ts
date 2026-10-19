@@ -223,15 +223,18 @@ export interface StreamOptions {
   progressTimeoutMs?: number;
 
   /**
-   * Whether membrane retries a 429 rate limit itself. Default true: a 429
-   * that ends a provider call before it delivered anything is retried, like a
-   * 529, unless its stated wait is longer than its schedule's
-   * `maxRetryDelayMs`, which reaches the caller at once. With `false`, a 429
-   * is the caller's: membrane doesn't retry it and throws it at once, with
-   * the provider's stated wait on `retryAfterMs`. For a caller that paces
-   * rate limits itself. A 529 is still retried.
+   * Whether membrane retries the call's failed provider calls itself.
+   * Default true: a provider call that fails with a retryable error before
+   * it delivered anything is sent again, in any round, on the `retry`
+   * config's schedules. With `false`, membrane sends each provider call
+   * once, whatever the error and whatever the config says: the first failure
+   * is thrown as it came, with the provider's advice on it (`retryable`, and
+   * a stated wait on `retryAfterMs`), and `hooks.onError`, which is asked
+   * before each retry, isn't asked. For a caller whose own layer retries. A
+   * refusal re-issue (`refusalRetries`) is asked for separately and isn't
+   * affected.
    */
-  retryRateLimits?: boolean;
+  retry?: boolean;
 
   /** Request ID for correlation */
   requestId?: string;
@@ -314,14 +317,16 @@ export interface CompleteOptions {
   refusalRetries?: number;
 
   /**
-   * Whether membrane retries a 429 rate limit itself. Default true, unless
-   * the 429's stated wait is longer than its schedule's `maxRetryDelayMs`,
-   * which is thrown at once. With `false`, a 429 is the caller's: membrane
-   * doesn't retry it and throws it at once, with the provider's stated wait
-   * on `retryAfterMs`. For a caller that paces rate limits itself. Other
-   * retryable errors keep their retries.
+   * Whether membrane retries the call's failed request itself. Default true:
+   * a request that fails with a retryable error is sent again on the `retry`
+   * config's schedules. With `false`, membrane sends it once, whatever the
+   * error and whatever the config says: the first failure is thrown as it
+   * came, with the provider's advice on it (`retryable`, and a stated wait on
+   * `retryAfterMs`), and `hooks.onError`, which is asked before each retry,
+   * isn't asked. For a caller whose own layer retries. A refusal re-issue
+   * (`refusalRetries`) is asked for separately and isn't affected.
    */
-  retryRateLimits?: boolean;
+  retry?: boolean;
 
   /** Request timeout */
   timeoutMs?: number;

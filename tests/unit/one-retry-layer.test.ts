@@ -3,11 +3,11 @@
  *
  *  - AnthropicAdapter's SDK client sends each request a call makes once: its
  *    own retries (two by default, invisible to membrane) are off on them, so
- *    a 429 reaches a caller that asked for it at once, and `attempts`,
- *    `backoff` and `retryDelaysMs` count every send. The cache keepalive's
- *    background replays keep the SDK's retries.
+ *    with `retry: false` a 429 reaches the caller after one send, and
+ *    `details.timing.attempts` and `retryDelaysMs` count every send. The
+ *    cache keepalive's background replays keep the SDK's retries.
  *  - What the SDK used to retry before delivery, membrane retries: a 5xx, a
- *    provider's 408 and a connection failure get the base schedule, five
+ *    provider's 408 and a connection failure get the base schedule, three
  *    attempts by default, on every entry point. `maxRetries` still sets it.
  *  - A deadline that ran out on a sent request is the caller's: it isn't sent
  *    again. A connect timeout is, where the adapter can tell it apart.
@@ -87,17 +87,23 @@ async function yielding(m: Membrane): Promise<StreamEvent[]> {
 }
 
 describe('membrane retries what the SDK used to, before delivery, on every entry point', () => {
-  it('a 5xx gets the base schedule, five attempts by default', async () => {
+  it('a 5xx gets three attempts by default', async () => {
     const adapter = new FailingAdapter(Infinity, () => serverError('zz internal', 500));
     const events = await yielding(membrane(adapter));
 
-    expect(adapter.sends).toBe(5);
-    const backoffs = events.filter((e) => e.type === 'backoff') as Extract<StreamEvent, { type: 'backoff' }>[];
-    expect(backoffs.map((e) => [e.schedule, e.attempt, e.maxAttempts])).toEqual([
-      ['base', 1, 4], ['base', 2, 4], ['base', 3, 4], ['base', 4, 4],
-    ]);
+    expect(adapter.sends).toBe(3);
     const error = (events.at(-1) as Extract<StreamEvent, { type: 'error' }>).error;
-    expect(error).toMatchObject({ httpStatus: 500, attempts: 5 });
+    expect(error).toMatchObject({ httpStatus: 500 });
+  });
+
+  it('its waits are the base schedule: unjittered, one per retry', async () => {
+    // FAST's base schedule waits exactly 1 ms; the overloaded one is jittered.
+    const adapter = new FailingAdapter(2, () => serverError('zz internal', 500));
+    const events = await yielding(membrane(adapter));
+
+    expect(adapter.sends).toBe(3);
+    const complete = events.at(-1) as Extract<StreamEvent, { type: 'complete' }>;
+    expect(complete.response.details.timing).toMatchObject({ attempts: 3, retryDelaysMs: [1, 1] });
   });
 
   it.each(['complete', 'stream', 'yielding'] as const)('%s: a connection failure is sent again', async (entry) => {
@@ -124,7 +130,7 @@ describe('membrane retries what the SDK used to, before delivery, on every entry
       : entry === 'stream'
         ? await m.stream(REQUEST).catch((e) => e)
         : ((await yielding(m)).at(-1) as Extract<StreamEvent, { type: 'error' }>).error;
-    expect(thrown).toMatchObject({ httpStatus: 503, attempts: 1 });
+    expect(thrown).toMatchObject({ httpStatus: 503 });
     expect(adapter.sends).toBe(1);
   });
 
@@ -138,7 +144,7 @@ describe('membrane retries what the SDK used to, before delivery, on every entry
         : ((await yielding(m)).at(-1) as Extract<StreamEvent, { type: 'error' }>).error;
     // Still the retryable timeout the caller sees; membrane just doesn't spend
     // another full deadline on it.
-    expect(thrown).toMatchObject({ type: 'timeout', retryable: true, attempts: 1 });
+    expect(thrown).toMatchObject({ type: 'timeout', retryable: true });
     expect(adapter.sends).toBe(1);
   });
 });
@@ -172,15 +178,15 @@ describe('AnthropicAdapter sends each request once', () => {
     expect(fetch).toHaveBeenCalledTimes(3);
   });
 
-  it('through membrane, a 429 left to the caller arrives after one send', async () => {
+  it('through membrane, with retry: false a 429 arrives after one send', async () => {
     const fetch = vi.fn(async () => new Response(
       JSON.stringify({ type: 'error', error: { type: 'rate_limit_error', message: 'zz slow down' } }),
       { status: 429, headers: { 'content-type': 'application/json', 'retry-after': '30' } },
     ));
     vi.stubGlobal('fetch', fetch);
     const m = new Membrane(adapter(), { formatter: new NativeFormatter() });
-    await expect(m.stream(REQUEST, { retryRateLimits: false })).rejects.toMatchObject({
-      type: 'rate_limit', retryAfterMs: 30_000, attempts: 1,
+    await expect(m.stream(REQUEST, { retry: false })).rejects.toMatchObject({
+      type: 'rate_limit', retryAfterMs: 30_000,
     });
     expect(fetch).toHaveBeenCalledTimes(1);
   });
@@ -308,7 +314,7 @@ describe('a deadline on a sent request is the caller’s; a connect timeout is s
     it.each(['complete', 'stream', 'yielding'] as const)('%s: undici’s headers timeout is sent once', async (entry) => {
       const fetch = vi.fn(async () => { throw headersTimeout(); });
       vi.stubGlobal('fetch', fetch);
-      expect(await run(openai(), entry)).toMatchObject({ type: 'timeout', retryable: true, attempts: 1 });
+      expect(await run(openai(), entry)).toMatchObject({ type: 'timeout', retryable: true });
       expect(fetch).toHaveBeenCalledTimes(1);
     });
 
@@ -320,28 +326,28 @@ describe('a deadline on a sent request is the caller’s; a connect timeout is s
         { status: 200, headers: { 'content-type': entry === 'complete' ? 'application/json' : 'text/event-stream' } },
       ));
       vi.stubGlobal('fetch', fetch);
-      expect(await run(openai(), entry)).toMatchObject({ type: 'timeout', retryable: true, attempts: 1 });
+      expect(await run(openai(), entry)).toMatchObject({ type: 'timeout', retryable: true });
       expect(fetch).toHaveBeenCalledTimes(1);
     });
 
     it.each(['complete', 'stream', 'yielding'] as const)('%s: a connect timeout gets the base schedule', async (entry) => {
       const fetch = vi.fn(async () => { throw connectTimeout(); });
       vi.stubGlobal('fetch', fetch);
-      expect(await run(openai(), entry)).toMatchObject({ type: 'timeout', retryable: true, attempts: 5 });
-      expect(fetch).toHaveBeenCalledTimes(5);
+      expect(await run(openai(), entry)).toMatchObject({ type: 'timeout', retryable: true });
+      expect(fetch).toHaveBeenCalledTimes(3);
     });
 
     it('ETIMEDOUT gets the base schedule', async () => {
       const fetch = vi.fn(async () => { throw systemTimeout(); });
       vi.stubGlobal('fetch', fetch);
-      expect(await run(openai(), 'stream')).toMatchObject({ type: 'timeout', attempts: 5 });
-      expect(fetch).toHaveBeenCalledTimes(5);
+      expect(await run(openai(), 'stream')).toMatchObject({ type: 'timeout' });
+      expect(fetch).toHaveBeenCalledTimes(3);
     });
 
     it.each(['complete', 'stream', 'yielding'] as const)('%s: Bun’s fetch timeout is sent once', async (entry) => {
       const fetch = vi.fn(async () => { throw bunTimeout(); });
       vi.stubGlobal('fetch', fetch);
-      expect(await run(openai(), entry)).toMatchObject({ type: 'timeout', retryable: true, attempts: 1 });
+      expect(await run(openai(), entry)).toMatchObject({ type: 'timeout', retryable: true });
       expect(fetch).toHaveBeenCalledTimes(1);
     });
 
@@ -404,7 +410,7 @@ describe('a deadline on a sent request is the caller’s; a connect timeout is s
       const fetch = vi.fn(async () => { throw connectTimeout(); });
       vi.stubGlobal('fetch', fetch);
       const thrown = await run(anthropic(), entry);
-      expect(thrown).toMatchObject({ type: 'timeout', retryable: true, attempts: 1 });
+      expect(thrown).toMatchObject({ type: 'timeout', retryable: true });
       expect(isDeadlineExpiry(thrown)).toBe(true);
       expect(fetch).toHaveBeenCalledTimes(1);
     });
@@ -412,15 +418,15 @@ describe('a deadline on a sent request is the caller’s; a connect timeout is s
     it.each(['complete', 'stream', 'yielding'] as const)('%s: undici’s headers timeout is sent once', async (entry) => {
       const fetch = vi.fn(async () => { throw headersTimeout(); });
       vi.stubGlobal('fetch', fetch);
-      expect(await run(anthropic(), entry)).toMatchObject({ type: 'timeout', retryable: true, attempts: 1 });
+      expect(await run(anthropic(), entry)).toMatchObject({ type: 'timeout', retryable: true });
       expect(fetch).toHaveBeenCalledTimes(1);
     });
 
     it.each(['complete', 'stream', 'yielding'] as const)('%s: a reset connection gets the base schedule', async (entry) => {
       const fetch = vi.fn(async () => { throw reset(); });
       vi.stubGlobal('fetch', fetch);
-      expect(await run(anthropic(), entry)).toMatchObject({ type: 'network', retryable: true, attempts: 5 });
-      expect(fetch).toHaveBeenCalledTimes(5);
+      expect(await run(anthropic(), entry)).toMatchObject({ type: 'network', retryable: true });
+      expect(fetch).toHaveBeenCalledTimes(3);
     });
 
     // A read that fails after the headers reaches the stream paths wrapped
@@ -434,7 +440,7 @@ describe('a deadline on a sent request is the caller’s; a connect timeout is s
       const fetch = failedRead(bodyTimeout);
       vi.stubGlobal('fetch', fetch);
       const thrown = await run(anthropic(), entry);
-      expect(thrown).toMatchObject({ type: 'timeout', retryable: true, attempts: 1 });
+      expect(thrown).toMatchObject({ type: 'timeout', retryable: true });
       expect(isDeadlineExpiry(thrown)).toBe(true);
       expect(fetch).toHaveBeenCalledTimes(1);
     });
@@ -443,7 +449,7 @@ describe('a deadline on a sent request is the caller’s; a connect timeout is s
       const fetch = failedRead(bunTimeout);
       vi.stubGlobal('fetch', fetch);
       const thrown = await run(anthropic(), entry);
-      expect(thrown).toMatchObject({ type: 'timeout', retryable: true, attempts: 1 });
+      expect(thrown).toMatchObject({ type: 'timeout', retryable: true });
       expect(isDeadlineExpiry(thrown)).toBe(true);
       expect(fetch).toHaveBeenCalledTimes(1);
     });
@@ -451,8 +457,8 @@ describe('a deadline on a sent request is the caller’s; a connect timeout is s
     it.each(['stream', 'yielding'] as const)('%s: a socket closed before any event gets the base schedule', async (entry) => {
       const fetch = failedRead(() => undici('other side closed', 'SocketError', 'UND_ERR_SOCKET', 'terminated'));
       vi.stubGlobal('fetch', fetch);
-      expect(await run(anthropic(), entry)).toMatchObject({ type: 'network', retryable: true, attempts: 5 });
-      expect(fetch).toHaveBeenCalledTimes(5);
+      expect(await run(anthropic(), entry)).toMatchObject({ type: 'network', retryable: true });
+      expect(fetch).toHaveBeenCalledTimes(3);
     });
   });
 

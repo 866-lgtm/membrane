@@ -11,7 +11,8 @@
   run once for the round, as they do for a refusal re-issue, and a cancellation
   during a later round's wait returns an `AbortedResponse` with what the
   earlier rounds delivered. A completed response's `details.timing.attempts`
-  counts every send, retries included.
+  counts every send, retries included, and `streamYielding()`'s now carries
+  `details.timing.retryDelaysMs` too, listing the waits, as `stream()`'s does.
 - On `complete()`, a refusal re-issue (`refusalRetries`) no longer spends the
   retry budget for transport errors: after a re-issue, a 529 or 429 gets the
   whole schedule again, as it does on the streaming paths.

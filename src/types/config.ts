@@ -15,8 +15,8 @@ import type { NormalizeEvent, PrefillFormatter } from '../formatters/types.js';
 export interface RetryConfig {
   /**
    * Bound on TOTAL attempts for a retryable error that ends a provider call
-   * before it delivered anything, the first included: 5 means one try and up
-   * to four retries; 0 or 1 means no retries (default: 5). It covers a 5xx,
+   * before it delivered anything, the first included: 3 means one try and up
+   * to two retries; 0 or 1 means no retries (default: 3). It covers a 5xx,
    * a provider's 408 and a connection failure, on every entry point and
    * adapter. A deadline that runs out on a request already sent is left to
    * the caller: AnthropicAdapter's idle and first-event watchdogs, undici's
@@ -25,16 +25,14 @@ export interface RetryConfig {
    * (the SDK reports both the same way). On Node, the other adapters'
    * connect timeouts are sent again like any connection failure. Bun's fetch
    * timeout doesn't say which stage ran out, so on Bun a stalled connect is
-   * left to the caller too. A retryable rate
-   * limit (429) gets at least 5 attempts whatever this says (unless the call
-   * sets `retryRateLimits: false`), and a provider capacity error (529) gets
+   * left to the caller too. A retryable rate limit (429) gets at least 5
+   * attempts whatever this says, and a provider capacity error (529) gets
    * the larger of this and `overloaded.maxRetries`, on the `overloaded`
    * schedule. Membrane is the only layer that retries a call's requests:
    * AnthropicAdapter turns its SDK client's own retries off for them, and
-   * only the cache keepalive's background replays keep the SDK's. A host
-   * whose own retry layer should be the only one sets 1 here, 0 for
-   * `overloaded.maxRetries`, and `retryRateLimits: false` on each call, and
-   * reads `MembraneError.attempts`.
+   * only the cache keepalive's background replays keep the SDK's. A caller
+   * whose own layer retries passes `retry: false` on the call, which turns
+   * every one of membrane's retries off for it, these floors included.
    */
   maxRetries: number;
 
@@ -265,11 +263,11 @@ export interface MembraneConfig {
 // ============================================================================
 
 export const DEFAULT_RETRY_CONFIG: RetryConfig = {
-  // 5 attempts = 4 waits: 1s → 2s → 4s → 8s, about 15 seconds of patience
-  // for a 5xx or a dropped connection before anything was delivered. That
-  // replaces the retries AnthropicAdapter's SDK client used to make inside
-  // each attempt, which are off now that membrane is the one retry layer.
-  maxRetries: 5,
+  // 3 attempts = 2 waits: 1s → 2s, the three sends AnthropicAdapter's SDK
+  // client used to make inside each attempt, for a 5xx or a dropped
+  // connection before anything was delivered. Its retries are off now that
+  // membrane is the one retry layer.
+  maxRetries: 3,
   retryDelayMs: 1000,
   backoffMultiplier: 2,
   maxRetryDelayMs: 30000,
