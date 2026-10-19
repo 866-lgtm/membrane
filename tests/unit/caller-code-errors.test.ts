@@ -19,7 +19,8 @@ import { AnthropicAdapter } from '../../src/providers/anthropic.js';
 import { OpenAIResponsesAPIAdapter } from '../../src/providers/openai-responses-api.js';
 import { OpenAIResponsesFormatter } from '../../src/formatters/openai-responses.js';
 import { NativeFormatter } from '../../src/formatters/native.js';
-import { MembraneError, callerCodeError, rateLimitError } from '../../src/types/errors.js';
+import { MembraneError, callerCodeError, invalidRequestError, rateLimitError, runCallerCode } from '../../src/types/errors.js';
+import { AnthropicXmlFormatter } from '../../src/formatters/anthropic-xml.js';
 import type { NormalizedRequest } from '../../src/types/index.js';
 
 const text = (t: string) => ({ type: 'text' as const, text: t });
@@ -45,7 +46,7 @@ const callerError = () => new Error('zz rate limit exceeded in the caller');
 class CountingAdapter extends MockAdapter {
   completeCalls = 0;
   streamCalls = 0;
-  constructor() { super({ defaultResponse: 'done and done', completeDelayMs: 0, streamChunkDelayMs: 0, streamChunkSize: 4 }); }
+  constructor(defaultResponse = 'done and done') { super({ defaultResponse, completeDelayMs: 0, streamChunkDelayMs: 0, streamChunkSize: 4 }); }
   override async complete(...args: Parameters<MockAdapter['complete']>) { this.completeCalls++; return super.complete(...args); }
   override async stream(...args: Parameters<MockAdapter['stream']>) { this.streamCalls++; return super.stream(...args); }
 }
@@ -90,26 +91,40 @@ const call = (path: 'complete' | 'stream', membrane: Membrane, req: NormalizedRe
 afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals(); });
 
 describe('callerCodeError', () => {
-  it('wraps an error that isn\'t a MembraneError, classified by its wording, not retryable, with the original as cause', () => {
-    const original = callerError();
+  it('wraps an error that isn\'t a MembraneError: its type read from its wording, not retryable, nothing a response would state, the original as cause', () => {
+    const original = new Error('zz rate limit exceeded in the caller, retry after 30 seconds');
     const error = callerCodeError(original);
     expect(error).toBeInstanceOf(MembraneError);
     expect(error).toMatchObject({ type: 'rate_limit', retryable: false, message: original.message });
+    expect(error.httpStatus).toBeUndefined();
+    expect(error.retryAfterMs).toBeUndefined();
     expect(error.cause).toBe(original);
   });
 
-  it('marks a MembraneError not retryable, as the same object', () => {
-    const original = rateLimitError('zz a retryable MembraneError');
+  it('keeps a MembraneError that already isn\'t retryable as itself', () => {
+    const original = invalidRequestError('zz a MembraneError that says not retryable');
     expect(callerCodeError(original)).toBe(original);
-    expect(original.retryable).toBe(false);
+    expect(original.cause).toBeUndefined();
   });
 
-  it('wraps a frozen MembraneError it can\'t mark, with the original as cause', () => {
-    const original = Object.freeze(rateLimitError('zz a frozen MembraneError'));
+  it('wraps a retryable MembraneError, leaving the caller\'s object as it was', () => {
+    const stated = { httpStatus: 429, providerErrorCode: 'zz_rate_limited', retryAfterMs: 30_000, rawRequest: { zz: 'the nested request' } };
+    const original = new MembraneError({ type: 'rate_limit', message: 'zz a nested call\'s 429', retryable: true, ...stated });
     const error = callerCodeError(original);
     expect(error).not.toBe(original);
-    expect(error).toMatchObject({ type: 'rate_limit', retryable: false });
+    expect(error).toMatchObject({ type: 'rate_limit', retryable: false, message: original.message });
     expect(error.cause).toBe(original);
+    expect(error.httpStatus).toBeUndefined();
+    expect(error.providerErrorCode).toBeUndefined();
+    expect(error.retryAfterMs).toBeUndefined();
+    expect(error.rawRequest).toBeUndefined();
+    expect(original).toMatchObject({ retryable: true, ...stated });
+  });
+
+  it('runCallerCode hands back a promise the caller\'s code returns as it is', async () => {
+    const returned = Promise.reject(callerError());
+    returned.catch(() => {});
+    expect(runCallerCode(() => returned)).toBe(returned);
   });
 });
 
@@ -129,6 +144,18 @@ describe('complete() sends once when the caller\'s code throws after the respons
     const error = await rejection(membrane.complete(request()));
     expect(adapter.completeCalls).toBe(1);
     expect(error.retryable).toBe(false);
+  });
+
+  it('the afterResponse hook, rethrowing a nested call\'s retryable MembraneError, which it still holds unchanged', async () => {
+    const adapter = new CountingAdapter();
+    const nested = rateLimitError('zz the nested call was rate limited', 30_000);
+    const membrane = new Membrane(adapter, { ...noDelay, hooks: { afterResponse: async () => { throw nested; } } });
+    const error = await rejection(membrane.complete(request()));
+    expect(adapter.completeCalls).toBe(1);
+    expect(error).not.toBe(nested);
+    expect(error).toMatchObject({ type: 'rate_limit', retryable: false });
+    expect(error.cause).toBe(nested);
+    expect(nested).toMatchObject({ retryable: true, retryAfterMs: 30_000 });
   });
 });
 
@@ -176,34 +203,78 @@ describe('the caller\'s code before the send runs once', () => {
       expect(error.retryable).toBe(false);
     });
 
-    it(`${path}: the Anthropic adapter's dynamicHeaders`, async () => {
+    it(`${path}: the Anthropic adapter's dynamicHeaders, before the keepalive records the request`, async () => {
       let runs = 0;
       const { adapter, create } = anthropic({ dynamicHeaders: () => { runs++; throw callerError(); } });
+      const record = vi.fn();
+      (adapter as any).cacheKeepalive = { record };
+      const error = await rejection(call(path, new Membrane(adapter, noDelay), request()));
+      expect(runs).toBe(1);
+      expect(create).not.toHaveBeenCalled();
+      expect(record).not.toHaveBeenCalled();
+      expect(error.retryable).toBe(false);
+    });
+
+    it(`${path}: a getter on the record dynamicHeaders returns`, async () => {
+      let runs = 0;
+      const record = { get 'x-zz-stamp'() { runs++; throw callerError(); } };
+      const { adapter, create } = anthropic({ dynamicHeaders: () => record });
       const error = await rejection(call(path, new Membrane(adapter, noDelay), request()));
       expect(runs).toBe(1);
       expect(create).not.toHaveBeenCalled();
       expect(error.retryable).toBe(false);
     });
+
+    it(`${path}: onCacheWireReceipt is called with the request as this, as before`, async () => {
+      const req = request();
+      let seen: unknown;
+      req.onCacheWireReceipt = function (this: unknown) { seen = this; };
+      await call(path, new Membrane(new CountingAdapter(), noDelay), req);
+      expect(seen).toBe(req);
+    });
   }
 });
 
 describe('the onError hook is the caller\'s code too', () => {
-  /** Fails its first call with a provider's rate limit, so onError is asked. */
+  /**
+   * Reports its request, as real adapters do before sending, then fails its
+   * first call with a provider's rate limit, so onError is asked.
+   */
   class RateLimitedOnce extends CountingAdapter {
     override async complete(...args: Parameters<MockAdapter['complete']>) {
-      if (this.completeCalls++ === 0) throw rateLimitError('zz the provider says slow down');
+      if (this.completeCalls++ === 0) {
+        args[1]?.onRequest?.(args[0]);
+        throw rateLimitError('zz the provider says slow down');
+      }
       return MockAdapter.prototype.complete.apply(this, args);
     }
     override async stream(...args: Parameters<MockAdapter['stream']>) {
-      if (this.streamCalls++ === 0) throw rateLimitError('zz the provider says slow down');
+      if (this.streamCalls++ === 0) {
+        args[2]?.onRequest?.(args[0]);
+        throw rateLimitError('zz the provider says slow down');
+      }
       return MockAdapter.prototype.stream.apply(this, args);
     }
   }
 
+  /** Swallows what onRequest throws, as a logging wrapper might, then fails its first call with a rate limit. */
+  class SwallowingRateLimitedOnce extends CountingAdapter {
+    override async complete(...args: Parameters<MockAdapter['complete']>) {
+      try { args[1]?.onRequest?.(args[0]); } catch { /* swallowed */ }
+      if (this.completeCalls++ === 0) throw rateLimitError('zz the provider says slow down');
+      return MockAdapter.prototype.complete.call(this, args[0], { ...args[1], onRequest: undefined });
+    }
+    override async stream(...args: Parameters<MockAdapter['stream']>) {
+      try { args[2]?.onRequest?.(args[0]); } catch { /* swallowed */ }
+      if (this.streamCalls++ === 0) throw rateLimitError('zz the provider says slow down');
+      return MockAdapter.prototype.stream.call(this, args[0], args[1], { ...args[2], onRequest: undefined });
+    }
+  }
+
   for (const path of ['complete', 'stream'] as const) {
-    it(`${path}: what it throws leaves as a MembraneError that isn't retryable`, async () => {
+    it(`${path}: what it throws, or rejects with, leaves as a MembraneError that isn't retryable`, async () => {
       const original = callerError();
-      const membrane = new Membrane(new RateLimitedOnce(), { ...noDelay, hooks: { onError: () => { throw original; } } });
+      const membrane = new Membrane(new RateLimitedOnce(), { ...noDelay, hooks: { onError: async () => { throw original; } } });
       const error = await rejection(call(path, membrane, request()));
       expect(error.retryable).toBe(false);
       expect(error.cause).toBe(original);
@@ -217,7 +288,39 @@ describe('the onError hook is the caller\'s code too', () => {
       expect(path === 'complete' ? adapter.completeCalls : adapter.streamCalls).toBe(2);
       expect(onError).toHaveBeenCalledTimes(1);
     });
+
+    it(`${path}: a provider's rate limit after the caller's error was swallowed in the same attempt is still retried (control)`, async () => {
+      const adapter = new SwallowingRateLimitedOnce();
+      let runs = 0;
+      await expect(call(path, new Membrane(adapter, noDelay), request(), { onRequest: () => { runs++; throw callerError(); } })).resolves.toBeDefined();
+      expect(path === 'complete' ? adapter.completeCalls : adapter.streamCalls).toBe(2);
+      expect(runs).toBe(2);
+    });
   }
+});
+
+describe('the configured logger and a model registry run beside the call, so complete() sends once when they throw', () => {
+  it('a logger whose warn() throws, while membrane warns of a tool block that parsed to nothing', async () => {
+    const emptyBlock = '<' + 'function_calls>\nzz musing: no invokes in here\n</' + 'function_calls>';
+    const adapter = new CountingAdapter(`zz_bot: here goes\n${emptyBlock}`);
+    let runs = 0;
+    const logger = { debug() {}, info() {}, error() {}, warn: () => { runs++; throw callerError(); } };
+    const membrane = new Membrane(adapter, { ...noDelay, formatter: new AnthropicXmlFormatter(), logger });
+    const error = await rejection(membrane.complete(request({ tools: [tool], toolMode: 'xml' })));
+    expect(runs).toBe(1);
+    expect(adapter.completeCalls).toBe(1);
+    expect(error.retryable).toBe(false);
+  });
+
+  it('a registry whose getPricing throws, as membrane prices the response', async () => {
+    const adapter = new CountingAdapter();
+    let runs = 0;
+    const registry = { getPricing: () => { runs++; throw callerError(); } } as any;
+    const error = await rejection(new Membrane(adapter, { ...noDelay, registry }).complete(request()));
+    expect(runs).toBe(1);
+    expect(adapter.completeCalls).toBe(1);
+    expect(error.retryable).toBe(false);
+  });
 });
 
 describe('stream() after emission: the caller\'s error is not retryable, a provider\'s keeps its classification', () => {
@@ -240,19 +343,68 @@ describe('stream() after emission: the caller\'s error is not retryable, a provi
     expect(error.cause).toBe(original);
   });
 
-  it('onToolCalls rejects', async () => {
-    class ToolUse extends CountingAdapter {
-      override async stream(req: any, _callbacks: any, options?: any): Promise<any> {
-        this.streamCalls++;
-        options?.onRequest?.(req);
-        return { content: [{ type: 'tool_use', id: 't9', name: 'lookup', input: {} }], stopReason: 'tool_use', usage: { inputTokens: 1, outputTokens: 1 }, model: req.model, rawRequest: req, raw: {} };
-      }
+  /** Answers with text, then a tool call, as content blocks: the native loop's pre-tool text and tool round. */
+  class ToolUse extends CountingAdapter {
+    override async stream(req: any, callbacks: any, options?: any): Promise<any> {
+      this.streamCalls++;
+      options?.onRequest?.(req);
+      const content = [{ type: 'text', text: 'zz before the call' }, { type: 'tool_use', id: 't9', name: 'lookup', input: {} }];
+      content.forEach((block, index) => callbacks.onContentBlock?.(index, block));
+      return { content, stopReason: 'tool_use', usage: { inputTokens: 1, outputTokens: 1 }, model: req.model, rawRequest: req, raw: {} };
     }
+  }
+
+  it('onToolCalls rejects', async () => {
     const adapter = new ToolUse();
+    const original = callerError();
+    const onToolCalls = vi.fn(async () => { throw original; });
     const membrane = new Membrane(adapter, { ...noDelay, formatter: new NativeFormatter() });
-    const error = await rejection(membrane.stream(request({ tools: [tool] }), { onChunk: () => {}, onToolCalls: async () => { throw callerError(); } }));
+    const error = await rejection(membrane.stream(request({ tools: [tool] }), { onChunk: () => {}, onToolCalls }));
+    expect(adapter.streamCalls).toBe(1);
+    expect(onToolCalls).toHaveBeenCalledTimes(1);
+    expect(error.retryable).toBe(false);
+    expect(error.cause).toBe(original);
+  });
+
+  it('onPreToolContent rejects', async () => {
+    const adapter = new ToolUse();
+    const original = callerError();
+    const membrane = new Membrane(adapter, { ...noDelay, formatter: new NativeFormatter() });
+    const error = await rejection(membrane.stream(request({ tools: [tool] }), {
+      onChunk: () => {}, onToolCalls: async () => [], onPreToolContent: async () => { throw original; },
+    }));
     expect(adapter.streamCalls).toBe(1);
     expect(error.retryable).toBe(false);
+    expect(error.cause).toBe(original);
+  });
+
+  // Each tracked callback, through an adapter that reaches it. ToolUse
+  // reports content blocks, which the native loop turns into block events.
+  const native = { tools: [tool], toolMode: 'native' };
+  const callbacks: Array<[string, () => CountingAdapter, () => NativeFormatter | undefined, Record<string, unknown>]> = [
+    ['onResponse', () => new CountingAdapter(), () => undefined, {}],
+    ['onUsage', () => new CountingAdapter(), () => undefined, {}],
+    ['onBlock', () => new ToolUse(), () => new NativeFormatter(), native],
+    ['onContentBlockUpdate', () => new ToolUse(), () => undefined, {}],
+  ];
+  for (const [name, makeAdapter, formatter, extra] of callbacks) {
+    it(`${name} throws`, async () => {
+      const adapter = makeAdapter();
+      const original = callerError();
+      const f = formatter();
+      const membrane = new Membrane(adapter, { ...noDelay, ...(f ? { formatter: f } : {}) });
+      const error = await rejection(membrane.stream(request(extra), { onChunk: () => {}, [name]: () => { throw original; } }));
+      expect(adapter.streamCalls).toBe(1);
+      expect(error.retryable).toBe(false);
+      expect(error.cause).toBe(original);
+    });
+  }
+
+  it('a caller\'s AbortError still ends stream() as a cancellation, as before', async () => {
+    const stop = Object.assign(new Error('zz the caller stopped'), { name: 'AbortError' });
+    let chunks = 0;
+    const result: any = await new Membrane(new CountingAdapter(), noDelay).stream(request(), { onChunk: () => { if (++chunks === 2) throw stop; } });
+    expect(result).toMatchObject({ aborted: true, reason: 'error' });
   });
 
   it('a provider\'s rate limit after a chunk keeps retryable: true (control)', async () => {
@@ -296,7 +448,15 @@ describe('streamYielding(): the error event carries a MembraneError that isn\'t 
 describe('the Responses adapter: a throwing onFastModeFallback is logged, and the response stands', () => {
   for (const path of ['complete', 'stream'] as const) {
     it(path, async () => {
-      const fetch = vi.fn(async () => new Response('data: {"type":"response.completed","response":{"status":"completed","output":[],"service_tier":"default"}}\n\n'));
+      const completed = {
+        type: 'response.completed',
+        response: {
+          status: 'completed', service_tier: 'default',
+          output: [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'zz the paid answer' }] }],
+          usage: { input_tokens: 7, output_tokens: 3 },
+        },
+      };
+      const fetch = vi.fn(async () => new Response(`data: ${JSON.stringify(completed)}\n\n`));
       vi.stubGlobal('fetch', fetch);
       const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
       const original = callerError();
@@ -304,9 +464,15 @@ describe('the Responses adapter: a throwing onFastModeFallback is logged, and th
       const adapter = new OpenAIResponsesAPIAdapter({ mode: 'subscription', credentials: () => ({ token: 't' }), fastMode: true, onFastModeFallback: fallback });
       const membrane = new Membrane(adapter, { ...noDelay, formatter: new OpenAIResponsesFormatter() });
       const req: NormalizedRequest = { messages: [{ participant: 'user', content: [text('hello')] }], config: { model: 'gpt-5.4', maxTokens: 100 } };
-      await expect(call(path, membrane, req)).resolves.toBeDefined();
-      expect(fetch).toHaveBeenCalledTimes(1);
+      for (let i = 0; i < 2; i++) {
+        const response: any = await call(path, membrane, req);
+        expect(response.content).toMatchObject([text('zz the paid answer')]);
+        expect(response.usage).toMatchObject({ inputTokens: 7, outputTokens: 3 });
+      }
+      expect(fetch).toHaveBeenCalledTimes(2);
+      expect(fallback).toHaveBeenCalledTimes(1);
       expect(fallback).toHaveBeenCalledWith('default');
+      expect(warn).toHaveBeenCalledTimes(1);
       expect(warn).toHaveBeenCalledWith('[membrane:openai-responses] onFastModeFallback threw; the response stands:', original);
     });
   }

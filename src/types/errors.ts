@@ -755,25 +755,33 @@ export function withRawRequest(error: MembraneError, rawRequest: unknown): Membr
 }
 
 /**
- * What the caller's own code threw while membrane ran it: a hook, a request
- * or stream callback, a receipt consumer or a header stamp, the code that
- * observes or shapes a request or a response. It leaves membrane classified
- * as before, but never retryable: resending the request can't fix the
- * caller's code, and would pay for another provider call or run that code
- * again. Membrane's own retries stop on it, and so does a caller's policy
- * that reads `retryable`. A MembraneError stays the same object; any other
- * error, or a frozen MembraneError that can't be marked, is wrapped, with the
- * original as `cause`.
+ * What the caller's own code threw while membrane ran it beside a call: a
+ * hook, a request or stream callback, a receipt consumer, a header stamp,
+ * the configured logger or a model registry's pricing. Resending the provider
+ * request can't mend that code, and would pay for another call or run it
+ * again, so the error is never retryable: membrane's own retries stop on it,
+ * and so does a caller's policy that reads `retryable`. (What builds, sends
+ * or reads the call, such as an adapter, the transport, a credential
+ * resolver, a formatter or a parser, keeps its own classification.)
+ *
+ * A MembraneError that already says it isn't retryable leaves as itself.
+ * Anything else, a retryable MembraneError included, is wrapped, with the
+ * original as `cause`, so the caller's own objects are never changed. The
+ * wrapper keeps the type membrane reads from the error, but nothing a
+ * provider's response would state (an HTTP status, a provider code, a wait),
+ * since no response to this call stands behind it, and no request:
+ * complete() and stream() attach their own as it leaves.
  */
 export function callerCodeError(error: unknown): MembraneError {
-  if (error instanceof MembraneError) {
-    if (!error.retryable) return error;
-    try {
-      Object.defineProperty(error, 'retryable', { value: false, enumerable: true, writable: true, configurable: true });
-      return error;
-    } catch { /* Frozen: wrapped below, like any other error. */ }
-  }
-  const wrapped = new MembraneError({ ...classifyError(error), retryable: false });
+  if (error instanceof MembraneError && !error.retryable) return error;
+  const wrapped = new MembraneError({
+    ...classifyError(error),
+    retryable: false,
+    httpStatus: undefined,
+    providerErrorCode: undefined,
+    retryAfterMs: undefined,
+    rawRequest: undefined,
+  });
   Object.defineProperty(wrapped, 'cause', { value: error, writable: true, configurable: true });
   return wrapped;
 }

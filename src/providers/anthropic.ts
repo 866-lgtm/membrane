@@ -428,14 +428,15 @@ export class AnthropicAdapter implements ProviderAdapter {
     options?.onRequest?.(fullRequest);
 
     const headers = this.betaHeaders(request, anthropicRequest);
+    // Before the keepalive records the request: a dynamicHeaders that throws
+    // ends the call before the send, leaving nothing to replay.
+    const live = this.liveHeaders(headers, 'complete');
     this.cacheKeepalive?.record(
       fullRequest as unknown as Record<string, unknown>, headers, 'complete',
     );
 
     try {
-      const response = await this.createMessage(
-        fullRequest, this.liveHeaders(headers, 'complete'), options?.signal,
-      );
+      const response = await this.createMessage(fullRequest, live, options?.signal);
 
       return this.parseResponse(response, fullRequest);
     } catch (error) {
@@ -456,6 +457,10 @@ export class AnthropicAdapter implements ProviderAdapter {
     const fullRequest = { ...anthropicRequest, stream: true };
     assertMessagePrefillSupported(fullRequest.model, fullRequest.messages, options, this.name, fullRequest);
     options?.onRequest?.(fullRequest);
+
+    // Before the keepalive records the request: a dynamicHeaders that throws
+    // ends the call before the send, leaving nothing to replay.
+    const live = this.liveHeaders(this.betaHeaders(request, anthropicRequest), 'stream');
 
     // Snapshot the primary lane's prefix so it can be held warm across idle
     // gaps. `stream: true` is dropped at replay time (transport, not cache key).
@@ -523,7 +528,7 @@ export class AnthropicAdapter implements ProviderAdapter {
       session = this.credentialSession(idleAbort.signal, onTransportActivity);
       const stream = await session.client.messages.stream(anthropicRequest, {
         signal: session.signal,
-        headers: this.liveHeaders(this.betaHeaders(request, anthropicRequest), 'stream'),
+        headers: live,
       });
 
       // Accumulate response metadata from SSE events directly, so we can
@@ -829,10 +834,14 @@ export class AnthropicAdapter implements ProviderAdapter {
    *  keepalive recorder receives the base headers BEFORE this merge, so
    *  replayed touches never carry a stale telemetry value. */
   private liveHeaders(base: Record<string, string> | undefined, lane: DynamicHeadersContext['lane']): Record<string, string> | undefined {
-    const dyn = runCallerCode(() => this.dynamicHeaders?.({ lane }));
+    // Reading the returned record runs the caller's getters too.
+    const dyn = runCallerCode(() => {
+      const record = this.dynamicHeaders?.({ lane });
+      return record && Object.entries(record);
+    });
     if (!dyn) return base;
     const out: Record<string, string> = { ...(base ?? {}) };
-    for (const [k, v] of Object.entries(dyn)) {
+    for (const [k, v] of dyn) {
       if (v !== null && v !== undefined && v !== '') out[k] = String(v);
     }
     return Object.keys(out).length ? out : undefined;

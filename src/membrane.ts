@@ -21,6 +21,7 @@ import type {
   StreamCallbacks,
   ModelRegistry,
   MembraneConfig,
+  MembraneLogger,
   StreamOptions,
   CompleteOptions,
   BasicUsage,
@@ -1025,7 +1026,7 @@ export class Membrane {
     let consecutiveStalledResumptions = 0;
     let enteredViaResumption = false;
     let prevRoundStopSequence: string | undefined;
-    const warnLog = this.config.logger ?? console;
+    const warnLog = this.warnLogger();
 
     /** Count an automatic resumption; emits the visibility warning at the
      *  threshold and returns false when the cap says the turn should end. */
@@ -2231,6 +2232,17 @@ export class Membrane {
   // ==========================================================================
 
   /**
+   * The logger membrane warns through: the configured one, or console. The
+   * configured logger's warn() is the caller's code, so what it throws leaves
+   * as callerCodeError: a log sink's failure ends the call and isn't resent.
+   */
+  private warnLogger(): Pick<MembraneLogger, 'warn'> {
+    const logger = this.config.logger;
+    if (!logger) return console;
+    return { warn: (...args) => runCallerCode(() => logger.warn(...args)) };
+  }
+
+  /**
    * Fail loudly when a wire-request receipt consumer throws.
    *
    * Wire-request receipts are emitted from inside the adapter's `onRequest`,
@@ -3118,7 +3130,7 @@ export class Membrane {
     },
     stopReason: StopReason
   ): void {
-    const warnLog = this.config.logger ?? console;
+    const warnLog = this.warnLogger();
 
     if (diagnostics.unclosedToolBlock) {
       warnLog.warn(
@@ -3411,7 +3423,7 @@ export class Membrane {
   ): import('./types/provider.js').ModelPricing | undefined {
     const servedModel = actualModel && actualModel !== requestedModel ? actualModel : undefined;
     const fromRegistry = (modelId: string | undefined) =>
-      modelId === undefined ? undefined : this.registry?.getPricing(modelId);
+      modelId === undefined ? undefined : runCallerCode(() => this.registry?.getPricing(modelId));
     const fromBuiltin = (modelId: string | undefined) =>
       modelId === undefined ? undefined : getDefaultPricing(modelId);
 
@@ -3636,7 +3648,7 @@ export class Membrane {
     // and a partial implementation would corrupt the turn instead of
     // retrying it. Fail LOUD and OFF rather than silently mis-retrying.
     if (toolMode !== 'native' && (options.refusalRetries ?? 0) > 0) {
-      (this.config.logger ?? console).warn(
+      this.warnLogger().warn(
         '[membrane] refusalRetries is ignored in XML tool mode ' +
         '(native-only for now) — the turn will surface the refusal as before.',
       );
@@ -3697,7 +3709,7 @@ export class Membrane {
     let consecutiveStalledResumptions = 0;
     let enteredViaResumption = false;
     let prevRoundStopSequence: string | undefined;
-    const warnLog = this.config.logger ?? console;
+    const warnLog = this.warnLogger();
 
     // Initialize parser from the formatter streamYielding selected, so the
     // parser and the build below read the same format.
