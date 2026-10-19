@@ -60,8 +60,20 @@ import type { InjectedMessage } from '../../src/types/yielding-stream.js';
 
 afterEach(() => {
   vi.unstubAllGlobals();
+  vi.unstubAllEnvs();
   vi.restoreAllMocks();
 });
+
+/**
+ * The two image-shedding tests need a request over the byte cap that shedding
+ * answers to. They lower that cap through `MEMBRANE_MAX_REQUEST_BYTES`, its
+ * documented override, so eight copies of a 96 KiB image are over it. Against
+ * the default 28 MiB cap each request carried eight copies of a 6 MiB image,
+ * about 64 MiB of base64, and on a loaded host the test outlasted vitest's 5 s
+ * default. request-byte-cap.test.ts holds the default itself.
+ */
+const SHEDDING_CAP_BYTES = 256 * 1024;
+const SHEDDING_IMAGE_BYTES = 96 * 1024;
 
 const noopTool: ToolDefinition = {
   name: 'noop',
@@ -253,7 +265,8 @@ describe('native yielding rounds', () => {
   });
 
   it('is unknown when opt-in image shedding removed something', async () => {
-    const big = Buffer.alloc(6 * 1024 * 1024, 7).toString('base64');
+    vi.stubEnv('MEMBRANE_MAX_REQUEST_BYTES', String(SHEDDING_CAP_BYTES));
+    const big = Buffer.alloc(SHEDDING_IMAGE_BYTES, 7).toString('base64');
     const pngHeader = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]).toString('base64');
     const adapter = new ScriptedAdapter([finalTurn()]);
     const huge: ContentBlock = { type: 'image', source: { type: 'base64', mediaType: 'image/png', data: pngHeader + big } } as ContentBlock;
@@ -1326,7 +1339,8 @@ describe('an automated review of #104\'s own range', () => {
   });
 
   it('XML prefill: opt-in image shedding in the initial build makes the round unknown', async () => {
-    const big = Buffer.alloc(6 * 1024 * 1024, 7).toString('base64');
+    vi.stubEnv('MEMBRANE_MAX_REQUEST_BYTES', String(SHEDDING_CAP_BYTES));
+    const big = Buffer.alloc(SHEDDING_IMAGE_BYTES, 7).toString('base64');
     const pngHeader = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]).toString('base64');
     const huge: ContentBlock = { type: 'image', source: { type: 'base64', mediaType: 'image/png', data: pngHeader + big } } as ContentBlock;
     const adapter = new MockAdapter({ streamChunkDelayMs: 0, completeDelayMs: 0, responseQueue: ['done.'] });
