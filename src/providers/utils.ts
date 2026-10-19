@@ -280,7 +280,7 @@ export interface StreamedToolCall {
  */
 export function streamedToolCalls(): { add(entry: unknown): void; calls(): StreamedToolCall[] } {
   // Each slot holds the calls that joined it, in order. A piece continues
-  // the one with its id, or else the last.
+  // the latest of them with its id, or else the last.
   const indexed: StreamedToolCall[][] = [];
   const unindexed: StreamedToolCall[] = [];
   const byId = new Map<unknown, StreamedToolCall>();
@@ -332,10 +332,10 @@ export function streamedToolCalls(): { add(entry: unknown): void; calls(): Strea
     },
     calls() {
       // Every call comes back under an id of its own, since a result names its call by id
-      // alone, and an empty one goes back as no id at all (the adapters send a result's
-      // `tool_use_id || toolUseId`). A call with no id takes `call_<n>`, from n = 1, and one
-      // whose id an earlier call in the list holds takes `<id>_<n>`, from n = 2, each with
-      // the first n that no call has.
+      // alone, and an empty one can't be answered (the adapters send a result's
+      // `tool_use_id || toolUseId`, which drops it or sends ""). A call with no id takes
+      // `call_<n>`, from n = 1, and one whose id an earlier call in the list holds takes
+      // `<id>_<n>`, from n = 2, each with the first n that no call has.
       const all = [...Object.values(indexed).flat(), ...unindexed];
       const taken = new Set(all.map((c) => c.id));
       const seen = new Set<string>();
@@ -351,7 +351,7 @@ export function streamedToolCalls(): { add(entry: unknown): void; calls(): Strea
         }
         seen.add(c.id);
       }
-      if (minted.length) console.warn(`[membrane] The server repeated or left out a streamed tool call's id; ids given: ${minted.join(', ')}`);
+      if (minted.length) console.warn(`[membrane] The server repeated or left out a streamed tool call's id; new ids: ${minted.join(', ')}`);
       return all;
     },
   };

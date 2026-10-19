@@ -22,15 +22,15 @@
   an `index`; one with an `index` opened an empty call. A stream that gives
   each call its own `index` and sends each call's id and name once, with no
   two calls under one id, comes back as before.
-- Every tool call in a response comes back under an id of its own, on the
-  same three adapters. A call with no id comes back as `call_<n>`, from
-  `call_1`, and one whose id an earlier call in the response already has as
-  `<id>_<n>`, from `<id>_2`, and a `[membrane]` warning names each. A call
-  with no id came back with `''`, which the adapters send back with a tool
-  result as no `tool_call_id` at all. Two calls under one id, as these
-  adapters returned for two calls in their own slots that a server gave one
-  id or none, made the native formatter's tool-pair check refuse the turn
-  that held them.
+- Every streamed tool call in a response comes back under an id of its own,
+  on the same three adapters. A call with no id comes back as `call_<n>`,
+  from `call_1`, and one whose id an earlier call in the response already has
+  as `<id>_<n>`, from `<id>_2`, and a `[membrane]` warning names each. A call
+  with no id came back with `''`, which no tool result can answer: the
+  adapters send it back as `""` or as no `tool_call_id` at all. Two calls
+  under one id, as these adapters returned for two calls in their own slots
+  that a server gave one id or none, made the native formatter's tool-pair
+  check refuse the turn that held them.
 - Four kinds of stream that came back as one call now come back as several:
   one call whose every piece repeats its name and changes its id, as one call
   per such piece; one whose first piece has no `index` and whose later pieces

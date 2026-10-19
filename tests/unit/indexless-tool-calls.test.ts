@@ -56,8 +56,8 @@ for (const [name, make] of adapters) {
     };
     const a = { id: 'call_a', name: 'zz_a', input: { x: 1 } };
     const b = { id: 'call_b', name: 'zz_b', input: { y: 2 } };
-    /** The warnings that name ids the assembler gave. */
-    const given = (warn: { mock: { calls: unknown[][] } }) => warn.mock.calls.map((args) => String(args[0])).filter((line) => line.includes('ids given'));
+    /** The warnings that name the new ids the assembler gave, apart from any other warning. */
+    const newIds = (warn: { mock: { calls: unknown[][] } }) => warn.mock.calls.map((args) => String(args[0])).filter((line) => line.includes('new ids'));
 
     it('calls with different ids and names stay separate calls, in one delta or across deltas', async () => {
       expect(await calls([
@@ -83,22 +83,26 @@ for (const [name, make] of adapters) {
     it('a call with no id comes back under one of its own, and the warning names it', async () => {
       const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
       expect(await calls([[piece(undefined, 'zz_a', '{"x":1}')]])).toEqual([{ id: 'call_1', name: 'zz_a', input: { x: 1 } }]);
-      expect(given(warn)).toEqual(['[membrane] The server repeated or left out a streamed tool call\'s id; ids given: "" as call_1']);
+      expect(newIds(warn)).toEqual(['[membrane] The server repeated or left out a streamed tool call\'s id; new ids: "" as call_1']);
       warn.mockRestore();
     });
 
-    it('calls that each have an id of their own keep them, and nothing is warned', async () => {
+    it('calls that each have an id of their own keep them, and no new id is warned of', async () => {
       const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
       expect(await calls([[piece('call_a', 'zz_a', '{"x":1}')], [piece('call_b', 'zz_b', '{"y":2}')]])).toEqual([a, b]);
-      expect(given(warn)).toEqual([]);
+      expect(newIds(warn)).toEqual([]);
       warn.mockRestore();
     });
 
     it('three calls under one id come back as x, x_2 and x_3, named in one warning', async () => {
       const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
       expect((await calls([[piece('x', 'zz_a', '{"a":1}')], [piece('x', 'zz_b', '{"b":2}')], [piece('x', 'zz_c', '{"c":3}')]])).map((c: { id: string }) => c.id)).toEqual(['x', 'x_2', 'x_3']);
-      expect(given(warn)).toEqual(['[membrane] The server repeated or left out a streamed tool call\'s id; ids given: "x" as x_2, "x" as x_3']);
+      expect(newIds(warn)).toEqual(['[membrane] The server repeated or left out a streamed tool call\'s id; new ids: "x" as x_2, "x" as x_3']);
       warn.mockRestore();
+    });
+
+    it("a call with no id skips a call_1 the server sent", async () => {
+      expect((await calls([[piece('call_1', 'zz_a', '{"x":1}')], [piece(undefined, 'zz_b', '{"y":2}')]])).map((c: { id: string }) => c.id)).toEqual(['call_1', 'call_2']);
     });
 
     it('a new id skips one that a later call has', async () => {
@@ -155,7 +159,7 @@ for (const [name, make] of adapters) {
         { id: 'call_0', name: 'zz_first', input: {} },
         { id: 'call_0_2', name: 'zz_second', input: { y: 2 } },
       ]);
-      expect(given(warn)).toEqual(['[membrane] The server repeated or left out a streamed tool call\'s id; ids given: "call_0" as call_0_2']);
+      expect(newIds(warn)).toEqual(['[membrane] The server repeated or left out a streamed tool call\'s id; new ids: "call_0" as call_0_2']);
       warn.mockRestore();
     });
 
@@ -174,7 +178,7 @@ for (const [name, make] of adapters) {
       const large = { index: 100_000_000, ...piece('call_z', 'zz_z', '{}') };
       const started = performance.now();
       const placed = await calls([[large], [piece('call_a', 'zz_a', '{"x":1}')]]);
-      // A scan of the 10^8 slots below it, in place of the id lookup, took about 8 s; placing takes well under 1 s.
+      // With a scan of the index slots in place of the Map lookup, this stream took about 8 s; placing takes well under 1 s.
       expect(performance.now() - started).toBeLessThan(1000);
       expect(placed).toEqual([{ id: 'call_z', name: 'zz_z', input: {} }, a]);
     });
