@@ -33,7 +33,7 @@ import {
   withRawRequest,
 } from '../types/index.js';
 import { isRawItemCarrier } from '../utils/fidelity.js';
-import { toolUseInputFromText, textOnlyToolResultContent, openAIImagePart, createCombinedSignal, SSELineParser, isDeadlineAbort, deadlineTimeoutError, throwOnStreamErrorFrame, assertTerminalEventObserved, streamIndex, isEventObject } from './utils.js';
+import { toolUseInputFromText, textOnlyToolResultContent, openAIImagePart, createCombinedSignal, SSELineParser, isDeadlineAbort, deadlineTimeoutError, throwOnStreamErrorFrame, assertTerminalEventObserved, streamedToolCalls, isEventObject } from './utils.js';
 import { requiresCompletionTokens, noTemperatureSupport, noStopSupport } from './openai.js';
 import { convertMcpMedia } from '../utils/mcp-media.js';
 
@@ -235,7 +235,7 @@ export class OpenAICompatibleAdapter implements ProviderAdapter {
       let reasoning = '';
       let finishReason: string | undefined;
       let sawTerminalEvent = false;
-      let toolCalls: OpenAIToolCall[] = [];
+      const toolCalls = streamedToolCalls();
       let streamUsage: OpenAIResponse['usage'] | undefined;
 
       // One frame handler for both the streamed lines and the EOF flush — the
@@ -279,28 +279,10 @@ export class OpenAICompatibleAdapter implements ProviderAdapter {
         }
 
         // Handle streaming tool calls
+        // streamedToolCalls places each entry: by its index, or, with none, by
+        // its id and name (antra-tess/membrane#159).
         if (Array.isArray(delta?.tool_calls)) {
-          for (const tc of delta.tool_calls) {
-            // An entry that isn't an object, or whose index isn't an array
-            // index (streamIndex: 0 when absent, and a string of digits with no
-            // leading zero counts, as array keys always took one), can't be
-            // placed, so it's dropped.
-            if (!tc || typeof tc !== 'object' || Array.isArray(tc)) continue;
-            const index = streamIndex(tc.index);
-            if (index === undefined) continue;
-            if (!toolCalls[index]) {
-              toolCalls[index] = {
-                id: tc.id ?? '',
-                type: 'function',
-                function: { name: '', arguments: '' },
-              };
-            }
-            if (tc.id) toolCalls[index].id = tc.id;
-            if (tc.function?.name) toolCalls[index].function.name = tc.function.name;
-            if (tc.function?.arguments) {
-              toolCalls[index].function.arguments += tc.function.arguments;
-            }
-          }
+          for (const tc of delta.tool_calls) toolCalls.add(tc);
         }
 
         if (parsed.choices?.[0]?.finish_reason) {
@@ -349,9 +331,10 @@ export class OpenAICompatibleAdapter implements ProviderAdapter {
 
       if (reasoning) message.reasoning = reasoning;
 
-      // The calls the stream placed, in index order: an index can skip a
-      // slot, and a hole would fail the response built from them.
-      const placedToolCalls = Object.values(toolCalls);
+      // The calls the stream placed: those with an index in index order (an
+      // index can skip a slot, and a hole would fail the response built from
+      // them), then those without one in the order they started.
+      const placedToolCalls = toolCalls.calls();
       if (placedToolCalls.length > 0) {
         message.tool_calls = placedToolCalls;
       }
