@@ -183,6 +183,78 @@ describe('the stream lane records a request at message_start', () => {
   });
 });
 
+describe('a refresh acts only on the snapshot it replayed', () => {
+  // Recording at message_start, a real call no longer touches its lineage at
+  // the send, so a refresh can be out while the call records a newer request.
+  const noRead = { input_tokens: 5, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 };
+  const replyWith = (usage: object) => ({ ...answer, content: [], stop_reason: 'max_tokens', usage });
+  function held() {
+    let release!: (value: unknown) => void;
+    const promise = new Promise((resolve) => { release = resolve; });
+    return { promise, release };
+  }
+
+  it('an ineffective refresh answering after a real call recorded a newer request leaves that request held', async () => {
+    let hold: ReturnType<typeof held> | undefined;
+    const { a, events, replays } = adapter({}, wire => {
+      if (wire.max_tokens !== 0) return answer;
+      if (hold) return hold.promise;
+      return replyWith(replays().length === 1 ? noRead : readUsage);
+    }, () => sdkStream([messageStart, ...rest]));
+    await a.stream(request('Resident system M'), noCallbacks);
+    // The first refresh reads nothing: one ineffective refresh, of the two
+    // after which the keepalive drops a lineage.
+    await vi.advanceTimersByTimeAsync(100);
+    expect(events.filter(e => e.type === 'ineffective')).toHaveLength(1);
+    // The second is out when a real call records the lineage's next request.
+    hold = held();
+    await vi.advanceTimersByTimeAsync(100);
+    expect(replays()).toHaveLength(2);
+    await a.stream(request('Resident system M', 2), noCallbacks);
+    const replay = hold;
+    hold = undefined;
+    replay.release(replyWith(noRead));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(events.filter(e => e.type === 'ineffective')).toHaveLength(2);
+    // The newer request is still held, touched when it was recorded…
+    const [lineage, ...others] = a.cacheKeepalive!.getStatus();
+    expect(others).toEqual([]);
+    expect(lineage!.idleMs).toBe(0);
+    // …and it's what the next refresh replays.
+    await vi.advanceTimersByTimeAsync(100);
+    expect(replays()).toHaveLength(3);
+    expect(replays()[2].messages).toHaveLength(2);
+  });
+
+  it("a tick doesn't replay a snapshot a real call replaced while it was refreshing another lineage", async () => {
+    let hold: ReturnType<typeof held> | undefined;
+    const isP = (wire: any) => JSON.stringify(wire.system).includes('Resident system P');
+    const { a, replays } = adapter({}, wire => {
+      if (wire.max_tokens !== 0) return answer;
+      if (hold && !isP(wire)) return hold.promise;
+      return replyWith(readUsage);
+    }, () => sdkStream([messageStart, ...rest]));
+    await a.stream(request('Resident system N'), noCallbacks);
+    await a.stream(request('Resident system P'), noCallbacks);
+    // Both fall due in one tick, N first; N's refresh is out when P's next
+    // request is recorded.
+    hold = held();
+    await vi.advanceTimersByTimeAsync(100);
+    expect(replays().map(isP)).toEqual([false]);
+    await a.stream(request('Resident system P', 2), noCallbacks);
+    const replay = hold;
+    hold = undefined;
+    replay.release(replyWith(readUsage));
+    await vi.advanceTimersByTimeAsync(0);
+    // The tick went on to P with the snapshot it had copied, which a real call
+    // had touched since: nothing to refresh.
+    expect(replays().filter(isP)).toEqual([]);
+    // The next tick replays P's newer request.
+    await vi.advanceTimersByTimeAsync(100);
+    expect(replays().filter(isP).map(wire => wire.messages.length)).toEqual([2]);
+  });
+});
+
 describe('the complete lane records a request once the response has arrived', () => {
   it('a refused complete() is never recorded', async () => {
     const { a, replays, client } = adapter({ lanes: ['complete'] }, () => { throw refused(); });

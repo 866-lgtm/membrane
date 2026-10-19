@@ -316,6 +316,10 @@ export class CacheKeepalive {
       const now = Date.now();
       for (const [key, lin] of [...this.lineages]) {
         if (this.stopped) break;
+        // An earlier poke of this tick took a round trip, and a real call may
+        // have replaced this key's lineage meanwhile (fresh, so not due) or an
+        // ineligible shape dropped it: act only on the one still recorded.
+        if (this.lineages.get(key) !== lin) continue;
         // The keepalive window is measured from the last REAL request, so pokes
         // can never extend their own mandate.
         if (now - lin.lastRealAt >= this.cfg.maxIdleMs) {
@@ -374,7 +378,9 @@ export class CacheKeepalive {
           writeTokens: wrote,
         });
         if (lin.ineffective >= this.cfg.maxIneffective) {
-          this.lineages.delete(key);
+          // Only this lineage: a real call during the poke may have recorded a
+          // fresh one under the same key, which keeps its keepalive.
+          if (this.lineages.get(key) === lin) this.lineages.delete(key);
         } else {
           lin.lastTouchAt = Date.now();
         }
