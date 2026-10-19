@@ -113,6 +113,17 @@ interface GeminiStreamState {
 }
 
 /**
+ * Whether a response's first candidate carries data: content or a finish
+ * reason. Gemini's API speaks proto3's JSON mapping, where a null field is
+ * unset, so a candidate whose content and finishReason are null or absent is
+ * none, and a prompt block beside it still reads as a refusal. complete() and
+ * stream() both ask here.
+ */
+function hasCandidateData(candidate: NonNullable<GeminiResponse['candidates']>[number] | undefined): boolean {
+  return candidate?.content != null || candidate?.finishReason != null;
+}
+
+/**
  * Gemini's usageMetadata follows proto3 JSON, which omits zero-valued counts:
  * when the object is present, a missing prompt, candidates or cache-read
  * count is a reported 0. Only a response with no usageMetadata at all leaves
@@ -474,7 +485,7 @@ export class GeminiAdapter implements ProviderAdapter {
     if (parsed.modelVersion) streamState.lastModelVersion = parsed.modelVersion;
     const candidate = parsed.candidates?.[0];
 
-    if (candidate?.content !== undefined || candidate?.finishReason !== undefined) {
+    if (hasCandidateData(candidate)) {
       streamState.sawCandidateData = true;
     }
 
@@ -504,8 +515,10 @@ export class GeminiAdapter implements ProviderAdapter {
       streamState.sawTerminalEvent = true;
     }
 
-    // A blocked prompt can ride a frame of its own, with zero candidates
-    if (parsed.promptFeedback?.blockReason !== undefined) {
+    // A blocked prompt can ride a frame of its own, with zero candidates. A
+    // null blockReason, proto3's JSON for an unset field, blocks nothing, so it
+    // neither ends the stream nor replaces a reason an earlier frame gave.
+    if (parsed.promptFeedback?.blockReason != null) {
       streamState.promptFeedback = parsed.promptFeedback;
     }
 
@@ -764,11 +777,11 @@ export class GeminiAdapter implements ProviderAdapter {
     return {
       content: this.buildContentBlocks(text, toolCalls, images),
       stopReason: this.resolveStopReason(
-        candidate !== undefined,
+        hasCandidateData(candidate),
         candidate?.finishReason,
         response.promptFeedback
       ),
-      providerStopReason: candidate?.finishReason ?? (candidate === undefined ? response.promptFeedback?.blockReason : undefined),
+      providerStopReason: candidate?.finishReason ?? (!hasCandidateData(candidate) ? response.promptFeedback?.blockReason : undefined) ?? undefined,
       stopSequence: undefined,
       usage: geminiUsageToProviderUsage(response.usageMetadata),
       ...geminiUnreportedUsage(response.usageMetadata),
@@ -824,12 +837,14 @@ export class GeminiAdapter implements ProviderAdapter {
     // A prompt blocked before generation is a refusal whatever reason Google
     // gives (SAFETY, OTHER, BLOCKLIST, BLOCK_REASON_UNSPECIFIED, ...): nothing
     // was generated. providerStopReason keeps the reason itself.
-    return promptBlockReason !== undefined
+    return promptBlockReason != null
       ? 'refusal'
       : this.mapFinishReason(candidateFinishReason);
   }
 
   private mapFinishReason(reason: string | undefined): string {
+    // No reason (or a null one) is a plain end of turn.
+    if (reason == null) return 'end_turn';
     switch (reason) {
       case 'STOP':
         return 'end_turn';
@@ -847,8 +862,6 @@ export class GeminiAdapter implements ProviderAdapter {
       case 'TOOL_CALLS':
       case 'FUNCTION_CALL':
         return 'tool_use';
-      case undefined:
-        return 'end_turn';
       // MALFORMED_FUNCTION_CALL, LANGUAGE, OTHER and anything Google adds
       // next have no membrane member; they travel as the provider's own
       // token. Membrane normalizes it to end_turn, since callers switch on a
