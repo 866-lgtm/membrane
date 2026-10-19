@@ -73,7 +73,7 @@ describe('ineligibleReason', () => {
     }))).toBeNull();
   });
 
-  it("accepts a request whose only one-hour marker is inside a document's source content exactly when membrane's marker budget counts it", () => {
+  it("treats a request whose only one-hour marker is inside a document's source content as membrane's marker budget does", () => {
     const document = {
       type: 'document',
       source: { type: 'content', content: [{ type: 'text', text: 'page', cache_control: { type: 'ephemeral', ttl: '1h' } }] },
@@ -214,7 +214,7 @@ describe('messagesForRefresh', () => {
     expect(messagesForRefresh(messages)).toEqual(messages.slice(0, 3));
   });
 
-  it("takes a marker inside a document's source content for one exactly when membrane's marker budget counts it", () => {
+  it("reads a marker inside a document's source content as membrane's marker budget does", () => {
     const document = { type: 'document', source: { type: 'content', content: [text('page', hour)] } };
     const messages = [user(text('a', hour)), assistant(text('b')), user(document), assistant(text('d')), user(text('e'))];
     const counted = countWireCacheMarkers({ messages: [user(document)] }) > 0;

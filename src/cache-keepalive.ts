@@ -207,9 +207,9 @@ export function ineligibleReason(wire: Record<string, unknown>): string | null {
 /**
  * The request's cache_control markers in system, tools and messages, as the
  * cache-marker budget finds them (collectMarkedBlocks), so the keepalive and
- * the budget agree on which breakpoints a request has. It reads every block
- * rather than stopping at the first 1h marker, which costs well under a
- * millisecond on a request of megabytes.
+ * the budget agree on which breakpoints a request has. It walks the whole
+ * request rather than stopping at the first 1h marker, which costs well under
+ * a millisecond on a request of megabytes.
  */
 function scanCacheMarkers(wire: Record<string, unknown>): { any: boolean; oneHour: boolean } {
   const marked = collectMarkedBlocks({ system: wire.system, tools: wire.tools, messages: wire.messages });
