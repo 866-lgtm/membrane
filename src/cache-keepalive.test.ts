@@ -57,6 +57,17 @@ describe('ineligibleReason', () => {
     expect(ineligibleReason(aux)).toBe('no-cache-breakpoint');
   });
 
+  it("accepts a request whose only one-hour marker sits on a block in a document's source content", () => {
+    const document = {
+      type: 'document',
+      source: { type: 'content', content: [{ type: 'text', text: 'page', cache_control: { type: 'ephemeral', ttl: '1h' } }] },
+    };
+    expect(ineligibleReason(wire({
+      system: [{ type: 'text', text: 'You are a resident.' }],
+      messages: [{ role: 'user', content: [document] }],
+    }))).toBeNull();
+  });
+
   it('rejects a 5m-only request: poking a 5m entry every few minutes costs more than it saves', () => {
     const short = wire({
       system: [{ type: 'text', text: 's', cache_control: { type: 'ephemeral' } }],
@@ -116,6 +127,39 @@ describe('messagesForRefresh', () => {
     expect(messagesForRefresh(messages)).toEqual(messages);
   });
 
+  it('keeps every message, the assistant messages after the marker among them, when no user message follows it', () => {
+    const messages = [user(text('a')), assistant(text('b', hour)), assistant(text('c'))];
+    expect(messagesForRefresh(messages)).toEqual(messages);
+  });
+
+  it("takes every user message of the turn that closes the run, so a tool call's results aren't split", () => {
+    const messages = [
+      user(text('a')),
+      assistant({ type: 'tool_use', id: 't1', name: 'read', input: {} }, { type: 'tool_use', id: 't2', name: 'read', input: {}, cache_control: hour }),
+      user({ type: 'tool_result', tool_use_id: 't1', content: 'one' }),
+      user({ type: 'tool_result', tool_use_id: 't2', content: 'two' }),
+      assistant(text('d')),
+      user(text('e')),
+    ];
+    expect(messagesForRefresh(messages)).toEqual(messages.slice(0, 4));
+  });
+
+  it("finds a one-hour marker on a message's second block", () => {
+    const messages = [user(text('a', hour)), assistant(text('b')), user(text('c'), text('d', hour)), assistant(text('e')), user(text('f'))];
+    expect(messagesForRefresh(messages)).toEqual(messages.slice(0, 3));
+  });
+
+  it("doesn't take a cache_control in a tool's input for a marker", () => {
+    const messages = [
+      user(text('a', hour)),
+      assistant({ type: 'tool_use', id: 't', name: 'send', input: { body: { cache_control: hour } } }),
+      user({ type: 'tool_result', tool_use_id: 't', content: 'sent' }),
+      assistant(text('d')),
+      user(text('e')),
+    ];
+    expect(messagesForRefresh(messages)).toEqual(messages.slice(0, 1));
+  });
+
   it('leaves out a five-minute marker after the last one-hour marker', () => {
     const messages = [user(text('a', hour)), assistant(text('b')), user(text('c', fiveMinutes))];
     expect(messagesForRefresh(messages)).toEqual(messages.slice(0, 1));
@@ -132,7 +176,7 @@ describe('messagesForRefresh', () => {
     expect(messagesForRefresh(messages)).toEqual(messages.slice(0, 3));
   });
 
-  it("finds a one-hour marker in a document's source content, which the eligibility scan doesn't walk", () => {
+  it("finds a one-hour marker in a document's source content", () => {
     const document = { type: 'document', source: { type: 'content', content: [text('page', hour)] } };
     const messages = [user(text('a', hour)), assistant(text('b')), user(document), assistant(text('d')), user(text('e'))];
     expect(messagesForRefresh(messages)).toEqual(messages.slice(0, 3));
@@ -208,7 +252,8 @@ describe('CacheKeepalive', () => {
 
   it('replays only through the last one-hour marker, leaving every message it keeps as recorded', async () => {
     const send = vi.fn().mockResolvedValue(hit);
-    const { ka } = setup(send);
+    const receipts: Array<{ request: Record<string, unknown> }> = [];
+    const { ka } = setup(send, { onCall: (call: { request: Record<string, unknown> }) => { receipts.push(call); } });
     const marked = { role: 'user', content: [{ type: 'text', text: 'the compiled window', cache_control: { type: 'ephemeral', ttl: '1h' } }] };
     const call = { role: 'assistant', content: [{ type: 'tool_use', id: 'toolu_1', name: 'read', input: { path: 'a' } }] };
     const result = { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'toolu_1', content: 'x'.repeat(5_000) }] };
@@ -220,7 +265,9 @@ describe('CacheKeepalive', () => {
     const expected: Record<string, unknown> = { ...original, messages: [marked], max_tokens: 0 };
     delete expected.stream;
     expect(JSON.stringify(payload)).toBe(JSON.stringify(expected));
-    // The record stays the exact wire: the next refresh cuts it the same way.
+    // The receipt carries the payload sent, cut as it was.
+    expect(JSON.stringify(receipts[0]!.request)).toBe(JSON.stringify(expected));
+    // A second refresh sends the same.
     await vi.advanceTimersByTimeAsync(50 * 60_000);
     expect(JSON.stringify(send.mock.calls[1]![0])).toBe(JSON.stringify(expected));
     ka.stop();

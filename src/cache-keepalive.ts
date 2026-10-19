@@ -23,7 +23,7 @@
 // `max_tokens: 0`, which runs prefill only: content `[]`, stop_reason
 // `max_tokens`, zero output tokens billed, and the cache entry refreshed. The
 // replay leaves out the messages after the request's last one-hour marker,
-// apart from what it takes to end on a user message (below).
+// apart from what it takes to end where a user turn ends (below).
 // A call is snapshotted only once the provider is known to have its prefix
 // (the adapter records at `message_start`, or once the SDK has a non-streamed
 // response): a request that failed before then isn't known to be cached, and
@@ -87,7 +87,8 @@ export type KeepaliveCall = {
   /** Unix epoch milliseconds when this poke attempt began. */
   startedAt: number;
   durationMs: number;
-  /** JSON wire payload sent by the poke: max_tokens is 0 and stream is omitted. */
+  /** JSON wire payload sent by the poke: max_tokens is 0, stream is omitted, and
+   *  its messages are the run of the recorded request's that `messagesForRefresh()` keeps. */
   request: Record<string, unknown>;
 } & (
   | { outcome: 'success'; response: Record<string, unknown> & { usage?: KeepaliveUsage } }
@@ -209,33 +210,11 @@ export function ineligibleReason(wire: Record<string, unknown>): string | null {
  */
 function scanCacheMarkers(wire: Record<string, unknown>): { any: boolean; oneHour: boolean } {
   let any = false;
-  let oneHour = false;
-
-  const visit = (node: unknown): void => {
-    if (oneHour) return; // nothing left to learn
-    if (Array.isArray(node)) {
-      for (const item of node) {
-        visit(item);
-        if (oneHour) return;
-      }
-      return;
-    }
-    if (!node || typeof node !== 'object') return;
-    const obj = node as Record<string, unknown>;
-    const cc = obj.cache_control as { ttl?: string } | undefined;
-    if (cc && typeof cc === 'object') {
+  const oneHour = [wire.system, wire.tools, wire.messages].some((surface) =>
+    someCacheControl(surface, (cc) => {
       any = true;
-      if (isOneHourMarker(cc)) {
-        oneHour = true;
-        return;
-      }
-    }
-    if (obj.content) visit(obj.content);
-  };
-
-  visit(wire.system);
-  visit(wire.tools);
-  visit(wire.messages);
+      return isOneHourMarker(cc);
+    }));
   return { any, oneHour };
 }
 
@@ -245,48 +224,58 @@ function isOneHourMarker(cc: { ttl?: unknown }): boolean {
 }
 
 /**
- * Whether `node` holds a one-hour marker anywhere in it: on a block, on a block
- * nested in its `content`, or deeper in its structure, such as in a document's
- * `source.content`. The eligibility scan above walks only `content` and stops at
- * the first one-hour marker. This one looks everywhere, since a refresh that
- * left out a message whose marker it couldn't see would read less than the
- * request cached.
+ * Whether `found` holds for a `cache_control` in `node` (a request's `system`,
+ * `tools` or `messages`, or one message), walked in order and stopping at the
+ * first it holds for. A marker sits on a block: an entry of `system` or
+ * `tools`, a message's content block, a block in another block's `content`
+ * (a tool result's), or a block in a document's `source.content`. Only those
+ * are walked, so JSON that a tool was given, which can hold any key, isn't
+ * read as a marker. Eligibility and the refresh's cut both ask here, so they
+ * agree on where a request's markers are.
  */
-function holdsOneHourMarker(node: unknown): boolean {
-  if (Array.isArray(node)) return node.some(holdsOneHourMarker);
+function someCacheControl(node: unknown, found: (cc: { ttl?: unknown }) => boolean): boolean {
+  if (Array.isArray(node)) return node.some((item) => someCacheControl(item, found));
   if (!node || typeof node !== 'object') return false;
-  const cc = (node as { cache_control?: unknown }).cache_control;
-  if (cc && typeof cc === 'object' && isOneHourMarker(cc as { ttl?: unknown })) return true;
-  return Object.values(node).some(holdsOneHourMarker);
+  const block = node as { cache_control?: unknown; content?: unknown; source?: unknown };
+  if (block.cache_control && typeof block.cache_control === 'object'
+    && found(block.cache_control as { ttl?: unknown })) return true;
+  if (someCacheControl(block.content, found)) return true;
+  const source = block.source as { content?: unknown } | null | undefined;
+  return typeof source === 'object' && source !== null && someCacheControl(source.content, found);
 }
 
 /**
  * The messages a refresh replays: the shortest leading run of the recorded
- * messages that holds every one-hour marker and ends on a user message.
+ * messages that holds every one-hour marker and ends where a user turn ends.
  *
  * A cache entry is written up to a marker, so nothing after the last one-hour
  * marker is kept warm by replaying it. A replay pays for it as input every
- * time, and writes it again where a five-minute marker covers it, which has
+ * time, or writes it again where a five-minute marker covers it, which has
  * expired by the time a refresh comes, 45 minutes after the last touch by
  * default.
- * The run ends on a user message, so that no model's rule against a trailing
- * assistant message refuses the refresh: it runs through the first user message
- * at or after the last one-hour marker's message, or from the start when the
- * markers sit only on `system` or `tools`. When no user message comes after
- * the marker, the run is every message, as the request was sent.
+ * The run ends where a user turn ends, so that no model's rule against a
+ * trailing assistant message refuses the refresh, and so that it doesn't split
+ * a tool call's results, since the API takes consecutive user messages as one
+ * turn. It runs through the first user message at or after the last one-hour
+ * marker's message, or from the start when the markers sit only on `system` or
+ * `tools`, and through the user messages directly after that one. When no user
+ * message comes after the marker, the run is every message, as the request was
+ * sent.
  */
 export function messagesForRefresh(messages: readonly unknown[]): unknown[] {
+  const isUser = (message: unknown) => (message as { role?: unknown } | null)?.role === 'user';
   let from = 0;
   for (let index = messages.length - 1; index >= 0; index--) {
-    if (holdsOneHourMarker(messages[index])) {
+    if (someCacheControl(messages[index], isOneHourMarker)) {
       from = index;
       break;
     }
   }
-  for (let index = from; index < messages.length; index++) {
-    if ((messages[index] as { role?: unknown } | null)?.role === 'user') return messages.slice(0, index + 1);
-  }
-  return messages.slice();
+  let end = from;
+  while (end < messages.length && !isUser(messages[end])) end++;
+  if (end === messages.length) return messages.slice();
+  while (end + 1 < messages.length && isUser(messages[end + 1])) end++;
+  return messages.slice(0, end + 1);
 }
 
 /**
