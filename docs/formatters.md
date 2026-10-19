@@ -85,7 +85,7 @@ The Responses formatter owns its provider-native input-item representation, incl
 
 ## Prefill compatibility
 
-Some Anthropic models reject a Messages request whose final role is assistant. The original contribution measured this on 2026-08-25 for Sonnet 4.6, Opus 4.6/4.7/4.8, Sonnet 5, and Fable 5. The maintainer re-measured the table on 2026-09-14 and confirmed Opus 5 and Fable 5.1 as well. Haiku 4.5 and Sonnet 4.5 accepted prefill; Haiku also accepted prefill with thinking enabled. Mythos entries in the table remain labelled family inferences rather than new measurements. These live observations belong to the original contribution and maintainer review; the correction's tests use mocked transports.
+Some Anthropic models reject a Messages request whose final role is assistant. The original contribution measured this on 2026-08-25 for Sonnet 4.6, Opus 4.6/4.7/4.8, Sonnet 5, and Fable 5. The maintainer re-measured the table on 2026-09-14 and confirmed Opus 5 and Fable 5.1 as well. On 2026-10-19 Haiku 5.5 refused it too, with no thinking config and with an adaptive or an enabled one, and Sonnet 5.5 refused it with none. Haiku 4.5 and Sonnet 4.5 accepted prefill; Haiku 4.5 also accepted prefill with thinking enabled. Mythos entries in the table remain labelled family inferences rather than new measurements. These live observations belong to the original contribution, the maintainer review and the 2026-10-19 measurement; the correction's tests use mocked transports.
 
 The shared table is `src/registry/model-capabilities.ts`. It recognizes direct and dated IDs, dotted OpenRouter versions, `bedrock:` aliases, Bedrock inference-profile/ARN spellings, and Vertex suffixes. Unknown models retain the legacy capable default.
 

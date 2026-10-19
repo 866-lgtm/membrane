@@ -45,6 +45,12 @@ describe('supportsAssistantPrefill', () => {
     expect(supportsAssistantPrefill('claude-fable-5')).toBe(false);
   });
 
+  it('reports refusal for claude-haiku-5-5 and claude-sonnet-5-5, measured 2026-10-19', () => {
+    expect(supportsAssistantPrefill('claude-haiku-5-5')).toBe(false);
+    // Listed through its family's prefix, claude-sonnet-5.
+    expect(supportsAssistantPrefill('claude-sonnet-5-5')).toBe(false);
+  });
+
   it('reports support for the ids that accepted prefill live', () => {
     expect(supportsAssistantPrefill('claude-haiku-4-5-20251001')).toBe(true);
     expect(supportsAssistantPrefill('claude-sonnet-4-5')).toBe(true);
