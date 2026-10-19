@@ -7,13 +7,13 @@
  * `null`) used to go to slot 0, so two calls became one: the second's id and
  * name replaced the first's, and their argument strings ran together. Now such
  * an entry never takes a slot, and one that carries nothing is dropped. Any
- * other joins the call that has its id; otherwise it starts a new call when it
- * carries a name and the current call (the one the last entry went to) has a
- * different name, or has an id while it carries a new one; otherwise it joins
- * the current call. A call keeps the first id and the first name a piece gives
- * it. Entries with an index are placed in their slots as before
+ * other joins the call that has its id, or failing that the current call (the
+ * one the last entry went to), unless it carries a name and a new id while that
+ * call has an id. Entries with an index are placed in their slots as before
  * (stream-callback-errors.test.ts covers them), and a slot's first entry takes
- * over a call that began without an index under its id.
+ * over a call that began without an index under its id. On every path, a piece
+ * that names a tool other than its call's starts a call of its own, and a call
+ * keeps the first id a piece gives it.
  */
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { OpenAIAdapter } from '../../src/providers/openai.js';
@@ -76,10 +76,11 @@ for (const [name, make] of adapters) {
     });
 
     it('an index of null counts as none', async () => {
-      const nullIndex = (id: string, args: string) => ({ index: null, ...piece(id, `zz_${id}`, args) });
+      // Two calls of one tool: in one slot they would be one call, while with no index each id starts its own.
+      const nullIndex = (id: string, args: string) => ({ index: null, ...piece(id, 'zz_read', args) });
       expect(await calls([[nullIndex('call_a', '{"x":1}')], [nullIndex('call_b', '{"y":2}')]])).toEqual([
-        { id: 'call_a', name: 'zz_call_a', input: { x: 1 } },
-        { id: 'call_b', name: 'zz_call_b', input: { y: 2 } },
+        { id: 'call_a', name: 'zz_read', input: { x: 1 } },
+        { id: 'call_b', name: 'zz_read', input: { y: 2 } },
       ]);
     });
 
@@ -118,8 +119,11 @@ for (const [name, make] of adapters) {
       ]);
     });
 
-    it("a later piece that repeats the call's id under another name doesn't rename the call", async () => {
-      expect(await calls([[piece('call_a', 'zz_a', '{"x":')], [piece('call_a', 'zz_other', '1}')]])).toEqual([a]);
+    it("a piece that repeats a call's id but names another tool starts a call of its own", async () => {
+      expect(await calls([[piece('call_0', 'zz_first', '')], [piece('call_0', 'zz_second', '{"y":2}')]])).toEqual([
+        { id: 'call_0', name: 'zz_first', input: {} },
+        { id: 'call_0', name: 'zz_second', input: { y: 2 } },
+      ]);
     });
 
     it("an entry with no index takes no index's slot: those with one come first, in index order", async () => {
@@ -158,8 +162,16 @@ for (const [name, make] of adapters) {
       expect(await calls([[{ index: 0, ...piece('call_a', 'zz_a', '{"x":') }], [{ index: 0, ...piece(undefined, undefined, '1}') }]])).toEqual([a]);
     });
 
-    it("a later indexed piece with another id and name doesn't change the call's", async () => {
-      expect(await calls([[{ index: 0, ...piece('call_a', 'zz_a', '{"x":') }], [{ index: 0, ...piece('call_b', 'zz_b', '1}') }]])).toEqual([a]);
+    it("a later indexed piece with another id and no name keeps the call's first id", async () => {
+      expect(await calls([[{ index: 0, ...piece('call_a', 'zz_a', '{"x":') }], [{ index: 0, ...piece('call_b', undefined, '1}') }]])).toEqual([a]);
+    });
+
+    it('a piece in a slot that names another tool starts a call of its own there, which the slot continues', async () => {
+      const at0 = (id: string | undefined, name: string | undefined, args: string) => ({ index: 0, ...piece(id, name, args) });
+      expect(await calls([[at0('call_a', 'zz_first', '')], [at0('call_b', 'zz_second', '')], [at0(undefined, undefined, '{"y":')], [at0(undefined, undefined, '2}')]])).toEqual([
+        { id: 'call_a', name: 'zz_first', input: {} },
+        { id: 'call_b', name: 'zz_second', input: { y: 2 } },
+      ]);
     });
   });
 }

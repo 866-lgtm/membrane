@@ -251,29 +251,32 @@ export interface StreamedToolCall {
 /**
  * Puts a Chat Completions stream's tool calls together from its `tool_calls`
  * entries, one `add` per entry, and gives them back with `calls()`. An entry
- * that isn't an object is dropped. A call's id and its name are each set by
- * the first piece that carries one, and no later piece replaces either, so
- * the call keeps the id it started under. Each piece's arguments are
- * appended to its call's.
+ * that isn't an object is dropped. Each piece's arguments are appended to its
+ * call's. A call's id is set by the first piece that carries one, and no
+ * later piece replaces it. A piece that names a tool other than its call's
+ * starts a call of its own, so a call's name, once set, never changes.
  *
  * An entry with an `index` goes to that slot, as `streamIndex` reads it, and
  * one whose index names no slot is dropped. A slot's first entry takes over
- * the call that began without an index under its id, if one did. OpenAI's
- * API spec requires an index on each streamed tool call, but some compatible
- * servers are reported to leave it out, and every entry without one went to
- * slot 0, so two calls became one (antra-tess/membrane#159). An entry whose
- * `index` is absent or `null` never takes a slot. If it carries no id, name
- * or arguments it is dropped, and otherwise it goes to the call that already
- * has its id, if one does. Else it starts a new call when it carries a name
- * and the current call, the one the last entry went to, has a different
- * name, or has an id while the entry carries a new one. Otherwise it goes to
- * the current call. The rule assumes a call's first piece carries its name,
- * so a later piece that carries only an id, even a new one, or only
- * arguments stays with its call. `calls()` gives the calls that have an
- * index in index order, then the others in the order they started.
+ * the call that began without an index under its id, if one did, and a later
+ * entry continues the call the slot started last. OpenAI's API spec requires
+ * an index on each streamed tool call, but some compatible servers are
+ * reported to leave it out, and every entry without one went to slot 0, so
+ * two calls became one (antra-tess/membrane#159). An entry whose `index` is
+ * absent or `null` never takes a slot. If it carries no id, name or
+ * arguments it is dropped. Otherwise it goes to the call that already has
+ * its id, if one does, or else to the current call, the one the last entry
+ * went to, unless it brings a name and a new id while that call has an id.
+ * The rule assumes a call's first piece carries its name, so a later piece
+ * that carries only an id, even a new one, or only arguments stays with its
+ * call. `calls()` gives the calls that have an index in index order, those
+ * in one slot in the order they started, then the others in the order they
+ * started.
  */
 export function streamedToolCalls(): { add(entry: unknown): void; calls(): StreamedToolCall[] } {
-  const indexed: StreamedToolCall[] = [];
+  // Each slot holds the calls started in it, in order; its next piece
+  // continues the last.
+  const indexed: StreamedToolCall[][] = [];
   const unindexed: StreamedToolCall[] = [];
   const byId = new Map<unknown, StreamedToolCall>();
   let current: StreamedToolCall | undefined;
@@ -284,38 +287,39 @@ export function streamedToolCalls(): { add(entry: unknown): void; calls(): Strea
       const tc = entry as { index?: unknown; id?: unknown; function?: { name?: unknown; arguments?: unknown } };
       const name = tc.function?.name;
       let call: StreamedToolCall | undefined;
+      let slot: StreamedToolCall[] | undefined;
       if (tc.index !== undefined && tc.index !== null) {
         const index = streamIndex(tc.index);
         if (index === undefined) return;
-        call = indexed[index];
-        if (!call) {
-          // A call that began without an index and comes back with its id
-          // and an index takes that slot, rather than leaving two calls.
-          const known = tc.id ? byId.get(tc.id) : undefined;
-          const at = known ? unindexed.indexOf(known) : -1;
-          if (known && at !== -1) unindexed.splice(at, 1);
-          call = indexed[index] = known && at !== -1 ? known : open();
+        slot = indexed[index] ??= [];
+        call = slot[slot.length - 1];
+        // A call that began without an index and comes back with its id
+        // and an index takes that slot, rather than leaving two calls.
+        const known = !call && tc.id ? byId.get(tc.id) : undefined;
+        const at = known ? unindexed.indexOf(known) : -1;
+        if (known && at !== -1) {
+          unindexed.splice(at, 1);
+          slot.push((call = known));
         }
       } else {
         // An entry that carries nothing adds nothing, and opens no call.
         if (!tc.id && !name && !tc.function?.arguments) return;
         call = tc.id ? byId.get(tc.id) : undefined;
-        if (!call) {
-          if (!current || (!!name && ((!!current.function.name && name !== current.function.name) || (!!tc.id && !!current.id)))) {
-            call = open();
-            unindexed.push(call);
-          } else call = current;
-        }
+        if (!call && !(name && tc.id && current?.id)) call = current;
+      }
+      if (!call || (name && call.function.name && name !== call.function.name)) {
+        call = open();
+        (slot ?? unindexed).push(call);
       }
       if (tc.id && !call.id) {
         call.id = tc.id as string;
         byId.set(tc.id, call);
       }
-      if (name && !call.function.name) call.function.name = name as string;
+      if (name) call.function.name = name as string;
       if (tc.function?.arguments) call.function.arguments += tc.function.arguments;
       current = call;
     },
-    calls: () => [...Object.values(indexed), ...unindexed],
+    calls: () => [...Object.values(indexed).flat(), ...unindexed],
   };
 }
 

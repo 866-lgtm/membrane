@@ -5,22 +5,29 @@
   second call's id and name replaced the first's and their arguments ran
   together. Now an entry with no `index` never takes an index's slot. One
   that carries no id, name or arguments is dropped. Any other joins the call
-  that already has its id. Failing that, it starts a new call when it carries
-  a name and the call the last entry went to already has a different name, or
-  has an id while the entry carries a new one. Otherwise it continues that
-  call. Calls without an index come after those with one, in the order they
-  started. Entries with an `index` go to their slots as before, and a call
-  that began without one moves to the slot a later entry gives it under its
-  id.
-- A streamed tool call keeps the first id and the first name a piece gives
-  it, on the same three adapters, with or without an `index`. A later piece
-  of the same call that carried a different one replaced it. A stream whose
-  entries all carry an `index`, and which sends each call's id and name
-  once, comes back as before.
-- Two streams that came back as one call now come back as two: one call
-  whose every piece repeats its name and changes its id, and one whose first
-  piece has no `index` and whose later pieces carry index 0 without its id.
-  These adapters still merge two calls of the same tool sent with no ids, or
-  whose names come before their ids, and distinct calls a server gives the
-  same id, as before. A call whose first piece carries its id but not its
-  name joins the call before it.
+  that already has its id, or failing that the call the last entry went to,
+  unless it carries a name and a new id while that call has an id; then it
+  starts a new call. Calls without an index come after those with one, in the
+  order they started. Entries with an `index` go to their slots as before,
+  and a call that began without one moves to the slot a later entry gives it
+  under its id.
+- On the same three adapters, with or without an `index`, a piece that names
+  a tool other than its call's starts a call of its own, and a call keeps the
+  first id a piece gives it. A later piece's name and id replaced the call's,
+  so two calls of different tools that a server put in one slot, or gave one
+  id, came back as one call under the later name and id, with their arguments
+  run together. They now come back as two calls, each with its own arguments.
+  A stream whose entries all carry an `index`, and which sends each call's id
+  and name once, comes back as before.
+- Three kinds of stream that came back as one call now come back as two: one
+  call whose every piece repeats its name and changes its id, one whose first
+  piece has no `index` and whose later pieces carry index 0 without its id,
+  and one call that a later piece renames midway through its arguments, whose
+  two halves then don't parse. In the first kind, a first piece with no
+  arguments becomes an extra call with `{}`. As before, these adapters merge
+  two calls of the same tool sent with no ids or with their names before
+  their ids, distinct calls of one tool given the same id or put in one slot,
+  and a call whose first piece has its id but no name into the call before
+  it. When the earlier call's arguments are empty, the merged call parses,
+  and in the last case it runs the earlier call's tool with the later call's
+  arguments.
