@@ -20,11 +20,11 @@
   it, and so did every Bedrock event that decoded, other than a `ping` and one
   that decoded to `null`. On the OpenAI, OpenAI-compatible and OpenRouter
   adapters, a `tool_calls` that isn't an array drops its tool calls, and an
-  entry that isn't an object, or that has an `index` which isn't an array
-  index (an integer from 0 to 2^32 - 2, or its decimal string with no leading
-  zero), drops that entry; the rest of the frame is read. The calls placed are
-  gathered in index order, so a first call at index 1, or one after a
-  dropped entry, no longer fails the response. A number
+  entry that isn't an object, or whose `index` isn't an array index (an
+  integer from 0 to 2^32 - 2, or its decimal string with no leading zero)
+  and isn't absent or `null`, drops that entry; the rest of the frame is
+  read. The calls placed are gathered in index order, so a first call at index
+  1, or one after a dropped entry, no longer fails the response. A number
   entry used to become an empty tool call. On Bedrock, an event that doesn't
   decode, or decodes to `null`, is skipped with a warning, as before, and so
   is a block start or stop whose index or block can't be placed. When a
