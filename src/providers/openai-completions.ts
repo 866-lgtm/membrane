@@ -29,7 +29,7 @@ import {
   isTypedAbortError,
   withRawRequest,
 } from '../types/index.js';
-import { createCombinedSignal, SSELineParser, isDeadlineAbort, deadlineTimeoutError, throwOnStreamErrorFrame, assertTerminalEventObserved } from './utils.js';
+import { createCombinedSignal, SSELineParser, isDeadlineAbort, deadlineTimeoutError, throwOnStreamErrorFrame, assertTerminalEventObserved, isEventObject } from './utils.js';
 
 // ============================================================================
 // Types
@@ -240,11 +240,10 @@ export class OpenAICompletionsAdapter implements ProviderAdapter {
         } catch {
           return; // Ignore parse errors (partial/keep-alive lines)
         }
-        // `data: null` carries nothing to read. Other JSON that isn't an
-        // object (a number, a string, an array) reads as nothing below.
-        if (parsed === null) return;
-        // A parsed provider event is progress (comments never reach here, and
-        // `data: null` is no event).
+        // JSON that isn't an object (`null`, a number, a string, an array)
+        // carries no event, so its frame is dropped.
+        if (!isEventObject(parsed)) return;
+        // A provider event is progress (comments never reach here).
         options?.onProgress?.();
 
         throwOnStreamErrorFrame(parsed, this.name, completionsRequest);
@@ -320,13 +319,12 @@ export class OpenAICompletionsAdapter implements ProviderAdapter {
         if (eot && !eotFound && accumulated.length > emittedLen) {
           callbacks.onChunk(accumulated.slice(emittedLen));
         }
-        if (eotFound) {
-          try { await reader.cancel(); } catch { /* stream already closed */ }
-        }
       } finally {
-        // A read loop that ends early, on a callback's error or any other,
-        // leaves the body unread: cancel it, so the provider stops sending
-        // and the connection is let go. After a full read it does nothing.
+        // A read loop that ends early, at the end-of-turn token, on a
+        // callback's error or any other, leaves the body unread: cancel it,
+        // without waiting on a cancel that may never settle, so the provider
+        // stops sending and the connection is let go. After a full read it
+        // does nothing.
         void reader.cancel().catch(() => {});
       }
 

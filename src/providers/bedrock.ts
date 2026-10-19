@@ -23,10 +23,11 @@ import {
   errorFromHttpResponse,
   errorFromProviderStatus,
   isTypedAbortError,
+  networkError,
   withRawRequest,
 } from '../types/index.js';
 import { stripEmptyTextRequest } from '../utils/empty-text.js';
-import { createCombinedSignal, isDeadlineAbort, deadlineTimeoutError, assertTerminalEventObserved, toolUseInputFromText, toolUseInputFromValue } from './utils.js';
+import { createCombinedSignal, isDeadlineAbort, deadlineTimeoutError, assertTerminalEventObserved, toolUseInputFromText, toolUseInputFromValue, streamIndex, isEventObject } from './utils.js';
 import {
   INTERLEAVED_THINKING_BETA,
   THINKING_BINDING_BETA,
@@ -779,11 +780,11 @@ export class BedrockAdapter implements ProviderAdapter {
           // Parse the JSON payload
           if (eventType === 'chunk' && payloadBytes.length > 0) {
             // Decode first. An event that doesn't decode, carries no bytes,
-            // or decodes to `null` is skipped, with a warning; other JSON
-            // that isn't an object reads as nothing below. Nothing after the
+            // or decodes to JSON that isn't an object (`null`, a number, a
+            // string, an array) is skipped, with a warning. Nothing after the
             // decode is caught here, so an error there, a caller's callback
             // included, fails the stream.
-            let eventData: BedrockStreamEvent | null | undefined;
+            let decoded: unknown;
             let skipped: unknown = 'no event in its bytes';
             try {
               const payloadJson = JSON.parse(new TextDecoder().decode(payloadBytes));
@@ -794,16 +795,18 @@ export class BedrockAdapter implements ProviderAdapter {
                 for (let i = 0; i < binaryStr.length; i++) {
                   bytes[i] = binaryStr.charCodeAt(i);
                 }
-                eventData = JSON.parse(new TextDecoder().decode(bytes)) as BedrockStreamEvent | null;
+                decoded = JSON.parse(new TextDecoder().decode(bytes));
+                skipped = 'bytes that decode to no object';
               }
             } catch (e) {
               skipped = e;
             }
-            if (eventData == null) console.warn('[membrane:bedrock] Skipping malformed stream event:', skipped);
+            const eventData = isEventObject(decoded) ? decoded as BedrockStreamEvent : undefined;
+            if (eventData === undefined) console.warn('[membrane:bedrock] Skipping malformed stream event:', skipped);
 
-            if (eventData != null) {
+            if (eventData !== undefined) {
               // A decoded model event is progress; a ping only proves the
-              // connection, and an event that decodes to `null` is no event.
+              // connection.
               if ((eventData as { type?: string }).type !== 'ping') onProgress?.();
 
               // Check for error events within the stream
@@ -837,12 +840,13 @@ export class BedrockAdapter implements ProviderAdapter {
                   cacheReadTokens = startUsage.cache_read_input_tokens;
                 }
               } else if (eventData.type === 'content_block_start') {
-                // A block whose index isn't a non-negative integer, or that
-                // isn't an object, can't be placed: it's skipped, with the
-                // warning, and its deltas join no block.
-                const startIndex = Number(eventData.index ?? 0);
+                // A block whose index names no slot (streamIndex: 0 when
+                // absent), or that isn't an object, an array included, can't
+                // be placed: it's skipped, with the warning, and its deltas
+                // join no block.
+                const startIndex = streamIndex(eventData.index);
                 const startBlock: unknown = eventData.content_block;
-                if (!Number.isInteger(startIndex) || startIndex < 0 || startBlock === null || typeof startBlock !== 'object') {
+                if (startIndex === undefined || startBlock === null || typeof startBlock !== 'object' || Array.isArray(startBlock)) {
                   console.warn('[membrane:bedrock] Skipping malformed stream event:', 'a content_block_start that names no block');
                   currentBlockIndex = -1;
                 } else {
@@ -885,8 +889,8 @@ export class BedrockAdapter implements ProviderAdapter {
                 // start from stop. Without this, downstream code that depends
                 // on the dual-fire convention (e.g. membrane's native
                 // yielding path) silently drops block_complete on Bedrock.
-                const blockIdx = Number((eventData as { index?: unknown }).index ?? currentBlockIndex);
-                if (!Number.isInteger(blockIdx) || blockIdx < 0 || contentBlocks[blockIdx] === undefined) {
+                const blockIdx = streamIndex((eventData as { index?: unknown }).index, currentBlockIndex);
+                if (blockIdx === undefined || blockIdx < 0 || contentBlocks[blockIdx] === undefined) {
                   console.warn('[membrane:bedrock] Skipping malformed stream event:', 'a content_block_stop that names no block');
                 } else {
                   stoppedBlocks.add(blockIdx);
@@ -961,6 +965,22 @@ export class BedrockAdapter implements ProviderAdapter {
     // NOTHING; a stream truncated after any content passed it and was
     // reported as a clean end_turn. message_delta is the terminal event.
     assertTerminalEventObserved(sawTerminalEvent, 'Bedrock', { modelId, ...request });
+
+    // A block start skipped as malformed leaves its slot empty, and a block's
+    // index is its place in the message, so a slot before the last block that
+    // no block filled is a block the message lost. The request was never
+    // answered in full, as when a stream ends before its terminal event, so it
+    // fails the same retryable way rather than returning the message without
+    // that block. The scan stops at the first empty slot.
+    let slot = 0;
+    while (slot < contentBlocks.length && slot in contentBlocks) slot++;
+    if (slot < contentBlocks.length) {
+      throw networkError(
+        `Bedrock stream lost content block ${slot}: no block start placed it`,
+        undefined,
+        { modelId, ...request }
+      );
+    }
 
     // Build response from accumulated data
     finalMessage = {

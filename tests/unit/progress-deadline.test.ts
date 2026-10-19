@@ -534,8 +534,8 @@ describe('Anthropic: the deadline follows SDK events, not keepalives', () => {
 describe('every streaming adapter reports progress once per parsed event', () => {
   // The end-to-end cases above drive two adapters through Membrane. The call
   // lives in each adapter's own parser, so the family fact is pinned here:
-  // three events that parse count; comments, keepalives and data that doesn't
-  // parse don't, and neither does `data: null` on the adapters that drop it.
+  // three events that parse to an object count; comments, keepalives, data
+  // that doesn't parse and data that parses to anything else don't.
   // Each body then ends without a terminal event, which is fine: only the
   // count matters.
   const sseBody = [
@@ -545,8 +545,10 @@ describe('every streaming adapter reports progress once per parsed event', () =>
     'data: {"zz":2}\n\n',
     'data: not json\n\n',
     'data: {"zz":3}\n\n',
+    'data: null\n\n',
+    'data: 5\n\n',
+    'data: [{"zz":4}]\n\n',
   ];
-  const dropsNull = new Set(['openai', 'gemini', 'openai-completions', 'openai-compatible', 'openrouter']);
   const adapters: Array<[string, () => { stream: (...args: never[]) => Promise<unknown> }]> = [
     ['openai', () => new OpenAIAdapter({ apiKey: 'zz-not-a-key' })],
     ['gemini', () => new GeminiAdapter({ apiKey: 'zz-not-a-key' })],
@@ -558,7 +560,7 @@ describe('every streaming adapter reports progress once per parsed event', () =>
 
   for (const [name, build] of adapters) {
     it(`${name}: three data frames, three reports`, async () => {
-      stubFetch(() => rawSseResponse(dropsNull.has(name) ? [...sseBody, 'data: null\n\n'] : sseBody));
+      stubFetch(() => rawSseResponse(sseBody));
       let progress = 0;
       const adapter = build() as unknown as {
         stream: (request: unknown, callbacks: unknown, options: ProviderRequestOptions) => Promise<unknown>;
@@ -574,7 +576,7 @@ describe('every streaming adapter reports progress once per parsed event', () =>
     });
   }
 
-  it('bedrock: decoded events count, pings and an event that decodes to null do not', async () => {
+  it('bedrock: decoded events count, pings and an event that decodes to no object do not', async () => {
     vi.spyOn(console, 'warn').mockImplementation(() => {});
     stubFetch(() => new Response(streamBody([
       chunkFrame({ type: 'message_start', message: { usage: { input_tokens: 3 } } }),
@@ -583,6 +585,8 @@ describe('every streaming adapter reports progress once per parsed event', () =>
       chunkFrame({ type: 'ping' }),
       chunkFrame({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'zz' } }),
       chunkFrame(null),
+      chunkFrame(5),
+      chunkFrame([{ type: 'message_stop' }]),
     ]), { status: 200 }));
     let progress = 0;
     await new BedrockAdapter({ accessKeyId: 'zz-not-a-key-id', secretAccessKey: 'zz-not-a-secret', region: 'zz-region-1' })

@@ -31,7 +31,7 @@ import {
   isTypedAbortError,
   withRawRequest,
 } from '../types/index.js';
-import { toolUseInputFromText, textOnlyToolResultContent, createCombinedSignal, SSELineParser, isDeadlineAbort, deadlineTimeoutError, throwOnStreamErrorFrame, assertTerminalEventObserved } from './utils.js';
+import { toolUseInputFromText, textOnlyToolResultContent, createCombinedSignal, SSELineParser, isDeadlineAbort, deadlineTimeoutError, throwOnStreamErrorFrame, assertTerminalEventObserved, streamIndex, isEventObject } from './utils.js';
 
 // ============================================================================
 // Types
@@ -318,11 +318,10 @@ export class OpenAIAdapter implements ProviderAdapter {
         } catch {
           return; // Ignore parse errors (partial/keep-alive lines)
         }
-        // `data: null` carries nothing to read. Other JSON that isn't an
-        // object (a number, a string, an array) reads as nothing below.
-        if (parsed === null) return;
-        // A parsed provider event is progress (comments never reach here, and
-        // `data: null` is no event).
+        // JSON that isn't an object (`null`, a number, a string, an array)
+        // carries no event, so its frame is dropped.
+        if (!isEventObject(parsed)) return;
+        // A provider event is progress (comments never reach here).
         options?.onProgress?.();
 
         throwOnStreamErrorFrame(parsed, 'OpenAI', openAIRequest);
@@ -337,13 +336,13 @@ export class OpenAIAdapter implements ProviderAdapter {
         // Handle streaming tool calls
         if (Array.isArray(delta?.tool_calls)) {
           for (const tc of delta.tool_calls) {
-            // An entry that isn't an object, or whose index isn't a
-            // non-negative integer (0 when absent; a string of digits counts,
-            // as array keys always took one), can't be placed, so it's
-            // dropped.
+            // An entry that isn't an object, or whose index isn't an array
+            // index (streamIndex: 0 when absent, and a string of digits with no
+            // leading zero counts, as array keys always took one), can't be
+            // placed, so it's dropped.
             if (!tc || typeof tc !== 'object' || Array.isArray(tc)) continue;
-            const index = Number(tc.index ?? 0);
-            if (!Number.isInteger(index) || index < 0) continue;
+            const index = streamIndex(tc.index);
+            if (index === undefined) continue;
             if (!toolCalls[index]) {
               toolCalls[index] = {
                 id: tc.id ?? '',

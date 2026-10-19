@@ -28,7 +28,7 @@ import {
   isTypedAbortError,
   withRawRequest,
 } from '../types/index.js';
-import { createCombinedSignal, textOnlyToolResultContent, toolUseInputFromValue, isDeadlineAbort, deadlineTimeoutError, throwOnStreamErrorFrame, assertTerminalEventObserved } from './utils.js';
+import { createCombinedSignal, textOnlyToolResultContent, toolUseInputFromValue, isDeadlineAbort, deadlineTimeoutError, throwOnStreamErrorFrame, assertTerminalEventObserved, isEventObject } from './utils.js';
 
 // ============================================================================
 // Gemini API Types
@@ -441,9 +441,10 @@ export class GeminiAdapter implements ProviderAdapter {
       // A frame that isn't valid JSON carries nothing to accumulate
       return;
     }
-    // `data: null` carries nothing to read, as on the other adapters.
-    if (parsed === null) return;
-    // A parsed provider event is progress (`data: null` is no event).
+    // JSON that isn't an object (`null`, a number, a string, an array)
+    // carries no event, so its frame is dropped, as on the other adapters.
+    if (!isEventObject(parsed)) return;
+    // A provider event is progress.
     onProgress?.();
     throwOnStreamErrorFrame(parsed, 'Gemini', rawRequest);
     if (parsed.modelVersion) streamState.lastModelVersion = parsed.modelVersion;
