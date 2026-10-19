@@ -6,14 +6,14 @@
  * servers are reported to leave it out. Every entry without one (absent or
  * `null`) used to go to slot 0, so two calls became one: the second's id and
  * name replaced the first's, and their argument strings ran together. Now such
- * an entry never takes a slot, and one that carries nothing is dropped. Any
- * other joins the call that has its id, or failing that the current call (the
- * one the last entry went to), unless it carries a name and a new id while that
- * call has an id. Entries with an index are placed in their slots as before
- * (stream-callback-errors.test.ts covers them), and a slot's first entry takes
- * over a call that began without an index under its id. On every path, a piece
- * that names a tool other than its call's starts a call of its own, and a call
- * keeps the first id a piece gives it.
+ * an entry never takes a slot. It joins the call that has its id, or failing
+ * that the current call (the one the last entry went to), unless it carries a
+ * name and a new id while that call has an id. Entries with an index are placed
+ * in their slots as before (stream-callback-errors.test.ts covers them), and
+ * one whose id names a call that began without an index moves that call into
+ * its slot. On every path, an entry that carries nothing is dropped, a piece
+ * that names a tool other than its call's starts a call of its own, a call
+ * keeps the first id a piece gives it, and no two calls come back under one id.
  */
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { OpenAIAdapter } from '../../src/providers/openai.js';
@@ -68,10 +68,10 @@ for (const [name, make] of adapters) {
       ]);
     });
 
-    it('calls with no ids but different names stay separate calls', async () => {
+    it('calls with no ids but different names stay separate calls, the second under an id of its own', async () => {
       expect(await calls([[piece(undefined, 'zz_a', '{"x":1}')], [piece(undefined, 'zz_b', '{"y":2}')]])).toEqual([
         { id: '', name: 'zz_a', input: { x: 1 } },
-        { id: '', name: 'zz_b', input: { y: 2 } },
+        { id: 'call_2', name: 'zz_b', input: { y: 2 } },
       ]);
     });
 
@@ -119,11 +119,19 @@ for (const [name, make] of adapters) {
       ]);
     });
 
-    it("a piece that repeats a call's id but names another tool starts a call of its own", async () => {
+    it("a piece that repeats a call's id but names another tool starts a call of its own, under an id of its own", async () => {
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
       expect(await calls([[piece('call_0', 'zz_first', '')], [piece('call_0', 'zz_second', '{"y":2}')]])).toEqual([
         { id: 'call_0', name: 'zz_first', input: {} },
-        { id: 'call_0', name: 'zz_second', input: { y: 2 } },
+        { id: 'call_0_2', name: 'zz_second', input: { y: 2 } },
       ]);
+      const minted = warn.mock.calls.map((args) => String(args[0])).filter((line) => line.includes('ids made unique'));
+      expect(minted).toEqual(['[membrane] The server repeated or left out a streamed tool call\'s id; ids made unique: "call_0" as call_0_2']);
+      warn.mockRestore();
+    });
+
+    it('a new id skips one another call already has', async () => {
+      expect((await calls([[piece('call_0', 'zz_a', '{"x":1}')], [piece('call_0_2', 'zz_c', '{"z":3}')], [piece('call_0', 'zz_b', '{"y":2}')]])).map((c: { id: string }) => c.id)).toEqual(['call_0', 'call_0_2', 'call_0_3']);
     });
 
     it("an entry with no index takes no index's slot: those with one come first, in index order", async () => {
@@ -164,6 +172,36 @@ for (const [name, make] of adapters) {
 
     it("a later indexed piece with another id and no name keeps the call's first id", async () => {
       expect(await calls([[{ index: 0, ...piece('call_a', 'zz_a', '{"x":') }], [{ index: 0, ...piece('call_b', undefined, '1}') }]])).toEqual([a]);
+    });
+
+    it('a named piece with a new id and the same tool continues its slot\'s call', async () => {
+      expect(await calls([[{ index: 0, ...piece('call_a', 'zz_a', '{"x":') }], [{ index: 0, ...piece('call_b', 'zz_a', '1}') }]])).toEqual([a]);
+    });
+
+    it('an empty entry with an index opens no call, so a call that began without one still moves into the slot', async () => {
+      expect(await calls([[piece('call_a', 'zz_a', '{"x":')], [{ index: 0 }], [{ index: 0, ...piece('call_a', undefined, '1}') }]])).toEqual([a]);
+    });
+
+    it("a call that began without an index moves into its slot by its id even when the slot holds another call", async () => {
+      expect(await calls([[piece('call_a', 'zz_a', '{"x":')], [{ index: 0, ...piece('call_x', 'zz_x', '{"z":3}') }], [{ index: 0, ...piece('call_a', undefined, '1}') }]])).toEqual([
+        { id: 'call_x', name: 'zz_x', input: { z: 3 } },
+        a,
+      ]);
+    });
+
+    it('an indexed piece naming another tool leaves the call that began without an index under its id where it was', async () => {
+      expect(await calls([[piece('call_a', 'zz_a', '{"x":1}')], [{ index: 0, ...piece('call_a', 'zz_b', '{"y":2}') }]])).toEqual([
+        { id: 'call_a', name: 'zz_b', input: { y: 2 } },
+        { id: 'call_a_2', name: 'zz_a', input: { x: 1 } },
+      ]);
+    });
+
+    it("an indexed piece whose id names a call in another slot takes nothing from the calls without an index", async () => {
+      expect(await calls([[{ index: 0, ...piece('call_a', 'zz_a', '{"x":1}') }], [piece('call_x', 'zz_x', '{"z":3}')], [{ index: 1, ...piece('call_a', 'zz_a', '') }]])).toEqual([
+        a,
+        { id: 'call_a_2', name: 'zz_a', input: {} },
+        { id: 'call_x', name: 'zz_x', input: { z: 3 } },
+      ]);
     });
 
     it('a piece in a slot that names another tool starts a call of its own there, which the slot continues', async () => {
