@@ -35,6 +35,7 @@ import type {
 } from './types.js';
 import { normalizeToolPairs, mergeConsecutiveRoles } from './normalize-tool-pairs.js';
 import { imageForRequest, toolResultContentForRequest } from '../utils/image-media.js';
+import { convertMcpMedia } from '../utils/mcp-media.js';
 import { assertCacheMarkersWithinLimit, countWireCacheMarkers } from '../utils/cache-marker-budget.js';
 import { anthropicServerBlockFor, unpairedServerBlocks } from '../utils/anthropic-server-blocks.js';
 
@@ -202,6 +203,10 @@ export class NativeFormatter implements PrefillFormatter {
   // ==========================================================================
 
   buildMessages(messages: NormalizedMessage[], options: BuildOptions): BuildResult {
+    // Media in MCP's form becomes membrane's first, for a caller that builds
+    // messages directly. Membrane's own builds have converted it already and
+    // get the same array back (utils/mcp-media.ts).
+    messages = convertMcpMedia(messages);
     const {
       participantMode,
       assistantParticipant,
@@ -516,12 +521,12 @@ export class NativeFormatter implements PrefillFormatter {
         }
         result.push(textBlock);
       } else if (block.type === 'image') {
-        if (block.source.type === 'base64') {
+        if (block.source?.type === 'base64') {
           const { mediaType, placeholder } = imageForRequest(block.source.data, block.source.mediaType);
           if (placeholder) {
-            // Not an image the API accepts (an SVG, or data that is no image
-            // at all): degrade to a text placeholder instead of poisoning the
-            // whole request.
+            // Not an image the API accepts (an SVG, data that is no image at
+            // all, or no data): degrade to a text placeholder instead of
+            // poisoning the whole request.
             result.push(placeholder);
             altered();
           } else {
@@ -540,13 +545,16 @@ export class NativeFormatter implements PrefillFormatter {
             result.push(imageBlock);
           }
         } else {
-          altered(); // a non-base64 image source has no branch here
+          // A source that isn't base64 has no branch here, and nor does no
+          // source object at all (media in MCP's form that didn't convert,
+          // utils/mcp-media.ts).
+          altered();
         }
       } else if (block.type === 'audio') {
         // Pass audio through in the same shape as images — the provider
         // adapters convert it (Gemini → inlineData, OpenRouter → input_audio).
         // Whether a given model accepts audio is the provider/model's concern.
-        if (block.source.type === 'base64') {
+        if (block.source?.type === 'base64') {
           result.push({
             type: 'audio',
             source: {
@@ -556,7 +564,7 @@ export class NativeFormatter implements PrefillFormatter {
             },
           });
         } else {
-          altered();
+          altered(); // as for an image
         }
       } else if (block.type === 'tool_use') {
         result.push({

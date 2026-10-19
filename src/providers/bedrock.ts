@@ -36,6 +36,7 @@ import {
   thinkingEnabled,
 } from './anthropic.js';
 import { imageForRequest, urlImageForRequest } from '../utils/image-media.js';
+import { convertMcpMedia, isSourcelessMedia } from '../utils/mcp-media.js';
 
 // ============================================================================
 // Adapter Configuration
@@ -492,26 +493,46 @@ export class BedrockAdapter implements ProviderAdapter {
     };
     const sanitizedMessages = (request.messages as any[]).map((msg: any) => {
       if (!Array.isArray(msg.content)) return msg;
+      // Media in MCP's form becomes membrane's first, for a caller that
+      // builds a request directly (Membrane's own builds have converted it
+      // already, utils/mcp-media.ts), as the Anthropic adapter converts it. A
+      // report about a block names the one the caller handed in.
+      const converted = convertMcpMedia(msg.content as unknown[]) as any[];
       return {
         ...msg,
-        content: msg.content.map((block: any) => remember((() => {
-          if (block.type === 'image' && block.sourceUrl !== undefined) {
-            const { sourceUrl, ...rest } = block;
-            return stripCacheTtl(toWireImage(rest, () => onContentAltered?.(block)));
+        content: msg.content.flatMap((original: any, index: number) => {
+          const block = converted[index];
+          if (isSourcelessMedia(block)) {
+            // Media with no source object (MCP's form that didn't convert)
+            // has no form the API takes: left out, and reported.
+            onContentAltered?.(original);
+            return [];
           }
-          if (block.type === 'image') {
-            return stripCacheTtl(toWireImage(block, () => onContentAltered?.(block)));
-          }
-          if (block.type === 'tool_result' && Array.isArray(block.content)) {
-            let substituted = false;
-            const content = block.content.map((inner: any) =>
-              inner?.type === 'image' ? toWireImage(inner, () => { substituted = true; }) : inner,
-            );
-            if (substituted) onContentAltered?.(block);
-            return stripCacheTtl({ ...block, content });
-          }
-          return stripCacheTtl(block);
-        })(), block)),
+          return [remember((() => {
+            if (block.type === 'image' && block.sourceUrl !== undefined) {
+              const { sourceUrl, ...rest } = block;
+              return stripCacheTtl(toWireImage(rest, () => onContentAltered?.(original)));
+            }
+            if (block.type === 'image') {
+              return stripCacheTtl(toWireImage(block, () => onContentAltered?.(original)));
+            }
+            if (block.type === 'tool_result' && Array.isArray(block.content)) {
+              let altered = false;
+              // Media with no source object has no form the API takes here
+              // either: left out, and the result reported, as at the top.
+              const content = block.content.flatMap((inner: any) => {
+                if (isSourcelessMedia(inner)) {
+                  altered = true;
+                  return [];
+                }
+                return [inner?.type === 'image' ? toWireImage(inner, () => { altered = true; }) : inner];
+              });
+              if (altered) onContentAltered?.(original);
+              return stripCacheTtl({ ...block, content });
+            }
+            return stripCacheTtl(block);
+          })(), original)];
+        }),
       };
     });
 

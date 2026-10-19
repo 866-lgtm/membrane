@@ -35,6 +35,7 @@ import {
 import { isRawItemCarrier } from '../utils/fidelity.js';
 import { toolUseInputFromText, textOnlyToolResultContent, openAIImagePart, createCombinedSignal, SSELineParser, isDeadlineAbort, deadlineTimeoutError, throwOnStreamErrorFrame, assertTerminalEventObserved } from './utils.js';
 import { requiresCompletionTokens, noTemperatureSupport, noStopSupport } from './openai.js';
+import { convertMcpMedia } from '../utils/mcp-media.js';
 
 // ============================================================================
 // Types
@@ -362,7 +363,10 @@ export class OpenAICompatibleAdapter implements ProviderAdapter {
   }
 
   private buildRequest(request: ProviderRequest): any {
-    const messages = this.convertMessages(request.messages as any[]);
+    // Media in MCP's form becomes membrane's first, for a caller that builds
+    // a request directly (Membrane's own builds have converted it already,
+    // utils/mcp-media.ts).
+    const messages = this.convertMessages(convertMcpMedia(request.messages as any[]));
     
     // Handle system prompt (same as openrouter.ts)
     if (request.system) {
