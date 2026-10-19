@@ -257,17 +257,20 @@ export interface StreamedToolCall {
  * appended to its call's.
  *
  * An entry with an `index` goes to that slot, as `streamIndex` reads it, and
- * one whose index names no slot is dropped. OpenAI always sends one, but some
- * compatible servers leave it out, and every entry without one went to slot
- * 0, so two calls became one (antra-tess/membrane#159). An entry whose
- * `index` is absent or `null` never takes a slot. It goes to the call that
- * already has its id, if one does. Otherwise it starts a new call when it
- * carries a name and the current call, the one the last entry went to, has a
- * different name, or another id while the entry carries one too. Otherwise
- * it goes to the current call. Every format seen sends a call's name on its
- * first piece, so a later piece that carries only an id, even a new one, or
- * only arguments stays with its call. `calls()` gives the calls that have an
- * index in index order, then the others in the order they started.
+ * one whose index names no slot is dropped. A slot's first entry takes over
+ * the call that began without an index under its id, if one did. OpenAI
+ * always sends an index, but some compatible servers leave it out, and every
+ * entry without one went to slot 0, so two calls became one
+ * (antra-tess/membrane#159). An entry whose `index` is absent or `null` never
+ * takes a slot. If it carries no id, name or arguments it is dropped, and
+ * otherwise it goes to the call that already has its id, if one does. Else it
+ * starts a new call when it carries a name and the current call, the one the
+ * last entry went to, has a different name, or has an id while the entry
+ * carries a new one. Otherwise it goes to the current call. Every format seen
+ * sends a call's name on its first piece, so a later piece that carries only
+ * an id, even a new one, or only arguments stays with its call. `calls()`
+ * gives the calls that have an index in index order, then the others in the
+ * order they started.
  */
 export function streamedToolCalls(): { add(entry: unknown): void; calls(): StreamedToolCall[] } {
   const indexed: StreamedToolCall[] = [];
@@ -284,8 +287,18 @@ export function streamedToolCalls(): { add(entry: unknown): void; calls(): Strea
       if (tc.index !== undefined && tc.index !== null) {
         const index = streamIndex(tc.index);
         if (index === undefined) return;
-        call = indexed[index] ??= open();
+        call = indexed[index];
+        if (!call) {
+          // A call that began without an index and comes back with its id
+          // and an index takes that slot, rather than leaving two calls.
+          const known = tc.id ? byId.get(tc.id) : undefined;
+          const at = known ? unindexed.indexOf(known) : -1;
+          if (known && at !== -1) unindexed.splice(at, 1);
+          call = indexed[index] = known && at !== -1 ? known : open();
+        }
       } else {
+        // An entry that carries nothing adds nothing, and opens no call.
+        if (!tc.id && !name && !tc.function?.arguments) return;
         call = tc.id ? byId.get(tc.id) : undefined;
         if (!call) {
           if (!current || (!!name && ((!!current.function.name && name !== current.function.name) || (!!tc.id && !!current.id)))) {

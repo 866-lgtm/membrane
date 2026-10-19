@@ -5,13 +5,15 @@
  * OpenAI sends `index` on every entry; some OpenAI-compatible servers leave it
  * out. Every entry without one (absent or `null`) used to go to slot 0, so two
  * calls became one: the second's id and name replaced the first's, and their
- * argument strings ran together. Now such an entry never takes a slot. It
- * joins the call that has its id; otherwise it starts a new call when it
- * carries a name and the current call (the one the last entry went to) has a
- * different name, or another id while it carries one too; otherwise it joins
- * the current call. A call keeps the first id and the first name a piece
- * gives it. Entries with an index are placed in their slots as before
- * (stream-callback-errors.test.ts covers them).
+ * argument strings ran together. Now such an entry never takes a slot, and
+ * one that carries nothing is dropped. It joins the call that has its id;
+ * otherwise it starts a new call when it carries a name and the current call
+ * (the one the last entry went to) has a different name, or has an id while
+ * it carries a new one; otherwise it joins the current call. A call keeps the
+ * first id and the first name a piece gives it. Entries with an index are
+ * placed in their slots as before (stream-callback-errors.test.ts covers
+ * them), and a slot's first entry takes over a call that began without an
+ * index under its id.
  */
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { OpenAIAdapter } from '../../src/providers/openai.js';
@@ -129,7 +131,35 @@ for (const [name, make] of adapters) {
 
     it('an entry with no index after a call at a large index is placed without walking the index space', async () => {
       const large = { index: 100_000_000, ...piece('call_z', 'zz_z', '{}') };
-      expect(await calls([[large], [piece('call_a', 'zz_a', '{"x":1}')]])).toEqual([{ id: 'call_z', name: 'zz_z', input: {} }, a]);
+      const started = performance.now();
+      const placed = await calls([[large], [piece('call_a', 'zz_a', '{"x":1}')]]);
+      // A walk of the 10^8 slots below it took about 8 s (the first round's toolCallSlot); placing takes well under 1 s.
+      expect(performance.now() - started).toBeLessThan(1000);
+      expect(placed).toEqual([{ id: 'call_z', name: 'zz_z', input: {} }, a]);
+    });
+
+    it('a call that began without an index keeps its pieces when later ones carry its id and an index', async () => {
+      expect(await calls([[piece('call_a', 'zz_a', '{"x":')], [{ index: 0, ...piece('call_a', undefined, '1}') }]])).toEqual([a]);
+    });
+
+    it('an entry with no index that carries nothing opens no call', async () => {
+      expect(await calls([[{}], [{ index: 0, ...piece('call_a', 'zz_a', '{"x":1}') }]])).toEqual([a]);
+    });
+
+    it('a call whose id comes first and whose name follows takes the name', async () => {
+      expect(await calls([[piece('call_a', undefined, '{"x":')], [piece(undefined, 'zz_a', '1}')]])).toEqual([a]);
+    });
+
+    it('a call whose name is repeated and whose id arrives later stays one call', async () => {
+      expect(await calls([[piece(undefined, 'zz_a', '{"x":')], [piece('call_a', 'zz_a', '1}')]])).toEqual([a]);
+    });
+
+    it('an indexed call continued in its slot stays one call, as OpenAI streams it', async () => {
+      expect(await calls([[{ index: 0, ...piece('call_a', 'zz_a', '{"x":') }], [{ index: 0, ...piece(undefined, undefined, '1}') }]])).toEqual([a]);
+    });
+
+    it("a later indexed piece with another id and name doesn't change the call's", async () => {
+      expect(await calls([[{ index: 0, ...piece('call_a', 'zz_a', '{"x":') }], [{ index: 0, ...piece('call_b', 'zz_b', '1}') }]])).toEqual([a]);
     });
   });
 }
