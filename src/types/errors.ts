@@ -771,17 +771,20 @@ export function withRawRequest(error: MembraneError, rawRequest: unknown): Membr
  * leaves as itself, as they do to any MembraneError that has none.) The
  * wrapper keeps the type membrane reads from the error, but nothing a
  * provider's response would state (an HTTP status, a provider code, a wait),
- * since no response to this call stands behind it, and no request taken from
- * the caller's error, which would be another call's.
+ * since no response to this call stands behind it, and no request or raw
+ * error taken from a MembraneError the caller threw, which would be another
+ * call's.
  */
 export function callerCodeError(error: unknown): MembraneError {
   if (error instanceof MembraneError && !error.retryable) return error;
+  const info = classifyError(error);
   const wrapped = new MembraneError({
-    ...classifyError(error),
+    ...info,
     retryable: false,
     httpStatus: undefined,
     providerErrorCode: undefined,
     retryAfterMs: undefined,
+    rawError: error instanceof MembraneError ? undefined : info.rawError,
     rawRequest: undefined,
   });
   Object.defineProperty(wrapped, 'cause', { value: error, writable: true, configurable: true });

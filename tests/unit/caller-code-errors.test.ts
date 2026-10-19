@@ -52,6 +52,17 @@ class CountingAdapter extends MockAdapter {
   override async stream(...args: Parameters<MockAdapter['stream']>) { this.streamCalls++; return super.stream(...args); }
 }
 
+/** An SDK message stream that plays back the events given. */
+function scriptedStream(events: unknown[]) {
+  return {
+    controller: { abort() { /* nothing to abort */ } },
+    [Symbol.asyncIterator]() {
+      let i = 0;
+      return { async next() { return i < events.length ? { value: events[i++], done: false } : { value: undefined, done: true }; } };
+    },
+  };
+}
+
 /** An Anthropic adapter whose SDK client is a stub, so nothing leaves the test. */
 function anthropic(config: Record<string, unknown> = {}) {
   const adapter = new AnthropicAdapter({ apiKey: 'sk-test', cacheKeepalive: { enabled: false }, ...config });
@@ -92,13 +103,14 @@ const call = (path: 'complete' | 'stream', membrane: Membrane, req: NormalizedRe
 afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals(); });
 
 describe('callerCodeError', () => {
-  it('wraps an error that isn\'t a MembraneError: its type read from its wording, not retryable, nothing a response would state, the original as cause', () => {
+  it('wraps an error that isn\'t a MembraneError: its type read from its wording, not retryable, no status or wait, its raw error and cause the caller\'s', () => {
     const original = new Error('zz rate limit exceeded in the caller, retry after 30 seconds');
     const error = callerCodeError(original);
     expect(error).toBeInstanceOf(MembraneError);
     expect(error).toMatchObject({ type: 'rate_limit', retryable: false, message: original.message });
     expect(error.httpStatus).toBeUndefined();
     expect(error.retryAfterMs).toBeUndefined();
+    expect(error.rawError).toMatchObject({ name: 'Error', message: original.message });
     expect(error.cause).toBe(original);
   });
 
@@ -108,8 +120,8 @@ describe('callerCodeError', () => {
     expect(original.cause).toBeUndefined();
   });
 
-  it('wraps a retryable MembraneError, leaving the caller\'s object as it was', () => {
-    const stated = { httpStatus: 429, providerErrorCode: 'zz_rate_limited', retryAfterMs: 30_000, rawRequest: { zz: 'the nested request' } };
+  it('wraps a retryable MembraneError, taking nothing of another call\'s from it and leaving it as it was', () => {
+    const stated = { httpStatus: 429, providerErrorCode: 'zz_rate_limited', retryAfterMs: 30_000, rawError: { zz: 'the nested provider error' }, rawRequest: { zz: 'the nested request' } };
     const original = new MembraneError({ type: 'rate_limit', message: 'zz a nested call\'s 429', retryable: true, ...stated });
     const error = callerCodeError(original);
     expect(error).not.toBe(original);
@@ -118,6 +130,7 @@ describe('callerCodeError', () => {
     expect(error.httpStatus).toBeUndefined();
     expect(error.providerErrorCode).toBeUndefined();
     expect(error.retryAfterMs).toBeUndefined();
+    expect(error.rawError).toBeUndefined();
     expect(error.rawRequest).toBeUndefined();
     expect(original).toMatchObject({ retryable: true, ...stated });
   });
@@ -442,6 +455,34 @@ describe('stream() after emission: the caller\'s error is not retryable, a provi
       const membrane = new Membrane(adapter, { ...noDelay, ...(f ? { formatter: f } : {}) });
       const error = await rejection(membrane.stream(request(extra), { onChunk: () => {}, [name]: () => { throw original; } }));
       expect(adapter.streamCalls).toBe(1);
+      expect(error.retryable).toBe(false);
+      expect(error.cause).toBe(original);
+    });
+  }
+
+  // Through the real AnthropicAdapter, whose stream handler lets a callback's
+  // error through, with its SDK client playing back a scripted stream.
+  for (const name of ['onChunk', 'onUsage'] as const) {
+    it(`${name} throws, through the Anthropic adapter`, async () => {
+      const events = [
+        { type: 'message_start', message: { id: 'msg', type: 'message', role: 'assistant', model: 'claude-sonnet-4-6', content: [], stop_reason: null, usage: { input_tokens: 1, output_tokens: 0 } } },
+        { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } },
+        { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'Hello ' } },
+        { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'world' } },
+        { type: 'content_block_stop', index: 0 },
+        { type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 2 } },
+        { type: 'message_stop' },
+      ];
+      const adapter = new AnthropicAdapter({ apiKey: 'sk-test', cacheKeepalive: { enabled: false } });
+      let sends = 0;
+      const client: any = { messages: { stream: async () => { sends++; return scriptedStream(events); } } };
+      client.withOptions = () => client;
+      (adapter as any).client = client;
+      const original = callerError();
+      let runs = 0;
+      const error = await rejection(new Membrane(adapter, noDelay).stream(request(), { onChunk: () => {}, [name]: () => { runs++; throw original; } }));
+      expect(sends).toBe(1);
+      expect(runs).toBe(1);
       expect(error.retryable).toBe(false);
       expect(error.cause).toBe(original);
     });
