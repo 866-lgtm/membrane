@@ -14,20 +14,25 @@
 - What these adapters can't read is still dropped. A data line that isn't
   JSON, or whose JSON isn't an object (`null`, a number, a string, an array),
   drops its frame, on Gemini and the Responses API too, where `data: null`
-  failed the stream. On the OpenAI, OpenAI-compatible and OpenRouter adapters,
-  a `tool_calls` that isn't an array drops its tool calls, and an entry that
-  isn't an object, or whose `index` isn't an array index (an integer from 0 to
-  2^32 - 2, or its decimal string with no leading zero; absent or `null`
-  counts as 0), drops that entry; the rest of the frame is read. The calls
-  placed are gathered in index order, so a first call at index 1, or one after
-  a dropped entry, no longer fails the response. A number entry used to become
-  an empty tool call. On Bedrock, an event that doesn't decode, or decodes to
-  `null`, is skipped with a warning, as before, and so is a block start or
-  stop whose index or block can't be placed. When a skipped block start leaves
-  the message without a block before later ones, the call fails as a retryable
-  `network` error naming that block. Where the start's index named no slot, or
-  its block was `null`, the call failed with a `TypeError`; where its block
-  was another value that isn't an object, it returned the message without that
-  block. An event that carries no `bytes` (the field missing or empty), which
-  was skipped silently, and one that decodes to other JSON that isn't an
-  object, which was read as nothing, are now skipped with the warning too.
+  failed the stream. A frame whose JSON isn't an object no longer renews the
+  progress deadline (`progressTimeoutMs`), and a Bedrock event that decodes to
+  such JSON doesn't either. In 0.6.0 every SSE data frame that parsed renewed
+  it, and so did every Bedrock event that decoded, other than a `ping` and one
+  that decoded to `null`. On the OpenAI, OpenAI-compatible and OpenRouter
+  adapters, a `tool_calls` that isn't an array drops its tool calls, and an
+  entry that isn't an object, or whose `index` isn't an array index (an
+  integer from 0 to 2^32 - 2, or its decimal string with no leading zero;
+  absent or `null` counts as 0), drops that entry; the rest of the frame is
+  read. The calls placed are gathered in index order, so a first call at index
+  1, or one after a dropped entry, no longer fails the response. A number
+  entry used to become an empty tool call. On Bedrock, an event that doesn't
+  decode, or decodes to `null`, is skipped with a warning, as before, and so
+  is a block start or stop whose index or block can't be placed. When a
+  skipped block start leaves the message without a block before later ones,
+  the call fails as a retryable `network` error naming that block. Where the
+  start's index named no slot, or its block was `null`, the call failed with a
+  `TypeError`; where its block was another value that isn't an object, it
+  returned the message without that block. An event that carries no `bytes`
+  (the field missing or empty), which was skipped silently, and one that
+  decodes to other JSON that isn't an object, which was read as nothing, are
+  now skipped with the warning too.
