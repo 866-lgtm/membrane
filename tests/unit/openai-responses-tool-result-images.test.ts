@@ -80,7 +80,7 @@ describe('tool results carrying images (Responses)', () => {
     });
   });
 
-  it('helper: the same stand-in, which names no cause, for an empty URL and for base64 outside the source; empty base64 data in a source is decided, and gets the placeholder', () => {
+  it('helper: the same stand-in, which names no cause, for an empty URL and for base64 outside the source; empty base64 data in a source is decided, and gets the note that it came without its data', () => {
     const standIn = { type: 'input_text', text: "[system: an image in this tool result was NOT shown to you. This request couldn't carry it, so you are not seeing it.]" };
     expect(responsesToolOutput([
       { type: 'image', source: { type: 'base64', data: '', mediaType: 'image/png' } },
@@ -88,7 +88,7 @@ describe('tool results carrying images (Responses)', () => {
       { type: 'image', data: 'iVBORw0KGgo=', mimeType: 'image/png' },
     ])).toEqual({
       output: [
-        { type: 'input_text', text: expect.stringContaining('its data is not a JPEG, PNG, GIF or WebP image, the formats this request can carry (it was labelled "image/png")') },
+        { type: 'input_text', text: expect.stringContaining('it came without its data') },
         standIn,
         standIn,
       ],

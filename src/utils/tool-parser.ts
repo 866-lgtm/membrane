@@ -20,7 +20,7 @@ import type {
   ToolDefinition,
 } from '../types/index.js';
 import { createHash } from 'node:crypto';
-import { imageForRequest, isAcceptedImage } from './image-media.js';
+import { dataUrlImage, imageForRequest, isAcceptedImage, linkImageNote, type RasterImageMediaType } from './image-media.js';
 import { readToolSchema, type ParameterDeclaration, type ToolSchemaReading } from './tool-schema.js';
 
 // ============================================================================
@@ -597,27 +597,52 @@ const STRUCTURAL_TAG_RE =
   /<\/?(?:antml:)?(?:function_calls|function_results|invoke|result|stdout|error|tool_name)\b/;
 
 /** A tool-result image's data and the label it came with, whether it carries
- *  them in a `source` or MCP-style as `data` and `mimeType`. The XML replay of
- *  a split (anthropic-xml's sentSplit) reads a stored result's images with it
- *  too, so the two read the same blocks as images. */
+ *  them in a `source` or MCP-style as `data` and `mimeType`. A `data:` URL
+ *  holds its image inline, so its bytes and label are read from it; any other
+ *  url source's image is at its URL, so none is read, not even data the
+ *  source also carries, as the native path reads one
+ *  (toolResultContentForRequest). The XML replay of a split (anthropic-xml's
+ *  sentSplit) reads a stored result's images with it too, so the two read the
+ *  same blocks as images. */
 export function toolResultImage(block: unknown): { data: unknown; declared: unknown } {
-  const b = block as { source?: { data?: unknown; mediaType?: unknown; media_type?: unknown }; data?: unknown; mimeType?: unknown };
-  return b.source
-    ? { data: b.source.data, declared: b.source.mediaType ?? b.source.media_type }
-    : { data: b.data, declared: b.mimeType };
+  const b = block as { source?: { type?: unknown; url?: unknown; data?: unknown; mediaType?: unknown; media_type?: unknown }; data?: unknown; mimeType?: unknown };
+  if (!b.source) return { data: b.data, declared: b.mimeType };
+  if (b.source.type === 'url') {
+    const inline = dataUrlImage(b.source.url);
+    return { data: inline?.data, declared: inline?.declared };
+  }
+  return { data: b.source.data, declared: b.source.mediaType ?? b.source.media_type };
+}
+
+/** A tool-result image as an xml tool loop takes it: its media type and
+ *  data when the request can send it, or the note that stands in its place.
+ *  One at a URL a provider would fetch gets the link's note, since these
+ *  results carry no links; any other, a `data:` URL's among them, is
+ *  imageForRequest's decision, which also notes an image that came without
+ *  its data. */
+function xmlResultImage(
+  block: unknown,
+): { mediaType: RasterImageMediaType; data: string; note?: undefined } | { note: { type: 'text'; text: string } } {
+  const { data, declared } = toolResultImage(block);
+  const source = (block as { source?: unknown }).source;
+  // toolResultImage reads no data from a url source only when it isn't a data: URL.
+  if (data === undefined && typeof source === 'object' && source !== null && (source as { type?: unknown }).type === 'url') {
+    return { note: linkImageNote((source as { url?: unknown }).url) };
+  }
+  const image = imageForRequest(data, declared);
+  return image.placeholder ? { note: image.placeholder } : { mediaType: image.mediaType, data: data as string };
 }
 
 /** The text that stands for a tool-result image where XML can't carry it:
  *  the format and size of an image the request would send, saying the model
- *  isn't seeing it, or the placeholder for data it wouldn't send. The
- *  placeholder quotes the image's label, so callers guard it as they guard
+ *  isn't seeing it, or the note for one it wouldn't send. A note can quote
+ *  what the caller gave (a link, a label), so callers guard it as they guard
  *  the result's own text. */
 function imageNote(block: Extract<ToolResultContentBlock, { type: 'image' }>): string {
-  const { data, declared } = toolResultImage(block);
-  const { mediaType, placeholder } = imageForRequest(data, declared);
-  if (placeholder) return placeholder.text;
-  const sizeKb = Math.round(((data as string).length * 0.75) / 1024);
-  return `[Image: ${mediaType}, ~${sizeKb}KB, not shown to you]`;
+  const image = xmlResultImage(block);
+  if (image.note) return image.note.text;
+  const sizeKb = Math.round((image.data.length * 0.75) / 1024);
+  return `[Image: ${image.mediaType}, ~${sizeKb}KB, not shown to you]`;
 }
 
 function renderResultContentString(result: ToolResult): string {
@@ -1412,18 +1437,19 @@ export function formatToolResultsForSplitTurn(results: ToolResult[]): SplitTurnC
         if (block.type === 'text') {
           textParts.push(guardResultContent(block.text));
         } else if (block.type === 'image') {
-          const { data, declared } = toolResultImage(block);
-          const { mediaType, placeholder } = imageForRequest(data, declared);
-          if (placeholder) {
-            textParts.push(guardResultContent(placeholder.text));
+          const image = xmlResultImage(block);
+          if (image.note) {
+            // A note can quote the caller's text (a link, a label), so it
+            // passes the guard the result's own text does.
+            textParts.push(guardResultContent(image.note.text));
           } else {
             resultHasImages = true;
             resultImages.push({
               type: 'image',
               source: {
                 type: 'base64',
-                media_type: mediaType,
-                data: data as string,
+                media_type: image.mediaType,
+                data: image.data,
               },
             });
           }

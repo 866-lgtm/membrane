@@ -32,6 +32,7 @@ import type {
 import { responsesToolOutput } from '../providers/responses-input.js';
 
 import { imageForRequest, urlImageForRequest } from '../utils/image-media.js';
+import { convertMcpMedia } from '../utils/mcp-media.js';
 import { carriesAnthropicServerBlock } from '../utils/anthropic-server-blocks.js';
 
 export const OPENAI_RESPONSES_ITEMS_METADATA_KEY = 'openaiResponsesItems';
@@ -102,6 +103,10 @@ export class OpenAIResponsesFormatter implements PrefillFormatter {
   readonly reportsAlterations = true;
 
   buildMessages(messages: NormalizedMessage[], options: BuildOptions): BuildResult {
+    // Media in MCP's form becomes membrane's first, for a caller that builds
+    // messages directly. Membrane's own builds have converted it already and
+    // get the same array back (utils/mcp-media.ts).
+    messages = convertMcpMedia(messages);
     const items: NativeItem[] = [];
     let hasImportedItems = false;
 
@@ -215,7 +220,7 @@ export class OpenAIResponsesFormatter implements PrefillFormatter {
           type: isAssistant ? 'output_text' : 'input_text',
           text: block.text,
         });
-      } else if (block.type === 'image' && !isAssistant) {
+      } else if (block.type === 'image' && !isAssistant && typeof block.source === 'object' && block.source !== null) {
         const source = block.source;
         if (source.type === 'url') {
           // A data: URL holds its image inline and takes the same decision;
@@ -257,8 +262,10 @@ export class OpenAIResponsesFormatter implements PrefillFormatter {
         flushMessage();
         out.push({ type: 'reasoning', encrypted_content: block.data, summary: [] });
       } else {
-        // An assistant image, a thinking block without its provider item, and
-        // any other block type have no input form here: left out.
+        // An assistant image, an image with no source object (media in MCP's
+        // form that didn't convert, utils/mcp-media.ts), a thinking block
+        // without its provider item, and any other block type have no input
+        // form here: left out.
         onAltered?.();
       }
     }

@@ -26,7 +26,8 @@ import {
   withRawRequest,
 } from '../types/index.js';
 import { isRawItemCarrier } from '../utils/fidelity.js';
-import { toolUseInputFromText, textOnlyToolResultContent, openAIImagePart, createCombinedSignal, SSELineParser, isDeadlineAbort, deadlineTimeoutError, throwOnStreamErrorFrame, assertTerminalEventObserved } from './utils.js';
+import { convertMcpMedia } from '../utils/mcp-media.js';
+import { toolUseInputFromText, textOnlyToolResultContent, openAIImagePart, createCombinedSignal, SSELineParser, isDeadlineAbort, deadlineTimeoutError, throwOnStreamErrorFrame, assertTerminalEventObserved, streamIndex, isEventObject } from './utils.js';
 
 // ============================================================================
 // Types
@@ -272,15 +273,20 @@ export class OpenRouterAdapter implements ProviderAdapter {
           return;
         }
 
-        // Parse first; only JSON noise is ignorable. Everything after the
-        // parse must NOT be swallowed by the catch below.
+        // Parse first: a line that isn't JSON is noise to ignore. Nothing
+        // after the parse is caught here, so an error there, a caller's
+        // callback included, fails the stream. What the handler can't read is
+        // dropped below by checks, not by a catch.
         let parsed: Record<string, any>;
         try {
           parsed = JSON.parse(data);
         } catch {
           return; // Ignore parse errors (partial/keep-alive lines)
         }
-        // A parsed provider event is progress (comments never reach here).
+        // JSON that isn't an object (`null`, a number, a string, an array)
+        // carries no event, so its frame is dropped.
+        if (!isEventObject(parsed)) return;
+        // A provider event is progress (comments never reach here).
         options?.onProgress?.();
 
         // OpenRouter delivers mid-stream failures (e.g. upstream 429s) as an
@@ -289,90 +295,99 @@ export class OpenRouterAdapter implements ProviderAdapter {
         // retry logic can handle it. Shared with every other SSE adapter.
         throwOnStreamErrorFrame(parsed, 'OpenRouter', openRouterRequest);
 
-        try {
-          const delta = parsed.choices?.[0]?.delta;
+        const delta = parsed.choices?.[0]?.delta;
 
-          // Text remains a text-only callback stream. Keep image parts in
-          // order instead of coercing content arrays into "[object Object]".
-          const appendPart = (part: unknown): void => {
-            if (!part || typeof part !== 'object') return;
-            const block = part as { type?: unknown; text?: unknown };
-            if (block.type === 'text' && typeof block.text === 'string' && block.text !== '') {
-              const previous = contentParts[contentParts.length - 1];
-              if (previous?.type === 'text') previous.text += block.text;
-              else contentParts.push({ type: 'text', text: block.text });
-              callbacks.onChunk(block.text);
-            } else if (block.type === 'image_url') {
-              const url = readImageUrl(part);
-              if (url === undefined) return;
-              contentParts.push(part as OpenRouterContentBlock);
-              callbacks.onContentBlock?.(contentParts.length - 1, imageFromUrl(url));
+        // Text remains a text-only callback stream. Keep image parts in
+        // order instead of coercing content arrays into "[object Object]".
+        const appendPart = (part: unknown): void => {
+          if (!part || typeof part !== 'object') return;
+          const block = part as { type?: unknown; text?: unknown };
+          if (block.type === 'text' && typeof block.text === 'string' && block.text !== '') {
+            const previous = contentParts[contentParts.length - 1];
+            if (previous?.type === 'text') previous.text += block.text;
+            else contentParts.push({ type: 'text', text: block.text });
+            callbacks.onChunk(block.text);
+          } else if (block.type === 'image_url') {
+            const url = readImageUrl(part);
+            if (url === undefined) return;
+            contentParts.push(part as OpenRouterContentBlock);
+            callbacks.onContentBlock?.(contentParts.length - 1, imageFromUrl(url));
+          }
+        };
+        if (typeof delta?.content === 'string' && delta.content) {
+          appendPart({ type: 'text', text: delta.content });
+        } else if (Array.isArray(delta?.content)) {
+          for (const part of delta.content) appendPart(part);
+        }
+        if (Array.isArray(delta?.images)) {
+          for (const image of delta.images) {
+            appendPart({ type: 'image_url', image_url: image?.image_url });
+          }
+        }
+
+        // Handle streaming tool calls
+        if (Array.isArray(delta?.tool_calls)) {
+          for (const tc of delta.tool_calls) {
+            // An entry that isn't an object, or whose index isn't an array
+            // index (streamIndex: 0 when absent, and a string of digits with no
+            // leading zero counts, as array keys always took one), can't be
+            // placed, so it's dropped.
+            if (!tc || typeof tc !== 'object' || Array.isArray(tc)) continue;
+            const index = streamIndex(tc.index);
+            if (index === undefined) continue;
+            if (!toolCalls[index]) {
+              toolCalls[index] = {
+                id: tc.id ?? '',
+                type: 'function',
+                function: { name: '', arguments: '' },
+              };
             }
-          };
-          if (typeof delta?.content === 'string' && delta.content) {
-            appendPart({ type: 'text', text: delta.content });
-          } else if (Array.isArray(delta?.content)) {
-            for (const part of delta.content) appendPart(part);
-          }
-          if (Array.isArray(delta?.images)) {
-            for (const image of delta.images) {
-              appendPart({ type: 'image_url', image_url: image?.image_url });
+            if (tc.id) toolCalls[index].id = tc.id;
+            if (tc.function?.name) toolCalls[index].function.name = tc.function.name;
+            if (tc.function?.arguments) {
+              toolCalls[index].function.arguments += tc.function.arguments;
             }
           }
+        }
 
-          // Handle streaming tool calls
-          if (delta?.tool_calls) {
-            for (const tc of delta.tool_calls) {
-              const index = tc.index ?? 0;
-              if (!toolCalls[index]) {
-                toolCalls[index] = {
-                  id: tc.id ?? '',
-                  type: 'function',
-                  function: { name: '', arguments: '' },
-                };
-              }
-              if (tc.id) toolCalls[index].id = tc.id;
-              if (tc.function?.name) toolCalls[index].function.name = tc.function.name;
-              if (tc.function?.arguments) {
-                toolCalls[index].function.arguments += tc.function.arguments;
-              }
-            }
-          }
+        if (parsed.choices?.[0]?.finish_reason) {
+          finishReason = parsed.choices[0].finish_reason;
+          sawTerminalEvent = true;
+        }
 
-          if (parsed.choices?.[0]?.finish_reason) {
-            finishReason = parsed.choices[0].finish_reason;
-            sawTerminalEvent = true;
-          }
+        // Capture usage data (comes in final chunk when stream_options.include_usage is set)
+        if (parsed.usage) {
+          streamUsage = parsed.usage;
+        }
 
-          // Capture usage data (comes in final chunk when stream_options.include_usage is set)
-          if (parsed.usage) {
-            streamUsage = parsed.usage;
-          }
-
-          if (parsed.model) {
-            servedModel = parsed.model;
-          }
-        } catch (e) {
-          // Ignore parse errors
+        if (parsed.model) {
+          servedModel = parsed.model;
         }
       };
 
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
 
-        const chunk = decoder.decode(value, { stream: true });
-        for (const data of sseParser.feed(chunk)) {
+          const chunk = decoder.decode(value, { stream: true });
+          for (const data of sseParser.feed(chunk)) {
+            processDataLine(data);
+          }
+        }
+
+        // A final `data:` line that arrived without its trailing newline is still
+        // buffered here. Servers and proxies do close right after writing the
+        // last event, so dropping it would report a finished turn as a dropped
+        // connection at the guard below.
+        for (const data of sseParser.flush()) {
           processDataLine(data);
         }
-      }
-
-      // A final `data:` line that arrived without its trailing newline is still
-      // buffered here. Servers and proxies do close right after writing the
-      // last event, so dropping it would report a finished turn as a dropped
-      // connection at the guard below.
-      for (const data of sseParser.flush()) {
-        processDataLine(data);
+      } finally {
+        // A read loop that ends early, on a callback's error or any other,
+        // leaves the body unread: cancel it, so the provider stops sending
+        // and the connection is let go. After a full read it does nothing.
+        void reader.cancel().catch(() => {});
       }
 
       assertTerminalEventObserved(sawTerminalEvent, 'OpenRouter', openRouterRequest);
@@ -385,8 +400,11 @@ export class OpenRouterAdapter implements ProviderAdapter {
           : contentParts.filter(part => part.type === 'text').map(part => part.text).join('') || null,
       };
 
-      if (toolCalls.length > 0) {
-        message.tool_calls = toolCalls;
+      // The calls the stream placed, in index order: an index can skip a
+      // slot, and a hole would fail the response built from them.
+      const placedToolCalls = Object.values(toolCalls);
+      if (placedToolCalls.length > 0) {
+        message.tool_calls = placedToolCalls;
       }
 
       return this.parseStreamedResponse(message, finishReason, servedModel ?? request.model, streamUsage, openRouterRequest);
@@ -408,7 +426,10 @@ export class OpenRouterAdapter implements ProviderAdapter {
   }
 
   private buildRequest(request: ProviderRequest): any {
-    const messages = this.convertMessages(request.messages as any[]);
+    // Media in MCP's form becomes membrane's first, for a caller that builds
+    // a request directly (Membrane's own builds have converted it already,
+    // utils/mcp-media.ts).
+    const messages = this.convertMessages(convertMcpMedia(request.messages as any[]));
     
     const params: any = {
       model: request.model,

@@ -48,6 +48,7 @@ import { unreportedUsage } from '../utils/usage.js';
 import { assertPromptToolSupport } from './request-capabilities.js';
 
 import { imageForRequest, OPENAI_IMAGE_EDIT_TYPES } from '../utils/image-media.js';
+import { convertMcpMedia } from '../utils/mcp-media.js';
 import type {
   ProviderAdapter,
   ProviderRequest,
@@ -233,6 +234,14 @@ export class OpenAIResponsesAdapter implements ProviderAdapter {
     options?: ProviderRequestOptions
   ): Promise<ProviderResponse> {
     assertPromptToolSupport(request, options, this.name, { kind: 'none', extraTools: request.extra?.tools });
+    // Media in MCP's form becomes membrane's first, for a caller that builds
+    // a request directly (Membrane's own builds have converted it already,
+    // utils/mcp-media.ts), so the images it attaches and the transcript's
+    // image numbers read one form.
+    if (Array.isArray(request.messages)) {
+      const messages = convertMcpMedia(request.messages as unknown[]) as ProviderRequest['messages'];
+      if (messages !== request.messages) request = { ...request, messages };
+    }
     const allImages = this.allowImageEditing ? this.collectImages(request) : [];
     const selected = this.selectImages(allImages);
     const inputImages = selected.map(ref => ref.dataUrl);

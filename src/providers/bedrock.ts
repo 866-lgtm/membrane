@@ -23,10 +23,11 @@ import {
   errorFromHttpResponse,
   errorFromProviderStatus,
   isTypedAbortError,
+  networkError,
   withRawRequest,
 } from '../types/index.js';
 import { stripEmptyTextRequest } from '../utils/empty-text.js';
-import { createCombinedSignal, isDeadlineAbort, deadlineTimeoutError, assertTerminalEventObserved, toolUseInputFromText, toolUseInputFromValue } from './utils.js';
+import { createCombinedSignal, isDeadlineAbort, deadlineTimeoutError, assertTerminalEventObserved, toolUseInputFromText, toolUseInputFromValue, streamIndex, isEventObject } from './utils.js';
 import {
   INTERLEAVED_THINKING_BETA,
   THINKING_BINDING_BETA,
@@ -36,6 +37,7 @@ import {
   thinkingEnabled,
 } from './anthropic.js';
 import { imageForRequest, urlImageForRequest } from '../utils/image-media.js';
+import { convertMcpMedia, isSourcelessMedia } from '../utils/mcp-media.js';
 
 // ============================================================================
 // Adapter Configuration
@@ -492,26 +494,46 @@ export class BedrockAdapter implements ProviderAdapter {
     };
     const sanitizedMessages = (request.messages as any[]).map((msg: any) => {
       if (!Array.isArray(msg.content)) return msg;
+      // Media in MCP's form becomes membrane's first, for a caller that
+      // builds a request directly (Membrane's own builds have converted it
+      // already, utils/mcp-media.ts), as the Anthropic adapter converts it. A
+      // report about a block names the one the caller handed in.
+      const converted = convertMcpMedia(msg.content as unknown[]) as any[];
       return {
         ...msg,
-        content: msg.content.map((block: any) => remember((() => {
-          if (block.type === 'image' && block.sourceUrl !== undefined) {
-            const { sourceUrl, ...rest } = block;
-            return stripCacheTtl(toWireImage(rest, () => onContentAltered?.(block)));
+        content: msg.content.flatMap((original: any, index: number) => {
+          const block = converted[index];
+          if (isSourcelessMedia(block)) {
+            // Media with no source object (MCP's form that didn't convert)
+            // has no form the API takes: left out, and reported.
+            onContentAltered?.(original);
+            return [];
           }
-          if (block.type === 'image') {
-            return stripCacheTtl(toWireImage(block, () => onContentAltered?.(block)));
-          }
-          if (block.type === 'tool_result' && Array.isArray(block.content)) {
-            let substituted = false;
-            const content = block.content.map((inner: any) =>
-              inner?.type === 'image' ? toWireImage(inner, () => { substituted = true; }) : inner,
-            );
-            if (substituted) onContentAltered?.(block);
-            return stripCacheTtl({ ...block, content });
-          }
-          return stripCacheTtl(block);
-        })(), block)),
+          return [remember((() => {
+            if (block.type === 'image' && block.sourceUrl !== undefined) {
+              const { sourceUrl, ...rest } = block;
+              return stripCacheTtl(toWireImage(rest, () => onContentAltered?.(original)));
+            }
+            if (block.type === 'image') {
+              return stripCacheTtl(toWireImage(block, () => onContentAltered?.(original)));
+            }
+            if (block.type === 'tool_result' && Array.isArray(block.content)) {
+              let altered = false;
+              // Media with no source object has no form the API takes here
+              // either: left out, and the result reported, as at the top.
+              const content = block.content.flatMap((inner: any) => {
+                if (isSourcelessMedia(inner)) {
+                  altered = true;
+                  return [];
+                }
+                return [inner?.type === 'image' ? toWireImage(inner, () => { altered = true; }) : inner];
+              });
+              if (altered) onContentAltered?.(original);
+              return stripCacheTtl({ ...block, content });
+            }
+            return stripCacheTtl(block);
+          })(), original)];
+        }),
       };
     });
 
@@ -799,90 +821,120 @@ export class BedrockAdapter implements ProviderAdapter {
 
           // Parse the JSON payload
           if (eventType === 'chunk' && payloadBytes.length > 0) {
+            // Decode first. An event that doesn't decode, carries no bytes,
+            // or decodes to JSON that isn't an object (`null`, a number, a
+            // string, an array) is skipped, with a warning. Nothing after the
+            // decode is caught here, so an error there, a caller's callback
+            // included, fails the stream.
+            let decoded: unknown;
+            let skipped: unknown = 'no event in its bytes';
             try {
               const payloadJson = JSON.parse(new TextDecoder().decode(payloadBytes));
               if (payloadJson.bytes) {
-                // Decode base64 payload
                 // Decode base64 → bytes → UTF-8 string (atob returns Latin-1, mangling multi-byte emoji)
                 const binaryStr = atob(payloadJson.bytes);
                 const bytes = new Uint8Array(binaryStr.length);
                 for (let i = 0; i < binaryStr.length; i++) {
                   bytes[i] = binaryStr.charCodeAt(i);
                 }
-                const eventData = JSON.parse(new TextDecoder().decode(bytes)) as BedrockStreamEvent;
-                // A decoded model event is progress; a ping only proves the connection.
-                if ((eventData as { type?: string }).type !== 'ping') onProgress?.();
+                decoded = JSON.parse(new TextDecoder().decode(bytes));
+                skipped = 'bytes that decode to no object';
+              }
+            } catch (e) {
+              skipped = e;
+            }
+            const eventData = isEventObject(decoded) ? decoded as BedrockStreamEvent : undefined;
+            if (eventData === undefined) console.warn('[membrane:bedrock] Skipping malformed stream event:', skipped);
 
-                // Check for error events within the stream
-                if (eventData.type === 'error') {
-                  // Anthropic's own error event: its error.type
-                  // (overloaded_error, rate_limit_error, ...) is the code
-                  // the shared table reads a status from; one it doesn't
-                  // know stays a 500.
-                  const streamError = (eventData as any).error;
-                  throw new BedrockError(
-                    undefined,
-                    `Bedrock stream error: ${streamError?.message || JSON.stringify(eventData)}`,
-                    typeof streamError?.type === 'string' ? streamError.type : undefined
-                  );
+            if (eventData !== undefined) {
+              // A decoded model event is progress; a ping only proves the
+              // connection.
+              if ((eventData as { type?: string }).type !== 'ping') onProgress?.();
+
+              // Check for error events within the stream
+              if (eventData.type === 'error') {
+                // Anthropic's own error event: its error.type
+                // (overloaded_error, rate_limit_error, ...) is the code
+                // the shared table reads a status from; one it doesn't
+                // know stays a 500.
+                const streamError = (eventData as any).error;
+                throw new BedrockError(
+                  undefined,
+                  `Bedrock stream error: ${streamError?.message || JSON.stringify(eventData)}`,
+                  typeof streamError?.type === 'string' ? streamError.type : undefined
+                );
+              }
+
+              if (eventData.type === 'message_start' && eventData.message) {
+                // Cache metrics ride the same usage objects as on the direct
+                // API. Dropping them (pre-2026-07-31) made caching look
+                // permanently inert on Bedrock streams: complete() surfaced
+                // them, stream() zeroed them, and every ledger/pricing
+                // consumer downstream saw zeros. (Connectome issue #35.)
+                inputTransformations = eventData.message.input_transformations;
+                const startUsage = eventData.message.usage;
+                inputTokens = startUsage?.input_tokens ?? 0;
+                inputReported = typeof startUsage?.input_tokens === 'number';
+                if (startUsage?.cache_creation_input_tokens != null) {
+                  cacheCreationTokens = startUsage.cache_creation_input_tokens;
                 }
-
-                if (eventData.type === 'message_start' && eventData.message) {
-                  // Cache metrics ride the same usage objects as on the direct
-                  // API. Dropping them (pre-2026-07-31) made caching look
-                  // permanently inert on Bedrock streams: complete() surfaced
-                  // them, stream() zeroed them, and every ledger/pricing
-                  // consumer downstream saw zeros. (Connectome issue #35.)
-                  inputTransformations = eventData.message.input_transformations;
-                  const startUsage = eventData.message.usage;
-                  inputTokens = startUsage?.input_tokens ?? 0;
-                  inputReported = typeof startUsage?.input_tokens === 'number';
-                  if (startUsage?.cache_creation_input_tokens != null) {
-                    cacheCreationTokens = startUsage.cache_creation_input_tokens;
+                if (startUsage?.cache_read_input_tokens != null) {
+                  cacheReadTokens = startUsage.cache_read_input_tokens;
+                }
+              } else if (eventData.type === 'content_block_start') {
+                // A block whose index names no slot (streamIndex: 0 when
+                // absent), or that isn't an object, an array included, can't
+                // be placed: it's skipped, with the warning, and its deltas
+                // join no block.
+                const startIndex = streamIndex(eventData.index);
+                const startBlock: unknown = eventData.content_block;
+                if (startIndex === undefined || startBlock === null || typeof startBlock !== 'object' || Array.isArray(startBlock)) {
+                  console.warn('[membrane:bedrock] Skipping malformed stream event:', 'a content_block_start that names no block');
+                  currentBlockIndex = -1;
+                } else {
+                  currentBlockIndex = startIndex;
+                  contentBlocks[currentBlockIndex] = startBlock as { type: string };
+                  callbacks.onContentBlock?.(currentBlockIndex, startBlock);
+                }
+              } else if (eventData.type === 'content_block_delta') {
+                if (eventData.delta?.type === 'text_delta' && eventData.delta.text) {
+                  fullText += eventData.delta.text;
+                  callbacks.onChunk(eventData.delta.text);
+                  if (contentBlocks[currentBlockIndex]) {
+                    contentBlocks[currentBlockIndex]!.text = (contentBlocks[currentBlockIndex]!.text ?? '') + eventData.delta.text;
                   }
-                  if (startUsage?.cache_read_input_tokens != null) {
-                    cacheReadTokens = startUsage.cache_read_input_tokens;
+                } else if (eventData.delta?.type === 'thinking_delta' && eventData.delta.thinking) {
+                  callbacks.onChunk(eventData.delta.thinking);
+                  if (contentBlocks[currentBlockIndex]) {
+                    contentBlocks[currentBlockIndex]!.thinking = (contentBlocks[currentBlockIndex]!.thinking ?? '') + eventData.delta.thinking;
                   }
-                } else if (eventData.type === 'content_block_start') {
-                  currentBlockIndex = eventData.index ?? 0;
-                  contentBlocks[currentBlockIndex] = eventData.content_block as { type: string };
-                  callbacks.onContentBlock?.(currentBlockIndex, eventData.content_block);
-                } else if (eventData.type === 'content_block_delta') {
-                  if (eventData.delta?.type === 'text_delta' && eventData.delta.text) {
-                    fullText += eventData.delta.text;
-                    callbacks.onChunk(eventData.delta.text);
-                    if (contentBlocks[currentBlockIndex]) {
-                      contentBlocks[currentBlockIndex]!.text = (contentBlocks[currentBlockIndex]!.text ?? '') + eventData.delta.text;
-                    }
-                  } else if (eventData.delta?.type === 'thinking_delta' && eventData.delta.thinking) {
-                    callbacks.onChunk(eventData.delta.thinking);
-                    if (contentBlocks[currentBlockIndex]) {
-                      contentBlocks[currentBlockIndex]!.thinking = (contentBlocks[currentBlockIndex]!.thinking ?? '') + eventData.delta.thinking;
-                    }
-                  } else if (eventData.delta?.type === 'signature_delta' && (eventData.delta as any).signature) {
-                    if (contentBlocks[currentBlockIndex]) {
-                      contentBlocks[currentBlockIndex]!.signature = (contentBlocks[currentBlockIndex]!.signature ?? '') + (eventData.delta as any).signature;
-                      // Reported as it accumulates, so a stream that ends before
-                      // content_block_stop still keeps the signature it received.
-                      callbacks.onThinkingSignature?.(currentBlockIndex, contentBlocks[currentBlockIndex]!.signature!);
-                    }
-                  } else if (eventData.delta?.type === 'input_json_delta' && (eventData.delta as any).partial_json !== undefined) {
-                    // Tool-call arguments stream as input_json_delta fragments.
-                    // Dropping these (pre-2026-07-21 behavior) gutted every
-                    // tool_use block: stop_reason said tool_use but the block
-                    // lost its input — and then its id/name in final assembly.
-                    const blk = contentBlocks[currentBlockIndex] as (typeof contentBlocks)[number] & { partialJson?: string };
-                    if (blk) {
-                      blk.partialJson = (blk.partialJson ?? '') + (eventData.delta as any).partial_json;
-                    }
+                } else if (eventData.delta?.type === 'signature_delta' && (eventData.delta as any).signature) {
+                  if (contentBlocks[currentBlockIndex]) {
+                    contentBlocks[currentBlockIndex]!.signature = (contentBlocks[currentBlockIndex]!.signature ?? '') + (eventData.delta as any).signature;
+                    // Reported as it accumulates, so a stream that ends before
+                    // content_block_stop still keeps the signature it received.
+                    callbacks.onThinkingSignature?.(currentBlockIndex, contentBlocks[currentBlockIndex]!.signature!);
                   }
-                } else if (eventData.type === 'content_block_stop') {
-                  // Mirror the Anthropic adapter: fire onContentBlock a second
-                  // time with the finalised block so consumers can distinguish
-                  // start from stop. Without this, downstream code that depends
-                  // on the dual-fire convention (e.g. membrane's native
-                  // yielding path) silently drops block_complete on Bedrock.
-                  const blockIdx = (eventData as { index?: number }).index ?? currentBlockIndex;
+                } else if (eventData.delta?.type === 'input_json_delta' && (eventData.delta as any).partial_json !== undefined) {
+                  // Tool-call arguments stream as input_json_delta fragments.
+                  // Dropping these (pre-2026-07-21 behavior) gutted every
+                  // tool_use block: stop_reason said tool_use but the block
+                  // lost its input — and then its id/name in final assembly.
+                  const blk = contentBlocks[currentBlockIndex] as (typeof contentBlocks)[number] & { partialJson?: string };
+                  if (blk) {
+                    blk.partialJson = (blk.partialJson ?? '') + (eventData.delta as any).partial_json;
+                  }
+                }
+              } else if (eventData.type === 'content_block_stop') {
+                // Mirror the Anthropic adapter: fire onContentBlock a second
+                // time with the finalised block so consumers can distinguish
+                // start from stop. Without this, downstream code that depends
+                // on the dual-fire convention (e.g. membrane's native
+                // yielding path) silently drops block_complete on Bedrock.
+                const blockIdx = streamIndex((eventData as { index?: unknown }).index, currentBlockIndex);
+                if (blockIdx === undefined || blockIdx < 0 || contentBlocks[blockIdx] === undefined) {
+                  console.warn('[membrane:bedrock] Skipping malformed stream event:', 'a content_block_stop that names no block');
+                } else {
                   stoppedBlocks.add(blockIdx);
                   // Finalize tool_use blocks: parse accumulated argument JSON
                   // into `input` before the block_complete fire, so consumers
@@ -897,42 +949,37 @@ export class BedrockAdapter implements ProviderAdapter {
                     else stoppedBlk.unparseableInput = parsed.unparseableInput;
                   }
                   callbacks.onContentBlock?.(blockIdx, contentBlocks[blockIdx]);
-                } else if (eventData.type === 'message_delta') {
-                  sawTerminalEvent = true;
-                  if (Array.isArray(eventData.input_transformations)) inputTransformations = eventData.input_transformations;
-                  if (eventData.usage) {
-                    outputTokens = eventData.usage.output_tokens;
-                    if (typeof eventData.usage.output_tokens === 'number') outputReported = true;
-                    // message_delta carries cumulative cache metrics — use as
-                    // authoritative when present (same contract as the
-                    // Anthropic adapter).
-                    if (eventData.usage.cache_creation_input_tokens != null) {
-                      cacheCreationTokens = eventData.usage.cache_creation_input_tokens;
-                    }
-                    if (eventData.usage.cache_read_input_tokens != null) {
-                      cacheReadTokens = eventData.usage.cache_read_input_tokens;
-                    }
+                }
+              } else if (eventData.type === 'message_delta') {
+                sawTerminalEvent = true;
+                if (Array.isArray(eventData.input_transformations)) inputTransformations = eventData.input_transformations;
+                if (eventData.usage) {
+                  outputTokens = eventData.usage.output_tokens;
+                  if (typeof eventData.usage.output_tokens === 'number') outputReported = true;
+                  // message_delta carries cumulative cache metrics — use as
+                  // authoritative when present (same contract as the
+                  // Anthropic adapter).
+                  if (eventData.usage.cache_creation_input_tokens != null) {
+                    cacheCreationTokens = eventData.usage.cache_creation_input_tokens;
                   }
-                  if (eventData.delta?.stop_reason) {
-                    stopReason = eventData.delta.stop_reason;
-                  }
-                  // WHICH stop sequence fired, not just that one did. Dropping
-                  // this (pre-2026-07-26) broke prefill/XML tool use on
-                  // Bedrock entirely: membrane's tool gate matches
-                  // stopSequence === '</function_calls>', so calls were never
-                  // parsed or executed, the close tag was never restored, and
-                  // the turn continuation looped forever on the dangling
-                  // block (~6 output tokens per full-prefill round).
-                  if (eventData.delta?.stop_sequence) {
-                    stopSequence = eventData.delta.stop_sequence;
+                  if (eventData.usage.cache_read_input_tokens != null) {
+                    cacheReadTokens = eventData.usage.cache_read_input_tokens;
                   }
                 }
+                if (eventData.delta?.stop_reason) {
+                  stopReason = eventData.delta.stop_reason;
+                }
+                // WHICH stop sequence fired, not just that one did. Dropping
+                // this (pre-2026-07-26) broke prefill/XML tool use on
+                // Bedrock entirely: membrane's tool gate matches
+                // stopSequence === '</function_calls>', so calls were never
+                // parsed or executed, the close tag was never restored, and
+                // the turn continuation looped forever on the dangling
+                // block (~6 output tokens per full-prefill round).
+                if (eventData.delta?.stop_sequence) {
+                  stopSequence = eventData.delta.stop_sequence;
+                }
               }
-            } catch (e) {
-              // Re-throw BedrockErrors (from error events above)
-              if (e instanceof BedrockError) throw e;
-              // Skip genuinely malformed events (e.g. truncated JSON)
-              console.warn('[membrane:bedrock] Skipping malformed stream event:', e);
             }
           }
 
@@ -941,6 +988,10 @@ export class BedrockAdapter implements ProviderAdapter {
         }
       }
     } finally {
+      // A read loop that ends early, on a callback's error or any other,
+      // leaves the body unread: cancel it, so the provider stops sending and
+      // the connection is let go. After a full read it does nothing.
+      void reader.cancel().catch(() => {});
       reader.releaseLock();
     }
 
@@ -956,6 +1007,22 @@ export class BedrockAdapter implements ProviderAdapter {
     // NOTHING; a stream truncated after any content passed it and was
     // reported as a clean end_turn. message_delta is the terminal event.
     assertTerminalEventObserved(sawTerminalEvent, 'Bedrock', { modelId, ...request });
+
+    // A block start skipped as malformed leaves its slot empty, and a block's
+    // index is its place in the message, so a slot before the last block that
+    // no block filled is a block the message lost. The request was never
+    // answered in full, as when a stream ends before its terminal event, so it
+    // fails the same retryable way rather than returning the message without
+    // that block. The scan stops at the first empty slot.
+    let slot = 0;
+    while (slot < contentBlocks.length && slot in contentBlocks) slot++;
+    if (slot < contentBlocks.length) {
+      throw networkError(
+        `Bedrock stream lost content block ${slot}: no block start placed it`,
+        undefined,
+        { modelId, ...request }
+      );
+    }
 
     // Build response from accumulated data
     finalMessage = {

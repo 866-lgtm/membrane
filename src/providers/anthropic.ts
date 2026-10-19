@@ -9,6 +9,7 @@ import Anthropic, { type ClientOptions } from '@anthropic-ai/sdk';
 import { stripEmptyTextBlocks, stripEmptyTextRequest } from '../utils/empty-text.js';
 import { anthropicServerBlockFor, isAnthropicServerBlock, unpairedServerBlocks, type AnthropicServerBlock } from '../utils/anthropic-server-blocks.js';
 import { imageForRequest, urlImageForRequest, assertWithinByteBudget, shedImagesToFitByteBudget } from '../utils/image-media.js';
+import { convertMcpMedia, isSourcelessMedia } from '../utils/mcp-media.js';
 import type {
   ProviderAdapter,
   ProviderInputTransformation,
@@ -873,9 +874,22 @@ export class AnthropicAdapter implements ProviderAdapter {
     // and is silently rejected (the model sees the text label only).
     const sanitizedMessages = (request.messages as any[]).map((msg: any) => {
       if (!Array.isArray(msg.content)) return msg;
+      // Media in MCP's form becomes membrane's first, for a caller that
+      // builds a request directly (Membrane's own builds have converted it
+      // already, utils/mcp-media.ts). A report about a block names the one
+      // the caller handed in.
+      const converted = convertMcpMedia(msg.content as unknown[]);
       return {
         ...msg,
-        content: msg.content.map((block: any) => {
+        content: msg.content.map((original: any, index: number) => {
+          const block = converted[index] as any;
+          if (isSourcelessMedia(block)) {
+            // Media with no source object (MCP's form that didn't convert)
+            // has no form the API takes: left out, as in a tool_result, and
+            // reported.
+            onContentAltered?.(original);
+            return undefined;
+          }
           if (block.type === 'image') {
             const { sourceUrl, ...rest } = block;
             if (block.source?.type === 'url') {
@@ -884,7 +898,7 @@ export class AnthropicAdapter implements ProviderAdapter {
               // the API's to fetch.
               const image = urlImageForRequest(block.source.url);
               if (image.placeholder) {
-                onContentAltered?.(block);
+                onContentAltered?.(original);
                 return rest.cache_control ? { ...image.placeholder, cache_control: rest.cache_control } : image.placeholder;
               }
               if (image.data) return { ...rest, source: { type: 'base64', media_type: image.mediaType, data: image.data } };
@@ -899,7 +913,7 @@ export class AnthropicAdapter implements ProviderAdapter {
             if (image.placeholder) {
               // Data that is no accepted image goes as the placeholder text,
               // keeping any cache breakpoint the image carried.
-              onContentAltered?.(block);
+              onContentAltered?.(original);
               return rest.cache_control ? { ...image.placeholder, cache_control: rest.cache_control } : image.placeholder;
             }
             return {
@@ -920,11 +934,11 @@ export class AnthropicAdapter implements ProviderAdapter {
             // text block carried nothing.
             const carried = (block.content as Array<{ type?: string; text?: unknown }>)
               .filter((b) => !(b?.type === 'text' && (typeof b.text !== 'string' || b.text === ''))).length;
-            if (content.length !== carried || substituted) onContentAltered?.(block);
+            if (content.length !== carried || substituted) onContentAltered?.(original);
             return { ...block, content };
           }
           return block;
-        }),
+        }).filter((block: unknown) => block !== undefined),
       };
     });
 
@@ -1194,9 +1208,11 @@ function toAnthropicToolResultContent(
     if (block.type === 'text') {
       out.push({ type: 'text', text: block.text });
     } else if (block.type === 'image') {
-      const image = block.source.type === 'base64'
+      // An image with no source object, someone else's shape that isn't
+      // MCP's form, has nothing to send and is left out.
+      const image = block.source?.type === 'base64'
         ? anthropicImage(block.source.data, block.source.mediaType ?? (block.source as { media_type?: string }).media_type)
-        : block.source.type === 'url' ? anthropicUrlImage(block.source.url) : undefined;
+        : block.source?.type === 'url' ? anthropicUrlImage(block.source.url) : undefined;
       if (image?.type === 'text') onPlaceholder?.();
       if (image) out.push(image);
     }
@@ -1244,10 +1260,14 @@ function anthropicUrlImage(url: string): Anthropic.ImageBlockParam | Anthropic.T
  * calls, as NativeFormatter keeps them there; without it, every lone one is
  * left out. In any other role a server block is left out, as NativeFormatter
  * leaves it out of a user turn, which has no place for one. A caller that
- * names no role gets that too, as it always got for a carrier. Nothing
- * reports what it leaves out: it has no alteration callback. It sees one
- * turn, so a turn whose only blocks pairing leaves out comes back empty, for
- * the caller to drop as NativeFormatter drops it.
+ * names no role gets that too, as it always got for a carrier. Media in
+ * MCP's form is converted to membrane's first (utils/mcp-media.ts), at the
+ * top of the turn and inside a `tool_result`. A document that doesn't
+ * convert, with no source after that, is left out, and so is an image with no
+ * source object that isn't MCP's form, with neither `data` nor `mimeType`.
+ * Nothing reports what it leaves out: it has no alteration callback. It sees
+ * one turn, so a turn whose only blocks pairing leaves out comes back empty,
+ * for the caller to drop as NativeFormatter drops it.
  */
 export function toAnthropicContent(
   blocks: ContentBlock[],
@@ -1260,7 +1280,7 @@ export function toAnthropicContent(
   // the model produced (see utils/anthropic-server-blocks.ts). In an
   // assistant turn, swap it in before the empty-text cleanup, which would
   // drop the carrier as empty text; in any other, leave it out.
-  const swapped = blocks.flatMap((block): Array<ContentBlock | AnthropicServerBlock> => {
+  const swapped = convertMcpMedia(blocks).flatMap((block): Array<ContentBlock | AnthropicServerBlock> => {
     const serverBlock = anthropicServerBlockFor(block);
     if (serverBlock === undefined) return [block];
     return options.role === 'assistant' ? [serverBlock] : [];
@@ -1284,14 +1304,20 @@ export function toAnthropicContent(
       }
         
       case 'image':
-        if (block.source.type === 'base64') {
+        // An image with no source object, someone else's shape that isn't
+        // MCP's form, has nothing to send and is left out.
+        if (block.source?.type === 'base64') {
           result.push(anthropicImage(block.source.data, block.source.mediaType ?? (block.source as { media_type?: string }).media_type));
-        } else if (block.source.type === 'url') {
+        } else if (block.source?.type === 'url') {
           result.push(anthropicUrlImage(block.source.url));
         }
         break;
         
       case 'document':
+        // One with no source object, MCP's form that didn't convert or
+        // someone else's shape, has nothing for a document block to carry.
+        // Audio or video meets the error below in either form.
+        if (isSourcelessMedia(block)) break;
         result.push({
           type: 'document',
           source: {

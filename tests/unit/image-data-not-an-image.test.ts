@@ -347,7 +347,7 @@ describe('data: URLs', () => {
     const percent = [...gifBytes].map((byte) => `%${byte.toString(16).padStart(2, '0')}`).join('');
     expect(urlImageForRequest(`data:image/gif,${percent}`)).toEqual({ url: `data:image/gif;base64,${GIF}`, mediaType: 'image/gif', data: GIF });
     // A data: URL without the comma that starts its data holds no image.
-    expect(urlImageForRequest('data:image/png;base64').placeholder?.text).toContain('the formats this request can carry (it was labelled "image/png")');
+    expect(urlImageForRequest('data:image/png;base64').placeholder?.text).toContain('it came without its data');
   });
 
   it('the Anthropic adapter sends a data: URL image as base64 data or the placeholder, and a remote URL as a URL', () => {
@@ -540,12 +540,12 @@ describe('tool-result images without a source', () => {
 });
 
 describe('the Responses transport', () => {
-  it('sends the placeholder for empty base64 data and for a normalized tool-result image, and drops an empty image_url', () => {
+  it('sends the note for empty base64 data, the placeholder for a normalized tool-result image, and drops an empty image_url', () => {
     const items = normalizeResponsesInput([
       { role: 'user', content: [{ type: 'image', source: { type: 'base64', mediaType: 'image/png', data: '' } }, { type: 'image', image_url: '' }] },
       { role: 'user', content: [{ type: 'tool_result', toolUseId: 'c1', content: [notes()] }] },
     ] as any) as any[];
-    expect(items[0].content).toEqual([{ type: 'input_text', text: expect.stringContaining(SAID) }]);
+    expect(items[0].content).toEqual([{ type: 'input_text', text: expect.stringContaining('it came without its data') }]);
     expect(items[1].output).toEqual([{ type: 'input_text', text: expect.stringContaining(SAID) }]);
   });
 });
@@ -656,13 +656,13 @@ describe('round reports name a message whose image became the placeholder', () =
     expect([...fidelity.altered]).toEqual([1]);
   });
 
-  // An MCP-shaped image (data and mimeType, no source) is decided by its data
-  // in the native builder, so a PNG is carried. The Responses tool output
-  // gives an image with no source a note, as on main, so there it alters its
-  // message too.
+  // An MCP-shaped image (data and mimeType, no source) becomes membrane's
+  // form where the formatter takes its messages (utils/mcp-media.ts), so a
+  // PNG is carried by either builder. On main the Responses tool output gave
+  // it the note for an image with no source, and altered its message too.
   it.each([
     ['native', () => new NativeFormatter(), [3]],
-    ['Responses', () => new OpenAIResponsesFormatter(), [3, 4]],
+    ['Responses', () => new OpenAIResponsesFormatter(), [3]],
   ] as const)('the %s formatter names a tool result whose image became the placeholder, and not one whose image is a PNG', (_name, create, altered) => {
     const fidelity = new FidelityNotes();
     create().buildMessages([

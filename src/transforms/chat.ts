@@ -11,6 +11,7 @@ import type {
   ContentBlock,
 } from '../types/index.js';
 import { isTextContent, isToolUseContent, isToolResultContent } from '../types/index.js';
+import { convertMcpMedia } from '../utils/mcp-media.js';
 
 // ============================================================================
 // Chat Transform Result
@@ -58,7 +59,10 @@ export interface ChatTransformOptions {
 // ============================================================================
 
 /**
- * Transform normalized request to chat format
+ * Transform normalized request to chat format. Media in MCP's form is
+ * converted to membrane's first (utils/mcp-media.ts), so it comes out as the
+ * same media in membrane's form does. An image with no source object that
+ * isn't MCP's form, with neither `data` nor `mimeType`, is left out.
  */
 export function transformToChat(
   request: NormalizedRequest,
@@ -73,7 +77,7 @@ export function transformToChat(
   const userSet = new Set(userParticipants);
   const messages: ChatMessage[] = [];
   
-  for (const message of request.messages) {
+  for (const message of convertMcpMedia(request.messages)) {
     const role = determineRole(message.participant, assistantName, userSet);
     const content = transformContent(message.content);
     
@@ -127,7 +131,7 @@ function transformContent(blocks: ContentBlock[]): ChatContent[] {
   for (const block of blocks) {
     if (isTextContent(block)) {
       result.push({ type: 'text', text: block.text });
-    } else if (block.type === 'image' && block.source.type === 'base64') {
+    } else if (block.type === 'image' && block.source?.type === 'base64') {
       result.push({
         type: 'image',
         source: {

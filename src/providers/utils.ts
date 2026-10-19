@@ -219,6 +219,36 @@ function notAnObject(raw: string, value: unknown): ToolUseInput {
   return { input: {}, unparseableInput: raw };
 }
 
+/** The largest array index, 2^32 - 2. */
+const MAX_ARRAY_INDEX = 2 ** 32 - 2;
+
+/**
+ * The slot a streamed piece names: a tool call's `index` on the OpenAI-family
+ * wires, a content block's on Bedrock. A number or a string that is an array
+ * index names its slot, as a plain array keyed by it takes one: an integer
+ * from 0 to 2^32 - 2, or its decimal string with no leading zero. Absent or
+ * `null` names `absent`.
+ * Anything else names none, and the caller drops the piece: a negative,
+ * fractional or larger number, a boolean, any other string (`"01"`
+ * included), an array or an object. `Number()` would read several of these
+ * as a slot: `false`, `""`, `" "`, `[]` and `"00"` as 0, `true`, `"0x1"` and
+ * `"01"` as 1, `"1e1"` as 10.
+ */
+export function streamIndex(value: unknown, absent = 0): number | undefined {
+  if (value === undefined || value === null) return absent;
+  const index = typeof value === 'string' && /^(?:0|[1-9]\d*)$/.test(value) ? Number(value) : value;
+  return typeof index === 'number' && Number.isInteger(index) && index >= 0 && index <= MAX_ARRAY_INDEX ? index : undefined;
+}
+
+/**
+ * Whether a parsed SSE frame, or a decoded Bedrock event, is an event: a JSON
+ * object. `null`, a number, a string, a boolean or an array carries none, so
+ * the adapters drop its frame before they report progress.
+ */
+export function isEventObject(value: unknown): boolean {
+  return isPlainObject(value);
+}
+
 /**
  * A tool call's `input` from the argument text a provider sent (OpenAI-family
  * `function.arguments`, Anthropic and Bedrock `input_json_delta`
