@@ -324,7 +324,7 @@ describe('a refresh acts only on the snapshot it replayed', () => {
     hold = held();
     await vi.advanceTimersByTimeAsync(100);
     expect(replays().map(isQ)).toEqual([false]);
-    await a.stream({ ...request('Resident system Q', 2), thinking: { type: 'enabled', budget_tokens: 512 } }, noCallbacks);
+    await a.stream({ ...request('Resident system Q', 2), maxTokens: 2048, thinking: { type: 'enabled', budget_tokens: 1024 } }, noCallbacks);
     expect(events.filter(e => e.type === 'skipped').map(e => (e as { reason: string }).reason)).toEqual(['legacy-thinking-budget']);
     const replay = hold;
     hold = undefined;
