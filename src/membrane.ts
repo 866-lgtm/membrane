@@ -3336,7 +3336,7 @@ export class Membrane {
       ...(provider.responseId ? { messageId: provider.responseId } : {}),
       ...(provider.requestId ? { requestId: provider.requestId } : {}),
     };
-    console.warn(
+    this.warnLogger().warn(
       `[membrane] ${provider.model || '(unknown model)'} ended round ${round} with ` +
       `stop_reason ${reported ?? '(none)'} but returned ${calls.length} tool call(s) ` +
       `(${anomaly.toolNames.join(', ')}); ` +
