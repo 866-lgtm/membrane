@@ -155,9 +155,16 @@ export interface ToolUseContent {
    * arguments, even nothing: then it is the empty string. A call truncated by
    * max_tokens is the usual cause. Where arguments come as a value rather
    * than text (Gemini's, or an `input` that isn't an object), it holds that
-   * value as JSON. `input` is then `{}`, or for a streamed Anthropic or
-   * Bedrock call whatever its content_block_start carried: a wire-valid tool
-   * call with empty arguments, indistinguishable from a genuine no-arg call
+   * value as JSON. It is also set on every tool_use block of a streamed
+   * Anthropic or Bedrock response whose block events broke the API's order
+   * (a block started while another was open or at an index already used, or
+   * an event for a block other than the open one), holding the arguments the
+   * call had, as JSON when they had parsed: such a stream can't vouch for
+   * which call any arguments belong to, so none of its calls is taken as
+   * complete.
+   * `input` is then `{}`, or for a streamed Anthropic or Bedrock call
+   * whatever its content_block_start carried: a wire-valid tool call with
+   * empty arguments, indistinguishable from a genuine no-arg call
    * once it is written to durable history. Presence of this field, the empty
    * string included, means `input` is NOT the model's arguments, so a
    * consumer can refuse the block (or attempt its own repair) instead of

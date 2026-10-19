@@ -716,6 +716,29 @@ export class BedrockAdapter implements ProviderAdapter {
     // max_tokens never gets one, as in the Anthropic adapter.
     const stoppedBlocks = new Set<number>();
     let currentBlockIndex = -1;
+    // Block events come in the API's order, as the Anthropic adapter holds
+    // them to: a start while no block is open, for an index not used yet,
+    // then that block's deltas and its stop. A stream that ends with a block
+    // open, as a max_tokens cut does, is in order. The first event that isn't
+    // means the stream can't vouch for which call any arguments belong to:
+    // no later block event is applied, a block still open stays unstopped
+    // (marked below), and every tool_use block in the response is marked,
+    // with one warning.
+    let blockOrderBroken = false;
+    // A start that names no block, while none is open, is skipped as it
+    // always was: until the next start, the deltas and stop after it join no
+    // block rather than breaking block order, and a later block still fails
+    // the call over the block the message lost. A start while a block is
+    // open, or for an index already used, breaks block order whatever it
+    // names.
+    let skippedStart = false;
+    const blockOpen = (): boolean =>
+      currentBlockIndex >= 0 && contentBlocks[currentBlockIndex] !== undefined && !stoppedBlocks.has(currentBlockIndex);
+    const breakBlockOrder = (what: string): void => {
+      if (blockOrderBroken) return;
+      blockOrderBroken = true;
+      console.warn('[membrane:bedrock] Skipping malformed stream event:', `${what}; no later block event is applied, and every tool_use block in the response is marked`);
+    };
     let finalMessage: BedrockMessageResponse | undefined;
     let inputTokens = 0;
     let outputTokens = 0;
@@ -882,22 +905,31 @@ export class BedrockAdapter implements ProviderAdapter {
                   cacheReadTokens = startUsage.cache_read_input_tokens;
                 }
               } else if (eventData.type === 'content_block_start') {
-                // A block whose index names no slot (streamIndex: 0 when
-                // absent), or that isn't an object, an array included, can't
-                // be placed: it's skipped, with the warning, and its deltas
-                // join no block.
+                // Order first: a start while a block is open, or for an index
+                // already used, breaks block order whatever it names. Then a
+                // block whose index names no slot (an absent index is slot 0,
+                // as streamIndex reads it), or that isn't an object, an array
+                // included, can't be placed: it's skipped, with the warning,
+                // and its deltas and stop join no block.
                 const startIndex = streamIndex(eventData.index);
                 const startBlock: unknown = eventData.content_block;
-                if (startIndex === undefined || startBlock === null || typeof startBlock !== 'object' || Array.isArray(startBlock)) {
+                if (blockOrderBroken || blockOpen() || (startIndex !== undefined && contentBlocks[startIndex] !== undefined)) {
+                  breakBlockOrder('a content_block_start while a block is open or for an index already used');
+                } else if (startIndex === undefined || startBlock === null || typeof startBlock !== 'object' || Array.isArray(startBlock)) {
                   console.warn('[membrane:bedrock] Skipping malformed stream event:', 'a content_block_start that names no block');
                   currentBlockIndex = -1;
+                  skippedStart = true;
                 } else {
+                  skippedStart = false;
                   currentBlockIndex = startIndex;
                   contentBlocks[currentBlockIndex] = startBlock as { type: string };
                   callbacks.onContentBlock?.(currentBlockIndex, startBlock);
                 }
               } else if (eventData.type === 'content_block_delta') {
-                if (eventData.delta?.type === 'text_delta' && eventData.delta.text) {
+                const deltaIndex = streamIndex((eventData as { index?: unknown }).index, currentBlockIndex);
+                if (blockOrderBroken || (!skippedStart && (!blockOpen() || deltaIndex !== currentBlockIndex))) {
+                  breakBlockOrder('a content_block_delta for a block other than the open one');
+                } else if (eventData.delta?.type === 'text_delta' && eventData.delta.text) {
                   fullText += eventData.delta.text;
                   callbacks.onChunk(eventData.delta.text);
                   if (contentBlocks[currentBlockIndex]) {
@@ -932,8 +964,15 @@ export class BedrockAdapter implements ProviderAdapter {
                 // on the dual-fire convention (e.g. membrane's native
                 // yielding path) silently drops block_complete on Bedrock.
                 const blockIdx = streamIndex((eventData as { index?: unknown }).index, currentBlockIndex);
-                if (blockIdx === undefined || blockIdx < 0 || contentBlocks[blockIdx] === undefined) {
-                  console.warn('[membrane:bedrock] Skipping malformed stream event:', 'a content_block_stop that names no block');
+                if (skippedStart) {
+                  // After a skipped start no block is open. A stop joins no
+                  // block, as the skipped block's deltas do, whatever index it
+                  // names: nothing is applied or reported. (A block it names
+                  // can only be one already stopped.)
+                } else if (blockOrderBroken || !blockOpen() || blockIdx !== currentBlockIndex) {
+                  // A stop for no block, or for a block never started,
+                  // included.
+                  breakBlockOrder('a content_block_stop for a block other than the open one');
                 } else {
                   stoppedBlocks.add(blockIdx);
                   // Finalize tool_use blocks: parse accumulated argument JSON
@@ -1047,9 +1086,18 @@ export class BedrockAdapter implements ProviderAdapter {
           // and whatever argument text arrived marks it, none included, as in
           // the Anthropic adapter: the call never finished, so nothing says
           // its arguments were complete, even text that parses.
-          const unparseableInput = stoppedBlocks.has(blockIdx) ? tb.unparseableInput : (tb.partialJson ?? '');
+          let unparseableInput = stoppedBlocks.has(blockIdx) ? tb.unparseableInput : (tb.partialJson ?? '');
+          let input = tb.input ?? {};
+          // After a break in block order no call counts as complete, those
+          // finished before it included: one not already marked keeps its
+          // arguments, as JSON, in the marker, and an empty input. One already
+          // marked keeps its marker and the input its start carried.
+          if (blockOrderBroken && unparseableInput === undefined) {
+            unparseableInput = JSON.stringify(input);
+            input = {};
+          }
           return {
-            type: 'tool_use', id: tb.id, name: tb.name, input: tb.input ?? {},
+            type: 'tool_use', id: tb.id, name: tb.name, input,
             ...(unparseableInput !== undefined ? { unparseableInput } : {}),
           } as unknown as { type: 'text'; text?: string };
         }
