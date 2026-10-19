@@ -463,9 +463,6 @@ export class Membrane {
     while (true) {
       attempts++;
       tries++;
-      // This pass's receipt guard: a receipt consumer that threw ends the
-      // call with its own error, before anything is classified or retried.
-      let receiptGuard: ReturnType<Membrane['wireReceiptGuard']> | undefined;
 
       try {
         const { providerRequest, prefillResult, toolMode } = this.transformRequest(request, activeFormatter);
@@ -486,7 +483,7 @@ export class Membrane {
         const useWireReceipt = this.adapter.cacheReceiptBasis === 'wire-request';
         let receiptEmitted = false;
         if (!useWireReceipt) deliverCacheWireReceipt(request, finalRequest);
-        receiptGuard = useWireReceipt && request.onCacheWireReceipt
+        const receiptGuard = useWireReceipt && request.onCacheWireReceipt
           ? this.wireReceiptGuard(options.signal)
           : undefined;
 
@@ -600,9 +597,6 @@ export class Membrane {
               });
           throw cancelled;
         }
-        // A receipt consumer that threw stopped the call before its request
-        // went out: its error, typed as before, is the answer, never retried.
-        if (receiptGuard?.failure) throw this.attachRawRequest(error, rawRequest);
         // A refused build never reached the provider, and its own type is
         // the answer. Rethrow it as it is instead of wrapping it as a
         // transport error.
@@ -2775,9 +2769,6 @@ export class Membrane {
         // MembraneError yet is typed by errorFromThrown, so the retry is
         // decided on the type that is thrown.
         const typed = errorFromThrown(failure.error);
-        // A receipt consumer that threw stopped the call before its request
-        // went out: its error is the answer, never retried.
-        if (receiptGuard?.failure) throw typed;
         // A call that delivered anything can't be sent again.
         if (delivered) throw typed;
         // The call's signal first, as complete() reads the caller's: a
