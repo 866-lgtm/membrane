@@ -90,10 +90,15 @@ export interface ProviderCapabilities {
  * OpenAI (`cache-inclusive`): `prompt_tokens` stayed at 1732 across a cache hit
  * that reported `cached_tokens: 1664`, so cached is a SUBSET of the prompt.
  *
+ * `cache-inclusive` describes the input count as a whole: every cached token,
+ * read or written, is inside it, and membrane subtracts both to restate it.
+ * `cache-excluded` counts are disjoint already: fresh input, cache writes and
+ * cache reads are three parts of the prompt.
+ *
  * `unknown` is a real epistemic state, not a default to lean on: it means no
  * one has established this adapter's convention, and membrane will pass the
- * counts through unchanged and warn the first time a cache read makes the
- * ambiguity bite.
+ * counts through unchanged and warn the first time a cache read or write makes
+ * the ambiguity bite.
  */
 export type UsageCacheConvention = 'cache-excluded' | 'cache-inclusive' | 'unknown';
 
@@ -212,6 +217,16 @@ export interface ProviderAdapter {
    * maintenance messages). Wrappers must forward this capability. */
   readonly requiresNativeResponsesInput?: boolean;
 
+  /** Whether Membrane sends an assistant turn's Anthropic server-tool blocks
+   * (web search and the like) back through this adapter. Only AnthropicAdapter
+   * declares it: a live check had the Anthropic API accept web search's two
+   * (server_tool_use, web_search_tool_result), and whether another provider
+   * accepts them is unknown. For any other adapter
+   * Membrane leaves them out before cache markers are placed
+   * (BuildOptions.anthropicServerBlocks). Decorators must forward this
+   * capability. */
+  readonly replaysAnthropicServerBlocks?: boolean;
+
   /**
    * True when this adapter carries the content of every message in the
    * ProviderRequest it receives into its API call (format conversion
@@ -324,7 +339,10 @@ export interface ProviderRequestOptions {
   promptMessages?: import('./message.js').NormalizedMessage[];
   signal?: AbortSignal;
   timeoutMs?: number;
-  /** Abort if no SSE event arrives within this many ms (default: 120000) */
+  /** Anthropic idle deadline after the first SDK event (default: 600000 ms).
+   * Nonempty Web response-body bytes, including SSE keepalives, refresh it;
+   * other SDK-supported bodies refresh it on SDK events. This does not bound
+   * total duration or generation progress. */
   idleTimeoutMs?: number;
   /**
    * Deadline for the FIRST stream event (TTFT). Large contexts on a cache
@@ -395,7 +413,10 @@ export interface ProviderResponse {
   /**
    * Verbatim terminal reason reported by the provider, before normalization.
    * Omit when no reason was reported. Custom adapters opt in by supplying it;
-   * Membrane does not infer it from stopReason or parse adapter-specific raw data.
+   * Membrane does not parse adapter-specific raw data for it. Without it,
+   * details.stop.providerReason carries stopReason when that's a non-empty
+   * string membrane doesn't map (it becomes end_turn), and is left unset
+   * otherwise. A value that isn't a non-empty string counts as none.
    */
   providerStopReason?: string;
   

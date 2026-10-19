@@ -12,6 +12,476 @@ Releases up to and including 0.5.75 predate this file; for their contents see
 
 ## Unreleased
 
+## 0.6.0 — 2026-10-18
+
+### Breaking
+
+- **Anyone running membrane on a Node before 22.12:** membrane now declares `engines.node` `>=22.12.0`, where it declared `>=20.0.0`, and CI tests at Node 22.12.0 exactly, at 24 and at the newest Node, where it tested the newest 20.x and 24. Node 20 reached end of life on 2026-04-30. npm warns when it installs membrane on an older Node, and refuses only with `engine-strict` set. Nothing in membrane's code changes with this; older Node versions are simply no longer tested.
+  - **Migration:** run Node 22.12 or later.
+  - **Siblings:** no released sibling's range admits this release: context-manager 0.14.1 depends on `^0.5.69`, and agent-framework 0.22.1 and connectome-host 0.10.2 on `^0.5.87`, so their installs keep getting 0.5.x. A sibling takes on this floor when it raises its range.
+  - **Unchanged:** membrane's API, its output, and what it sends to providers.
+
+### Added
+
+- Add `progressTimeoutMs` to `stream()`, `streamYielding()` and `complete()` options: a per-provider-call deadline that only progress renews (default off; a value that isn't a positive number of milliseconds leaves it off too). Every parsed provider event renews it: an SDK event, an SSE data frame that parses, a decoded Bedrock event. SSE comments, Anthropic and Bedrock `ping`s and raw body bytes don't. So a connection that stays up while the model sends nothing still ends, on every adapter, at a deadline the caller sets per call. Each provider call gets its own deadline, refusal re-issues included, and time between calls, such as tool execution or the yielding tool wait, never counts. It bounds the wait for the first event too, and silence is measured on the monotonic clock, so a step of the system clock moves no expiry. A stretch with no parsed event counts as no progress whatever the model is doing: reasoning a provider doesn't stream, while it sends only keepalives, can expire the deadline, so set it above the longest such stretch you expect. Anthropic models whose thinking streams with `display: "omitted"` send no deltas while they think, which can last minutes. A call that streams no events reports no progress before its response, so the deadline bounds it as a whole: `complete()` on most adapters, and `OpenAIResponsesAdapter` (the Images API) even from `stream()`. `OpenAIResponsesAPIAdapter` in subscription mode answers `complete()` by streaming, so there its events renew the deadline. On expiry the call aborts as a `TimeoutAbortError`: `stream()` returns `AbortedResponse{ reason: 'timeout' }`, `streamYielding()` emits `aborted` with reason `'timeout'`, and `complete()` throws. Its message names the deadline and says when the call began, how many provider events it had and when the last came, for example `No provider progress within 1800000ms: the call began at 2026-10-14T12:00:00.000Z, provider events: 412, the last at 2026-10-14T12:04:10.250Z`. With the option unset, adapters receive the same options as before.
+- **Provider adapters and decorators:** `ProviderRequestOptions` gains `onProgress`. A streaming adapter calls `options.onProgress?.()` once per parsed provider event, never for keepalives, comments or raw bytes; the built-in streaming adapters and `MockAdapter` do. A decorator must forward `onProgress` with the other options. An adapter or decorator that never calls it turns `progressTimeoutMs` into a total deadline for its calls. The deadline aborts the call's signal with the same mark as `timeoutMs`, so an adapter that maps `isDeadlineAbort` to `deadlineTimeoutError` needs no new error path. The Anthropic adapter now does that mapping for its caller's signal on both `stream()` and `complete()`.
+
+- Yielding streams report each provider round that stands. The `usage`
+  event carries `round` (`RoundReport`) with the round's index, mapped stop
+  reason and own usage, and `altered`: the consumer messages that round's
+  request did not carry verbatim. Messages are addressed by
+  `NormalizedRequest.messages` index, and injected messages as
+  `[batch, index]` into the array as supplied, for every batch still
+  retained; tool blocks stripped from an injected message make it altered.
+  `fidelity` is `unknown` whenever an empty list would prove nothing: an
+  uninstrumented formatter or adapter, an image opt-in shedding replaced, a
+  `beforeRequest` hook that changed either of its arguments (the provider
+  request by replacement or in place, or the normalized request in place;
+  an in-place change keeps every later round `unknown` too), or an adapter
+  alteration that could not be attributed. Otherwise it is `established`.
+  `injectedBatch` gives the newest batch and how many of its supplied
+  positions the round accounts for: all of them on the native path, none on
+  the XML prefill path. With established fidelity, each was carried
+  verbatim unless `altered` names it, as it names a message whose tool
+  blocks were stripped even when nothing else of it was sent.
+  `ToolContext.supportsInjectedMessages` says which path applies.
+- **Formatters and provider adapters:** `PrefillFormatter.reportsAlterations`
+  and `ProviderAdapter.reportsContentAlterations` declare that a path reports
+  what it does not carry verbatim. Formatters record alterations in
+  `BuildOptions.fidelity`. Adapters call the new
+  `ProviderRequestOptions.onContentAltered`, which decorators must forward,
+  along with the capability. All built-in formatters, and the Anthropic,
+  Bedrock, Responses API and mock adapters, declare it; an undeclared path
+  makes rounds `unknown`.
+- **Raw forms:** where a path sends a provider-native raw form in place of
+  the fields it stands in for (on the OpenAI Responses formatter, a block's
+  `rawItem` and a message's `openaiResponsesItems`; in the Responses API
+  adapter, a `redacted_thinking` block's reasoning `rawItem`; on the XML
+  prefill path, `rawXml`), that raw form is what the round carries. The
+  block or message counts as carried verbatim when its raw form is, and the
+  fields it stands in for are not compared with it, so a consumer that edits
+  content under a raw form must drop or replace the raw form, or the edit
+  doesn't reach the provider. Blocks whose items share a type and id are one
+  item, sent once, and a block whose item differs under the same key isn't
+  carried. A zero-width carrier (`''` text holding an object `rawItem`) that
+  a path leaves out, as every built-in path but the Responses formatter does,
+  alters its message.
+- **Provider adapters:** `ProviderRequestOptions.onContentAltered(block?)`
+  takes the request's own block when one block was altered, and membrane
+  attributes it to the message that block came from. Declaring adapters
+  report through the final body, passthrough parameters and cleanup
+  included. Anthropic and Bedrock now report whitespace-only text removed by
+  their empty-text cleanup (an exactly empty `''` block is still no loss) and
+  a passthrough `messages` that replaces the built messages. Anthropic also
+  reports nested tool-result blocks with no Anthropic form; Bedrock passes
+  them through. The Responses API adapter reports what its input
+  normalization leaves out or changes, naming the block, and a failed tool
+  result, since a `function_call_output` has no error flag; the Responses
+  formatter reports such a result too.
+- `normalizeToolPairs` tells a caller that follows blocks by identity which
+  ones it rewrote as new objects: `NormalizeOptions.onBlockRewritten` hears a
+  `tool_result` rewritten as text, an orphan or a duplicate. NativeFormatter
+  uses it to attribute those occurrences.
+- `ProviderResponse.unreportedUsage` names the required counts
+  (`inputTokens`, `outputTokens`) a provider did not report. Their 0 in
+  `usage` stays for accounting, and round reports leave them out. Every
+  built-in adapter that can lack a count names it (the mock always reports
+  both). A round report's `usage` (`RoundUsage`) carries token counts only,
+  never accounting's `estimatedCost`, in membrane's one convention:
+  `inputTokens` excludes the cached span, reads and writes, restated for a
+  cache-inclusive provider. An adapter whose cache convention is `'unknown'`
+  passes its counts through as the provider gave them.
+
+- `thinking.blockBinding` asks the API what to do with a signed thinking
+  block the request sends back when the conversation before it has changed
+  since it was minted: `{ prefixMismatchBehavior: 'drop_block' }` removes the
+  failing blocks and the request proceeds, and `'error'` fails it with a 400.
+  The Anthropic and Bedrock adapters send it as `thinking.block_binding`, with
+  the `thinking-binding-controls-2026-08-01` beta, inside the thinking config
+  membrane builds: enabled thinking whose budget fits, adaptive thinking, or
+  a Fable or Mythos model, whose thinking config is otherwise left out.
+  Fable 5 and 5.1 accepted it on 2026-10-10, and with `display` beside it
+  on 2026-10-12 (that config carries `display` when it's set). Mythos
+  hasn't been tried, and that family has refused thinking configs with a
+  400 before, so setting it for a Mythos model may fail every request;
+  Bedrock's acceptance of the beta hasn't been tried either. A request with
+  no thinking config carries no binding: thinking disabled (Fable and Mythos
+  think whatever `enabled` says, so they carry it whenever it's asked for), a
+  budget that can't fit under `maxTokens`, or a request the XML or
+  completions formatter builds to end in an assistant prefill.
+  A `thinking` object passed through `providerParams` replaces membrane's,
+  binding included. Unset, nothing is sent, and the account's default
+  applies.
+- Yielding streams report what the provider did with that thinking:
+  `RoundReport.thinking` lists the blocks it dropped (`dropped`) and the
+  ones that failed a binding check but were shown anyway, where the check
+  isn't enforced (`mismatchAllowed`, read from the API's
+  `thinking_mismatch_allowed` entries, which we haven't seen live). Each
+  entry gives the provider's reason and its `messages.{i}.content.{j}`
+  path, which indexes the request as sent, after membrane's merges and
+  injections; where membrane can say, the entry also gives the consumer's
+  own coordinates: the message it came from (`message`, `injected` as
+  `[batch, index]`, or `round` for an earlier round of the stream) and the
+  block's index in it. `ProviderResponse.inputTransformations` carries the
+  provider's own report, and a streamed response's raw form now includes
+  `input_transformations`.
+
+### Changed
+
+- `estimatedCost` is now omitted, with the one-time unpriced-model warning,
+  for `gemini-2.5-flash-image`, `gemini-2.5-flash-preview-tts`,
+  `gemini-2.5-pro-preview-tts` and `gemini-2.5-flash-native-audio-*`. A text
+  model's row matched them by prefix and priced their image, speech or audio
+  output at its text rate, below what Google charges for it. The new rows leave
+  `gemini-3.8-flash-tts`, `gemini-3.8-flash-lite-tts` and
+  `gemini-3.1-flash-lite-image` unpriced. A `ModelRegistry` can still price
+  any of them.
+
+- Two of the notes membrane writes in place of media it doesn't send now say that the model isn't seeing it, so a note isn't read as the content. In XML tool mode, a tool result's image that isn't sent as an image reads "[Image: image/png, ~12KB, not shown to you]" (in a split turn, the images sent at the split are shown, and later results' images read the note), and so does an image, document, audio or video in a result the normalizer turned into text. A tool-result image the OpenAI Responses input can't carry now says, as membrane's stripped-image note does, that an image was there and isn't seen: "[system: an image in this tool result was NOT shown to you. This request couldn't carry it, so you are not seeing it.]". Other notes, such as "[Image omitted]" past the Responses input-image cap, are unchanged. The first request after upgrading carries the new text wherever membrane renders one of these notes, so a provider's prompt cache misses from the first such note on, once. A results block stored with its raw XML replays as it was stored.
+
+- **Build:** membrane is now built and typechecked with TypeScript 7 (`^7.0.2`), the native compiler, in place of 5.9. Built from the same source, the published JavaScript is byte-identical; the declaration files that differ do so only in the quote style of string-literal types (`'wire-request'` for `"wire-request"`); and the source maps that differ do so only in their `mappings`. A git or clone install runs the `prepare` build, which now needs TypeScript 7's compiler binary. That ships as optional packages for twenty OS/CPU pairs, so on another platform, or with optional dependencies omitted, the build fails, where 5.9's JavaScript compiler ran wherever Node does. A registry install runs no compiler.
+
+### Fixed
+
+- The built-in pricing table now prices Gemini's current models (#121).
+  `gemini-4-argon`, `gemini-3.8-flash`, `gemini-3.6-flash`,
+  `gemini-3.1-pro-preview`, `gemini-3.1-flash-lite` and
+  `gemini-3-flash-preview` had no row, so their `estimatedCost` was omitted.
+  A rate Google publishes with the date it changes is kept with that date, and
+  the estimate follows the date a call is priced on, with no membrane upgrade:
+  `gemini-4-argon` is priced at 2/10 per million tokens through November 30,
+  2026 and 4/20 from December 1, and the 3.6 and 3.8 Flash models at 0.75/3.75
+  through December 31, 2026 and 1.50/7.50 from January 1, 2027. Google names
+  no time zone, so each change is taken to start at midnight US Pacific time.
+- `gemini-3.5-flash` and `gemini-3.7-flash`, whose requests Google now routes
+  to `gemini-3.6-flash` and `gemini-3.8-flash`, are priced at those models'
+  rates. `gemini-3.5-flash` was priced at 1.50/9, its rate before it was
+  deprecated.
+
+- **Usage accounting:** the cache hit ratio now counts cache writes as part of the prompt. `details.cache.hitRatio` is cache reads over fresh input, cache writes and cache reads together, where it left the writes out, so on Anthropic and Bedrock calls that write cache it drops to its true value: 100 fresh, 5,000 written and 5,000 read is 49.5%, where it was reported as 98%. Cost is unchanged for those adapters, which price each count at its own rate. The docs that gave the total prompt as `inputTokens + cacheReadTokens` now give `inputTokens + cacheCreationTokens + cacheReadTokens`.
+  - A `cache-inclusive` adapter's input count is now read as holding every cached token, written as well as read, and membrane subtracts both. No built-in inclusive adapter reports cache writes. For one that does, `inputTokens` drops by its writes, and they are priced once, at the model's write rate, instead of at that rate and the input rate both; a model without a write rate leaves them unpriced, as it does reads without a read rate.
+  - OpenRouter resolves a response that reports Anthropic's `cache_creation_input_tokens` as `cache-excluded`, as it already did one reporting `cache_read_input_tokens`, so Anthropic's writes are never subtracted from `prompt_tokens`. The only counts this moves are those of a response that reports Anthropic's write field and OpenAI's `prompt_tokens_details.cached_tokens` above zero, without Anthropic's read field: its cached reads are no longer subtracted from `prompt_tokens`.
+  - An adapter whose convention is `unknown` now warns once when it reports cache writes, as it did when it reported cache reads, since its writes now enter the total prompt and the hit ratio.
+
+- `openrouter`, `openai`, `openai-compatible` and `openai-completions` fail the
+  call when the provider reports an error inside an HTTP 200, streamed or not
+  (#136): an `error` object, at the top level or on the first choice,
+  whatever the finish reason, or a first choice that ends with
+  `finish_reason: "error"`.
+  - A response whose first choice ends with `finish_reason: "error"` was an
+    `end_turn` holding the partial text, with the token disclosed as
+    `details.stop.providerReason` and logged once. It now throws. An `error`
+    object on that choice classifies the error, as a top-level one does; that
+    is how OpenRouter documents a non-streaming generation that failed
+    partway. With no `error` object at all, it is a `MembraneError` of type
+    `server`, retryable, with `httpStatus` 500, as OpenRouter's documented
+    mid-stream `server_error` is. `complete()` retries it when `maxRetries`
+    allows another attempt, as it does any retryable error, and a retry layer
+    above membrane that reads `retryable` will send the request again too.
+  - A non-streaming 200 whose body is only an `error` object threw
+    `Cannot read properties of undefined (reading '0')`, typed `unknown` and
+    not retryable. It now throws the error a stream frame carrying that
+    object gives, classified from its code or status. OpenRouter's documented
+    `server_error` is a retryable server error, so `complete()` retries it
+    when `maxRetries` allows another attempt.
+  - A non-streaming 200 with an `error` object beside its choices returned
+    the choices' content, and a stream chunk with an `error` object on its
+    choice was read as an ordinary chunk. Both now throw, as a chunk with a
+    top-level `error` object already did.
+  - A stream chunk with a top-level `error` object, OpenRouter's documented
+    mid-stream failure, already threw, classified by that object, and still
+    does.
+
+- XML tool mode reads OpenAPI 3.0's `nullable: true` beside a parameter's
+  `type` as it reads a type list naming `null` (#143). Before,
+  `{type: "string", nullable: true}` read as a plain string. A written
+  `null` reached the tool as the text `"null"`, and the tool instructions
+  didn't mark the parameter `nullable="true"`. For any other type the null
+  arrived, with a warning that it wasn't the declared type. Only
+  `nullable: true` itself counts, and only beside a `type`. Membrane doesn't
+  consult a sibling `enum` or `const`, as for any `type`.
+- The tool instructions now mark `nullable="true"` on a declaration membrane
+  can read but can't give one type, when it admits null. Examples are a type
+  list such as `["string", "number", "null"]`, `nullable: true` beside such
+  a list, and an `anyOf` of several types with a null branch. Such a
+  parameter still parses by the legacy guess, which already read a written
+  `null` as null.
+- The first request after upgrading carries the changed instructions for
+  every tool with such a parameter, so a provider's prompt cache misses from
+  those instructions on, once.
+
+- A `stopReason` that membrane doesn't map (one other than `end_turn`,
+  `max_tokens`, `stop_sequence`, `tool_use`, `pause_turn` and `refusal`),
+  returned by an adapter without `providerStopReason`, is now kept as
+  `details.stop.providerReason` (#154), also when membrane then ends the
+  response at a stop sequence it finds itself. Membrane still normalizes the
+  token to `end_turn` and logs it once, but the token was dropped, so a
+  custom adapter's `stopReason: 'error'` read as a clean end of turn to a
+  caller that checks `providerReason`. When the adapter gives a
+  `providerStopReason`, `providerReason` still carries that, and a
+  `stopReason` membrane maps, returned alone, still leaves `providerReason`
+  unset.
+  - A `providerStopReason` that isn't a non-empty string, such as `null` or
+    `''`, now counts as none: the field is a string, omitted when no reason
+    was reported. It was reported as `providerReason` as it came, so where a
+    built-in adapter passes on a server's empty stop token, `providerReason`
+    is now unset. An empty or non-string `stopReason` isn't carried either.
+  - Otherwise the built-in adapters' responses don't change: they return
+    `providerStopReason` beside any token membrane doesn't map.
+
+- Anthropic server-tool blocks (`server_tool_use`, `web_search_tool_result`
+  and the other blocks the API returns for a tool it runs itself, and
+  `container_upload` for a file it puts in the code-execution container) go
+  back to the Anthropic API in their place in the turn. The native tool
+  loops and `fromAnthropicContent` kept each on a zero-width `rawItem`
+  carrier, but NativeFormatter, which the native tool loops build through,
+  and the exported `toAnthropicContent` dropped the carrier as empty text.
+  So a replayed web-search turn lost its search results. With signed
+  thinking in the turn, claude-sonnet-4-6 refused it in a live check:
+  "`thinking` or `redacted_thinking` blocks in the latest assistant message
+  cannot be modified". claude-haiku-5-5 accepted it and ran the search
+  again. Each now sends the block itself, as a copy without any
+  `cache_control` stored on it or its carrier. A block stored as itself, as
+  a seeded history can hold it, goes back the same way. NativeFormatter
+  sends it only in the assistant's own turns, the native tool loops'
+  requests included: another participant's message, sent as a user turn,
+  still leaves it out. `toAnthropicContent` sends it when given
+  `{ role: 'assistant' }`, and otherwise leaves it out, as it always left
+  out a carrier.
+- Except where the API refuses a block in its turn. A server call goes only
+  with its result after it in the turn, and a result only with its call
+  before it: the API refuses either alone, so a lone one is left out of its
+  turn and its message is reported altered. The request's final assistant
+  message keeps its lone calls, since a paused turn (`pause_turn`) resumes
+  there; `toAnthropicContent` takes `lastMessage` for that turn. The API
+  takes each id once per turn, so the first call of an id pairs with the
+  first result after it, and a second call with that id, or a second result
+  for it, is left out too. A call whose `id`, or a result whose
+  `tool_use_id`, isn't a string is left out of every turn, the final one
+  included. A turn left with nothing is dropped. `container_upload`, which
+  the API refuses in any assistant turn, is always left out.
+- Membrane sends these blocks back only through `AnthropicAdapter`. Live
+  checks on claude-haiku-4-5 had the Anthropic API accept each type sent
+  back beside its partner, with or without a cache marker on it, except
+  `container_upload`; the MCP connector's pair was checked through
+  `count_tokens` only, and code execution's success results were built from
+  the SDK's types. It leaves them out of every other provider's requests,
+  Bedrock's included, in the build itself, before it places cache markers
+  and merges turns, so those requests are what they were before: a provider
+  adapter declares `replaysAnthropicServerBlocks`, and NativeFormatter takes
+  `anthropicServerBlocks`, off by default. Whether Bedrock accepts them is
+  unknown, and a refusal there would fail every request carrying the
+  conversation. In XML tool mode the turn is text, so these blocks still
+  aren't sent there.
+- Anthropic API requests for a stored history with such a turn change from
+  that turn on: a prompt-cache prefix written before upgrading that reaches
+  past the turn no longer matches, and the search results are input tokens on
+  every later request. A turn stored through `complete()` before this release
+  has no carrier to send, so a model that refuses it with signed thinking
+  still refuses it: an upgrade can't restore what was never kept.
+- A caller that builds a request with NativeFormatter itself for the
+  Anthropic API passes `anthropicServerBlocks: true`, or what it builds
+  leaves out the server blocks that inference sends. A host's token count is
+  the usual such caller, connectome-host's `buildCountTokensPayload` among
+  them: without the option its count runs low from a server-tool turn on.
+- Streaming: a server tool's call (`server_tool_use`, `mcp_tool_use`) kept
+  the empty `input` of its `content_block_start`, because only a `tool_use`
+  assembled its `input_json_delta` fragments. It now holds the input the
+  model wrote. Fragments that don't parse to an object, and a call cut off
+  mid-input, leave the start's `input: {}` with the text in
+  `unparseableInput`, and a warning names the block; whitespace alone is no
+  input. Either call goes back as stored, `{}` without the marker, wherever
+  the pairing rule keeps it: a stopped call with its result after it, or a
+  lone call in the request's final message. A cut-off call has no result
+  after it, so only the final message keeps it.
+- `complete()` keeps a provider block it has no normalized form for (an
+  Anthropic server-tool block, or an opaque Responses item such as a
+  compaction) on a zero-width carrier, as the native tool loops do, instead
+  of dropping it, and an XML closing tag it restores goes on the last text
+  block that isn't a carrier. It still keeps no `rawItem` on the text and
+  thinking blocks it normalizes, which the native tool loops do keep.
+  `fromAnthropicContent` carries a server-tool block without the
+  unknown-type warning.
+- Request shapes for other wires leave a server-tool block out, bare or on
+  its carrier. The OpenAI Responses formatter no longer replays one as an
+  input item, the Responses input normalization no longer passes one through
+  as a message part or an empty text part, and the XML and completions
+  formatters, the OpenAI, OpenAI-compatible, OpenRouter and OpenAI
+  completions adapters, and the exported `toOpenAIMessages`,
+  `toOpenRouterMessages`, `toOpenAIContent` and `toGeminiParts`, no longer
+  write a zero-width carrier as an empty text part or line, and neither does
+  the exported `extractText`. `toOpenAIContent` still answers `''` for a
+  turn whose only text blocks are carriers.
+
+- Anthropic streaming idle watchdog now treats received Web response-body bytes, including SSE `ping` keepalives the SDK filters out, as transport activity after the first SDK event. The default idle deadline remains 600000 ms; the fixed first-event deadline is unchanged. SDK-supported bodies without `pipeThrough` pass through unchanged and retain event-based idle checks. Stream setup failures now clean up the watchdog and caller abort listener. This change adds no total-duration or generation-progress deadline; a stream with continuous body activity can remain open indefinitely.
+
+- `timeoutMs` past 2³¹−1 ms (about 24.8 days), `Infinity` included, no longer times a request out after about 1 ms. Node runs a timer whose delay is longer than that after 1 ms, so deadlines are now armed in steps within the limit: a long one fires on time, and `Infinity` never fires. `progressTimeoutMs` follows the same rule.
+
+- Two more refusals of the account or its credential are typed `auth`, as a
+  low credit balance and reached usage limits already were: "This
+  organization has been disabled." and "This credential is only authorized
+  for use with Claude Code and cannot be used for other API requests."
+  Anthropic sends both as a 400. Typed `invalid_request` before, they read
+  to callers as something wrong with the request, which no change to the
+  request fixes. The text is matched in any provider's own error message,
+  as the other two are, so another provider's 400 or 422 that says one of
+  these is `auth` too.
+
+- `gemini`: a response whose cached count exceeds its prompt count is read as
+  cache-excluded, so membrane counts its cached span beside its prompt. The
+  usage check now also accepts a `totalTokenCount` that includes that span,
+  the total membrane counts, besides the total of Google's formula, so such a
+  response no longer logs "usageMetadata does not reconcile" on every call.
+  None of the published responses cited for the cache-inclusive reading
+  shows this case; the one-time warning that the response is read as
+  cache-excluded still says when it is met. A total that
+  matches neither sum still logs, and names both. The warning's closing
+  sentence, that some billed tokens are in another usageMetadata field, now
+  appears only when the total exceeds every sum it names.
+
+- `gemini` reads `usageMetadata.toolUsePromptTokenCount`, the prompt tokens
+  Gemini's built-in tools add, into `inputTokens`, and counts it in the check
+  against `totalTokenCount`. A response that reported the field logged
+  "usageMetadata does not reconcile" every time, and its tool-use tokens were
+  left out of usage and the cost estimate, though Google bills code
+  execution's, URL context's and file search's as input (#120). Grounding,
+  with Google Search or Google Maps, is billed per query or per grounded
+  prompt, which membrane doesn't price, and for text models Google doesn't say
+  whether grounding's retrieved context is counted in this field or charged as
+  input. If it is counted and not charged, a grounded response's input is
+  overstated.
+
+- `openai-compatible` now sends OpenAI's own parameter surface when the model
+  is one of OpenAI's reasoning-generation models (GPT-5 and later, o-series),
+  e.g. with `baseURL` pointed at `https://api.openai.com/v1`: `max_completion_tokens`
+  instead of `max_tokens`, and no custom `temperature`/`top_p` or unsupported
+  `stop`. Previously every request for those models failed with "Unsupported
+  parameter: 'max_tokens' is not supported with this model". Model detection is
+  shared with the `openai` adapter; all other model ids keep the legacy
+  parameters.
+
+- A `tool_use` block's `input` is now always a plain object, as
+  `ToolUseContent` types it. When a model's arguments aren't a JSON object,
+  `input` is `{}` and `unparseableInput` keeps what came, as the Anthropic
+  adapter already did for a call its stream left unfinished.
+  - The OpenAI, OpenAI-compatible, OpenAI Responses and OpenRouter adapters
+    stored whatever `JSON.parse` returned, so a model's arguments of `null`,
+    a number, a string or an array became `input` as they were. Arguments
+    that didn't parse became `{}` with nothing to tell them from a call with
+    no arguments. Both are now `{}` with `unparseableInput`. In a
+    non-streamed response, an `arguments` field that isn't text at all,
+    which these wires' specs don't allow, is read as a value, as Gemini's
+    `args` are, and a `null` field is a call with no arguments.
+  - The Anthropic and Bedrock stream assemblies kept a parse that wasn't an
+    object; Bedrock also kept `{}` silently for arguments that didn't parse.
+    Both now mark them. Bedrock now also marks a call the stream left open
+    (no `content_block_stop`, as when `max_tokens` cuts it), as the Anthropic
+    adapter does: `input` stays what `content_block_start` carried, and
+    `unparseableInput` holds whatever arguments arrived, `""` when none did.
+    Before, it parsed what had arrived as if the call had finished, and
+    kept `{}` unmarked when that didn't parse or nothing had arrived.
+  - Gemini copied `functionCall.args` into `input` unchecked. `input` is now
+    `{}` when the call carries no args, or `null` ones (unset, in Gemini's
+    proto3 JSON), and a value that isn't an object is kept, as JSON, in
+    `unparseableInput`. The exported `fromAnthropicContent` and Bedrock's
+    non-streamed response follow the same rule for the `input` the provider
+    sent, where `null` is a value that isn't an object.
+  - `Membrane.complete` and `Membrane.stream` give every `tool_use` in the
+    content they hand on an object `input`, whatever an adapter gave: an
+    `input` that isn't an object reaches the caller as `{}`, with
+    `unparseableInput` holding it as JSON unless the adapter marked the block
+    already. `Membrane.complete` now carries an adapter's
+    `unparseableInput`, as streamed responses already did, and its
+    `toolCalls` get the same object `input`. The streaming block events
+    (`block_complete`, and the deprecated `onContentBlockUpdate`) still
+    report a tool call as the adapter streamed it, with no marker.
+  - `ToolCall` has `unparseableInput` too, set from the call's block, so an
+    executor can answer a marked call with an error result instead of
+    running it with `{}`. It's on the calls `stream()` hands `onToolCalls`,
+    the yielding stream's `tool-calls` event and `complete()`'s `toolCalls`.
+  - A call with empty arguments, or arguments that are only JSON
+    whitespace, is `{}`, unmarked.
+  - The warning for arguments that aren't an object, which the Anthropic
+    and Bedrock stream assemblies now log too for a call that finished, no
+    longer includes the parse error, whose message quotes the arguments. A
+    call the stream left open is marked without a warning; the response's
+    stop reason says why.
+
+- **Stream labels and block events at a stop:** when a prefill loop found a stop sequence inside a provider chunk, the text before it went out as one chunk, labelled with the block the parser was in after the whole chunk. So the end of a `<thinking>` block that closed in that chunk, or of a tool call before its `</function_calls>` stop, went out as visible text to `stream()`'s `onChunk` and to `streamYielding()`'s `tokens` events. Now the parser takes only the text before the stop, and each piece goes out labelled by its own block, as on a chunk with no stop. Where the provider sends no typed blocks, each piece carries its block's index from the parser, and the parser's block events for that chunk (`onBlock`, and `streamYielding()`'s `block` events) go out too; they were dropped before. Such a round now ends as one the provider stopped: its block in progress gets the `block_complete` it never got, the text the parser held back at its end (a possible tag's start, such as a trailing `<`) goes out, and block indices go on through the turn instead of starting again at 0. A tool call before such a stop goes out as it does at a provider's stop: the parser's `tool_call` block for the call's text, then the parsed call's. There, the held-back text now goes out at the end of every round; the stream dropped it, though the content kept it. Where the provider sends typed blocks, each piece carries the index of the provider's block, as on other chunks there, a thinking block's text keeps the provider's label, and the stream carries the provider's block events, not the parser's; what the parser held back at a round's end isn't streamed, as before. When a stop turns out to sit inside a block the model opened, its text went out with `blockIndex: 0` and a type read after it, so a `</function_calls>` stop put back, as with no `onToolCalls`, went out as visible text. Where the provider sends no typed blocks, it now goes back through the parser: no block is in progress after the round's end, so text starts a new block of the same type, which goes on into the next round, and a closing tag goes out as neither text nor a block event. Where it sends typed blocks, the stop still goes out as one piece with `blockIndex: 0`, now labelled with the block it sits in, so a closing tag goes out as part of the block it closes, not as visible text. A stop split across two chunks is unchanged: its first part goes out before the stop is found, the round's block in progress never completes, and block indices start again at 0. The response's content is unchanged, except where a stop is now put back and the turn goes on, as the next item says.
+- **A closing tag with no block in progress:** when the stream parser read a `</thinking>`, `</function_calls>` or `</function_results>` with no block in progress, it sent a `block_complete` for a block that never started and, where nothing was open, took that tag's depth below 0. It now sends no block event, and depths stop at 0. With thinking on, the model's `</thinking>` right after the `<thinking>` a tool round adds was one such tag. A depth below 0 also hid a block the model opened after such a tag, where no block was open before it, so a stop the provider applied inside that block ended the turn; that stop is now put back and the turn goes on, as it already did for a stop the loop found. So where that stop lands, the response now holds the rest of the turn instead of ending there, and the turn makes the continuation calls a stop the loop finds already makes. A block the model opens that only brings back a depth the prefill left open still reads as nothing opened, as before.
+
+- Gemini's usage is read as cache-inclusive: `promptTokenCount` counts the cached span `cachedContentTokenCount` reports. That is Google's UsageMetadata definition, stated for explicit cached content, where Google's caching cookbook shows it (a total of prompt + thoughts + candidates, with the cached span inside the prompt), and one published chat fits it for the implicit hits membrane meets too: in googleapis/python-genai#2064, `promptTokenCount` grows steadily through a chat while `cachedContentTokenCount` drops to 0 and comes back. So in Membrane's responses `inputTokens` is now the fresh input on a Gemini cache hit, as it is for every provider whose cache convention is known (an adapter that declares `unknown` passes its counts through, except for a response that carries its own convention, as OpenRouter's do when they report a cache read), and a hit is counted once by the cache-hit ratio, by cost and by any consumer summing input, cache reads and cache writes. A response whose cached count exceeds its prompt count can't include it, so that response is read as cache-excluded instead, with a one-time warning. Since Gemini now declares a convention, the one-time warning about an adapter that declares `unknown` no longer fires for it.
+  - **What callers see:** on a Gemini cache hit, `inputTokens` falls by the cached span, and the estimated cost falls with it: the cached span is priced once, at the model's cache-read rate. A pricing row without a cache-read rate leaves that span unpriced, as cache reads are for every provider, where it used to ride in `inputTokens` at the input rate; every priced Gemini row in the default table has one. Usage recorded before the upgrade keeps the old reading, so a sum across the upgrade steps down.
+  - **Unchanged:** a direct `GeminiAdapter` caller still gets `promptTokenCount` in `inputTokens`, beside `toolUsePromptTokenCount` where a response reports it, with `usageCacheConvention: 'cache-inclusive'` declaring how to read it. A response whose cached count exceeds its prompt count carries `cacheConvention: 'cache-excluded'` for that response. A response without a cache read is unchanged.
+
+- The native formatter sends no system block for an empty system prompt. With
+  the default `membrane-system` cache markers and no message breakpoint, it
+  had wrapped `''` as a cache-marked empty text block, which the API doesn't
+  cache. Empty text blocks in a system array are dropped the same way before
+  the fallback marker goes on the last block, and an array left empty sends
+  no system block.
+
+- OpenAI chat completions, the OpenAI Responses API and Gemini now keep a
+  provider-reported cache-read count of 0 as `cacheReadTokens: 0`. Before,
+  a reported 0 was dropped to `undefined`, indistinguishable from a provider
+  that reported nothing. An unreported count is still absent. Gemini's
+  `usageMetadata` follows proto3 JSON, which omits zero counts, so when it is
+  present a missing `cachedContentTokenCount` is a reported 0, as a missing
+  `candidatesTokenCount` is; only a response without `usageMetadata` leaves
+  the count unreported.
+- Turn totals (the usage `complete()` and `stream()` return, the `usage`
+  event's `usage`, and `onUsage`) and a refused attempt's record
+  (`details.usage.discardedAttempts`) carry a cache-read or cache-creation
+  count, and thinking tokens, once any round reported it, a 0 included, as
+  each round's own entry in `perRound` does. Before, a count was added only
+  when it was positive, so a reported 0 was lost there too. A count no round
+  reported is still absent. This changes values a caller reads without
+  `round`: where a provider reports 0, the totals now carry the 0.
+
+- Image data that its destination doesn't accept now becomes the visible text
+  placeholder wherever membrane converts it for a request, whatever type it is
+  labelled with. Data whose bytes matched no format used to keep its label, so
+  a text file labelled `image/png` went to the provider as an image, and the
+  API refused that request and every later one that carried it in history. The
+  decision recognizes each format by its header and takes the destination's
+  formats: JPEG, PNG, GIF and WebP by default, Gemini's PNG, JPEG, WebP, HEIC
+  and HEIF (so a GIF sent to Gemini now becomes the placeholder), and the
+  Images adapter's PNG, WebP and JPEG. The request builders still send only
+  the four default formats, so HEIC and HEIF reach Gemini only from a direct
+  adapter call or a hook-replaced request. Tool results in native tool
+  requests, every adapter (called directly or through a builder), the XML
+  tool-result notes, the XML replay of a split image round, and the OpenAI
+  Responses formatter and transport now check it, and the Images adapter
+  leaves such data unattached. A `data:` URL
+  takes the same decision. A native `input_image` part becomes the placeholder
+  when its data holds no accepted image, and otherwise replays verbatim, its
+  label included. A remote URL goes out as it is, and so does a caller's
+  whole-payload override (`extra.messages`, `extra.contents`). An XML tool
+  loop whose result's only image became the placeholder no longer sends an
+  empty image turn. The placeholder now names the formats the request can
+  carry and the label the data had, quoted. Its new text also replaces the
+  text an image of an unsupported type already got, so after upgrading,
+  requests from a context that holds one change from that point, and its
+  prompt cache is written again from there once. An image whose header shows
+  an accepted format is sent as before, labelled by its header;
+  `toAnthropicContent` now labels a generated image that way too, and an image
+  with no label now goes under its header's type, where the OpenAI-family
+  adapters sent `image/png` and Gemini `image/jpeg`.
+- An MCP-shaped image in a tool result (`{ type: 'image', data, mimeType }`)
+  is now decided by its data. The native builder gave every such image the
+  placeholder, and the XML builder failed on one, so an accepted one now
+  reaches the model as an image wherever its request carries tool-result
+  images. A context that holds such images sends larger requests from the
+  first one after upgrading, and its prompt cache is written again from there
+  once.
+
+- In XML mode under `cacheMarkers: 'cm-owned'`, the formatter no longer marks the last block of an unmarked system array, as it already didn't for a system string or in native mode, and as `cm-owned` promises. That marker took a fifth slot beside a caller's four message breakpoints, and the build then threw "cache_control limit exceeded: 5 markers". At three or fewer breakpoints, an XML request with an unmarked system array now carries one marker fewer: a `cm-owned` caller that wants its system prompt marked marks a system block itself, as with the native formatter.
+
+- In XML tool mode, a round whose tool result carries an image sends the image in a user turn of its own, and the response used to keep only the result's text, so a later request built from it showed no image and no sign of one. Now the result whose images were sent keeps what the tool returned, images included, in its block and in the response's tool results, and its block marks where the results block split (`rawXmlImagesAt`). The XML replay sends the block split there, with those images, as the turn did, so the model keeps seeing them on later turns, as in native tool mode. Later requests therefore carry those images until something removes them. A response stored before this fix has no mark, so it replays without the images, as it did.
+  - When the replay can't split a marked block (its mark no longer falls where a result closes, or no image it holds can be sent), it sends the raw text whole, and if the result still holds an image, the round report counts the message altered.
+  - Results of two rounds with the same text, stored next to each other, as a host that keeps results apart from their calls stores them, replay as two blocks, each with the images its round sent. They used to replay as one block, which left the second round's block out. The calls of two such rounds replay as two blocks too.
+- In XML tool mode, a round whose results hold images, none of which the API accepts (such as `image/bmp`), no longer splits the turn. It sent an empty user turn, which the Messages API is expected to refuse; the results now go in as text, with the note that names the refused media type where each image was.
+
 ## 0.5.87 — 2026-10-13
 
 ### Breaking

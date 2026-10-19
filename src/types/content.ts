@@ -40,10 +40,20 @@ export interface TextContent {
   cache_control?: CacheControl;
   /**
    * Opaque provider-native item this block was derived from (e.g. an OpenAI
-   * Responses output item). Provider-native formatters replay it verbatim;
-   * other providers must ignore it. A zero-width carrier (`text: ''` plus
-   * `rawItem`) has no normalized equivalent and must be filtered out of
-   * requests for providers that reject empty text blocks (Anthropic).
+   * Responses output item, or an Anthropic server-tool block). Formatters
+   * for its own wire replay it verbatim; other providers must ignore it. A
+   * zero-width carrier (`text: ''` plus `rawItem`) has no normalized
+   * equivalent. Membrane's build for an adapter that declares
+   * `replaysAnthropicServerBlocks` (AnthropicAdapter) sends one holding an
+   * Anthropic server-tool block as that block, in the assistant turn that
+   * produced it (`utils/anthropic-server-blocks.ts`), unless the block can't
+   * go alone there: a server call with no result after it in its turn, or a
+   * result with no call before it, is left out and its message reported, and
+   * the request's final message, if it's the assistant's, keeps its lone
+   * calls. Membrane's build for any other adapter, Bedrock's included, leaves
+   * it out; an adapter's own `buildRequest` sends what it is given. Every
+   * Anthropic-shaped build filters out any other carrier, since Anthropic
+   * rejects empty text blocks. Text serializations leave it out.
    *
    * Where it is replayed, it goes out in place of this block's other fields,
    * which are not read: a consumer that changes the block's content
@@ -180,9 +190,35 @@ export interface ToolResultContent {
    * consumer that changes the result (truncating it, say) must drop or
    * replace `rawXml` too, or the change won't reach the provider, and round
    * reports count the block as carried when its raw text is
-   * (utils/fidelity.ts).
+   * (utils/fidelity.ts). Where `rawXmlImagesAt` is set, the replay can also
+   * send the images the turn sent, from `content`, at that place (see there).
    */
   rawXml?: string;
+  /**
+   * Set on the result whose images an XML tool loop sent in a user turn of
+   * their own, splitting its results block: the offset in `rawXml` where the
+   * split fell. Its `content` then holds what the tool returned, images
+   * included. The prefill path replays `rawXml` split at that offset, with
+   * the images from `content` that an XML split sends (the accepted image
+   * formats) between the two parts, as the turn sent it, and the images are
+   * carried with the raw text. It sends `rawXml` whole instead when the
+   * offset no longer falls where a result or error in the block closes, or when
+   * `content` holds no image a split sends; if `content` still holds an image
+   * then, the request leaves it out and the round report counts the message
+   * altered. A message that also carries images of its own goes to the
+   * provider as one user turn, with these images where the split fell. What
+   * the turn added after the block, such as the thinking opener a thinking
+   * turn writes there, replays as it did before. A consumer that changes the
+   * result, removing an image included, drops this with `rawXml`: the result
+   * then renders from `content`, with a note where an image isn't sent.
+   * Results with the same `rawXml` replay as one block, its text sent once,
+   * for as many results as the parser reads from that text; more results
+   * with the same text are another round's, and replay as a block of their
+   * own, as does a second result with this mark. The count is the parser's
+   * reading today, so it holds while the parser reads the text as the turn's
+   * parse did.
+   */
+  rawXmlImagesAt?: number;
   /** See {@link TextContent.rawItem}. */
   rawItem?: unknown;
 }

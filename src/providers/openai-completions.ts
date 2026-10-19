@@ -30,6 +30,7 @@ import {
   withRawRequest,
 } from '../types/index.js';
 import { createCombinedSignal, SSELineParser, isDeadlineAbort, deadlineTimeoutError, throwOnStreamErrorFrame, assertTerminalEventObserved, isEventObject } from './utils.js';
+import { isRawItemCarrier } from '../utils/fidelity.js';
 
 // ============================================================================
 // Types
@@ -246,6 +247,8 @@ export class OpenAICompletionsAdapter implements ProviderAdapter {
         // A provider event is progress (comments never reach here).
         options?.onProgress?.();
 
+        // A frame that reports an error throws here, before its text, or an
+        // end-of-turn token in it, is read.
         throwOnStreamErrorFrame(parsed, this.name, completionsRequest);
 
         const text = parsed.choices?.[0]?.text;
@@ -414,6 +417,8 @@ export class OpenAICompletionsAdapter implements ProviderAdapter {
 
       for (const block of content) {
         if (block.type === 'text') {
+          // A zero-width carrier holds a block this wire has no form for.
+          if (isRawItemCarrier(block)) continue;
           textParts.push(block.text);
         } else if (block.type === 'image' || block.type === 'image_url') {
           hadImages = true;
@@ -527,7 +532,10 @@ export class OpenAICompletionsAdapter implements ProviderAdapter {
         throw errorFromHttpResponse(this.name, response, await response.text(), request);
       }
 
-      return await response.json() as CompletionsResponse;
+      const body: unknown = await response.json();
+      // A 200 can carry the provider's error, as a stream frame can.
+      throwOnStreamErrorFrame(body, this.name, request, 'response error');
+      return body as CompletionsResponse;
     } finally {
       cleanup?.();
     }
@@ -600,6 +608,9 @@ export class OpenAICompletionsAdapter implements ProviderAdapter {
   }
 
   private mapFinishReason(reason: string | undefined): string {
+    // No reason (or a server's null) is a plain end of turn, as in the three
+    // sibling OpenAI-family adapters.
+    if (reason == null) return 'end_turn';
     switch (reason) {
       case 'stop':
         return 'end_turn';
@@ -609,8 +620,6 @@ export class OpenAICompletionsAdapter implements ProviderAdapter {
         // Matches the three sibling OpenAI-family adapters; this one alone
         // reported a filtered completion as a clean finish.
         return 'refusal';
-      case undefined:
-        return 'end_turn';
       default:
         // Unrecognized reasons travel as the provider's own token so
         // membrane's mapper can disclose and log them.

@@ -1318,14 +1318,17 @@ function withCanonicalResultId(block: ProviderBlock): ProviderBlock {
  * replaced by the empty string with no signal of the loss.
  *
  * This deliberately does not reuse `renderResultContentString` from
- * `utils/tool-parser.ts`: that helper takes an internal `ToolResult` whose
- * image blocks carry camelCase `mediaType`, while blocks arriving here are
- * provider-shaped, and a part's media type may be spelled as Anthropic's
- * wire-form `media_type`, as Membrane's `mediaType` (a part a builder passed
- * through unconverted), or as `mimeType` (an MCP-style or generated image).
- * Reading all three spellings is the point; the image placeholder text is
- * kept identical so the two renderings stay recognisable as the same thing
- * to a model.
+ * `utils/tool-parser.ts`: that helper renders an internal `ToolResult`'s text
+ * and images, deciding each image's data for the request (data in no format
+ * the request can carry gets `imageForRequest`'s placeholder), while parts
+ * arriving here are provider-shaped and of every media kind, and a part's
+ * media type may be spelled as Anthropic's wire-form `media_type`, as
+ * Membrane's `mediaType` (a part a builder passed through unconverted), or as
+ * `mimeType` (an MCP-style or generated image). Reading all three spellings
+ * is the point. An image's placeholder here keeps the form of that helper's
+ * note for an image the request would carry, so the two renderings stay
+ * recognisable as the same thing to a model; this renderer doesn't decide the
+ * data, so it names the media type the part was labelled with.
  */
 function renderResultContent(block: ProviderBlock): string {
   const content = (block as { content?: unknown }).content;

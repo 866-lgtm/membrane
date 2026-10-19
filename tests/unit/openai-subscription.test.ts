@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from 'vitest';
+import { afterEach, describe, expect, test, vi } from 'vitest';
 import { Membrane, OpenAIResponsesFormatter } from '../../src/index.js';
 import type { ProviderRequest } from '../../src/index.js';
 import { OpenAIResponsesAPIAdapter, type CredentialResolver } from '../../src/index.js';
@@ -7,6 +7,7 @@ const originalFetch = globalThis.fetch;
 
 afterEach(() => {
   globalThis.fetch = originalFetch;
+  vi.restoreAllMocks();
 });
 
 function request(extra: Record<string, unknown> = {}): ProviderRequest {
@@ -200,7 +201,7 @@ describe('OpenAI Responses subscription mode', () => {
         {
           type: 'message', role: 'user', content: [
             { type: 'text', text: 'inspect' },
-            { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'aGVsbG8=' } },
+            { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'iVBORw0KGgo=' } },
           ],
         },
         {
@@ -221,7 +222,7 @@ describe('OpenAI Responses subscription mode', () => {
       {
         type: 'message', role: 'user', content: [
           { type: 'input_text', text: 'inspect' },
-          { type: 'input_image', image_url: 'data:image/png;base64,aGVsbG8=' },
+          { type: 'input_image', image_url: 'data:image/png;base64,iVBORw0KGgo=' },
         ],
       },
       { type: 'function_call', call_id: 'call_1', name: 'lookup', arguments: '{"q":"x"}' },
@@ -230,6 +231,7 @@ describe('OpenAI Responses subscription mode', () => {
   });
 
   test.each(['complete', 'stream'] as const)('%s sniffs normalized image bytes at the subscription transport boundary', async (lane) => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
     const png = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg==';
     let body: Record<string, any> = {};
     globalThis.fetch = async (_input, init) => {
@@ -262,7 +264,8 @@ describe('OpenAI Responses subscription mode', () => {
     else await adapter.stream(req, { onChunk: () => {} });
     expect(body.input[0].content).toEqual([
       ...Array.from({ length: 3 }, () => ({ type: 'input_image', image_url: 'data:image/png;base64,' + png })),
-      { type: 'input_image', image_url: 'data:image/gif;base64,unknown' },
+      // Data that is no image goes as the placeholder, whatever its label.
+      { type: 'input_text', text: expect.stringContaining('its data is not a JPEG, PNG, GIF or WebP image, the formats this request can carry (it was labelled "image/gif")') },
       { type: 'input_image', image_url: 'https://example.test/image.png' },
       { type: 'input_image', image_url: nativeUrl },
     ]);

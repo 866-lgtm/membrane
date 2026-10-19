@@ -51,7 +51,9 @@ export interface ToolCallsEvent {
  * On the yielding paths it is emitted once per provider round whose response
  * stands (after any refusal retries), and then carries `round`: that round's
  * own report. Streams created with `emitUsage: false` emit no usage events,
- * so no round reports either.
+ * so no round reports either. A round whose response arrives after the
+ * stream was cancelled isn't reported: the stream ended at its aborted event.
+ * Nor is a round the cancel aborts in flight, since no response arrives.
  */
 export interface UsageEvent {
   type: 'usage';
@@ -98,12 +100,13 @@ export interface RoundReport {
   /**
    * This round's own usage, only what the provider reported: a count it did
    * not report is absent, not 0 (even where accounting keeps a 0 default),
-   * and a reported 0 is 0. Counts are in membrane's one convention, as every
-   * usage it reports is: `inputTokens` excludes cache reads, so a
-   * cache-inclusive provider's input count is restated without them
-   * (`normalizeUsageToCacheExcluded`), and `inputTokens + cacheReadTokens` is
-   * the prompt the provider counted. An adapter whose convention is
-   * `'unknown'` passes its counts through as the provider gave them.
+   * and a reported 0 is 0. An adapter that declares its cache convention has
+   * its counts in membrane's one convention: `inputTokens` excludes the cached
+   * span, so a cache-inclusive provider's input count is restated without its
+   * cache reads and writes (`normalizeUsageToCacheExcluded`), and
+   * `inputTokens + cacheCreationTokens + cacheReadTokens` is the prompt the
+   * provider counted. An adapter whose convention is `'unknown'` passes its
+   * counts through as the provider gave them.
    */
   usage: RoundUsage;
   /**
@@ -242,7 +245,11 @@ export interface RetryingEvent {
 }
 
 /**
- * Aborted event - stream was cancelled.
+ * Aborted event: the stream ended before the turn finished. It carries what
+ * the turn had recorded by then: the text so far (`rawAssistantText`, and as
+ * blocks in `partialContent`) and the tool rounds run (`toolCalls`,
+ * `toolResults`). A round whose tools were still running shows its calls with
+ * no results.
  */
 export interface AbortedEvent {
   type: 'aborted';
@@ -360,7 +367,13 @@ export interface YieldingStream extends AsyncIterable<StreamEvent> {
 
   /**
    * Cancel the stream. Any in-flight requests will be aborted.
-   * The iterator will yield an 'aborted' event and then complete.
+   * The iterator will yield an 'aborted' event and then complete, with
+   * nothing after it. The event carries what the turn had recorded when
+   * cancel() was called (see AbortedEvent). Results passed to
+   * provideToolResults() just before it aren't recorded yet, so their calls
+   * show no results. If the stream has already queued or delivered its
+   * complete, error or aborted event, cancel() adds no event of its own, and
+   * that event stays the stream's last.
    */
   cancel(): void;
 
@@ -396,7 +409,10 @@ export interface YieldingStreamOptions {
   /** Request timeout (per API call, not total) */
   timeoutMs?: number;
 
-  /** Abort if no SSE event arrives within this many ms (default: 120000) */
+  /** Anthropic idle deadline after the first SDK event (default: 600000 ms).
+   * Nonempty Web response-body bytes, including SSE keepalives, refresh it;
+   * other SDK-supported bodies refresh it on SDK events. This does not bound
+   * total duration or generation progress. */
   idleTimeoutMs?: number;
 
   /**

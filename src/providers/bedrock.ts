@@ -35,8 +35,8 @@ import {
   readInputTransformations,
   sendsBlockBinding,
   thinkingEnabled,
-  detectImageMediaType,
 } from './anthropic.js';
+import { imageForRequest, urlImageForRequest } from '../utils/image-media.js';
 
 // ============================================================================
 // Adapter Configuration
@@ -293,10 +293,12 @@ async function signRequest(
 export class BedrockAdapter implements ProviderAdapter {
   readonly name = 'bedrock';
   /**
-   * Reports what it leaves out: whitespace-only text its cleanup removes, and
-   * a passthrough `messages` that replaces the built ones. Otherwise it
-   * carries message content as built, nested tool-result blocks included;
-   * only wire fields (sourceUrl, cache ttl, media_type spelling) change.
+   * Reports what it leaves out: whitespace-only text its cleanup removes, an
+   * image whose data the API doesn't accept, which goes as the placeholder
+   * (at the top level or nested in a tool result), and a passthrough
+   * `messages` that replaces the built ones. Otherwise it carries message
+   * content as built, nested tool-result blocks included; only wire fields
+   * (sourceUrl, cache ttl, media_type spelling) change.
    */
   readonly reportsContentAlterations = true;
   readonly cacheReceiptBasis = 'wire-request' as const;
@@ -453,20 +455,39 @@ export class BedrockAdapter implements ProviderAdapter {
     // caller that sets cacheTtl. (Connectome issue #35.)
     // Bedrock is strict about the wire shape of image sources: internal blocks
     // carry camelCase `mediaType`, the API requires snake_case `media_type`.
-    // The Anthropic adapter converts on both paths (toAnthropicContent /
-    // toAnthropicToolResultContent); without the same conversion here a
-    // tool-returned image 400s with "media_type: Field required" mid-turn
+    // The Anthropic adapter converts on both paths (top-level images in its
+    // buildRequest, nested ones through toAnthropicToolResultContent); without
+    // the same conversion here a tool-returned image 400s with
+    // "media_type: Field required" mid-turn
     // (observed on eidoverse snapshot results, 2026-08-08). Applies to
     // top-level image blocks AND images nested inside tool_result content.
-    const toWireImage = (block: any): any => {
+    // Data that is no image the API accepts goes as imageForRequest's
+    // placeholder text instead, keeping any cache breakpoint the image
+    // carried; `onPlaceholder` hears each one.
+    const toWireImage = (block: any, onPlaceholder: () => void): any => {
       const source = block.source;
+      if (source?.type === 'url') {
+        // A data: URL holds its image inline, so it goes as base64 data or
+        // the placeholder; any other URL goes as it is.
+        const image = urlImageForRequest(source.url);
+        if (image.placeholder) {
+          onPlaceholder();
+          return block.cache_control ? { ...image.placeholder, cache_control: block.cache_control } : image.placeholder;
+        }
+        return image.data ? { ...block, source: { type: 'base64', media_type: image.mediaType, data: image.data } } : block;
+      }
       if (!source || source.type !== 'base64') return block;
       const { mediaType, media_type, ...restSource } = source;
+      const image = imageForRequest(source.data, media_type ?? mediaType);
+      if (image.placeholder) {
+        onPlaceholder();
+        return block.cache_control ? { ...image.placeholder, cache_control: block.cache_control } : image.placeholder;
+      }
       return {
         ...block,
         source: {
           ...restSource,
-          media_type: detectImageMediaType(source.data, (media_type ?? mediaType) as string),
+          media_type: image.mediaType,
         },
       };
     };
@@ -477,18 +498,18 @@ export class BedrockAdapter implements ProviderAdapter {
         content: msg.content.map((block: any) => remember((() => {
           if (block.type === 'image' && block.sourceUrl !== undefined) {
             const { sourceUrl, ...rest } = block;
-            return stripCacheTtl(toWireImage(rest));
+            return stripCacheTtl(toWireImage(rest, () => onContentAltered?.(block)));
           }
           if (block.type === 'image') {
-            return stripCacheTtl(toWireImage(block));
+            return stripCacheTtl(toWireImage(block, () => onContentAltered?.(block)));
           }
           if (block.type === 'tool_result' && Array.isArray(block.content)) {
-            return stripCacheTtl({
-              ...block,
-              content: block.content.map((inner: any) =>
-                inner?.type === 'image' ? toWireImage(inner) : inner,
-              ),
-            });
+            let substituted = false;
+            const content = block.content.map((inner: any) =>
+              inner?.type === 'image' ? toWireImage(inner, () => { substituted = true; }) : inner,
+            );
+            if (substituted) onContentAltered?.(block);
+            return stripCacheTtl({ ...block, content });
           }
           return stripCacheTtl(block);
         })(), block)),

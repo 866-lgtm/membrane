@@ -11,7 +11,7 @@
 
 import { unreportedUsage } from '../utils/usage.js';
 import { createHash, randomUUID } from 'node:crypto';
-import { normalizeResponsesInput } from './responses-input.js';
+import { nativeInputForRequest, normalizeResponsesInput } from './responses-input.js';
 import { fetchWithCredentials, type CredentialResolver } from './credentials.js';
 import { assertMessagePrefillSupported } from './request-capabilities.js';
 
@@ -28,6 +28,7 @@ import {
   abortError,
   classifyError,
   errorFromHttpResponse,
+  invalidRequestError,
   isTypedAbortError,
   networkError,
   withRawRequest,
@@ -151,6 +152,44 @@ export interface OpenAIResponsesAPIAdapterConfig {
   extraHeaders?: Record<string, string>;
 }
 
+/**
+ * The `strict` a function tool is sent with: an explicit boolean as given,
+ * `false` when omitted or null (see {@link OpenAIResponsesAPIAdapter.convertTools}),
+ * and a refusal naming the tool for anything else. The refusal's message says
+ * what kind of value it found, quoting only a short string, so the message
+ * doesn't copy a caller's value whole. The refusal carries `rawRequest`, the
+ * request as far as it was built when refused: provider params merged, and
+ * the tools and input as the caller gave them, the refused tool among them.
+ * It's evidence of what was refused, not a body to send. Without it, Membrane
+ * would give the error the last request it sent in the turn, where there was
+ * one, which isn't the one refused.
+ */
+function functionToolStrictness(toolName: unknown, strict: unknown, position: number, rawRequest: unknown): boolean {
+  if (strict === undefined || strict === null) return false;
+  if (typeof strict === 'boolean') return strict;
+  const spelled = typeof strict === 'string'
+    ? strict.length <= MAX_QUOTED_STRICT_CHARS ? JSON.stringify(strict) : `a ${strict.length}-character string`
+    : Array.isArray(strict)
+      ? 'an array'
+      : typeof strict === 'function'
+        ? 'a function'
+        : typeof strict === 'object'
+          ? 'an object'
+          : `${typeof strict} ${String(strict)}`;
+  const tool = typeof toolName === 'string' && toolName !== ''
+    ? `function tool ${JSON.stringify(toolName)}`
+    : `the function tool at tools[${position}], which has no name,`;
+  throw invalidRequestError(
+    `OpenAI Responses API: ${tool} has strict set to ` +
+      `${spelled}; strict must be true, false, null or omitted (omitted and null are sent as false).`,
+    undefined,
+    rawRequest,
+  );
+}
+
+/** The longest `strict` string a refusal quotes; a longer one is given by its length. */
+const MAX_QUOTED_STRICT_CHARS = 40;
+
 /** A cache key is any JSON string, a header value is not: anything beyond
  * short visible ASCII is sent as a digest, which is just as stable. */
 function headerSafeSessionId(key: string): string {
@@ -165,7 +204,12 @@ function headerSafeSessionId(key: string): string {
 
 export class OpenAIResponsesAPIAdapter implements ProviderAdapter {
   readonly name: string = 'openai-responses-api';
-  /** Carries native input items verbatim, and reports what subscription-mode normalization leaves out. */
+  /**
+   * Carries native input items verbatim, and reports what it can't: what
+   * subscription-mode normalization leaves out or changes, and, in either
+   * mode, a native input_image whose data: URL holds no image the API
+   * accepts, which goes as the placeholder.
+   */
   readonly reportsContentAlterations = true;
 
   /**
@@ -435,7 +479,7 @@ export class OpenAIResponsesAPIAdapter implements ProviderAdapter {
     if (instructions) responsesRequest.instructions = instructions;
     if (request.temperature !== undefined) responsesRequest.temperature = request.temperature;
     if (request.topP !== undefined) responsesRequest.top_p = request.topP;
-    if (request.tools?.length) responsesRequest.tools = this.convertTools(request.tools);
+    if (request.tools?.length) responsesRequest.tools = request.tools;
 
     if (request.extra) {
       const {
@@ -458,11 +502,20 @@ export class OpenAIResponsesAPIAdapter implements ProviderAdapter {
       responsesRequest.include = this.mergeEncryptedReasoningInclude(include);
     }
 
+    // Strictness is a property of the tools that reach the wire, whether they
+    // came as request.tools or as a provider-params override of them.
+    if (Array.isArray(responsesRequest.tools)) {
+      responsesRequest.tools = this.convertTools(responsesRequest.tools, responsesRequest);
+    }
+
     // These invariants define the adapter's stateless native-item contract and
     // cannot be overridden through provider params.
+    // The API takes native items as they are, but an input_image whose data:
+    // URL holds no image would be refused on every request, so it goes as the
+    // placeholder in either mode.
     responsesRequest.input = this.subscription
       ? normalizeResponsesInput(request.messages, onContentAltered)
-      : request.messages as OpenAIResponsesInputItem[];
+      : nativeInputForRequest(request.messages, onContentAltered);
     responsesRequest.store = false;
     responsesRequest.include = this.mergeEncryptedReasoningInclude(responsesRequest.include);
     if (this.subscription) {
@@ -504,15 +557,42 @@ export class OpenAIResponsesAPIAdapter implements ProviderAdapter {
     return text || undefined;
   }
 
-  private convertTools(tools: unknown[]): unknown[] {
-    return tools.map((rawTool: any) => {
+  /**
+   * Every function tool this converts reaches the wire with a boolean `strict`.
+   *
+   * Left out, strictness is whatever the provider defaults to, and strict
+   * validation treats every property as one the model must send. A tool schema
+   * written as plain JSON Schema means the opposite: a property outside
+   * `required` may be omitted. So an omitted or null `strict` is sent as
+   * `false`, stating what the schema means, as the Codex client (a plain
+   * `strict: bool` on every function tool) and pi's Responses conversion
+   * (default `false`) do. An explicit boolean is the caller's choice and is
+   * kept. Any other value is refused rather than coerced: true and false each
+   * change what the model may send, so neither is a safe guess.
+   *
+   * This holds on all three function paths: a flat Responses function, a
+   * nested Chat-style `{ type: 'function', function }` (whose `strict` is read
+   * from the function, or from the wrapper when the function's is omitted or
+   * null), and a definition built from `inputSchema`/`input_schema`/
+   * `parameters`. Every other tool passes through as the caller wrote it: a
+   * non-function tool, which has no such field, and a container such as a
+   * Responses namespace tool, whose member functions keep whatever `strict`
+   * they were given. Membrane builds no container tools, so one arrives only
+   * as a caller wrote it, in the API's own shape. A refusal carries
+   * `rawRequest`, the request as far as it was built, as its own.
+   */
+  private convertTools(tools: unknown[], rawRequest: unknown): unknown[] {
+    return tools.map((rawTool: any, position) => {
       if (rawTool?.type && rawTool.type !== 'function') return rawTool;
 
-      // Responses function definitions are flat. Accept them verbatim, while
-      // also adapting Membrane and Chat Completions function schemas.
-      if (rawTool?.type === 'function' && rawTool.name) return rawTool;
+      // Responses function definitions are flat: kept as given, apart from
+      // strict. Membrane and Chat Completions function schemas are adapted.
+      if (rawTool?.type === 'function' && rawTool.name) {
+        return { ...rawTool, strict: functionToolStrictness(rawTool.name, rawTool.strict, position, rawRequest) };
+      }
       if (rawTool?.type === 'function' && rawTool.function) {
-        return { type: 'function', ...rawTool.function };
+        const fn = rawTool.function;
+        return { type: 'function', ...fn, strict: functionToolStrictness(fn.name, fn.strict ?? rawTool.strict, position, rawRequest) };
       }
       return {
         type: 'function',
@@ -523,7 +603,7 @@ export class OpenAIResponsesAPIAdapter implements ProviderAdapter {
           rawTool?.inputSchema ??
           rawTool?.input_schema ??
           { type: 'object', properties: {} },
-        ...(rawTool?.strict !== undefined ? { strict: rawTool.strict } : {}),
+        strict: functionToolStrictness(rawTool?.name, rawTool?.strict, position, rawRequest),
       };
     });
   }
