@@ -484,8 +484,49 @@ describe('an enum or const beside a type that admits null (#150)', () => {
       fld4: { type: ['string', 'null'], const: 'zz-a' } as never,
       fld5: { type: ['string', 'null'], const: null } as never,
       fld6: { type: ['integer', 'null'], enum: [1, 2, null] } as never,
+      fld7: { $ref: '#/$defs/zz1' },
+      fld8: { anyOf: [{ type: ['string', 'null'], enum: ['zz-a', 'zz-b'] }, { type: 'integer' }] } as never,
+      fld9: { anyOf: [{ type: 'string', enum: ['zz-a', 'zz-b'] }, { type: 'null' }] } as never,
+      fld10: { anyOf: [{ type: ['string', 'null'], enum: ['zz-a', 'zz-b'] }, { type: 'string' }] } as never,
+      fld11: { allOf: [{ type: ['string', 'null'], enum: ['zz-a', 'zz-b'] }, { type: ['string', 'null'] }] } as never,
+      fld12: { $ref: '#/$defs/zz2' },
+      fld13: { type: ['string', 'null'], allOf: [{ enum: ['zz-a', 'zz-b'] }] } as never,
+      fld14: { type: ['string', 'null'], $ref: '#/$defs/zz3' } as never,
+      fld15: { type: ['string', 'null'], anyOf: [{ enum: ['zz-a'] }, { type: 'null' }] } as never,
+      // A type name this reader doesn't know, beside an enum: unresolved, as on
+      // main, and the tool's other parameters read as they do without it.
+      fld16: { type: ['STRING', 'null'], enum: ['zz-a'] } as never,
+    },
+    $defs: {
+      // An OpenAPI component enum declared nullable, as converted schemas carry it.
+      zz1: { type: 'string', nullable: true, enum: ['zz-a', 'zz-b'] } as never,
+      zz2: { type: ['string', 'null'], enum: ['zz-a', 'zz-b'] } as never,
+      zz3: { enum: ['zz-a', 'zz-b'] },
     },
   });
+  // Root alternatives declaring one parameter. A call may fit either of a
+  // oneOf's alternatives, and must fit both of an allOf's.
+  const rootTool = toolWith('zz_enum_nullable_root_tool', {
+    type: 'object',
+    oneOf: [
+      { properties: { fld1: { type: ['string', 'null'] } } },
+      { properties: { fld1: { type: 'string', enum: ['zz-a', 'zz-b'] } } },
+    ],
+  } as never);
+  const rootSplitTool = toolWith('zz_enum_nullable_root_split_tool', {
+    type: 'object',
+    oneOf: [
+      { properties: { fld1: { type: ['string', 'null'], enum: ['zz-a', 'zz-b'] } } },
+      { properties: { fld1: { type: 'string' } } },
+    ],
+  } as never);
+  const rootAllOfTool = toolWith('zz_enum_nullable_root_allof_tool', {
+    type: 'object',
+    allOf: [
+      { properties: { fld1: { type: ['string', 'null'] } } },
+      { properties: { fld1: { type: 'string', enum: ['zz-a', 'zz-b'] } } },
+    ],
+  } as never);
 
   it('does not mark a parameter nullable when its enum leaves null out', () => {
     const doc = renderedTools(tool);
@@ -512,14 +553,70 @@ describe('an enum or const beside a type that admits null (#150)', () => {
     expect(doc).toContain('<parameter name="fld5" type="string" nullable="true">');
   });
 
+  it('reads an enum behind a $ref the same way', () => {
+    const doc = renderedTools(tool);
+    expect(doc).toContain('<parameter name="fld7" type="string">');
+    expect(doc).toContain('<parameter name="fld12" type="string">');
+  });
+
+  it('reads an enum in a branch the same way', () => {
+    const doc = renderedTools(tool);
+    // Neither branch accepts null: the first's enum leaves it out, the second is integer.
+    expect(doc).toContain('<parameter name="fld8">');
+    expect(doc).toContain('<parameter name="fld10" type="string">');
+    expect(doc).toContain('<parameter name="fld11" type="string">');
+  });
+
+  it('reads the keywords beside a type, not only its own enum or const', () => {
+    const doc = renderedTools(tool);
+    expect(doc).toContain('<parameter name="fld13" type="string">');
+    expect(doc).toContain('<parameter name="fld14" type="string">');
+    expect(doc).toContain('<parameter name="fld15" type="string" nullable="true">');
+  });
+
+  it('keeps the mark where a branch admits null on its own', () => {
+    expect(renderedTools(tool)).toContain('<parameter name="fld9" type="string" nullable="true">');
+  });
+
+  it('keeps the mark where one root alternative admits null', () => {
+    expect(renderedTools(rootTool)).toContain('<parameter name="fld1" type="string" nullable="true">');
+  });
+
+  it('withholds it where no root alternative admits null', () => {
+    expect(renderedTools(rootSplitTool)).toContain('<parameter name="fld1" type="string" enum="zz-a,zz-b">');
+  });
+
+  it('reads root allOf alternatives together, for the mark and the parse', () => {
+    expect(renderedTools(rootAllOfTool)).toContain('<parameter name="fld1" type="string">');
+    expect(parseParam(rootAllOfTool, 'fld1', 'null')).toBe('null');
+  });
+
+  it('leaves a type name it cannot read beside an enum as it was', () => {
+    expect(renderedTools(tool)).toContain('<parameter name="fld16" enum="zz-a">');
+  });
+
+  it('keeps the parse as it was behind a $ref, in a branch, beside a type and in a root alternative', () => {
+    const { result } = captureWarnings(() => [
+      ...['fld7', 'fld8', 'fld9', 'fld10', 'fld11', 'fld12', 'fld13', 'fld14'].map(fld =>
+        parseParam(tool, fld, 'null')
+      ),
+      parseParam(rootTool, 'fld1', 'null'),
+      parseParam(rootSplitTool, 'fld1', 'null'),
+    ]);
+    expect(result).toEqual([null, null, null, null, null, null, null, null, null, null]);
+  });
+
   it('keeps the parse as it was: a written null still follows the type', () => {
     const { result, messages } = captureWarnings(() => [
       parseParam(tool, 'fld1', 'null'),
       parseParam(tool, 'fld2', 'null'),
       parseParam(tool, 'fld3', 'null'),
+      parseParam(tool, 'fld4', 'null'),
+      parseParam(tool, 'fld5', 'null'),
+      parseParam(tool, 'fld6', 'null'),
       parseParam(tool, 'fld1', 'zz-a'),
     ]);
-    expect(result).toEqual([null, null, null, 'zz-a']);
+    expect(result).toEqual([null, null, null, null, null, null, 'zz-a']);
     expect(messages).toHaveLength(0);
   });
 });

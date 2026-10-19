@@ -215,7 +215,8 @@ function withoutFraming(value: string): string {
  *
  * What happens next depends on the parameter's declaration, as
  * {@link readToolSchema} reads it — the same reading the XML tool
- * instructions are rendered from:
+ * instructions are rendered from, except that they withhold a null the
+ * schema's other keywords leave out (#150):
  *   - typed `string` → the text as written, less one layout newline on each
  *                 side ({@link withoutFraming}). No JSON.parse, no trim: an
  *                 exact-match edit tool must be able to send leading and
@@ -745,10 +746,7 @@ export interface ToolDefinitionForPrompt {
      * `type="undefined"` or a type the parser will not apply.
      */
     type?: string;
-    /**
-     * The declaration admits null, and no `enum` or `const` beside its type
-     * leaves null out: renders `nullable="true"`.
-     */
+    /** The reading's `instructedNullable` (#150): renders `nullable="true"`. */
     nullable?: boolean;
     description?: string;
     required?: boolean;
@@ -757,41 +755,12 @@ export interface ToolDefinitionForPrompt {
 }
 
 /**
- * Whether the instructions tell the model a parameter admits null (#150).
- *
- * The reading takes the type's word for it ({@link ParameterDeclaration}'s
- * `nullable`), and so does the parse. The instructions also consult an `enum`
- * or `const` beside that type: OpenAPI 3.0.3 says of `nullable` that "Other
- * Schema Object constraints retain their defined behavior, and therefore may
- * disallow the use of `null` as a value", and JSON Schema's `enum` admits
- * only its listed values. So `{type: ["string", "null"], enum: ["a", "b"]}`
- * and `{type: "string", nullable: true, enum: ["a", "b"]}` are NOT marked:
- * null is a value the schema doesn't accept, and the instructions shouldn't
- * invite it. The parse is left as it is: a written null for such a parameter
- * is invalid for the schema whether it reaches the tool as null or as the
- * text "null". Every declaring node is consulted, so a parameter declared in
- * several root variants is marked only when none of them lists an enum or
- * const without null.
- */
-function instructedNullable(declaration: ParameterDeclaration): boolean {
-  if (!declaration.nullable) return false;
-  return declaration.declaredBy.every(node => {
-    if (typeof node !== 'object' || node === null || Array.isArray(node)) return true;
-    const own = node as Record<string, unknown>;
-    if (Object.hasOwn(own, 'enum') && Array.isArray(own.enum) && !own.enum.includes(null)) {
-      return false;
-    }
-    if (Object.hasOwn(own, 'const') && own.const !== null) return false;
-    return true;
-  });
-}
-
-/**
  * A tool definition as the XML tool instructions present it, read from its
  * input schema by the same reading the XML parameter parser applies
  * ({@link readToolSchema}): the type the model is told a parameter has is the
  * type its value is parsed by, and a parameter the parser cannot type states
- * none.
+ * none. Its null mark is the reading's `instructedNullable`, which keywords
+ * that leave null out withhold though the parse admits null (#150).
  */
 export function toolDefinitionForPrompt(tool: ToolDefinition): ToolDefinitionForPrompt {
   const { parameters } = readToolSchema(tool.inputSchema);
@@ -803,7 +772,7 @@ export function toolDefinitionForPrompt(tool: ToolDefinition): ToolDefinitionFor
         name,
         {
           type: declaration.type,
-          nullable: instructedNullable(declaration) || undefined,
+          nullable: declaration.instructedNullable || undefined,
           description: declaration.description,
           required: declaration.required,
           enum: declaration.enum,
