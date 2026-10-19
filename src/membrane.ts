@@ -21,6 +21,7 @@ import type {
   StreamCallbacks,
   ModelRegistry,
   MembraneConfig,
+  MembraneLogger,
   StreamOptions,
   CompleteOptions,
   BasicUsage,
@@ -65,9 +66,9 @@ import {
   isAbortedResponse,
   unsupportedError,
 } from './types/index.js';
-import { isDeadlineExpiry, errorFromThrown } from './types/errors.js';
 import type { BuildResult } from './formatters/types.js';
 import { computeCacheWireReceipt } from './cache-wire-receipt.js';
+import { awaitCallerCode, runCallerCode, isDeadlineExpiry, errorFromThrown } from './types/errors.js';
 import { createProgressDeadline } from './providers/utils.js';
 import {
   parseToolCalls,
@@ -101,6 +102,7 @@ import {
 } from './formatters/normalize-tool-pairs.js';
 import { YieldingStreamImpl } from './yielding-stream.js';
 import { calculateCost, warnUnpricedModel } from './utils/cost.js';
+import { isAnthropicServerBlock } from './utils/anthropic-server-blocks.js';
 import {
   TurnUsageAccumulator,
   calculateCacheHitRatio,
@@ -110,8 +112,9 @@ import {
 import {
   shedImagesToFitByteBudget, assertWithinByteBudget,
 } from './utils/image-media.js';
+import { convertMcpMedia } from './utils/mcp-media.js';
 import { getDefaultPricing } from './registry/default-pricing.js';
-import { FidelityNotes, requestFingerprint, type MessageOrigin } from './utils/fidelity.js';
+import { FidelityNotes, isRawItemCarrier, requestFingerprint, type MessageOrigin } from './utils/fidelity.js';
 
 /** Anthropic's thinking-binding controls, as a thinking config carries them. */
 type BlockBindingParam = { prefix_mismatch_behavior: 'error' | 'drop_block' };
@@ -326,14 +329,52 @@ function isBuildRefusal(error: unknown): error is MembraneError {
 }
 
 /**
- * Stop reasons membrane has already logged as unmapped (see mapStopReason).
- * A server can send a fresh token on every response (one carrying an id, say),
- * so the set stops growing at MAX_LOGGED_STOP_REASONS.
+ * Hand a request's receipt consumer its receipt for `described`. The receipt
+ * is membrane's to compute; what the consumer throws is the caller's.
+ */
+function deliverCacheWireReceipt(request: NormalizedRequest, described: unknown): void {
+  const consumer = request.onCacheWireReceipt;
+  if (!consumer) return;
+  const receipt = computeCacheWireReceipt(described);
+  runCallerCode(() => consumer.call(request, receipt));
+}
+
+/**
+ * Stop reasons membrane has already logged as unmapped (see mapStopReason),
+ * as the log line printed them (see shownStopReason). A server can send a
+ * fresh token on every response (one carrying an id, say), so the set stops
+ * growing at MAX_LOGGED_STOP_REASONS.
  */
 const warnedStopReasons = new Set<string>();
 const MAX_LOGGED_STOP_REASONS = 64;
 /** Longest stop-reason token printed whole; real tokens are short. */
 const MAX_LOGGED_STOP_REASON_CHARS = 128;
+
+/**
+ * A stop reason as the unmapped-reason log line prints it, which is also the
+ * key it's logged once by. A string is printed as a JSON string, so a newline
+ * can't forge a log line, cut to a token's length. An adapter can return a
+ * stop reason outside its type, passing on a server's value or written in
+ * JavaScript. A number, null or undefined is then printed by its value, which
+ * is short and holds no quote or line break, and anything else by its kind,
+ * each marked as not a string. Such a value is never read as a string, so
+ * printing it can't throw and fail the call, and a fresh object on every
+ * response is one reason rather than a new one each time.
+ */
+function shownStopReason(reason: unknown): string {
+  if (typeof reason === 'string') {
+    return JSON.stringify(
+      reason.length > MAX_LOGGED_STOP_REASON_CHARS ? `${reason.slice(0, MAX_LOGGED_STOP_REASON_CHARS)}…` : reason
+    );
+  }
+  const byValue = reason == null || typeof reason === 'number';
+  return `${byValue ? String(reason) : typeof reason} (not a string)`;
+}
+
+/** A stop token an adapter reported: a non-empty string. */
+function isStopToken(value: unknown): value is string {
+  return typeof value === 'string' && value !== '';
+}
 
 /**
  * Feed a provider chunk to an XML loop's parser, up to the first stop.
@@ -444,7 +485,7 @@ export class Membrane {
           : clampCacheMarkers(finalRequest, 'complete').total;
         const useWireReceipt = this.adapter.cacheReceiptBasis === 'wire-request';
         let receiptEmitted = false;
-        if (!useWireReceipt) request.onCacheWireReceipt?.(computeCacheWireReceipt(finalRequest));
+        if (!useWireReceipt) deliverCacheWireReceipt(request, finalRequest);
         receiptGuard = useWireReceipt && request.onCacheWireReceipt
           ? this.wireReceiptGuard(options.signal)
           : undefined;
@@ -473,19 +514,21 @@ export class Membrane {
                 markersInRequest = countWireCacheMarkers(req as Parameters<typeof countWireCacheMarkers>[0]);
                 if (!receiptEmitted) {
                   receiptEmitted = true;
-                  receiptGuard?.emit(() => request.onCacheWireReceipt?.(computeCacheWireReceipt(req)));
+                  receiptGuard?.emit(() => deliverCacheWireReceipt(request, req));
                 }
               }
-              options.onRequest?.(req);
+              runCallerCode(() => options.onRequest?.(req));
             },
           });
           rawProviderResponse = receiptGuard ? await receiptGuard.settle(adapterCall) : await adapterCall;
         } finally {
           progress.cleanup();
         }
-        // Restate usage in the one convention before any ratio or price sees it.
+        // Restate usage in the one convention before any ratio or price sees it,
+        // and the stop token as membrane carries it (see providerReasonFor).
         const providerResponse: ProviderResponse = {
           ...rawProviderResponse,
+          providerStopReason: this.providerReasonFor(rawProviderResponse),
           usage: normalizeUsageToCacheExcluded(
             rawProviderResponse.usage,
             this.adapter.name,
@@ -494,7 +537,7 @@ export class Membrane {
         };
 
         // Call onResponse callback with raw response from API
-        options.onResponse?.(providerResponse.raw);
+        runCallerCode(() => options.onResponse?.(providerResponse.raw));
 
         const response = this.transformResponse(
           providerResponse,
@@ -533,8 +576,9 @@ export class Membrane {
         }
 
         // Call afterResponse hook
-        if (this.config.hooks?.afterResponse) {
-          return await this.config.hooks.afterResponse(response, providerResponse.raw);
+        const hooks = this.config.hooks;
+        if (hooks?.afterResponse) {
+          return await awaitCallerCode(() => hooks.afterResponse!(response, providerResponse.raw));
         }
 
         return response;
@@ -577,8 +621,9 @@ export class Membrane {
 
         if (plan) {
           // Check hook for retry decision
-          if (this.config.hooks?.onError) {
-            const decision = await this.config.hooks.onError(errorInfo, tries);
+          const hooks = this.config.hooks;
+          if (hooks?.onError) {
+            const decision = await awaitCallerCode(() => hooks.onError!(errorInfo, tries));
             if (decision === 'abort') {
               throw classifiedError;
             }
@@ -678,11 +723,11 @@ export class Membrane {
         for (let i = 0; i < response.content.length; i++) {
           const block = response.content[i]!;
           if (block.type === 'text' && block.text) {
-            options.onChunk(block.text, {
+            runCallerCode(() => options.onChunk!(block.text, {
               type: 'text',
               visible: true,
               blockIndex: i,
-            });
+            }));
           }
         }
       }
@@ -693,12 +738,32 @@ export class Membrane {
     const activeFormatter = this.resolveActiveFormatter(options.formatter);
     const toolMode = this.resolveToolMode(request, activeFormatter);
 
+    // Each callback is the caller's code, so what it throws is never
+    // retried (see callerCodeError). The tool executor and the pre-tool
+    // callback are awaited, so their rejections are the caller's too, and
+    // onRequest, which fires before the send, is the caller's code as well.
+    const callerCode = <A extends unknown[], R>(fn?: (...args: A) => R) =>
+      fn && ((...args: A): R => runCallerCode(() => fn(...args)));
+    const awaitedCallerCode = <A extends unknown[], R>(fn?: (...args: A) => Promise<R> | R) =>
+      fn && ((...args: A): Promise<R> => awaitCallerCode(() => fn(...args)));
+    const callerOptions: StreamOptions = {
+      ...options,
+      onChunk: callerCode(options.onChunk),
+      onContentBlockUpdate: callerCode(options.onContentBlockUpdate),
+      onToolCalls: awaitedCallerCode(options.onToolCalls),
+      onPreToolContent: awaitedCallerCode(options.onPreToolContent),
+      onUsage: callerCode(options.onUsage),
+      onBlock: callerCode(options.onBlock),
+      onResponse: callerCode(options.onResponse),
+      onRequest: callerCode(options.onRequest),
+    };
+
     // A provider call that fails before it delivers anything is sent again
     // inside streamOnce, on every streaming path and in every round: nothing
     // has reached the caller from it, so retrying replays nothing.
     return toolMode === 'native'
-      ? this.streamWithNativeTools(request, options, activeFormatter)
-      : this.streamWithXmlTools(request, options, activeFormatter);
+      ? this.streamWithNativeTools(request, callerOptions, activeFormatter)
+      : this.streamWithXmlTools(request, callerOptions, activeFormatter);
   }
 
   /**
@@ -899,7 +964,7 @@ export class Membrane {
     let consecutiveStalledResumptions = 0;
     let enteredViaResumption = false;
     let prevRoundStopSequence: string | undefined;
-    const warnLog = this.config.logger ?? console;
+    const warnLog = this.warnLogger();
 
     /** Count an automatic resumption; emits the visibility warning at the
      *  threshold and returns false when the cap says the turn should end. */
@@ -1942,18 +2007,19 @@ export class Membrane {
           // tool records have no normalized ContentBlock equivalent. Retain a
           // zero-width carrier so Chronicle and the Responses formatter can
           // replay the raw item without surfacing synthetic prompt text.
-          // Anthropic-bound conversion paths filter these out (empty text
-          // blocks are a 400 there); the Responses formatter replays rawItem.
+          // The Responses formatter replays a Responses item; Anthropic-shaped
+          // requests send an Anthropic server-tool block back as itself and
+          // filter any other carrier out (empty text blocks are a 400 there).
           //
           // An item with a `type` this switch does not know (server_tool_use,
           // web_search_tool_result, search_result, mcp_tool_use, or whatever a
           // provider adds next) used to fall out of this chain and vanish. It
-          // gets the same carrier treatment, holding the item itself, plus a
-          // one-time warning so the gap surfaces instead of being inferred
-          // later from missing content.
-          const carriedRawItem = item.rawItem ?? item;
-          if (!item.rawItem) warnUnconvertibleProviderItem(item.type);
-          blocks.push({ type: 'text', text: '', rawItem: carriedRawItem });
+          // gets the same carrier treatment, holding the item itself. An
+          // Anthropic server-tool block is a known type there (a build that
+          // replays them sends it back as itself), so only another type gets
+          // a one-time warning, which surfaces the gap instead of leaving it
+          // to be inferred later from missing content.
+          blocks.push(providerItemCarrier(item));
         }
       }
       return blocks;
@@ -2113,6 +2179,17 @@ export class Membrane {
   // ==========================================================================
 
   /**
+   * The logger membrane warns through: the configured one, or console. The
+   * configured logger's warn() is the caller's code, so what it throws leaves
+   * as callerCodeError: a log sink's failure ends the call and isn't resent.
+   */
+  private warnLogger(): Pick<MembraneLogger, 'warn'> {
+    const logger = this.config.logger;
+    if (!logger) return console;
+    return { warn: (...args) => runCallerCode(() => logger.warn(...args)) };
+  }
+
+  /**
    * Fail loudly when a wire-request receipt consumer throws.
    *
    * Wire-request receipts are emitted from inside the adapter's `onRequest`,
@@ -2122,7 +2199,8 @@ export class Membrane {
    * the call before any provider request. Keep that contract for wire-request
    * receipts too: remember the failure, abort the adapter call through its
    * signal (adapters invoke `onRequest` before sending, so nothing goes out),
-   * and rethrow the consumer's original error once the adapter settles.
+   * and rethrow the consumer's error, as callerCodeError made it, once the
+   * adapter settles.
    */
   private wireReceiptGuard(callerSignal: AbortSignal | undefined) {
     const controller = new AbortController();
@@ -2168,8 +2246,9 @@ export class Membrane {
     normalizedRequest: NormalizedRequest,
     providerRequest: unknown,
   ): Promise<unknown> {
-    if (!this.config.hooks?.beforeRequest) return providerRequest;
-    const result = await this.config.hooks.beforeRequest(normalizedRequest, providerRequest);
+    const hooks = this.config.hooks;
+    if (!hooks?.beforeRequest) return providerRequest;
+    const result = await awaitCallerCode(() => hooks.beforeRequest!(normalizedRequest, providerRequest));
     return result ?? providerRequest;
   }
 
@@ -2276,7 +2355,12 @@ export class Membrane {
     // A formatter that does not report its alterations leaves the round's
     // fidelity unknown: an empty alteration list from it would prove nothing.
     if (fidelity && !activeFormatter.reportsAlterations) fidelity.uninstrumented = true;
-    const messages = nativeLoopMessages ?? request.messages;
+    // Every path's messages enter the build here, the native loop's each
+    // round: media in MCP's form becomes membrane's, so the formatters and
+    // the adapters after them read one form. A copy where anything converts:
+    // the caller's messages stay as they were, and the indices the build
+    // records alterations by are theirs.
+    const messages = convertMcpMedia(nativeLoopMessages ?? request.messages);
     // Extract user-provided stop sequences
     const additionalStopSequences = Array.isArray(request.stopSequences)
       ? request.stopSequences
@@ -2296,7 +2380,7 @@ export class Membrane {
         if (PREFIX_REWRITING_NORMALIZE_EVENT_KINDS.has(event.kind)) prefixRewritten = true;
         // The caller's view of every repair, textifications included: without
         // it a result turned into text would reach the model unannounced.
-        this.config.hooks?.onNormalize?.(event);
+        runCallerCode(() => this.config.hooks?.onNormalize?.(event));
       },
       deferCacheBudgetCheck: true,
       participantMode: 'multiuser',
@@ -2315,6 +2399,7 @@ export class Membrane {
       maxParticipantsForStop,
       contextPrefix: request.contextPrefix,
       prefillUserMessage: request.prefillUserMessage,
+      anthropicServerBlocks: this.adapter.replaysAnthropicServerBlocks === true,
       ...(fidelity ? { fidelity } : {}),
     });
 
@@ -2593,7 +2678,7 @@ export class Membrane {
     let receiptEmitted = false;
     // The adapter's content-alteration reports for the attempt in flight.
     let attemptAlterations: unknown[] = [];
-    if (!useWireReceipt) normalizedRequest.onCacheWireReceipt?.(computeCacheWireReceipt(finalRequest));
+    if (!useWireReceipt) deliverCacheWireReceipt(normalizedRequest, finalRequest);
     const receiptGuard = useWireReceipt && normalizedRequest.onCacheWireReceipt
       ? this.wireReceiptGuard(adapterOptions.signal)
       : undefined;
@@ -2616,7 +2701,7 @@ export class Membrane {
           // so receipt queues stay aligned with the one accepted usage event.
           if (!receiptEmitted) {
             receiptEmitted = true;
-            receiptGuard?.emit(() => normalizedRequest.onCacheWireReceipt?.(computeCacheWireReceipt(wireRequest)));
+            receiptGuard?.emit(() => deliverCacheWireReceipt(normalizedRequest, wireRequest));
           }
         }
         adapterOptions.onRequest?.(wireRequest);
@@ -2704,8 +2789,9 @@ export class Membrane {
         if (!plan) throw typed;
         // The same pre-retry hook contract as complete(): hosts use onError
         // for circuit-breaking, and its 'abort' decision ends the call here.
-        if (this.config.hooks?.onError) {
-          const decision = await this.config.hooks.onError(errorInfo, tries);
+        const hooks = this.config.hooks;
+        if (hooks?.onError) {
+          const decision = await awaitCallerCode(() => hooks.onError!(errorInfo, tries));
           if (decision === 'abort') throw typed;
         }
         const delayMs = this.calculateRetryDelay(tries, plan.overloaded, errorInfo);
@@ -2723,8 +2809,11 @@ export class Membrane {
       const rawResult = localStops ? localStops.finish(attemptResult!) : attemptResult!;
       // Restate usage in the one convention before any accumulator, ratio or
       // price sees it — this is the only door streamed usage enters through.
+      // The stop token is settled here too, from the adapter's own stop, before
+      // a local stop sequence, or the XML loop's, replaces its stopReason.
       const result: ProviderResponse = {
         ...rawResult,
+        providerStopReason: this.providerReasonFor(attemptResult!),
         usage: normalizeUsageToCacheExcluded(rawResult.usage, this.adapter.name, this.adapter.usageCacheConvention),
       };
       if (result.stopReason !== 'refusal' || retried >= maxAttempts) {
@@ -2955,6 +3044,12 @@ export class Membrane {
             data: block.data,
             mimeType: block.mimeType,
           });
+        } else if (block && (block.rawItem || block.type)) {
+          // A provider block with no normalized form (an Anthropic server-tool
+          // block, an opaque Responses item) used to vanish here, so a turn
+          // that used a server tool reached the history without it. Keep it
+          // as the tool loops do.
+          content.push(providerItemCarrier(block));
         }
       }
     } else if (typeof providerResponse.content === 'string') {
@@ -2968,10 +3063,12 @@ export class Membrane {
       providerResponse.stopSequence?.startsWith('</');
     if (stoppedOnClosingTag && providerResponse.stopSequence) {
       rawAssistantText += providerResponse.stopSequence;
-      // Update the last text content block if it exists
+      // Update the last text content block if it exists. A zero-width
+      // carrier is a text block holding a provider item, not text, so it keeps
+      // its empty text and stays a carrier.
       for (let i = content.length - 1; i >= 0; i--) {
         const block = content[i]!;
-        if (block.type === 'text') {
+        if (block.type === 'text' && !isRawItemCarrier(block)) {
           (block as { type: 'text'; text: string }).text += providerResponse.stopSequence;
           break;
         }
@@ -3059,7 +3156,7 @@ export class Membrane {
     },
     stopReason: StopReason
   ): void {
-    const warnLog = this.config.logger ?? console;
+    const warnLog = this.warnLogger();
 
     if (diagnostics.unclosedToolBlock) {
       warnLog.warn(
@@ -3268,36 +3365,57 @@ export class Membrane {
         // mapping — downstream consumers react to refusals (chapterx adds a
         // Discord reaction). Defaulting this to end_turn silently hid them.
         return 'refusal';
-      default:
+      default: {
         // Unknown reasons still normalize to end_turn — callers switch on a
         // closed union — but never silently: the raw token is disclosed as
-        // details.stop.providerReason and the mapping is logged, once per
-        // token per process (a compatible server may send its own token on
-        // every response). Provider enums grow, and the last time this
-        // default swallowed a member it hid safety refusals in production.
-        if (!warnedStopReasons.has(adapterReason) && warnedStopReasons.size < MAX_LOGGED_STOP_REASONS) {
-          warnedStopReasons.add(adapterReason);
-          // The token is the server's own text: printed as a JSON string, so
-          // a newline can't forge a log line, and cut to a token's length.
-          const shown = JSON.stringify(
-            adapterReason.length > MAX_LOGGED_STOP_REASON_CHARS
-              ? `${adapterReason.slice(0, MAX_LOGGED_STOP_REASON_CHARS)}…`
-              : adapterReason
-          );
+        // details.stop.providerReason (the adapter's providerStopReason when
+        // it's a non-empty string, or else this stop reason when it is one;
+        // see providerReasonFor) and the mapping is logged, once per reason
+        // per process (a compatible server may send its own token on every
+        // response). Provider enums grow, and the last time this default
+        // swallowed a member it hid safety refusals in production.
+        const shown = shownStopReason(adapterReason);
+        if (!warnedStopReasons.has(shown) && warnedStopReasons.size < MAX_LOGGED_STOP_REASONS) {
+          warnedStopReasons.add(shown);
           console.warn(
             `[membrane] Unmapped adapter stop reason ${shown} normalized to end_turn ` +
-              '(details.stop.providerReason is present when the adapter supplies the raw provider token; ' +
-              'logged once per reason)'
+              '(details.stop.providerReason carries the adapter\'s providerStopReason if that\'s a non-empty string, ' +
+              'else this stop reason if it\'s one; logged once per reason)'
           );
           if (warnedStopReasons.size === MAX_LOGGED_STOP_REASONS) {
             console.warn(
               `[membrane] ${MAX_LOGGED_STOP_REASONS} distinct unmapped stop reasons logged; further ones are not ` +
-                '(details.stop.providerReason still carries each)'
+                '(details.stop.providerReason still carries the adapter\'s providerStopReason if that\'s a non-empty ' +
+                'string, else the stop reason if it\'s one)'
             );
           }
         }
         return 'end_turn';
+      }
     }
+  }
+
+  /**
+   * The stop token details.stop.providerReason carries for an adapter's
+   * result: its providerStopReason, the provider's own word, when it gives
+   * one. Otherwise its stopReason when membrane doesn't map that token, so the
+   * token isn't lost behind the end_turn it becomes; that may be the adapter's
+   * own word rather than the provider's. A token membrane maps, given alone,
+   * leaves none: it may already be the adapter's normalization. Only a
+   * non-empty string counts as a token, in either field.
+   *
+   * mapStopReason maps each token it knows to itself, so a token it changes is
+   * one it doesn't map; reading it here logs that token, once per process.
+   * Both doors an adapter's result enters by, complete()'s and streamOnce,
+   * settle the token here, before membrane's own stop, a stop sequence the
+   * XML loop or LocalStopSequences finds, replaces the adapter's stopReason.
+   */
+  private providerReasonFor(
+    result: Pick<ProviderResponse, 'stopReason' | 'providerStopReason'>
+  ): string | undefined {
+    if (isStopToken(result.providerStopReason)) return result.providerStopReason;
+    const token: unknown = result.stopReason;
+    return isStopToken(token) && this.mapStopReason(token) !== token ? token : undefined;
   }
 
   private calculateCacheHitRatio(usage: Pick<DetailedUsage, 'inputTokens' | 'cacheCreationTokens' | 'cacheReadTokens'>): number {
@@ -3331,7 +3449,7 @@ export class Membrane {
   ): import('./types/provider.js').ModelPricing | undefined {
     const servedModel = actualModel && actualModel !== requestedModel ? actualModel : undefined;
     const fromRegistry = (modelId: string | undefined) =>
-      modelId === undefined ? undefined : this.registry?.getPricing(modelId);
+      modelId === undefined ? undefined : runCallerCode(() => this.registry?.getPricing(modelId));
     const fromBuiltin = (modelId: string | undefined) =>
       modelId === undefined ? undefined : getDefaultPricing(modelId);
 
@@ -3576,7 +3694,7 @@ export class Membrane {
     // and a partial implementation would corrupt the turn instead of
     // retrying it. Fail LOUD and OFF rather than silently mis-retrying.
     if (toolMode !== 'native' && (options.refusalRetries ?? 0) > 0) {
-      (this.config.logger ?? console).warn(
+      this.warnLogger().warn(
         '[membrane] refusalRetries is ignored in XML tool mode ' +
         '(native-only for now) — the turn will surface the refusal as before.',
       );
@@ -3637,7 +3755,7 @@ export class Membrane {
     let consecutiveStalledResumptions = 0;
     let enteredViaResumption = false;
     let prevRoundStopSequence: string | undefined;
-    const warnLog = this.config.logger ?? console;
+    const warnLog = this.warnLogger();
 
     // Initialize parser from the formatter streamYielding selected, so the
     // parser and the build below read the same format.
@@ -3736,6 +3854,23 @@ export class Membrane {
       }
       return true;
     };
+
+    // What an aborted event carries: the text so far and the tool rounds run.
+    // One builder for both aborts: the catch below uses it for a provider or
+    // deadline abort, and cancel() for the one it emits. The arrays are
+    // copies, since this loop can still record a round after a cancel.
+    const abortedPartial = () => {
+      const newContent = parser.getAccumulated().slice(initialPrefillLength);
+      return {
+        partialContent: xmlToolProtocol
+          ? attachSplitResults(parseAccumulatedIntoBlocks(newContent, { tools: request.tools, ...(initialBlockType ? { startInsideBlock: initialBlockType } : {}) }), splitRounds).blocks
+          : streamedThinking.content(newContent, (value, context) => formatter.parseContentBlocks(value, request.tools, context)),
+        rawAssistantText: newContent,
+        toolCalls: [...executedToolCalls],
+        toolResults: [...executedToolResults],
+      };
+    };
+    stream.setAbortSnapshot(abortedPartial);
 
     try {
       // Tool execution loop
@@ -4272,18 +4407,7 @@ export class Membrane {
       // Error. Reporting again here would deliver a second aborted.
       if (stream.isCancelled) return;
       if (this.isAbortError(error)) {
-        const fullAccumulated = parser.getAccumulated();
-        const newContent = fullAccumulated.slice(initialPrefillLength);
-        stream.emit({
-          type: 'aborted',
-          reason: this.abortReason(error, stream.signal),
-          partialContent: xmlToolProtocol
-              ? attachSplitResults(parseAccumulatedIntoBlocks(newContent, { tools: request.tools, ...(initialBlockType ? { startInsideBlock: initialBlockType } : {}) }), splitRounds).blocks
-              : streamedThinking.content(newContent, (value, context) => formatter.parseContentBlocks(value, request.tools, context)),
-          rawAssistantText: newContent,
-          toolCalls: executedToolCalls,
-          toolResults: executedToolResults,
-        });
+        stream.emit({ type: 'aborted', reason: this.abortReason(error, stream.signal), ...abortedPartial() });
       } else {
         throw error;
       }
@@ -4362,6 +4486,17 @@ export class Membrane {
     // come after the provider returns, from a caller's callback.
     let roundReceived: (() => ContentBlock[]) | undefined;
     let markersInLastRequest = 0;
+
+    // What an aborted event carries, from one builder for both aborts, as in
+    // the XML loop: the catch below uses it, and so does cancel(). The arrays
+    // are copies, since this loop can still record a round after a cancel.
+    const abortedPartial = () => ({
+      partialContent: [...allContentBlocks, ...(roundReceived?.() ?? [])],
+      rawAssistantText: allTextAccumulated,
+      toolCalls: [...executedToolCalls],
+      toolResults: [...executedToolResults],
+    });
+    stream.setAbortSnapshot(abortedPartial);
 
     try {
       // Tool execution loop
@@ -4667,17 +4802,24 @@ export class Membrane {
       // As above: a cancelled stream has already reported its abort.
       if (stream.isCancelled) return;
       if (this.isAbortError(error)) {
-        stream.emit({
-          type: 'aborted',
-          reason: this.abortReason(error, stream.signal),
-          partialContent: [...allContentBlocks, ...(roundReceived?.() ?? [])],
-          rawAssistantText: allTextAccumulated,
-          toolCalls: executedToolCalls,
-          toolResults: executedToolResults,
-        });
+        stream.emit({ type: 'aborted', reason: this.abortReason(error, stream.signal), ...abortedPartial() });
       } else {
         throw error;
       }
     }
   }
+}
+
+/**
+ * The zero-width carrier for a provider item no normalized ContentBlock
+ * represents (an Anthropic server-tool block, an opaque Responses item): the
+ * item rides on it as `rawItem`, so a formatter for its wire can send it back,
+ * and normalized consumers see no text. An item that already holds its native
+ * form as `rawItem` is carried as that form, and so is an Anthropic server-tool
+ * block, which is its own native form; any other is new to this module, and
+ * warns once per type.
+ */
+function providerItemCarrier(item: { type?: unknown; rawItem?: unknown }): ContentBlock {
+  if (!item.rawItem && !isAnthropicServerBlock(item)) warnUnconvertibleProviderItem(String(item.type));
+  return { type: 'text', text: '', rawItem: item.rawItem ?? item };
 }

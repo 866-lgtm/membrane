@@ -31,7 +31,9 @@ import {
   withRawRequest,
 } from '../types/index.js';
 import { errorFromThrown } from '../types/errors.js';
-import { toolUseInputFromText, textOnlyToolResultContent, openAIImagePart, createCombinedSignal, SSELineParser, isDeadlineAbort, deadlineTimeoutError, throwOnStreamErrorFrame, assertTerminalEventObserved } from './utils.js';
+import { isRawItemCarrier } from '../utils/fidelity.js';
+import { convertMcpMedia } from '../utils/mcp-media.js';
+import { toolUseInputFromText, textOnlyToolResultContent, openAIImagePart, createCombinedSignal, SSELineParser, isDeadlineAbort, deadlineTimeoutError, throwOnStreamErrorFrame, assertTerminalEventObserved, streamedToolCalls, isEventObject } from './utils.js';
 
 // ============================================================================
 // Types
@@ -293,7 +295,7 @@ export class OpenAIAdapter implements ProviderAdapter {
       let accumulated = '';
       let finishReason: string | undefined;
       let sawTerminalEvent = false;
-      let toolCalls: OpenAIToolCall[] = [];
+      const toolCalls = streamedToolCalls();
       let streamUsage: OpenAIResponse['usage'] | undefined;
       // The model the provider actually served, echoed on every SSE
       // chunk. Reporting the requested id instead hides alias
@@ -308,80 +310,76 @@ export class OpenAIAdapter implements ProviderAdapter {
           return;
         }
 
-        // Parse first; only JSON noise is ignorable. Everything after the
-        // parse must NOT be swallowed by the catch below.
+        // Parse first: a line that isn't JSON is noise to ignore. Nothing
+        // after the parse is caught here, so an error there, a caller's
+        // callback included, fails the stream. What the handler can't read is
+        // dropped below by checks, not by a catch.
         let parsed: Record<string, any>;
         try {
           parsed = JSON.parse(data);
         } catch {
           return; // Ignore parse errors (partial/keep-alive lines)
         }
-        // A parsed provider event is progress (comments never reach here).
+        // JSON that isn't an object (`null`, a number, a string, an array)
+        // carries no event, so its frame is dropped.
+        if (!isEventObject(parsed)) return;
+        // A provider event is progress (comments never reach here).
         options?.onProgress?.();
 
         throwOnStreamErrorFrame(parsed, 'OpenAI', openAIRequest);
 
-        try {
-          const delta = parsed.choices?.[0]?.delta;
+        const delta = parsed.choices?.[0]?.delta;
 
-          if (delta?.content) {
-            accumulated += delta.content;
-            callbacks.onChunk(delta.content);
-          }
+        if (delta?.content) {
+          accumulated += delta.content;
+          callbacks.onChunk(delta.content);
+        }
 
-          // Handle streaming tool calls
-          if (delta?.tool_calls) {
-            for (const tc of delta.tool_calls) {
-              const index = tc.index ?? 0;
-              if (!toolCalls[index]) {
-                toolCalls[index] = {
-                  id: tc.id ?? '',
-                  type: 'function',
-                  function: { name: '', arguments: '' },
-                };
-              }
-              if (tc.id) toolCalls[index].id = tc.id;
-              if (tc.function?.name) toolCalls[index].function.name = tc.function.name;
-              if (tc.function?.arguments) {
-                toolCalls[index].function.arguments += tc.function.arguments;
-              }
-            }
-          }
+        // Handle streaming tool calls
+        // streamedToolCalls places each entry: by its index, or, with none, by
+        // its id and name (antra-tess/membrane#159).
+        if (Array.isArray(delta?.tool_calls)) {
+          for (const tc of delta.tool_calls) toolCalls.add(tc);
+        }
 
-          if (parsed.choices?.[0]?.finish_reason) {
-            finishReason = parsed.choices[0].finish_reason;
-            sawTerminalEvent = true;
-          }
+        if (parsed.choices?.[0]?.finish_reason) {
+          finishReason = parsed.choices[0].finish_reason;
+          sawTerminalEvent = true;
+        }
 
-          // Capture usage data (comes in final chunk with stream_options.include_usage)
-          if (parsed.usage) {
-            streamUsage = parsed.usage;
-          }
+        // Capture usage data (comes in final chunk with stream_options.include_usage)
+        if (parsed.usage) {
+          streamUsage = parsed.usage;
+        }
 
-          if (parsed.model) {
-            servedModel = parsed.model;
-          }
-        } catch {
-          // Ignore parse errors in stream
+        if (parsed.model) {
+          servedModel = parsed.model;
         }
       };
 
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
 
-        const chunk = decoder.decode(value, { stream: true });
-        for (const data of sseParser.feed(chunk)) {
+          const chunk = decoder.decode(value, { stream: true });
+          for (const data of sseParser.feed(chunk)) {
+            processDataLine(data);
+          }
+        }
+
+        // A final `data:` line that arrived without its trailing newline is still
+        // buffered here. Servers and proxies do close right after writing the
+        // last event, so dropping it would report a finished turn as a dropped
+        // connection at the guard below.
+        for (const data of sseParser.flush()) {
           processDataLine(data);
         }
-      }
-
-      // A final `data:` line that arrived without its trailing newline is still
-      // buffered here. Servers and proxies do close right after writing the
-      // last event, so dropping it would report a finished turn as a dropped
-      // connection at the guard below.
-      for (const data of sseParser.flush()) {
-        processDataLine(data);
+      } finally {
+        // A read loop that ends early, on a callback's error or any other,
+        // leaves the body unread: cancel it, so the provider stops sending
+        // and the connection is let go. After a full read it does nothing.
+        void reader.cancel().catch(() => {});
       }
 
       assertTerminalEventObserved(sawTerminalEvent, 'OpenAI', openAIRequest);
@@ -392,8 +390,12 @@ export class OpenAIAdapter implements ProviderAdapter {
         content: accumulated || null,
       };
 
-      if (toolCalls.length > 0) {
-        message.tool_calls = toolCalls;
+      // The calls the stream placed: those with an index in index order (an
+      // index can skip a slot, and a hole would fail the response built from
+      // them), then those without one in the order they started.
+      const placedToolCalls = toolCalls.calls();
+      if (placedToolCalls.length > 0) {
+        message.tool_calls = placedToolCalls;
       }
 
       return this.parseStreamedResponse(message, finishReason, servedModel ?? request.model, streamUsage, openAIRequest);
@@ -419,7 +421,10 @@ export class OpenAIAdapter implements ProviderAdapter {
   }
 
   private buildRequest(request: ProviderRequest): any {
-    const messages = this.convertMessages(request.messages as any[]);
+    // Media in MCP's form becomes membrane's first, for a caller that builds
+    // a request directly (Membrane's own builds have converted it already,
+    // utils/mcp-media.ts).
+    const messages = this.convertMessages(convertMcpMedia(request.messages as any[]));
     const model = request.model;
     const maxTokens = request.maxTokens || this.defaultMaxTokens;
     
@@ -506,6 +511,10 @@ export class OpenAIAdapter implements ProviderAdapter {
 
         for (const block of msg.content) {
           if (block.type === 'text') {
+            // A zero-width carrier (a provider item with no normalized form,
+            // such as an Anthropic server-tool block) has no text and no form
+            // on this wire: an empty part would only add a blank line.
+            if (isRawItemCarrier(block)) continue;
             contentParts.push({ type: 'text', text: block.text });
           } else if (block.type === 'image') {
             // Convert Anthropic-style image to OpenAI image_url with data URI,
@@ -744,8 +753,11 @@ export class OpenAIAdapter implements ProviderAdapter {
  * Convert normalized content blocks to OpenAI message format
  */
 export function toOpenAIContent(blocks: ContentBlock[]): string | null {
-  const textBlocks = blocks.filter(b => b.type === 'text') as Array<{ type: 'text'; text: string }>;
-  if (textBlocks.length === 0) return null;
+  // A zero-width carrier holds a block this wire has no form for, so it adds
+  // no line; a turn whose only text blocks are carriers is '' as before, and
+  // only a turn with no text block at all is null.
+  const textBlocks = blocks.filter(b => b.type === 'text' && !isRawItemCarrier(b)) as Array<{ type: 'text'; text: string }>;
+  if (textBlocks.length === 0) return blocks.some(b => b.type === 'text') ? '' : null;
   return textBlocks.map(b => b.text).join('\n');
 }
 

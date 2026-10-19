@@ -219,6 +219,153 @@ function notAnObject(raw: string, value: unknown): ToolUseInput {
   return { input: {}, unparseableInput: raw };
 }
 
+/** The largest array index, 2^32 - 2. */
+const MAX_ARRAY_INDEX = 2 ** 32 - 2;
+
+/**
+ * The slot a streamed piece names: a tool call's `index` on the OpenAI-family
+ * wires, a content block's on Bedrock. A number or a string that is an array
+ * index names its slot, as a plain array keyed by it takes one: an integer
+ * from 0 to 2^32 - 2, or its decimal string with no leading zero. Absent or
+ * `null` names `absent`: Bedrock's block index reads it so, while a tool
+ * call with no index is placed by `streamedToolCalls` instead.
+ * Anything else names none, and the caller drops the piece: a negative,
+ * fractional or larger number, a boolean, any other string (`"01"`
+ * included), an array or an object. `Number()` would read several of these
+ * as a slot: `false`, `""`, `" "`, `[]` and `"00"` as 0, `true`, `"0x1"` and
+ * `"01"` as 1, `"1e1"` as 10.
+ */
+export function streamIndex(value: unknown, absent = 0): number | undefined {
+  if (value === undefined || value === null) return absent;
+  const index = typeof value === 'string' && /^(?:0|[1-9]\d*)$/.test(value) ? Number(value) : value;
+  return typeof index === 'number' && Number.isInteger(index) && index >= 0 && index <= MAX_ARRAY_INDEX ? index : undefined;
+}
+
+/** A tool call as the Chat Completions family streams it, put together from its pieces. */
+export interface StreamedToolCall {
+  id: string;
+  type: 'function';
+  function: { name: string; arguments: string };
+}
+
+/**
+ * Puts a Chat Completions stream's tool calls together from its `tool_calls`
+ * entries, one `add` per entry, and gives them back with `calls()`. An entry
+ * that isn't an object, or that carries no id, name or arguments, is dropped.
+ * Each piece's arguments are appended to its call's. A call's id is set by
+ * the first piece that carries one, and no later piece replaces it. A piece
+ * that names a tool other than its call's starts a call of its own, so a
+ * call's name, once set, never changes.
+ *
+ * An entry with an `index` goes to that slot, as `streamIndex` reads it, and
+ * one whose index names no slot is dropped. It continues the latest of the
+ * slot's calls that has its id; failing that, the call that began without an
+ * index under its id, which moves into the slot; or else the call that joined
+ * the slot last; in each case unless the entry names another tool. OpenAI's
+ * API spec requires an index on each streamed tool call, but some compatible
+ * servers are reported to leave it out, and every entry without one went to
+ * slot 0, so two calls became one (antra-tess/membrane#159). An entry whose
+ * `index` is absent or `null` never takes a slot. It goes to the call that
+ * already has its id, if one does, or else to the current call, the one the
+ * last entry went to, unless it brings a name and a new id while that call
+ * has an id. The rule assumes a call's first piece carries its name, so a
+ * later piece that carries only an id, even a new one, or only arguments
+ * stays with its call.
+ *
+ * `calls()` gives the calls that have an index in index order, those in one
+ * slot in the order they joined it, then the others in the order they
+ * started. Each comes back under an id of its own: a call with no id, or
+ * whose id an earlier one in the list holds, comes back under a new one, and
+ * a `[membrane]` warning names each.
+ */
+export function streamedToolCalls(): { add(entry: unknown): void; calls(): StreamedToolCall[] } {
+  // Each slot holds the calls that joined it, in order. A piece continues
+  // the latest of them with its id, or else the last.
+  const indexed: StreamedToolCall[][] = [];
+  const unindexed: StreamedToolCall[] = [];
+  const byId = new Map<unknown, StreamedToolCall>();
+  let current: StreamedToolCall | undefined;
+  const open = (): StreamedToolCall => ({ id: '', type: 'function', function: { name: '', arguments: '' } });
+  return {
+    add(entry) {
+      if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return;
+      const tc = entry as { index?: unknown; id?: unknown; function?: { name?: unknown; arguments?: unknown } };
+      const name = tc.function?.name;
+      // An entry that carries nothing adds nothing, and opens no call.
+      if (!tc.id && !name && !tc.function?.arguments) return;
+      // A piece that names a tool other than a call's own never joins that call.
+      const another = (c: StreamedToolCall): boolean => !!name && !!c.function.name && name !== c.function.name;
+      let call: StreamedToolCall | undefined;
+      let slot: StreamedToolCall[] | undefined;
+      if (tc.index !== undefined && tc.index !== null) {
+        const index = streamIndex(tc.index);
+        if (index === undefined) return;
+        slot = indexed[index] ??= [];
+        // The latest of the slot's calls with the piece's id, as byId keeps
+        // the latest call to take an id.
+        const own = tc.id ? slot.filter((c) => c.id === tc.id).at(-1) : undefined;
+        call = own ?? slot[slot.length - 1];
+        // A call that began without an index and comes back with its id
+        // and an index moves into that slot, rather than leaving two calls,
+        // unless a call in the slot already has the id.
+        const known = !own && tc.id ? byId.get(tc.id) : undefined;
+        const at = known && !another(known) ? unindexed.indexOf(known) : -1;
+        if (known && at !== -1) {
+          unindexed.splice(at, 1);
+          slot.push((call = known));
+        }
+      } else {
+        call = tc.id ? byId.get(tc.id) : undefined;
+        if (!call && !(name && tc.id && current?.id)) call = current;
+      }
+      if (!call || another(call)) {
+        call = open();
+        (slot ?? unindexed).push(call);
+      }
+      if (tc.id && !call.id) {
+        call.id = tc.id as string;
+        byId.set(tc.id, call);
+      }
+      if (name) call.function.name = name as string;
+      if (tc.function?.arguments) call.function.arguments += tc.function.arguments;
+      current = call;
+    },
+    calls() {
+      // Every call comes back under an id of its own, since a result names its call by id
+      // alone, and an empty one can't be answered (the adapters send a result's
+      // `tool_use_id || toolUseId`, which drops it or sends ""). A call with no id takes
+      // `call_<n>`, from n = 1, and one whose id an earlier call in the list holds takes
+      // `<id>_<n>`, from n = 2, each with the first n that no call has.
+      const all = [...Object.values(indexed).flat(), ...unindexed];
+      const taken = new Set(all.map((c) => c.id));
+      const seen = new Set<string>();
+      const minted: string[] = [];
+      for (const c of all) {
+        if (!c.id || seen.has(c.id)) {
+          const stem = c.id || 'call';
+          let n = c.id ? 2 : 1;
+          while (taken.has(`${stem}_${n}`)) n++;
+          minted.push(`${JSON.stringify(c.id)} as ${stem}_${n}`);
+          c.id = `${stem}_${n}`;
+          taken.add(c.id);
+        }
+        seen.add(c.id);
+      }
+      if (minted.length) console.warn(`[membrane] The server repeated or left out a streamed tool call's id; new ids: ${minted.join(', ')}`);
+      return all;
+    },
+  };
+}
+
+/**
+ * Whether a parsed SSE frame, or a decoded Bedrock event, is an event: a JSON
+ * object. `null`, a number, a string, a boolean or an array carries none, so
+ * the adapters drop its frame before they report progress.
+ */
+export function isEventObject(value: unknown): boolean {
+  return isPlainObject(value);
+}
+
 /**
  * A tool call's `input` from the argument text a provider sent (OpenAI-family
  * `function.arguments`, Anthropic and Bedrock `input_json_delta`

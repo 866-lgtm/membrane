@@ -417,6 +417,53 @@ describe('the XML replay of a split image round', () => {
     expect(rounds.map((r) => [r.altered.messages, r.fidelity])).toEqual([[[], 'established']]);
   });
 
+  it("sends a marked result's images as the live split chose them: media in MCP's form read by its data, and none it couldn't send", async () => {
+    // Beside its text, the tool returns an image in MCP's form, which is read
+    // by its data and sent; one in MCP's form with no mimeType, whose header
+    // decides it, so it's sent too; a base64 source with no data, and one whose data is
+    // empty; a URL image; a URL source that also carries data, whose image
+    // is at its URL, as the native path reads one; and a data: URL, whose
+    // bytes decide it, as the native path decides one. The response keeps
+    // them as returned.
+    const ZZ_GREEN = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJgggg';
+    const { adapter, response } = await runTurn(
+      [{ text: `zz preamble one\n${CALL_XML}`, ...CALL }, { text: 'zz final answer', stopReason: 'end_turn' }],
+      (_round, ids) => [{ toolUseId: ids[0]!, toolName: 'zz_shot', content: [
+        { type: 'text', text: 'zz shot ok' },
+        { type: 'image', data: ZZ_RED, mimeType: 'image/png' },
+        { type: 'image', data: ZZ_BLUE },
+        { type: 'image', source: { type: 'base64', mediaType: 'image/png' } },
+        { type: 'image', source: { type: 'base64', data: '', mediaType: 'image/png' } },
+        { type: 'image', source: { type: 'url', url: 'https://example.com/zz.png' } },
+        { type: 'image', source: { type: 'url', url: 'https://example.com/zz.png', data: ZZ_BLUE } },
+        { type: 'image', source: { type: 'url', url: `data:image/png;base64,${ZZ_GREEN}` } },
+      ] as unknown as ToolResultContentBlock[] }],
+    );
+    const sent = (request: ProviderRequest) => (request.messages as Array<{ content: unknown }>)
+      .flatMap((m) => (Array.isArray(m.content) ? m.content : []) as Array<{ type?: string; source?: { data?: unknown } }>)
+      .filter((b) => b.type === 'image')
+      .map((b) => b.source?.data);
+    expect(sent(adapter.requests[1]!)).toEqual([ZZ_RED, ZZ_BLUE, ZZ_GREEN]);
+    const { request } = await replay(response.content);
+    expect(census(request)).toEqual(['user:text', 'assistant:text', 'user:[image,image,image]', 'assistant:text']);
+    expect(sent(request)).toEqual([ZZ_RED, ZZ_BLUE, ZZ_GREEN]);
+  });
+
+  it('splits a round whose only image is a data: URL, and replays it so, as the native path sends one', async () => {
+    const { adapter, response } = await runTurn(
+      [{ text: `zz preamble one\n${CALL_XML}`, ...CALL }, { text: 'zz final answer', stopReason: 'end_turn' }],
+      (_round, ids) => [{ toolUseId: ids[0]!, toolName: 'zz_shot', content: [
+        { type: 'text', text: 'zz shot ok' },
+        { type: 'image', source: { type: 'url', url: `data:image/png;base64,${ZZ_RED}` } },
+      ] as unknown as ToolResultContentBlock[] }],
+    );
+    expect(census(adapter.requests[1]!)).toEqual(['user:text', 'assistant:text', 'user:[image]', 'assistant:text']);
+    expect(JSON.stringify(adapter.requests[1]!.messages)).toContain(ZZ_RED);
+    const { request } = await replay(response.content);
+    expect(census(request)).toEqual(['user:text', 'assistant:text', 'user:[image]', 'assistant:text']);
+    expect(JSON.stringify(request.messages)).toContain(ZZ_RED);
+  });
+
   it('replays two image rounds of one turn, each split where it was sent', async () => {
     const { response } = await runTurn(
       [{ text: `zz preamble one\n${CALL_XML}`, ...CALL }, { text: `zz preamble two\n${CALL_XML}`, ...CALL }, { text: 'zz final answer', stopReason: 'end_turn' }],
@@ -815,6 +862,33 @@ describe('the XML replay of a split image round', () => {
     expect(wire).toContain('its data is not a JPEG, PNG, GIF or WebP image, the formats this request can carry (it was labelled \\"image/png\\")');
     expect(wire).not.toContain(ZZ_RED);
     expect(wire).not.toContain(NOT_AN_IMAGE);
+    expect(rounds.map((r) => r.altered.messages)).toEqual([[1]]);
+  });
+
+  it('renders a stored result\'s URL images as the live render does once its raw text is gone: a link\'s note, and a data: URL by its bytes', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const { response } = await runTurn(
+      [{ text: `zz preamble one\n${CALL_XML}`, ...CALL }, { text: 'zz final answer', stopReason: 'end_turn' }],
+      (_round, ids) => [imageResult(ids[0]!)],
+    );
+    const marked = toolResults(response.content).find((b) => b.rawXmlImagesAt !== undefined)!;
+    // A consumer changes the result, and drops rawXml and rawXmlImagesAt with the change.
+    const { rawXml: _raw, rawXmlImagesAt: _at, ...rest } = marked;
+    const changed = response.content.map((b) => (b === marked
+      ? { ...rest, content: [
+        { type: 'text', text: 'zz shot (shortened)' },
+        { type: 'image', source: { type: 'url', url: 'https://example.com/zz.png' } },
+        { type: 'image', source: { type: 'url', url: `data:image/png;base64,${ZZ_RED}` } },
+      ] as unknown as ContentBlock[] }
+      : b));
+    const { request, rounds } = await replay(changed);
+    const wire = JSON.stringify(request.messages);
+    expect(census(request)).toEqual(['user:text', 'assistant:text']);
+    expect(wire).toContain(
+      "zz shot (shortened)\\n[system: an image that belongs here was NOT shown to you — it came as a link (https://example.com/zz.png), which tool results here can't carry. You are not seeing this image.]"
+      + `\\n[Image: image/png, ~${Math.round((ZZ_RED.length * 0.75) / 1024)}KB, not shown to you]`,
+    );
+    expect(wire).not.toContain(ZZ_RED);
     expect(rounds.map((r) => r.altered.messages)).toEqual([[1]]);
   });
 

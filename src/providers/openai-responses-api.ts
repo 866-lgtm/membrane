@@ -12,6 +12,7 @@
 import { unreportedUsage } from '../utils/usage.js';
 import { createHash, randomUUID } from 'node:crypto';
 import { nativeInputForRequest, normalizeResponsesInput } from './responses-input.js';
+import { blockHandedIn, convertMcpMedia } from '../utils/mcp-media.js';
 import { fetchWithCredentials, type CredentialResolver } from './credentials.js';
 import { assertMessagePrefillSupported } from './request-capabilities.js';
 
@@ -27,12 +28,13 @@ import {
   MembraneError,
   abortError,
   errorFromHttpResponse,
+  invalidRequestError,
   isTypedAbortError,
   networkError,
   withRawRequest,
 } from '../types/index.js';
 import { errorFromThrown } from '../types/errors.js';
-import { createCombinedSignal, SSELineParser, toolUseInputFromText, isDeadlineAbort, deadlineTimeoutError, throwOnStreamErrorFrame } from './utils.js';
+import { createCombinedSignal, SSELineParser, toolUseInputFromText, isDeadlineAbort, deadlineTimeoutError, throwOnStreamErrorFrame, isEventObject } from './utils.js';
 
 // ============================================================================
 // Provider-native Responses API types
@@ -127,7 +129,8 @@ export interface OpenAIResponsesAPIAdapterConfig {
   mode?: 'api' | 'subscription';
   /** Request priority service in subscription mode (default: false). */
   fastMode?: boolean;
-  /** Called once if a subscription response reports a non-priority tier. */
+  /** Called once if a subscription response reports a non-priority tier. If
+   * it throws, the error is logged with console.warn and the response stands. */
   onFastModeFallback?: (serviceTier: string) => void;
   /** Subscription mode: base of the prompt-cache routing id sent as the
    * `session_id` header and as `prompt_cache_key`. Each request appends a digest
@@ -150,6 +153,44 @@ export interface OpenAIResponsesAPIAdapterConfig {
   /** Additional HTTP headers. */
   extraHeaders?: Record<string, string>;
 }
+
+/**
+ * The `strict` a function tool is sent with: an explicit boolean as given,
+ * `false` when omitted or null (see {@link OpenAIResponsesAPIAdapter.convertTools}),
+ * and a refusal naming the tool for anything else. The refusal's message says
+ * what kind of value it found, quoting only a short string, so the message
+ * doesn't copy a caller's value whole. The refusal carries `rawRequest`, the
+ * request as far as it was built when refused: provider params merged, and
+ * the tools and input as the caller gave them, the refused tool among them.
+ * It's evidence of what was refused, not a body to send. Without it, Membrane
+ * would give the error the last request it sent in the turn, where there was
+ * one, which isn't the one refused.
+ */
+function functionToolStrictness(toolName: unknown, strict: unknown, position: number, rawRequest: unknown): boolean {
+  if (strict === undefined || strict === null) return false;
+  if (typeof strict === 'boolean') return strict;
+  const spelled = typeof strict === 'string'
+    ? strict.length <= MAX_QUOTED_STRICT_CHARS ? JSON.stringify(strict) : `a ${strict.length}-character string`
+    : Array.isArray(strict)
+      ? 'an array'
+      : typeof strict === 'function'
+        ? 'a function'
+        : typeof strict === 'object'
+          ? 'an object'
+          : `${typeof strict} ${String(strict)}`;
+  const tool = typeof toolName === 'string' && toolName !== ''
+    ? `function tool ${JSON.stringify(toolName)}`
+    : `the function tool at tools[${position}], which has no name,`;
+  throw invalidRequestError(
+    `OpenAI Responses API: ${tool} has strict set to ` +
+      `${spelled}; strict must be true, false, null or omitted (omitted and null are sent as false).`,
+    undefined,
+    rawRequest,
+  );
+}
+
+/** The longest `strict` string a refusal quotes; a longer one is given by its length. */
+const MAX_QUOTED_STRICT_CHARS = 40;
 
 /** A cache key is any JSON string, a header value is not: anything beyond
  * short visible ASCII is sent as a digest, which is just as stable. */
@@ -290,7 +331,10 @@ export class OpenAIResponsesAPIAdapter implements ProviderAdapter {
         } catch {
           return;
         }
-        // A parsed provider event is progress (comments never reach here).
+        // JSON that isn't an object (`null`, a number, a string, an array)
+        // carries no event, so its frame is dropped, as on the other adapters.
+        if (!isEventObject(event)) return;
+        // A provider event is progress (comments never reach here).
         options?.onProgress?.();
         events.push(event);
 
@@ -376,7 +420,13 @@ export class OpenAIResponsesAPIAdapter implements ProviderAdapter {
           typeof returnedTier === 'string' && returnedTier && returnedTier !== 'priority' &&
           !this.warnedFastFallback) {
         this.warnedFastFallback = true;
-        this.onFastModeFallback?.(returnedTier);
+        try {
+          this.onFastModeFallback?.(returnedTier);
+        } catch (error) {
+          // The response it reports on has arrived and stands. A retry would
+          // pay for another call and wouldn't run the callback again.
+          console.warn('[membrane:openai-responses] onFastModeFallback threw; the response stands:', error);
+        }
       }
       const parsed = this.parseResponse(terminalResponse, request.model, responsesRequest);
       parsed.content.forEach((block, index) => callbacks.onContentBlock?.(index, block));
@@ -420,6 +470,26 @@ export class OpenAIResponsesAPIAdapter implements ProviderAdapter {
     }, this.credentials ?? { token: this.apiKey });
   }
 
+  /**
+   * Subscription mode's input, built from membrane's content blocks. Media in
+   * MCP's form becomes membrane's first, for a caller that builds a request
+   * directly (Membrane's own builds have converted it already,
+   * utils/mcp-media.ts), and a report about a block names the one the caller
+   * handed in. API mode takes native items as they are, so it converts
+   * nothing.
+   */
+  private subscriptionInput(
+    messages: ProviderRequest['messages'],
+    onContentAltered?: (block?: unknown) => void,
+  ): ReturnType<typeof normalizeResponsesInput> {
+    const converted = convertMcpMedia(messages as unknown[]) as ProviderRequest['messages'];
+    const handedIn = blockHandedIn(messages as unknown[], converted as unknown[]);
+    return normalizeResponsesInput(
+      converted,
+      onContentAltered && ((block?: unknown) => onContentAltered(handedIn(block))),
+    );
+  }
+
   private buildRequest(request: ProviderRequest, onContentAltered?: (block?: unknown) => void): OpenAIResponsesAPIRequest {
     if (!Array.isArray(request.messages)) {
       throw new Error('OpenAI Responses API input must be a provider-native input-item array');
@@ -437,7 +507,7 @@ export class OpenAIResponsesAPIAdapter implements ProviderAdapter {
     if (instructions) responsesRequest.instructions = instructions;
     if (request.temperature !== undefined) responsesRequest.temperature = request.temperature;
     if (request.topP !== undefined) responsesRequest.top_p = request.topP;
-    if (request.tools?.length) responsesRequest.tools = this.convertTools(request.tools);
+    if (request.tools?.length) responsesRequest.tools = request.tools;
 
     if (request.extra) {
       const {
@@ -460,13 +530,19 @@ export class OpenAIResponsesAPIAdapter implements ProviderAdapter {
       responsesRequest.include = this.mergeEncryptedReasoningInclude(include);
     }
 
+    // Strictness is a property of the tools that reach the wire, whether they
+    // came as request.tools or as a provider-params override of them.
+    if (Array.isArray(responsesRequest.tools)) {
+      responsesRequest.tools = this.convertTools(responsesRequest.tools, responsesRequest);
+    }
+
     // These invariants define the adapter's stateless native-item contract and
     // cannot be overridden through provider params.
     // The API takes native items as they are, but an input_image whose data:
     // URL holds no image would be refused on every request, so it goes as the
     // placeholder in either mode.
     responsesRequest.input = this.subscription
-      ? normalizeResponsesInput(request.messages, onContentAltered)
+      ? this.subscriptionInput(request.messages, onContentAltered)
       : nativeInputForRequest(request.messages, onContentAltered);
     responsesRequest.store = false;
     responsesRequest.include = this.mergeEncryptedReasoningInclude(responsesRequest.include);
@@ -509,15 +585,42 @@ export class OpenAIResponsesAPIAdapter implements ProviderAdapter {
     return text || undefined;
   }
 
-  private convertTools(tools: unknown[]): unknown[] {
-    return tools.map((rawTool: any) => {
+  /**
+   * Every function tool this converts reaches the wire with a boolean `strict`.
+   *
+   * Left out, strictness is whatever the provider defaults to, and strict
+   * validation treats every property as one the model must send. A tool schema
+   * written as plain JSON Schema means the opposite: a property outside
+   * `required` may be omitted. So an omitted or null `strict` is sent as
+   * `false`, stating what the schema means, as the Codex client (a plain
+   * `strict: bool` on every function tool) and pi's Responses conversion
+   * (default `false`) do. An explicit boolean is the caller's choice and is
+   * kept. Any other value is refused rather than coerced: true and false each
+   * change what the model may send, so neither is a safe guess.
+   *
+   * This holds on all three function paths: a flat Responses function, a
+   * nested Chat-style `{ type: 'function', function }` (whose `strict` is read
+   * from the function, or from the wrapper when the function's is omitted or
+   * null), and a definition built from `inputSchema`/`input_schema`/
+   * `parameters`. Every other tool passes through as the caller wrote it: a
+   * non-function tool, which has no such field, and a container such as a
+   * Responses namespace tool, whose member functions keep whatever `strict`
+   * they were given. Membrane builds no container tools, so one arrives only
+   * as a caller wrote it, in the API's own shape. A refusal carries
+   * `rawRequest`, the request as far as it was built, as its own.
+   */
+  private convertTools(tools: unknown[], rawRequest: unknown): unknown[] {
+    return tools.map((rawTool: any, position) => {
       if (rawTool?.type && rawTool.type !== 'function') return rawTool;
 
-      // Responses function definitions are flat. Accept them verbatim, while
-      // also adapting Membrane and Chat Completions function schemas.
-      if (rawTool?.type === 'function' && rawTool.name) return rawTool;
+      // Responses function definitions are flat: kept as given, apart from
+      // strict. Membrane and Chat Completions function schemas are adapted.
+      if (rawTool?.type === 'function' && rawTool.name) {
+        return { ...rawTool, strict: functionToolStrictness(rawTool.name, rawTool.strict, position, rawRequest) };
+      }
       if (rawTool?.type === 'function' && rawTool.function) {
-        return { type: 'function', ...rawTool.function };
+        const fn = rawTool.function;
+        return { type: 'function', ...fn, strict: functionToolStrictness(fn.name, fn.strict ?? rawTool.strict, position, rawRequest) };
       }
       return {
         type: 'function',
@@ -528,7 +631,7 @@ export class OpenAIResponsesAPIAdapter implements ProviderAdapter {
           rawTool?.inputSchema ??
           rawTool?.input_schema ??
           { type: 'object', properties: {} },
-        ...(rawTool?.strict !== undefined ? { strict: rawTool.strict } : {}),
+        strict: functionToolStrictness(rawTool?.name, rawTool?.strict, position, rawRequest),
       };
     });
   }

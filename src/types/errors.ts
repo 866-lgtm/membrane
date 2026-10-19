@@ -805,6 +805,67 @@ export function isDeadlineExpiry(error: unknown): boolean {
 }
 
 /**
+ * What the caller's own code threw while membrane ran it beside a call: a
+ * hook, a request or stream callback, a receipt consumer, a header stamp,
+ * the configured logger or a model registry's pricing. Resending the provider
+ * request can't mend that code, and would pay for another call or run it
+ * again, so the error is never retryable: membrane's own retries stop on it,
+ * and so does a caller's policy that reads `retryable`. (What builds, sends
+ * or reads the call, such as an adapter, the transport, a credential
+ * resolver, a formatter or a parser, keeps its own classification.)
+ *
+ * A MembraneError that already says it isn't retryable leaves as itself.
+ * Anything else, a retryable MembraneError included, is wrapped, with the
+ * original as `cause`, so this never marks an error the caller still holds.
+ * (complete() and stream() may still attach their request to one that
+ * leaves as itself, as they do to any MembraneError that has none.) The
+ * wrapper keeps the type membrane reads from the error, but nothing a
+ * provider's response would state (an HTTP status, a provider code, a wait),
+ * since no response to this call stands behind it, and no request or raw
+ * error taken from a MembraneError the caller threw, which would be another
+ * call's.
+ */
+export function callerCodeError(error: unknown): MembraneError {
+  if (error instanceof MembraneError && !error.retryable) return error;
+  const info = classifyError(error);
+  const wrapped = new MembraneError({
+    ...info,
+    retryable: false,
+    httpStatus: undefined,
+    providerErrorCode: undefined,
+    retryAfterMs: undefined,
+    rawError: error instanceof MembraneError ? undefined : info.rawError,
+    rawRequest: undefined,
+  });
+  Object.defineProperty(wrapped, 'cause', { value: error, writable: true, configurable: true });
+  return wrapped;
+}
+
+/**
+ * Run the caller's code: what it throws leaves as a callerCodeError. Wrap
+ * each call membrane makes into the caller's code, since the rule covers
+ * those calls. A getter membrane reads outside them, such as on the caller's
+ * hooks or on a value its code returned, is a read, not a call, and its
+ * error is classified as before.
+ */
+export function runCallerCode<R>(run: () => R): R {
+  try {
+    return run();
+  } catch (error) {
+    throw callerCodeError(error);
+  }
+}
+
+/** Run caller code that membrane awaits, such as a hook or a tool executor. */
+export async function awaitCallerCode<R>(run: () => R | Promise<R>): Promise<R> {
+  try {
+    return await run();
+  } catch (error) {
+    throw callerCodeError(error);
+  }
+}
+
+/**
  * A cancellation is a TYPE, never a phrase. Matching 'abort' anywhere in a
  * message turned any error whose text merely contained it — a host tool
  * throwing "zz-tool policy aborted the run" — into a well-formed

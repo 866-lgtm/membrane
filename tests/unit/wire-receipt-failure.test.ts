@@ -114,11 +114,12 @@ describe('wire-request receipt guard on a generic adapter', () => {
     stream(_req: ProviderRequest, _callbacks: StreamCallbacks, options?: ProviderRequestOptions) { return this.send(options); }
   }
 
-  it('aborts through the signal and rethrows the original error', async () => {
+  it('aborts through the signal and rethrows the consumer\'s error, not retryable, with the original as cause', async () => {
     const adapter = new WireBasisAdapter();
     const failure = new Error('receipt consumer exploded');
     await expect(new Membrane(adapter, { formatter: new NativeFormatter() })
-      .stream({ ...request, onCacheWireReceipt: () => { throw failure; } })).rejects.toThrow(failure.message);
+      .stream({ ...request, onCacheWireReceipt: () => { throw failure; } }))
+      .rejects.toMatchObject({ message: failure.message, retryable: false, cause: failure });
     expect(adapter.sent).toBe(0);
   });
 

@@ -28,8 +28,10 @@ import {
   withRawRequest,
 } from '../types/index.js';
 import { errorFromThrown } from '../types/errors.js';
+import { isRawItemCarrier } from '../utils/fidelity.js';
 import { imageForRequest, GEMINI_IMAGE_TYPES } from '../utils/image-media.js';
-import { createCombinedSignal, textOnlyToolResultContent, toolUseInputFromValue, isDeadlineAbort, deadlineTimeoutError, throwOnStreamErrorFrame, assertTerminalEventObserved } from './utils.js';
+import { convertMcpMedia } from '../utils/mcp-media.js';
+import { createCombinedSignal, textOnlyToolResultContent, toolUseInputFromValue, isDeadlineAbort, deadlineTimeoutError, throwOnStreamErrorFrame, assertTerminalEventObserved, isEventObject } from './utils.js';
 
 // ============================================================================
 // Gemini API Types
@@ -112,6 +114,17 @@ interface GeminiStreamState {
 }
 
 /**
+ * Whether a response's first candidate carries data: content or a finish
+ * reason. Gemini's API speaks proto3's JSON mapping, where a null field is
+ * unset, so a candidate whose content and finishReason are null or absent is
+ * none, and a prompt block beside it still reads as a refusal. complete() and
+ * stream() both ask here.
+ */
+function hasCandidateData(candidate: NonNullable<GeminiResponse['candidates']>[number] | undefined): boolean {
+  return candidate?.content != null || candidate?.finishReason != null;
+}
+
+/**
  * Gemini's usageMetadata follows proto3 JSON, which omits zero-valued counts:
  * when the object is present, a missing prompt, candidates or cache-read
  * count is a reported 0. Only a response with no usageMetadata at all leaves
@@ -129,9 +142,11 @@ function geminiUnreportedUsage(usageMetadata: GeminiResponse['usageMetadata']): 
  * the output rate, so generated output is the SUM of the two; reading only
  * candidates reported a thinking turn at a fraction of its real size. The
  * reconciliation check makes the next such omission loud rather than silent:
- * Google's own total is the independent witness, and a mismatch means a
- * usageMetadata field outside prompt, tool-use prompt, candidates and
- * thoughts is carrying tokens.
+ * Google's own total is the independent witness, set against the tokens
+ * membrane counts, which are prompt, tool-use prompt, candidates and
+ * thoughts, and for a response read as cache-excluded the cached span
+ * besides. A total above them means a usageMetadata field outside those is
+ * carrying tokens. A total below them warns too, naming no field.
  *
  * `toolUsePromptTokenCount` is disjoint from `promptTokenCount` and is read
  * into `inputTokens`: Google bills code execution's intermediate tokens, URL
@@ -154,19 +169,6 @@ function geminiUsageToProviderUsage(
   const thoughtsTokens = usageMetadata?.thoughtsTokenCount;
   const totalTokens = usageMetadata?.totalTokenCount;
 
-  if (usageMetadata && totalTokens != null) {
-    const accountedTokens = promptTokens + toolUsePromptTokens + candidatesTokens + (thoughtsTokens ?? 0);
-    if (accountedTokens !== totalTokens) {
-      console.warn(
-        `[membrane:gemini] usageMetadata does not reconcile: promptTokenCount(${promptTokens})`
-        + ` + toolUsePromptTokenCount(${toolUsePromptTokens})`
-        + ` + candidatesTokenCount(${candidatesTokens}) + thoughtsTokenCount(${thoughtsTokens ?? 0})`
-        + ` = ${accountedTokens}, but totalTokenCount = ${totalTokens}.`
-        + ' Some billed tokens are in a usageMetadata field outside prompt, tool-use prompt, candidates and thoughts.'
-      );
-    }
-  }
-
   const cachedTokens = usageMetadata
     ? (typeof usageMetadata.cachedContentTokenCount === 'number' ? usageMetadata.cachedContentTokenCount : 0)
     : undefined;
@@ -174,9 +176,36 @@ function geminiUsageToProviderUsage(
   // count, so the inclusive reading doesn't fit this response. Reading its
   // prompt count as the fresh input is this adapter's choice: the response is
   // read as cache-excluded, against the declared convention (see
-  // GeminiAdapter.usageCacheConvention, whose basis is Google's definition,
-  // not a measured implicit hit).
+  // GeminiAdapter.usageCacheConvention for its basis).
   const promptExcludesCache = cachedTokens !== undefined && cachedTokens > promptTokens;
+
+  if (usageMetadata && totalTokens != null) {
+    const accountedTokens = promptTokens + toolUsePromptTokens + candidatesTokens + (thoughtsTokens ?? 0);
+    // A response read as cache-excluded counts its cached span beside its
+    // prompt, so a total that includes the span is the total membrane
+    // counts: prompt + tool-use prompt + cached + candidates + thoughts. None
+    // of the published responses GeminiAdapter.usageCacheConvention cites
+    // shows this regime, so both totals reconcile: Google's formula, which
+    // has no cached term, and that one. Meeting the regime is warned about
+    // once, below.
+    const largestSum = promptExcludesCache ? accountedTokens + cachedTokens : accountedTokens;
+    const reconciles = accountedTokens === totalTokens || largestSum === totalTokens;
+    if (!reconciles) {
+      // Only a total above every accepted sum says where the rest is.
+      const fields = promptExcludesCache
+        ? 'prompt, tool-use prompt, cached, candidates and thoughts'
+        : 'prompt, tool-use prompt, candidates and thoughts';
+      console.warn(
+        `[membrane:gemini] usageMetadata does not reconcile: promptTokenCount(${promptTokens})`
+        + ` + toolUsePromptTokenCount(${toolUsePromptTokens})`
+        + ` + candidatesTokenCount(${candidatesTokens}) + thoughtsTokenCount(${thoughtsTokens ?? 0})`
+        + ` = ${accountedTokens}`
+        + (promptExcludesCache ? ` (${largestSum} with cachedContentTokenCount(${cachedTokens}))` : '')
+        + `, but totalTokenCount = ${totalTokens}.`
+        + (totalTokens > largestSum ? ` Some billed tokens are in a usageMetadata field outside ${fields}.` : '')
+      );
+    }
+  }
   if (promptExcludesCache && !warnedPromptExcludesCache) {
     warnedPromptExcludesCache = true;
     console.warn(
@@ -237,24 +266,39 @@ export class GeminiAdapter implements ProviderAdapter {
    * as `cacheReadTokens`) reports, so membrane subtracts it to reach the
    * fresh input.
    *
-   * The basis is Google's definition, not a measured hit. The UsageMetadata
+   * The basis is Google's definition and published usage. The UsageMetadata
    * reference (https://ai.google.dev/api/generate-content, read 2026-10-10)
    * says `promptTokenCount` is "Number of tokens in the prompt. When
    * cachedContent is set, this is still the total effective prompt size
    * meaning this includes the number of tokens in the cached content", and
    * that `totalTokenCount` is "prompt + tool-use prompt + thoughts + response
-   * candidates" (read again 2026-10-15), with no cached term of its own. The "When cachedContent is set" sentence
-   * is about explicit caching (`cachedContent`), which membrane never sets
-   * itself: a hit through membrane is implicit unless a caller passes
-   * `cachedContent` through `providerParams`, and for an implicit hit the
-   * inclusion is inferred from the field's definition and the total, not
-   * stated. A response whose cached count exceeds its prompt count can't be
-   * read that way, so it is read as cache-excluded, with a warning (see
-   * geminiUsageToProviderUsage). No probe has measured an implicit hit: on
-   * 2026-08-25, three identical 10,893-token calls to gemini-3.5-flash-lite
-   * never reported the field (implicit caching did not trigger), and
-   * explicit `cachedContents` is refused on the free tier (429,
-   * TotalCachedContentStorageTokensPerModelFreeTier limit=0).
+   * candidates" (read again 2026-10-15), with no cached term of its own. The
+   * "When cachedContent is set" sentence is about explicit caching
+   * (`cachedContent`), which membrane never sets itself: a hit through
+   * membrane is implicit unless a caller passes `cachedContent` through
+   * `providerParams`. Published figures (each read 2026-10-15):
+   *   - explicit: Google's caching cookbook (google-gemini/cookbook,
+   *     quickstarts/Caching.ipynb) prints a response with promptTokenCount
+   *     322,707, of which 322,698 cached, 282 candidates, 4,049 thoughts and
+   *     a totalTokenCount of 327,038, which is prompt + thoughts + candidates,
+   *     the cached span inside the prompt;
+   *   - implicit: googleapis/python-genai#2064 (gemini-3-flash-preview, a
+   *     chat growing about 1,000 tokens a turn) shows promptTokenCount rising
+   *     steadily (7,996, 8,986, ... 17,972) while cachedContentTokenCount
+   *     goes from 6,134 to 0 and later from 0 to 16,391, so the prompt count
+   *     is the whole prompt whether the cache hit or not;
+   *   - implicit: Simon Willison's note of 2025-05-09 on Gemini 2.5 Flash
+   *     shows a cached count on an implicit hit, 200,658 beside a
+   *     204,082-token prompt (promptTokensDetails). With no promptTokenCount
+   *     or total shown, these figures fit either reading.
+   * Membrane's own probe hasn't measured a hit: on 2026-08-25, three
+   * identical 10,893-token calls to gemini-3.5-flash-lite never reported the
+   * field (implicit caching did not trigger), and explicit `cachedContents`
+   * is refused on the free tier (429,
+   * TotalCachedContentStorageTokensPerModelFreeTier limit=0). A response
+   * whose cached count exceeds its prompt count can't be read the inclusive
+   * way, so it is read as cache-excluded, with a warning (see
+   * geminiUsageToProviderUsage).
    */
   readonly usageCacheConvention = 'cache-inclusive' as const;
   private apiKey: string;
@@ -358,31 +402,38 @@ export class GeminiAdapter implements ProviderAdapter {
       };
       let buffer = '';
 
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
 
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split('\n');
-        // Keep the last potentially incomplete line in buffer
-        buffer = lines.pop() ?? '';
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split('\n');
+          // Keep the last potentially incomplete line in buffer
+          buffer = lines.pop() ?? '';
 
-        for (const line of lines) {
-          if (!line.startsWith('data: ')) continue;
-          this.consumeStreamFrame(line.slice(6).trim(), streamState, callbacks, geminiRequest, options?.onProgress);
+          for (const line of lines) {
+            if (!line.startsWith('data: ')) continue;
+            this.consumeStreamFrame(line.slice(6).trim(), streamState, callbacks, geminiRequest, options?.onProgress);
+          }
         }
-      }
 
-      // Process any remaining data in the buffer (final chunk may not end with newline)
-      const trailing = buffer.trim();
-      if (trailing) {
-        this.consumeStreamFrame(
-          trailing.startsWith('data: ') ? trailing.slice(6).trim() : trailing,
-          streamState,
-          callbacks,
-          geminiRequest,
-          options?.onProgress,
-        );
+        // Process any remaining data in the buffer (final chunk may not end with newline)
+        const trailing = buffer.trim();
+        if (trailing) {
+          this.consumeStreamFrame(
+            trailing.startsWith('data: ') ? trailing.slice(6).trim() : trailing,
+            streamState,
+            callbacks,
+            geminiRequest,
+            options?.onProgress,
+          );
+        }
+      } finally {
+        // A read loop that ends early, on a callback's error or any other,
+        // leaves the body unread: cancel it, so the provider stops sending
+        // and the connection is let go. After a full read it does nothing.
+        void reader.cancel().catch(() => {});
       }
 
       assertTerminalEventObserved(
@@ -435,14 +486,16 @@ export class GeminiAdapter implements ProviderAdapter {
       // A frame that isn't valid JSON carries nothing to accumulate
       return;
     }
-    // A parsed provider event is progress.
+    // JSON that isn't an object (`null`, a number, a string, an array)
+    // carries no event, so its frame is dropped, as on the other adapters.
+    if (!isEventObject(parsed)) return;
+    // A provider event is progress.
     onProgress?.();
-
     throwOnStreamErrorFrame(parsed, 'Gemini', rawRequest);
     if (parsed.modelVersion) streamState.lastModelVersion = parsed.modelVersion;
     const candidate = parsed.candidates?.[0];
 
-    if (candidate?.content !== undefined || candidate?.finishReason !== undefined) {
+    if (hasCandidateData(candidate)) {
       streamState.sawCandidateData = true;
     }
 
@@ -472,8 +525,10 @@ export class GeminiAdapter implements ProviderAdapter {
       streamState.sawTerminalEvent = true;
     }
 
-    // A blocked prompt can ride a frame of its own, with zero candidates
-    if (parsed.promptFeedback?.blockReason !== undefined) {
+    // A blocked prompt can ride a frame of its own, with zero candidates. A
+    // null blockReason, proto3's JSON for an unset field, blocks nothing, so it
+    // neither ends the stream nor replaces a reason an earlier frame gave.
+    if (parsed.promptFeedback?.blockReason != null) {
       streamState.promptFeedback = parsed.promptFeedback;
     }
 
@@ -487,7 +542,10 @@ export class GeminiAdapter implements ProviderAdapter {
   // --------------------------------------------------------------------------
 
   private buildRequest(request: ProviderRequest): GeminiRequest {
-    const contents = this.convertMessages(request.messages as any[], request.model);
+    // Media in MCP's form becomes membrane's first, for a caller that builds
+    // a request directly (Membrane's own builds have converted it already,
+    // utils/mcp-media.ts).
+    const contents = this.convertMessages(convertMcpMedia(request.messages as any[]), request.model);
     const maxTokens = request.maxTokens || this.defaultMaxTokens;
 
     const geminiRequest: GeminiRequest = { contents };
@@ -732,11 +790,11 @@ export class GeminiAdapter implements ProviderAdapter {
     return {
       content: this.buildContentBlocks(text, toolCalls, images),
       stopReason: this.resolveStopReason(
-        candidate !== undefined,
+        hasCandidateData(candidate),
         candidate?.finishReason,
         response.promptFeedback
       ),
-      providerStopReason: candidate?.finishReason ?? (candidate === undefined ? response.promptFeedback?.blockReason : undefined),
+      providerStopReason: candidate?.finishReason ?? (!hasCandidateData(candidate) ? response.promptFeedback?.blockReason : undefined) ?? undefined,
       stopSequence: undefined,
       usage: geminiUsageToProviderUsage(response.usageMetadata),
       ...geminiUnreportedUsage(response.usageMetadata),
@@ -792,12 +850,14 @@ export class GeminiAdapter implements ProviderAdapter {
     // A prompt blocked before generation is a refusal whatever reason Google
     // gives (SAFETY, OTHER, BLOCKLIST, BLOCK_REASON_UNSPECIFIED, ...): nothing
     // was generated. providerStopReason keeps the reason itself.
-    return promptBlockReason !== undefined
+    return promptBlockReason != null
       ? 'refusal'
       : this.mapFinishReason(candidateFinishReason);
   }
 
   private mapFinishReason(reason: string | undefined): string {
+    // No reason (or a null one) is a plain end of turn.
+    if (reason == null) return 'end_turn';
     switch (reason) {
       case 'STOP':
         return 'end_turn';
@@ -815,8 +875,6 @@ export class GeminiAdapter implements ProviderAdapter {
       case 'TOOL_CALLS':
       case 'FUNCTION_CALL':
         return 'tool_use';
-      case undefined:
-        return 'end_turn';
       // MALFORMED_FUNCTION_CALL, LANGUAGE, OTHER and anything Google adds
       // next have no membrane member; they travel as the provider's own
       // token. Membrane normalizes it to end_turn, since callers switch on a
@@ -848,7 +906,9 @@ export class GeminiAdapter implements ProviderAdapter {
  * Convert normalized content blocks to Gemini parts
  */
 export function toGeminiParts(blocks: ContentBlock[]): GeminiPart[] {
-  return blocks.map(block => {
+  // A zero-width carrier holds a block this wire has no form for, so it adds
+  // no part, as the builder's own text branch skips empty text.
+  return blocks.filter(block => !isRawItemCarrier(block)).map(block => {
     if (block.type === 'text') {
       return { text: (block as any).text };
     }

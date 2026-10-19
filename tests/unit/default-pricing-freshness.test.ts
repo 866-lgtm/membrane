@@ -7,14 +7,18 @@
  * undefined and `estimateCost` quietly omitted the cost.
  *
  * The expectations below were read off the providers' public price pages on
- * 2026-08-25; each is a row the table got wrong or was missing.
+ * 2026-08-25, and those in the Anthropic 5.x block off Anthropic's on
+ * 2026-10-19; each is a row the table got wrong or was missing.
  */
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { Membrane } from '../../src/membrane.js';
 import { calculateCost } from '../../src/utils/cost.js';
 import {
   getDefaultPricing,
+  PRICING_TABLE,
   DEFAULT_PRICING_LAST_VERIFIED,
+  ANTHROPIC_PRICING_LAST_VERIFIED,
+  GOOGLE_PRICING_LAST_VERIFIED,
 } from '../../src/registry/default-pricing.js';
 import type {
   ProviderAdapter,
@@ -70,13 +74,53 @@ describe('default pricing rows match the published price pages (2026-08-25)', ()
   });
 });
 
+describe('Anthropic 5.x rows match the published price page (2026-10-19)', () => {
+  // Opus 5.5, Sonnet 5.5 and Fable 5.1 had matched their family's shorter
+  // prefix and taken its rate; Mythos 5, Mythos 5.1 and Haiku 5.5 had none.
+  const usd = (input: number, output: number, cacheWrite: number, cacheRead: number) => ({
+    inputPerMillion: input, outputPerMillion: output, cacheWritePerMillion: cacheWrite,
+    cacheReadPerMillion: cacheRead, currency: 'USD', asOf: ANTHROPIC_PRICING_LAST_VERIFIED,
+  });
+  const rows: Array<[string, ReturnType<typeof usd>]> = [
+    ['claude-opus-5-5', usd(4, 20, 5, 0.20)],
+    ['claude-sonnet-5-5', usd(2, 10, 2.50, 0.10)],
+    ['claude-fable-5-1', usd(10, 50, 12.50, 0.25)],
+    ['claude-mythos-5-1', usd(10, 50, 12.50, 0.25)],
+    ['claude-mythos-5', usd(10, 50, 12.50, 1)],
+    // Its rate for prompts up to 100,000 tokens, whatever the prompt's length:
+    // the table has no field for the higher rate above that.
+    ['claude-haiku-5-5', usd(0.10, 0.50, 0.125, 0.01)],
+    // The family rows beside them keep their own rates.
+    ['claude-opus-5', usd(5, 25, 6.25, 0.50)],
+    ['claude-sonnet-5', usd(2, 10, 2.50, 0.20)],
+    ['claude-fable-5', usd(10, 50, 12.50, 1)],
+  ];
+  for (const [id, pricing] of rows) {
+    it(`prices ${id} at the page's rate`, () => {
+      expect(getDefaultPricing(id)).toEqual(pricing);
+    });
+  }
+});
+
 describe('pricing freshness is machine-readable', () => {
-  it('exports a table-level verification date', () => {
-    expect(DEFAULT_PRICING_LAST_VERIFIED).toMatch(/^\d{4}-\d{2}-\d{2}$/);
+  it('exports each section\'s verification date', () => {
+    for (const date of [DEFAULT_PRICING_LAST_VERIFIED, ANTHROPIC_PRICING_LAST_VERIFIED, GOOGLE_PRICING_LAST_VERIFIED]) {
+      expect(date).toMatch(/^\d{4}-\d{2}-\d{2}$/);
+    }
   });
 
-  it('stamps currently-published rows with that date', () => {
-    expect(getDefaultPricing('claude-sonnet-4-6')?.asOf).toBe(DEFAULT_PRICING_LAST_VERIFIED);
+  it('stamps currently-published rows with their section\'s date', () => {
+    expect(getDefaultPricing('claude-sonnet-4-6')?.asOf).toBe(ANTHROPIC_PRICING_LAST_VERIFIED);
+    expect(getDefaultPricing('gpt-4o-mini')?.asOf).toBe(DEFAULT_PRICING_LAST_VERIFIED);
+  });
+
+  it('dates every Anthropic row the page lists to the Anthropic reading, and the retired one to its last publication', () => {
+    const anthropic = PRICING_TABLE.filter((row) => row.prefix.startsWith('claude-') && row.pricing !== null);
+    for (const row of anthropic) {
+      const expected = row.prefix === 'claude-3-5-sonnet' ? '2025-07-01' : ANTHROPIC_PRICING_LAST_VERIFIED;
+      expect(`${row.prefix}: ${row.pricing?.asOf}`).toBe(`${row.prefix}: ${expected}`);
+    }
+    expect(anthropic.length).toBe(20);
   });
 
   it('dates a retired row to when its rate was last published, not to today', () => {
@@ -87,7 +131,7 @@ describe('pricing freshness is machine-readable', () => {
     const retired = getDefaultPricing('claude-3-5-sonnet');
 
     expect(retired?.asOf).toBe('2025-07-01');
-    expect(retired?.asOf).not.toBe(DEFAULT_PRICING_LAST_VERIFIED);
+    expect(retired?.asOf).not.toBe(ANTHROPIC_PRICING_LAST_VERIFIED);
   });
 
   it('surfaces the date on the cost breakdown as pricingAsOf', () => {
@@ -95,7 +139,7 @@ describe('pricing freshness is machine-readable', () => {
       { inputTokens: 1_000_000, outputTokens: 0 },
       getDefaultPricing('claude-sonnet-4-6')!,
     );
-    expect(breakdown.pricingAsOf).toBe(DEFAULT_PRICING_LAST_VERIFIED);
+    expect(breakdown.pricingAsOf).toBe(ANTHROPIC_PRICING_LAST_VERIFIED);
   });
 
   it('leaves pricingAsOf unset for registry pricing that carries no date', () => {

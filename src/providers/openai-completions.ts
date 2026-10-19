@@ -29,7 +29,8 @@ import {
   withRawRequest,
 } from '../types/index.js';
 import { errorFromThrown } from '../types/errors.js';
-import { createCombinedSignal, SSELineParser, isDeadlineAbort, deadlineTimeoutError, throwOnStreamErrorFrame, assertTerminalEventObserved } from './utils.js';
+import { createCombinedSignal, SSELineParser, isDeadlineAbort, deadlineTimeoutError, throwOnStreamErrorFrame, assertTerminalEventObserved, isEventObject } from './utils.js';
+import { isRawItemCarrier } from '../utils/fidelity.js';
 
 // ============================================================================
 // Types
@@ -230,97 +231,104 @@ export class OpenAICompletionsAdapter implements ProviderAdapter {
           return;
         }
 
-        // Parse first; only JSON noise is ignorable. Everything after the
-        // parse must NOT be swallowed by the catch below.
+        // Parse first: a line that isn't JSON is noise to ignore. Nothing
+        // after the parse is caught here, so an error there, a caller's
+        // callback included, fails the stream. What the handler can't read is
+        // dropped below by checks, not by a catch.
         let parsed: Record<string, any>;
         try {
           parsed = JSON.parse(data);
         } catch {
           return; // Ignore parse errors (partial/keep-alive lines)
         }
-        // A parsed provider event is progress (comments never reach here).
+        // JSON that isn't an object (`null`, a number, a string, an array)
+        // carries no event, so its frame is dropped.
+        if (!isEventObject(parsed)) return;
+        // A provider event is progress (comments never reach here).
         options?.onProgress?.();
 
         // A frame that reports an error throws here, before its text, or an
         // end-of-turn token in it, is read.
         throwOnStreamErrorFrame(parsed, this.name, completionsRequest);
 
-        try {
-          const text = parsed.choices?.[0]?.text;
+        const text = parsed.choices?.[0]?.text;
 
-          if (text) {
-            accumulated += text;
-            const idx = eot ? accumulated.indexOf(eot) : -1;
-            if (idx !== -1) {
-              // Truncate at the token, flush the un-emitted prefix, stop
-              accumulated = accumulated.slice(0, idx);
-              if (accumulated.length > emittedLen) {
-                callbacks.onChunk(accumulated.slice(emittedLen));
-              }
-              emittedLen = accumulated.length;
-              eotFound = true;
-              // The adapter's own end-of-turn token IS a terminal
-              // observation: the turn ended where this layer said it ends.
-              // The normalized reason is end_turn whatever the provider says;
-              // a finish_reason and usage this same frame carried are still
-              // read below. Later frames are not waited for.
-              sawTerminalEvent = true;
-            } else if (eot) {
-              // Emit all but a held-back tail that could be a partial token
-              const safeLen = Math.max(emittedLen, accumulated.length - (eot.length - 1));
-              if (safeLen > emittedLen) {
-                callbacks.onChunk(accumulated.slice(emittedLen, safeLen));
-                emittedLen = safeLen;
-              }
-            } else {
-              callbacks.onChunk(text);
+        if (text) {
+          accumulated += text;
+          const idx = eot ? accumulated.indexOf(eot) : -1;
+          if (idx !== -1) {
+            // Truncate at the token, flush the un-emitted prefix, stop
+            accumulated = accumulated.slice(0, idx);
+            if (accumulated.length > emittedLen) {
+              callbacks.onChunk(accumulated.slice(emittedLen));
             }
-          }
-
-          if (parsed.choices?.[0]?.finish_reason) {
-            finishReason = parsed.choices[0].finish_reason;
+            emittedLen = accumulated.length;
+            eotFound = true;
+            // The adapter's own end-of-turn token IS a terminal
+            // observation: the turn ended where this layer said it ends.
+            // The normalized reason is end_turn whatever the provider says;
+            // a finish_reason and usage this same frame carried are still
+            // read below. Later frames are not waited for.
             sawTerminalEvent = true;
+          } else if (eot) {
+            // Emit all but a held-back tail that could be a partial token
+            const safeLen = Math.max(emittedLen, accumulated.length - (eot.length - 1));
+            if (safeLen > emittedLen) {
+              callbacks.onChunk(accumulated.slice(emittedLen, safeLen));
+              emittedLen = safeLen;
+            }
+          } else {
+            callbacks.onChunk(text);
           }
+        }
 
-          // Usage rides the final chunk when stream_options.include_usage is set
-          if (parsed.usage) {
-            streamUsage = parsed.usage;
-          }
-        } catch {
-          // Ignore parse errors in stream
+        if (parsed.choices?.[0]?.finish_reason) {
+          finishReason = parsed.choices[0].finish_reason;
+          sawTerminalEvent = true;
+        }
+
+        // Usage rides the final chunk when stream_options.include_usage is set
+        if (parsed.usage) {
+          streamUsage = parsed.usage;
         }
       };
 
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
 
-        const chunk = decoder.decode(value, { stream: true });
-        for (const data of sseParser.feed(chunk)) {
-          processDataLine(data);
+          const chunk = decoder.decode(value, { stream: true });
+          for (const data of sseParser.feed(chunk)) {
+            processDataLine(data);
+            if (eotFound) break;
+          }
           if (eotFound) break;
         }
-        if (eotFound) break;
-      }
 
-      // A final `data:` line that arrived without its trailing newline is still
-      // buffered here. Servers and proxies do close right after writing the
-      // last event, so dropping it would report a finished turn as a dropped
-      // connection at the guard below. A stream already ended by the eotToken
-      // has nothing left to read.
-      if (!eotFound) {
-        for (const data of sseParser.flush()) {
-          processDataLine(data);
-          if (eotFound) break;
+        // A final `data:` line that arrived without its trailing newline is still
+        // buffered here. Servers and proxies do close right after writing the
+        // last event, so dropping it would report a finished turn as a dropped
+        // connection at the guard below. A stream already ended by the eotToken
+        // has nothing left to read.
+        if (!eotFound) {
+          for (const data of sseParser.flush()) {
+            processDataLine(data);
+            if (eotFound) break;
+          }
         }
-      }
 
-      // Flush any held-back tail if the token never completed
-      if (eot && !eotFound && accumulated.length > emittedLen) {
-        callbacks.onChunk(accumulated.slice(emittedLen));
-      }
-      if (eotFound) {
-        try { await reader.cancel(); } catch { /* stream already closed */ }
+        // Flush any held-back tail if the token never completed
+        if (eot && !eotFound && accumulated.length > emittedLen) {
+          callbacks.onChunk(accumulated.slice(emittedLen));
+        }
+      } finally {
+        // A read loop that ends early, at the end-of-turn token, on a
+        // callback's error or any other, leaves the body unread: cancel it,
+        // without waiting on a cancel that may never settle, so the provider
+        // stops sending and the connection is let go. After a full read it
+        // does nothing.
+        void reader.cancel().catch(() => {});
       }
 
       assertTerminalEventObserved(sawTerminalEvent, this.name, completionsRequest);
@@ -409,6 +417,8 @@ export class OpenAICompletionsAdapter implements ProviderAdapter {
 
       for (const block of content) {
         if (block.type === 'text') {
+          // A zero-width carrier holds a block this wire has no form for.
+          if (isRawItemCarrier(block)) continue;
           textParts.push(block.text);
         } else if (block.type === 'image' || block.type === 'image_url') {
           hadImages = true;
@@ -598,6 +608,9 @@ export class OpenAICompletionsAdapter implements ProviderAdapter {
   }
 
   private mapFinishReason(reason: string | undefined): string {
+    // No reason (or a server's null) is a plain end of turn, as in the three
+    // sibling OpenAI-family adapters.
+    if (reason == null) return 'end_turn';
     switch (reason) {
       case 'stop':
         return 'end_turn';
@@ -607,8 +620,6 @@ export class OpenAICompletionsAdapter implements ProviderAdapter {
         // Matches the three sibling OpenAI-family adapters; this one alone
         // reported a filtered completion as a clean finish.
         return 'refusal';
-      case undefined:
-        return 'end_turn';
       default:
         // Unrecognized reasons travel as the provider's own token so
         // membrane's mapper can disclose and log them.

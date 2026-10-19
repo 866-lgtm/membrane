@@ -7,7 +7,9 @@ import { assertMessagePrefillSupported } from './request-capabilities.js';
 
 import Anthropic, { type ClientOptions } from '@anthropic-ai/sdk';
 import { stripEmptyTextBlocks, stripEmptyTextRequest } from '../utils/empty-text.js';
+import { anthropicServerBlockFor, isAnthropicServerBlock, unpairedServerBlocks, type AnthropicServerBlock } from '../utils/anthropic-server-blocks.js';
 import { imageForRequest, urlImageForRequest, assertWithinByteBudget, shedImagesToFitByteBudget } from '../utils/image-media.js';
+import { convertMcpMedia, isSourcelessMedia } from '../utils/mcp-media.js';
 import type {
   ProviderAdapter,
   ProviderInputTransformation,
@@ -29,8 +31,9 @@ import {
   withRawRequest,
   unsupportedError,
 } from '../types/index.js';
-import { statusForProviderCode, deadlineExpired, isDeadlineExpiry, errorFromThrown } from '../types/errors.js';
+import { runCallerCode, statusForProviderCode, deadlineExpired, isDeadlineExpiry, errorFromThrown } from '../types/errors.js';
 import { flattenRootSchemaUnion } from './anthropic-tool-schema.js';
+import { isPlainObject } from '../utils/tool-schema.js';
 import { assertTerminalEventObserved, toolUseInputFromText, toolUseInputFromValue, isDeadlineAbort, deadlineTimeoutError } from './utils.js';
 import { fetchWithCredentials, validateCredential, type CredentialContext, type CredentialResolver } from './credentials.js';
 import { CacheKeepalive, type CacheKeepaliveConfig } from '../cache-keepalive.js';
@@ -45,13 +48,20 @@ import { CacheKeepalive, type CacheKeepaliveConfig } from '../cache-keepalive.js
  * non-retryable, so a single stray `temperature` kills the whole turn.
  * Mirrors the `noTemperatureSupport` gate in the OpenAI provider.
  *
- * This is the always-on-thinking / reasoning-forward tier, which removes the
- * sampling parameters from the API surface entirely (Sonnet 5 rejects only
- * non-default values). Everything else — Haiku 4.5, Sonnet 4.6, Opus 4.6 and
- * older — ACCEPTS `temperature`, so it must NOT be listed here.
+ * Most of these are the always-on-thinking / reasoning-forward tier, which
+ * removes the sampling parameters from the API surface entirely (Sonnet 5
+ * rejects only non-default values). Haiku 5.5 is listed on a measurement,
+ * below. Everything else — Haiku 4.5, Sonnet 4.6, Opus 4.6 and older —
+ * ACCEPTS `temperature`, so it must NOT be listed here.
  *
  *   - Opus 4.7 / Opus 4.8 / Sonnet 5 / Fable 5 / Mythos 5 / Mythos preview:
  *     documented 400 on any sampling parameter.
+ *   - Haiku 5.5: measured against the Messages API on 2026-10-19, with no
+ *     thinking config. `temperature` 0.2, `top_k` 40, and `top_p` 0.9 and 0.95
+ *     were each refused with a 400 ("`temperature` is deprecated for this
+ *     model", and likewise for the other two); `top_p` 0.99 was accepted.
+ *     Sonnet 5.5, which `claude-sonnet-5` matches, answered `top_p` 0.9 and
+ *     0.99 the same way. A listed model loses every `top_p`, 0.99 included.
  *
  * NB: claude-haiku-4-5 was previously listed here on the strength of a single
  * "observed 400 in production when temperature is sent" anecdote. Haiku 4.5
@@ -68,6 +78,7 @@ const NO_TEMPERATURE_MODELS = [
   'claude-opus-4-7',
   'claude-opus-4-8',
   'claude-sonnet-5',
+  'claude-haiku-5-5',
   'claude-fable-5',
   'claude-mythos-5',
   'claude-mythos-preview',
@@ -246,6 +257,39 @@ export interface AnthropicAdapterConfig {
 // Anthropic Adapter
 // ============================================================================
 
+/** The SDK's fetch signature, taken from its public ClientOptions. */
+type SdkFetch = NonNullable<ClientOptions['fetch']>;
+
+/**
+ * Wrap a fetch so each nonempty chunk of a successful response body is
+ * reported to `observe` before the SDK parses it. The SDK drops SSE `ping`
+ * events before callers see them, so this is the only point where keepalive
+ * bytes are observable through public APIs. Bytes and headers pass through
+ * unchanged; error responses are returned untouched so SDK error
+ * classification keeps their full metadata. The rebuilt Response has an empty
+ * `url`, which SDK 0.52 reads only for debug logging. Without `observe` the
+ * base fetch is returned as is. SDK-supported bodies without pipeThrough also
+ * pass through unchanged; their SDK events still refresh the idle watchdog.
+ */
+function observeBodyActivity(base: SdkFetch, observe?: () => void): SdkFetch {
+  if (!observe) return base;
+  return async (input, init) => {
+    const response = await base(input, init);
+    if (!response.ok || !response.body || typeof response.body.pipeThrough !== 'function') return response;
+    const body = response.body.pipeThrough(new TransformStream<Uint8Array, Uint8Array>({
+      transform(chunk, controller) {
+        if (chunk.byteLength > 0) observe();
+        controller.enqueue(chunk);
+      },
+    }));
+    return new Response(body, {
+      status: response.status,
+      statusText: response.statusText,
+      headers: response.headers,
+    });
+  };
+}
+
 export class AnthropicAdapter implements ProviderAdapter {
   readonly name = 'anthropic';
   /**
@@ -256,6 +300,8 @@ export class AnthropicAdapter implements ProviderAdapter {
    */
   readonly reportsContentAlterations = true;
   readonly cacheReceiptBasis = 'wire-request' as const;
+  /** Membrane sends server-tool blocks back through this adapter, in the turn that produced them. Live checks had the API accept each type, with or without a cache marker, but `container_upload`, which it refuses in an assistant turn and so is left out (see utils/anthropic-server-blocks.ts). */
+  readonly replaysAnthropicServerBlocks = true;
 
   /**
    * Verified live 2026-08-25 (claude-haiku-4-5, 4,650-token cached system
@@ -320,15 +366,23 @@ export class AnthropicAdapter implements ProviderAdapter {
   }
 
   /** One SDK operation owns its failure state: concurrent calls cannot
-   * overwrite each other's auth error or cancel each other's requests. */
-  private credentialSession(signal?: AbortSignal) {
+   * overwrite each other's auth error or cancel each other's requests.
+   * observeBody (stream only) is told about each nonempty chunk of a
+   * successful response body before SDK parsing, so transport liveness stays
+   * visible even for SSE keepalives the SDK filters out. */
+  private credentialSession(signal?: AbortSignal, observeBody?: () => void) {
     const credentials = this.credentials;
-    if (!credentials) return { client: this.client, signal, failure: () => undefined };
+    if (!credentials) {
+      const client = observeBody
+        ? this.client.withOptions({ fetch: observeBodyActivity((input, init) => fetch(input, init), observeBody) })
+        : this.client;
+      return { client, signal, failure: () => undefined };
+    }
     const abort = new AbortController();
     const combined = signal ? AbortSignal.any([signal, abort.signal]) : abort.signal;
     let failure: MembraneError | undefined;
     const client = this.client.withOptions({
-      fetch: (input, init) => {
+      fetch: observeBodyActivity((input, init) => {
         const headers = new Headers(init?.headers);
         headers.delete('x-api-key');
         return fetchWithCredentials(input, { ...init, headers }, async context => {
@@ -350,7 +404,7 @@ export class AnthropicAdapter implements ProviderAdapter {
             throw failure;
           }
         });
-      },
+      }, observeBody),
     });
     return { client, signal: combined, failure: () => failure };
   }
@@ -383,6 +437,9 @@ export class AnthropicAdapter implements ProviderAdapter {
     options?.onRequest?.(fullRequest);
 
     const headers = this.betaHeaders(request, anthropicRequest);
+    // Before the keepalive records the request: a dynamicHeaders that throws
+    // ends the call before the send, leaving nothing to replay.
+    const live = this.liveHeaders(headers, 'complete');
     this.cacheKeepalive?.record(
       fullRequest as unknown as Record<string, unknown>, headers, 'complete',
     );
@@ -391,9 +448,7 @@ export class AnthropicAdapter implements ProviderAdapter {
       // Membrane is the one retry layer (see Membrane's retryPlan): the SDK
       // client sends this request once. The keepalive's replays, which also
       // go through createMessage, keep the SDK's default.
-      const response = await this.createMessage(
-        fullRequest, this.liveHeaders(headers, 'complete'), options?.signal, { maxRetries: 0 },
-      );
+      const response = await this.createMessage(fullRequest, live, options?.signal, { maxRetries: 0 });
 
       return this.parseResponse(response, fullRequest);
     } catch (error) {
@@ -415,6 +470,10 @@ export class AnthropicAdapter implements ProviderAdapter {
     assertMessagePrefillSupported(fullRequest.model, fullRequest.messages, options, this.name, fullRequest);
     options?.onRequest?.(fullRequest);
 
+    // Before the keepalive records the request: a dynamicHeaders that throws
+    // ends the call before the send, leaving nothing to replay.
+    const live = this.liveHeaders(this.betaHeaders(request, anthropicRequest), 'stream');
+
     // Snapshot the primary lane's prefix so it can be held warm across idle
     // gaps. `stream: true` is dropped at replay time (transport, not cache key).
     this.cacheKeepalive?.record(
@@ -423,7 +482,7 @@ export class AnthropicAdapter implements ProviderAdapter {
       'stream',
     );
 
-    // Idle timeout: abort if no SSE event arrives within the deadline.
+    // Idle timeout: abort on transport silence after the first SDK event.
     // The SDK's timeout only covers the initial HTTP response headers;
     // once streaming starts, a silently dropped connection waits forever.
     // Default raised 120s → 600s (2026-07-20): on Opus 4.7+/Fable-class models
@@ -432,14 +491,15 @@ export class AnthropicAdapter implements ProviderAdapter {
     // request can legitimately be silent for minutes mid-stream. At 120s the
     // watchdog repeatedly killed real, billing, actively-thinking turns
     // (Cairn, 2026-07-20: every >120s think died for an hour straight). 600s
-    // matches the SDK's own request timeout; the watchdog now only catches
-    // truly dead connections, at the cost of slower detection.
+    // matches the SDK's own request timeout. Body keepalives now count as
+    // activity after the first SDK event; this is no total or progress bound.
     const idleMs = options?.idleTimeoutMs ?? 600_000;
     // TTFT can legitimately exceed the inter-event idle: on a large context
     // with a cache miss, the API sends only SSE `ping` keepalives until
     // message_start — and the SDK swallows pings before they reach this loop
-    // (core/streaming: `if (sse.event === 'ping') continue`). The watchdog is
-    // therefore BLIND until the first real event; killing at idleMs turned
+    // (core/streaming: `if (sse.event === 'ping') continue`). Transport body
+    // bytes, pings included, re-arm the idle timer only after the first event.
+    // The first event retains a fixed longer deadline; killing at idleMs turned
     // every long-TTFT request into a spurious "idle timeout" (Cairn, 600k
     // context, 2026-07-20: repeated deaths at exactly 120s). Give the first
     // event a much longer deadline; keep the tight idle for gaps after that.
@@ -464,13 +524,23 @@ export class AnthropicAdapter implements ProviderAdapter {
       );
     };
 
+    // Body bytes (including SSE pings the SDK filters before the loop below)
+    // prove transport liveness after the first SDK event. They re-arm the idle
+    // timer without extending the fixed first-event deadline; `settled` keeps
+    // late chunks from re-arming after cleanup.
+    let settled = false;
+    const onTransportActivity = () => {
+      if (sawEvent && !settled && !idleAbort.signal.aborted) resetIdleTimer();
+    };
+
     resetIdleTimer();
-    const session = this.credentialSession(idleAbort.signal);
+    let session: ReturnType<AnthropicAdapter['credentialSession']> | undefined;
 
     try {
+      session = this.credentialSession(idleAbort.signal, onTransportActivity);
       const stream = await session.client.messages.stream(anthropicRequest, {
         signal: session.signal,
-        headers: this.liveHeaders(this.betaHeaders(request, anthropicRequest), 'stream'),
+        headers: live,
         // Membrane is the one retry layer: the SDK client sends this once.
         maxRetries: 0,
       });
@@ -543,6 +613,40 @@ export class AnthropicAdapter implements ProviderAdapter {
               const parsed = toolUseInputFromText(currentBlockInputJson);
               if (parsed.unparseableInput === undefined) block.input = parsed.input;
               else block.unparseableInput = parsed.unparseableInput;
+            }
+          } else if (isAnthropicServerBlock(block) && 'input' in block) {
+            // A server tool's call (server_tool_use, mcp_tool_use) streams its
+            // input as input_json_delta fragments, as a tool_use does, and its
+            // content_block_start carried `input: {}`. The block is sent back
+            // verbatim in later turns, so it must hold the input the model
+            // wrote: only a block that stopped has all of it. One that didn't
+            // stop, or whose fragments don't parse to an object (the API
+            // refuses any other input), keeps the start's input and the raw
+            // accumulation in `unparseableInput`, as a tool_use does, so a
+            // consumer can tell the call it holds isn't the one the model
+            // made. A cut-off call has no result after it, so it goes
+            // back only where a lone call can (the request's final message),
+            // as stored, without the marker; anywhere else it's left out as
+            // a lone call (unpairedServerBlocks).
+            let whole = sawBlockStop;
+            // Whitespace alone is no input, {} unmarked, as a tool_use's is.
+            if (whole && currentBlockInputJson.trim()) {
+              let parsed: unknown;
+              try {
+                parsed = JSON.parse(currentBlockInputJson);
+              } catch {
+                whole = false;
+              }
+              if (whole && isPlainObject(parsed)) block.input = parsed;
+              else whole = false;
+            }
+            if (!whole) {
+              block.unparseableInput = currentBlockInputJson;
+              console.warn(
+                `[membrane:anthropic] the streamed input of ${String(block.type)} ${String(block.id ?? '(no id)')} ` +
+                `${sawBlockStop ? "didn't parse to an object" : 'was cut off before its block stopped'} ` +
+                `(${currentBlockInputJson.length} characters); it keeps the start's input, marked`,
+              );
             }
           }
         }
@@ -653,6 +757,7 @@ export class AnthropicAdapter implements ProviderAdapter {
       }
 
       // Clean up idle timer and external signal listener
+      settled = true;
       if (idleTimer) clearTimeout(idleTimer);
       options?.signal?.removeEventListener('abort', onExternalAbort);
 
@@ -713,6 +818,7 @@ export class AnthropicAdapter implements ProviderAdapter {
 
     } catch (error) {
       // Clean up timer on error path too
+      settled = true;
       if (idleTimer) clearTimeout(idleTimer);
       options?.signal?.removeEventListener('abort', onExternalAbort);
 
@@ -725,7 +831,7 @@ export class AnthropicAdapter implements ProviderAdapter {
         throw deadlineExpired(new MembraneError({
           type: 'timeout',
           message: sawEvent
-            ? `SSE stream idle timeout — no events received within ${idleMs}ms`
+            ? `SSE stream idle timeout — no observed activity within ${idleMs}ms`
             : `SSE stream first-event timeout — no message_start within ${firstEventMs}ms (TTFT deadline)`,
           retryable: true,
           rawError: error,
@@ -735,15 +841,15 @@ export class AnthropicAdapter implements ProviderAdapter {
       // A deadline on the caller's signal (Membrane's progressTimeoutMs) is a
       // timeout with its own message, whatever the SDK wrapped the abort in.
       if (isDeadlineAbort(options?.signal?.reason)) throw deadlineTimeoutError(options!.signal!.reason, fullRequest);
-      throw this.handleError(session.failure() ?? error, fullRequest);
+      throw this.handleError(session?.failure() ?? error, fullRequest);
     }
   }
 
   /** Base headers + the live dynamicHeaders stamp. Request time only: the
-   *  keepalive recorder receives the base headers BEFORE this merge, so
+   *  keepalive recorder receives the base headers without this stamp, so
    *  replayed touches never carry a stale telemetry value. */
   private liveHeaders(base: Record<string, string> | undefined, lane: DynamicHeadersContext['lane']): Record<string, string> | undefined {
-    const dyn = this.dynamicHeaders?.({ lane });
+    const dyn = runCallerCode(() => this.dynamicHeaders?.({ lane }));
     if (!dyn) return base;
     const out: Record<string, string> = { ...(base ?? {}) };
     for (const [k, v] of Object.entries(dyn)) {
@@ -782,9 +888,22 @@ export class AnthropicAdapter implements ProviderAdapter {
     // and is silently rejected (the model sees the text label only).
     const sanitizedMessages = (request.messages as any[]).map((msg: any) => {
       if (!Array.isArray(msg.content)) return msg;
+      // Media in MCP's form becomes membrane's first, for a caller that
+      // builds a request directly (Membrane's own builds have converted it
+      // already, utils/mcp-media.ts). A report about a block names the one
+      // the caller handed in.
+      const converted = convertMcpMedia(msg.content as unknown[]);
       return {
         ...msg,
-        content: msg.content.map((block: any) => {
+        content: msg.content.map((original: any, index: number) => {
+          const block = converted[index] as any;
+          if (isSourcelessMedia(block)) {
+            // Media with no source object (MCP's form that didn't convert)
+            // has no form the API takes: left out, as in a tool_result, and
+            // reported.
+            onContentAltered?.(original);
+            return undefined;
+          }
           if (block.type === 'image') {
             const { sourceUrl, ...rest } = block;
             if (block.source?.type === 'url') {
@@ -793,7 +912,7 @@ export class AnthropicAdapter implements ProviderAdapter {
               // the API's to fetch.
               const image = urlImageForRequest(block.source.url);
               if (image.placeholder) {
-                onContentAltered?.(block);
+                onContentAltered?.(original);
                 return rest.cache_control ? { ...image.placeholder, cache_control: rest.cache_control } : image.placeholder;
               }
               if (image.data) return { ...rest, source: { type: 'base64', media_type: image.mediaType, data: image.data } };
@@ -808,7 +927,7 @@ export class AnthropicAdapter implements ProviderAdapter {
             if (image.placeholder) {
               // Data that is no accepted image goes as the placeholder text,
               // keeping any cache breakpoint the image carried.
-              onContentAltered?.(block);
+              onContentAltered?.(original);
               return rest.cache_control ? { ...image.placeholder, cache_control: rest.cache_control } : image.placeholder;
             }
             return {
@@ -829,11 +948,11 @@ export class AnthropicAdapter implements ProviderAdapter {
             // text block carried nothing.
             const carried = (block.content as Array<{ type?: string; text?: unknown }>)
               .filter((b) => !(b?.type === 'text' && (typeof b.text !== 'string' || b.text === ''))).length;
-            if (content.length !== carried || substituted) onContentAltered?.(block);
+            if (content.length !== carried || substituted) onContentAltered?.(original);
             return { ...block, content };
           }
           return block;
-        }),
+        }).filter((block: unknown) => block !== undefined),
       };
     });
 
@@ -1125,9 +1244,11 @@ function toAnthropicToolResultContent(
     if (block.type === 'text') {
       out.push({ type: 'text', text: block.text });
     } else if (block.type === 'image') {
-      const image = block.source.type === 'base64'
+      // An image with no source object, someone else's shape that isn't
+      // MCP's form, has nothing to send and is left out.
+      const image = block.source?.type === 'base64'
         ? anthropicImage(block.source.data, block.source.mediaType ?? (block.source as { media_type?: string }).media_type)
-        : block.source.type === 'url' ? anthropicUrlImage(block.source.url) : undefined;
+        : block.source?.type === 'url' ? anthropicUrlImage(block.source.url) : undefined;
       if (image?.type === 'text') onPlaceholder?.();
       if (image) out.push(image);
     }
@@ -1161,10 +1282,52 @@ function anthropicUrlImage(url: string): Anthropic.ImageBlockParam | Anthropic.T
     : { type: 'image', source: { type: 'url', url: image.url } };
 }
 
-export function toAnthropicContent(blocks: ContentBlock[]): Anthropic.ContentBlockParam[] {
+/**
+ * Convert one turn's normalized content to Anthropic content blocks, for a
+ * caller outside membrane's own builds, which go through NativeFormatter.
+ *
+ * With `role: 'assistant'`, an Anthropic server-tool block, or its zero-width
+ * carrier, goes out as the block itself, in the place it had in the turn that
+ * produced it, as NativeFormatter sends it when its build replays server
+ * blocks (see utils/anthropic-server-blocks.ts), except a server call with no
+ * result after it in the turn, or a result with no call before it, which the
+ * API refuses (unpairedServerBlocks). With `lastMessage`, the turn is the
+ * request's final message, a paused turn being resumed, and keeps its lone
+ * calls, as NativeFormatter keeps them there; without it, every lone one is
+ * left out. In any other role a server block is left out, as NativeFormatter
+ * leaves it out of a user turn, which has no place for one. A caller that
+ * names no role gets that too, as it always got for a carrier. Media in
+ * MCP's form is converted to membrane's first (utils/mcp-media.ts), at the
+ * top of the turn and inside a `tool_result`. A document that doesn't
+ * convert, with no source after that, is left out, and so is an image with no
+ * source object that isn't MCP's form, with neither `data` nor `mimeType`.
+ * Nothing reports what it leaves out: it has no alteration callback. It sees
+ * one turn, so a turn whose only blocks pairing leaves out comes back empty,
+ * for the caller to drop as NativeFormatter drops it.
+ */
+export function toAnthropicContent(
+  blocks: ContentBlock[],
+  options: { role?: 'user' | 'assistant'; lastMessage?: boolean } = {},
+): Anthropic.ContentBlockParam[] {
   const result: Anthropic.ContentBlockParam[] = [];
-  
-  for (const block of stripEmptyTextBlocks(blocks)) {
+
+  // An Anthropic server-tool block (web search and the like), kept on a
+  // zero-width carrier, is that block on this wire: it is part of the turn
+  // the model produced (see utils/anthropic-server-blocks.ts). In an
+  // assistant turn, swap it in before the empty-text cleanup, which would
+  // drop the carrier as empty text; in any other, leave it out.
+  const swapped = convertMcpMedia(blocks).flatMap((block): Array<ContentBlock | AnthropicServerBlock> => {
+    const serverBlock = anthropicServerBlockFor(block);
+    if (serverBlock === undefined) return [block];
+    return options.role === 'assistant' ? [serverBlock] : [];
+  });
+  const unpaired = unpairedServerBlocks(swapped, options.lastMessage === true);
+  const sendable = stripEmptyTextBlocks(swapped.filter((block) => !unpaired.has(block)));
+  for (const block of sendable) {
+    if (isAnthropicServerBlock(block)) {
+      result.push(block as unknown as Anthropic.ContentBlockParam);
+      continue;
+    }
     switch (block.type) {
       case 'text': {
         const textBlock: any = { type: 'text', text: block.text };
@@ -1177,14 +1340,20 @@ export function toAnthropicContent(blocks: ContentBlock[]): Anthropic.ContentBlo
       }
         
       case 'image':
-        if (block.source.type === 'base64') {
+        // An image with no source object, someone else's shape that isn't
+        // MCP's form, has nothing to send and is left out.
+        if (block.source?.type === 'base64') {
           result.push(anthropicImage(block.source.data, block.source.mediaType ?? (block.source as { media_type?: string }).media_type));
-        } else if (block.source.type === 'url') {
+        } else if (block.source?.type === 'url') {
           result.push(anthropicUrlImage(block.source.url));
         }
         break;
         
       case 'document':
+        // One with no source object, MCP's form that didn't convert or
+        // someone else's shape, has nothing for a document block to carry.
+        // Audio or video meets the error below in either form.
+        if (isSourcelessMedia(block)) break;
         result.push({
           type: 'document',
           source: {
@@ -1322,9 +1491,13 @@ export function fromAnthropicContent(blocks: Anthropic.ContentBlock[]): ContentB
           // Preserve the encrypted `data` payload — without it the block
           // cannot be round-tripped and prior reasoning is lost.
           result.push({ type: 'redacted_thinking', data: (block as any).data } as any);
+        } else if (isAnthropicServerBlock(block)) {
+          // A server-tool block is its own native form: carried as itself,
+          // with no unknown-type warning, as membrane's response path does.
+          result.push({ type: 'text', text: '', rawItem: block } as ContentBlock);
         } else {
-          // server_tool_use, web_search_tool_result, search_result, mcp_tool_use
-          // and anything Anthropic adds later used to fall out here silently.
+          // search_result and anything Anthropic adds later used to fall out
+          // here silently.
           result.push(preserveUnconvertibleBlock(block, 'anthropic'));
         }
         break;

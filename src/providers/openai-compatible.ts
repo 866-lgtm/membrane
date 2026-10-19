@@ -32,8 +32,10 @@ import {
   withRawRequest,
 } from '../types/index.js';
 import { errorFromThrown } from '../types/errors.js';
-import { toolUseInputFromText, textOnlyToolResultContent, openAIImagePart, createCombinedSignal, SSELineParser, isDeadlineAbort, deadlineTimeoutError, throwOnStreamErrorFrame, assertTerminalEventObserved } from './utils.js';
+import { isRawItemCarrier } from '../utils/fidelity.js';
+import { toolUseInputFromText, textOnlyToolResultContent, openAIImagePart, createCombinedSignal, SSELineParser, isDeadlineAbort, deadlineTimeoutError, throwOnStreamErrorFrame, assertTerminalEventObserved, streamedToolCalls, isEventObject } from './utils.js';
 import { requiresCompletionTokens, noTemperatureSupport, noStopSupport } from './openai.js';
+import { convertMcpMedia } from '../utils/mcp-media.js';
 
 // ============================================================================
 // Types
@@ -233,7 +235,7 @@ export class OpenAICompatibleAdapter implements ProviderAdapter {
       let reasoning = '';
       let finishReason: string | undefined;
       let sawTerminalEvent = false;
-      let toolCalls: OpenAIToolCall[] = [];
+      const toolCalls = streamedToolCalls();
       let streamUsage: OpenAIResponse['usage'] | undefined;
 
       // One frame handler for both the streamed lines and the EOF flush — the
@@ -244,83 +246,79 @@ export class OpenAICompatibleAdapter implements ProviderAdapter {
           return;
         }
 
-        // Parse first; only JSON noise is ignorable. Everything after the
-        // parse must NOT be swallowed by the catch below.
+        // Parse first: a line that isn't JSON is noise to ignore. Nothing
+        // after the parse is caught here, so an error there, a caller's
+        // callback included, fails the stream. What the handler can't read is
+        // dropped below by checks, not by a catch.
         let parsed: Record<string, any>;
         try {
           parsed = JSON.parse(data);
         } catch {
           return; // Ignore parse errors (partial/keep-alive lines)
         }
-        // A parsed provider event is progress (comments never reach here).
+        // JSON that isn't an object (`null`, a number, a string, an array)
+        // carries no event, so its frame is dropped.
+        if (!isEventObject(parsed)) return;
+        // A provider event is progress (comments never reach here).
         options?.onProgress?.();
 
         throwOnStreamErrorFrame(parsed, this.name, openAIRequest);
 
-        try {
-          const delta = parsed.choices?.[0]?.delta;
+        const delta = parsed.choices?.[0]?.delta;
 
-          if (delta?.content) {
-            accumulated += delta.content;
-            callbacks.onChunk(delta.content);
-          }
+        if (delta?.content) {
+          accumulated += delta.content;
+          callbacks.onChunk(delta.content);
+        }
 
-          // Reasoning-model trace arrives on its own channel (not `content`),
-          // as `reasoning` or `reasoning_content` depending on the backend.
-          const reasoningDelta = reasoningOf(delta);
-          if (reasoningDelta !== undefined) {
-            reasoning += reasoningDelta;
-          }
+        // Reasoning-model trace arrives on its own channel (not `content`),
+        // as `reasoning` or `reasoning_content` depending on the backend.
+        const reasoningDelta = reasoningOf(delta);
+        if (reasoningDelta !== undefined) {
+          reasoning += reasoningDelta;
+        }
 
-          // Handle streaming tool calls
-          if (delta?.tool_calls) {
-            for (const tc of delta.tool_calls) {
-              const index = tc.index ?? 0;
-              if (!toolCalls[index]) {
-                toolCalls[index] = {
-                  id: tc.id ?? '',
-                  type: 'function',
-                  function: { name: '', arguments: '' },
-                };
-              }
-              if (tc.id) toolCalls[index].id = tc.id;
-              if (tc.function?.name) toolCalls[index].function.name = tc.function.name;
-              if (tc.function?.arguments) {
-                toolCalls[index].function.arguments += tc.function.arguments;
-              }
-            }
-          }
+        // Handle streaming tool calls
+        // streamedToolCalls places each entry: by its index, or, with none, by
+        // its id and name (antra-tess/membrane#159).
+        if (Array.isArray(delta?.tool_calls)) {
+          for (const tc of delta.tool_calls) toolCalls.add(tc);
+        }
 
-          if (parsed.choices?.[0]?.finish_reason) {
-            finishReason = parsed.choices[0].finish_reason;
-            sawTerminalEvent = true;
-          }
+        if (parsed.choices?.[0]?.finish_reason) {
+          finishReason = parsed.choices[0].finish_reason;
+          sawTerminalEvent = true;
+        }
 
-          // Usage rides the final chunk when stream_options.include_usage is set
-          if (parsed.usage) {
-            streamUsage = parsed.usage;
-          }
-        } catch {
-          // Ignore parse errors in stream
+        // Usage rides the final chunk when stream_options.include_usage is set
+        if (parsed.usage) {
+          streamUsage = parsed.usage;
         }
       };
 
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
 
-        const chunk = decoder.decode(value, { stream: true });
-        for (const data of sseParser.feed(chunk)) {
+          const chunk = decoder.decode(value, { stream: true });
+          for (const data of sseParser.feed(chunk)) {
+            processDataLine(data);
+          }
+        }
+
+        // A final `data:` line that arrived without its trailing newline is still
+        // buffered here. Servers and proxies do close right after writing the
+        // last event, so dropping it would report a finished turn as a dropped
+        // connection at the guard below.
+        for (const data of sseParser.flush()) {
           processDataLine(data);
         }
-      }
-
-      // A final `data:` line that arrived without its trailing newline is still
-      // buffered here. Servers and proxies do close right after writing the
-      // last event, so dropping it would report a finished turn as a dropped
-      // connection at the guard below.
-      for (const data of sseParser.flush()) {
-        processDataLine(data);
+      } finally {
+        // A read loop that ends early, on a callback's error or any other,
+        // leaves the body unread: cancel it, so the provider stops sending
+        // and the connection is let go. After a full read it does nothing.
+        void reader.cancel().catch(() => {});
       }
 
       assertTerminalEventObserved(sawTerminalEvent, this.name, openAIRequest);
@@ -333,8 +331,12 @@ export class OpenAICompatibleAdapter implements ProviderAdapter {
 
       if (reasoning) message.reasoning = reasoning;
 
-      if (toolCalls.length > 0) {
-        message.tool_calls = toolCalls;
+      // The calls the stream placed: those with an index in index order (an
+      // index can skip a slot, and a hole would fail the response built from
+      // them), then those without one in the order they started.
+      const placedToolCalls = toolCalls.calls();
+      if (placedToolCalls.length > 0) {
+        message.tool_calls = placedToolCalls;
       }
 
       return this.parseStreamedResponse(message, finishReason, request.model, streamUsage, openAIRequest);
@@ -361,7 +363,10 @@ export class OpenAICompatibleAdapter implements ProviderAdapter {
   }
 
   private buildRequest(request: ProviderRequest): any {
-    const messages = this.convertMessages(request.messages as any[]);
+    // Media in MCP's form becomes membrane's first, for a caller that builds
+    // a request directly (Membrane's own builds have converted it already,
+    // utils/mcp-media.ts).
+    const messages = this.convertMessages(convertMcpMedia(request.messages as any[]));
     
     // Handle system prompt (same as openrouter.ts)
     if (request.system) {
@@ -449,6 +454,10 @@ export class OpenAICompatibleAdapter implements ProviderAdapter {
 
         for (const block of msg.content) {
           if (block.type === 'text') {
+            // A zero-width carrier (a provider item with no normalized form,
+            // such as an Anthropic server-tool block) has no text and no form
+            // on this wire: an empty part would only add a blank line.
+            if (isRawItemCarrier(block)) continue;
             contentParts.push({ type: 'text', text: block.text });
           } else if (block.type === 'thinking') {
             // Round-trip the reasoning trace back to the provider (OpenRouter
@@ -706,6 +715,8 @@ export function toOpenAIMessages(
 
     for (const block of msg.content) {
       if (block.type === 'text') {
+        // A zero-width carrier holds a block this wire has no form for.
+        if (isRawItemCarrier(block)) continue;
         textParts.push(block.text);
       } else if (block.type === 'thinking') {
         if (typeof (block as { thinking?: string }).thinking === 'string') {

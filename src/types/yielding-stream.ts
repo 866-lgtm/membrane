@@ -51,7 +51,9 @@ export interface ToolCallsEvent {
  * On the yielding paths it is emitted once per provider round whose response
  * stands (after any refusal retries), and then carries `round`: that round's
  * own report. Streams created with `emitUsage: false` emit no usage events,
- * so no round reports either.
+ * so no round reports either. A round whose response arrives after the
+ * stream was cancelled isn't reported: the stream ended at its aborted event.
+ * Nor is a round the cancel aborts in flight, since no response arrives.
  */
 export interface UsageEvent {
   type: 'usage';
@@ -147,9 +149,10 @@ export interface RoundReport {
   /**
    * The signed thinking this round's request sent back that failed the
    * provider's binding check, as the provider reported it: Anthropic's
-   * `input_transformations`, which come back when `thinking.blockBinding` is
-   * set. Absent when the response carried no report; both lists empty when
-   * it reported that nothing failed. This is the provider's account, beside
+   * `input_transformations`, which come back when the request carries the
+   * binding (`thinking.blockBinding`'s doc names the requests that don't).
+   * Absent when the response carried no report; both lists empty when it
+   * reported that nothing failed. This is the provider's account, beside
    * `altered`, which is membrane's: a dropped block was carried on the
    * request verbatim and removed before the model saw it. Entries of a type
    * membrane doesn't know are left out.
@@ -244,7 +247,11 @@ export interface RetryingEvent {
 }
 
 /**
- * Aborted event - stream was cancelled.
+ * Aborted event: the stream ended before the turn finished. It carries what
+ * the turn had recorded by then: the text so far (`rawAssistantText`, and as
+ * blocks in `partialContent`) and the tool rounds run (`toolCalls`,
+ * `toolResults`). A round whose tools were still running shows its calls with
+ * no results.
  */
 export interface AbortedEvent {
   type: 'aborted';
@@ -362,7 +369,13 @@ export interface YieldingStream extends AsyncIterable<StreamEvent> {
 
   /**
    * Cancel the stream. Any in-flight requests will be aborted.
-   * The iterator will yield an 'aborted' event and then complete.
+   * The iterator will yield an 'aborted' event and then complete, with
+   * nothing after it. The event carries what the turn had recorded when
+   * cancel() was called (see AbortedEvent). Results passed to
+   * provideToolResults() just before it aren't recorded yet, so their calls
+   * show no results. If the stream has already queued or delivered its
+   * complete, error or aborted event, cancel() adds no event of its own, and
+   * that event stays the stream's last.
    */
   cancel(): void;
 
@@ -398,14 +411,18 @@ export interface YieldingStreamOptions {
   /** Request timeout (per API call, not total) */
   timeoutMs?: number;
 
-  /** Abort if no SSE event arrives within this many ms (default: 120000) */
+  /** Anthropic idle deadline after the first SDK event (default: 600000 ms).
+   * Nonempty Web response-body bytes, including SSE keepalives, refresh it;
+   * other SDK-supported bodies refresh it on SDK events. This does not bound
+   * total duration or generation progress. */
   idleTimeoutMs?: number;
 
   /**
    * Progress deadline, per provider call (default: off, as for any value
    * that isn't a positive number of ms). Every parsed provider event renews
-   * it (an SDK event, an SSE data frame); keepalives, SSE comments and raw
-   * bytes don't, so a connection that stays up while the model sends nothing
+   * it (an SDK event, an SSE data frame that parses to an object);
+   * keepalives, SSE comments and raw bytes don't, so a connection that stays
+   * up while the model sends nothing
    * still ends. On expiry the stream ends with an `aborted` event whose reason
    * is `'timeout'`, carrying what arrived. It bounds the wait for the first
    * event too. Time between provider calls, such as waiting for
