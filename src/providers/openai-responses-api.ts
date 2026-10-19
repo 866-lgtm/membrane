@@ -129,7 +129,8 @@ export interface OpenAIResponsesAPIAdapterConfig {
   mode?: 'api' | 'subscription';
   /** Request priority service in subscription mode (default: false). */
   fastMode?: boolean;
-  /** Called once if a subscription response reports a non-priority tier. */
+  /** Called once if a subscription response reports a non-priority tier. If
+   * it throws, the error is logged with console.warn and the response stands. */
   onFastModeFallback?: (serviceTier: string) => void;
   /** Subscription mode: base of the prompt-cache routing id sent as the
    * `session_id` header and as `prompt_cache_key`. Each request appends a digest
@@ -419,7 +420,13 @@ export class OpenAIResponsesAPIAdapter implements ProviderAdapter {
           typeof returnedTier === 'string' && returnedTier && returnedTier !== 'priority' &&
           !this.warnedFastFallback) {
         this.warnedFastFallback = true;
-        this.onFastModeFallback?.(returnedTier);
+        try {
+          this.onFastModeFallback?.(returnedTier);
+        } catch (error) {
+          // The response it reports on has arrived and stands. A retry would
+          // pay for another call and wouldn't run the callback again.
+          console.warn('[membrane:openai-responses] onFastModeFallback threw; the response stands:', error);
+        }
       }
       const parsed = this.parseResponse(terminalResponse, request.model, responsesRequest);
       parsed.content.forEach((block, index) => callbacks.onContentBlock?.(index, block));

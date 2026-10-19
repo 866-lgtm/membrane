@@ -21,6 +21,7 @@ import type {
   StreamCallbacks,
   ModelRegistry,
   MembraneConfig,
+  MembraneLogger,
   StreamOptions,
   CompleteOptions,
   BasicUsage,
@@ -67,6 +68,7 @@ import {
 } from './types/index.js';
 import type { BuildResult } from './formatters/types.js';
 import { computeCacheWireReceipt } from './cache-wire-receipt.js';
+import { awaitCallerCode, runCallerCode } from './types/errors.js';
 import { createProgressDeadline } from './providers/utils.js';
 import {
   parseToolCalls,
@@ -327,6 +329,17 @@ function isBuildRefusal(error: unknown): error is MembraneError {
 }
 
 /**
+ * Hand a request's receipt consumer its receipt for `described`. The receipt
+ * is membrane's to compute; what the consumer throws is the caller's.
+ */
+function deliverCacheWireReceipt(request: NormalizedRequest, described: unknown): void {
+  const consumer = request.onCacheWireReceipt;
+  if (!consumer) return;
+  const receipt = computeCacheWireReceipt(described);
+  runCallerCode(() => consumer.call(request, receipt));
+}
+
+/**
  * Stop reasons membrane has already logged as unmapped (see mapStopReason),
  * as the log line printed them (see shownStopReason). A server can send a
  * fresh token on every response (one carrying an id, say), so the set stops
@@ -465,7 +478,7 @@ export class Membrane {
           : clampCacheMarkers(finalRequest, 'complete').total;
         const useWireReceipt = this.adapter.cacheReceiptBasis === 'wire-request';
         let receiptEmitted = false;
-        if (!useWireReceipt) request.onCacheWireReceipt?.(computeCacheWireReceipt(finalRequest));
+        if (!useWireReceipt) deliverCacheWireReceipt(request, finalRequest);
         const receiptGuard = useWireReceipt && request.onCacheWireReceipt
           ? this.wireReceiptGuard(options.signal)
           : undefined;
@@ -494,10 +507,10 @@ export class Membrane {
                 markersInRequest = countWireCacheMarkers(req as Parameters<typeof countWireCacheMarkers>[0]);
                 if (!receiptEmitted) {
                   receiptEmitted = true;
-                  receiptGuard?.emit(() => request.onCacheWireReceipt?.(computeCacheWireReceipt(req)));
+                  receiptGuard?.emit(() => deliverCacheWireReceipt(request, req));
                 }
               }
-              options.onRequest?.(req);
+              runCallerCode(() => options.onRequest?.(req));
             },
           });
           rawProviderResponse = receiptGuard ? await receiptGuard.settle(adapterCall) : await adapterCall;
@@ -517,7 +530,7 @@ export class Membrane {
         };
 
         // Call onResponse callback with raw response from API
-        options.onResponse?.(providerResponse.raw);
+        runCallerCode(() => options.onResponse?.(providerResponse.raw));
 
         const response = this.transformResponse(
           providerResponse,
@@ -555,8 +568,9 @@ export class Membrane {
         }
 
         // Call afterResponse hook
-        if (this.config.hooks?.afterResponse) {
-          return await this.config.hooks.afterResponse(response, providerResponse.raw);
+        const hooks = this.config.hooks;
+        if (hooks?.afterResponse) {
+          return await awaitCallerCode(() => hooks.afterResponse!(response, providerResponse.raw));
         }
 
         return response;
@@ -596,8 +610,9 @@ export class Membrane {
 
         if (errorInfo.retryable && attempts < effectiveMax) {
           // Check hook for retry decision
-          if (this.config.hooks?.onError) {
-            const decision = await this.config.hooks.onError(errorInfo, attempts);
+          const hooks = this.config.hooks;
+          if (hooks?.onError) {
+            const decision = await awaitCallerCode(() => hooks.onError!(errorInfo, attempts));
             if (decision === 'abort') {
               throw classifiedError;
             }
@@ -697,11 +712,11 @@ export class Membrane {
         for (let i = 0; i < response.content.length; i++) {
           const block = response.content[i]!;
           if (block.type === 'text' && block.text) {
-            options.onChunk(block.text, {
+            runCallerCode(() => options.onChunk!(block.text, {
               type: 'text',
               visible: true,
               blockIndex: i,
-            });
+            }));
           }
         }
       }
@@ -724,18 +739,25 @@ export class Membrane {
     while (true) {
       attempts++;
       let emitted = false;
+      // Each callback is the caller's code, so what it throws is never
+      // retried (see callerCodeError). The tool executor and the pre-tool
+      // callback are awaited, so their rejections are the caller's too.
       const mark = <A extends unknown[], R>(fn?: (...args: A) => R) =>
-        fn && ((...args: A): R => { emitted = true; return fn(...args); });
+        fn && ((...args: A): R => { emitted = true; return runCallerCode(() => fn(...args)); });
+      const markAwaited = <A extends unknown[], R>(fn?: (...args: A) => Promise<R> | R) =>
+        fn && ((...args: A): Promise<R> => { emitted = true; return awaitCallerCode(() => fn(...args)); });
+      const onRequest = options.onRequest;
       const tracked: StreamOptions = {
         ...options,
         onChunk: mark(options.onChunk),
         onContentBlockUpdate: mark(options.onContentBlockUpdate),
-        onToolCalls: mark(options.onToolCalls),
-        onPreToolContent: mark(options.onPreToolContent),
+        onToolCalls: markAwaited(options.onToolCalls),
+        onPreToolContent: markAwaited(options.onPreToolContent),
         onUsage: mark(options.onUsage),
         onBlock: mark(options.onBlock),
         onResponse: mark(options.onResponse),
-        // onRequest fires before the send — it is not an emission.
+        // onRequest fires before the send: not an emission, but the caller's code.
+        onRequest: onRequest && ((rawRequest: unknown) => runCallerCode(() => onRequest(rawRequest))),
       };
 
       try {
@@ -770,8 +792,9 @@ export class Membrane {
           // Honor the same pre-retry hook contract as complete(): hosts use
           // onError for circuit-breaking, and its 'abort' decision must work
           // on the streaming path too.
-          if (this.config.hooks?.onError) {
-            const decision = await this.config.hooks.onError(errorInfo, attempts);
+          const hooks = this.config.hooks;
+          if (hooks?.onError) {
+            const decision = await awaitCallerCode(() => hooks.onError!(errorInfo, attempts));
             if (decision === 'abort') {
               throw error;
             }
@@ -1004,7 +1027,7 @@ export class Membrane {
     let consecutiveStalledResumptions = 0;
     let enteredViaResumption = false;
     let prevRoundStopSequence: string | undefined;
-    const warnLog = this.config.logger ?? console;
+    const warnLog = this.warnLogger();
 
     /** Count an automatic resumption; emits the visibility warning at the
      *  threshold and returns false when the cap says the turn should end. */
@@ -2210,6 +2233,17 @@ export class Membrane {
   // ==========================================================================
 
   /**
+   * The logger membrane warns through: the configured one, or console. The
+   * configured logger's warn() is the caller's code, so what it throws leaves
+   * as callerCodeError: a log sink's failure ends the call and isn't resent.
+   */
+  private warnLogger(): Pick<MembraneLogger, 'warn'> {
+    const logger = this.config.logger;
+    if (!logger) return console;
+    return { warn: (...args) => runCallerCode(() => logger.warn(...args)) };
+  }
+
+  /**
    * Fail loudly when a wire-request receipt consumer throws.
    *
    * Wire-request receipts are emitted from inside the adapter's `onRequest`,
@@ -2219,7 +2253,8 @@ export class Membrane {
    * the call before any provider request. Keep that contract for wire-request
    * receipts too: remember the failure, abort the adapter call through its
    * signal (adapters invoke `onRequest` before sending, so nothing goes out),
-   * and rethrow the consumer's original error once the adapter settles.
+   * and rethrow the consumer's error, as callerCodeError made it, once the
+   * adapter settles.
    */
   private wireReceiptGuard(callerSignal: AbortSignal | undefined) {
     const controller = new AbortController();
@@ -2260,8 +2295,9 @@ export class Membrane {
     normalizedRequest: NormalizedRequest,
     providerRequest: unknown,
   ): Promise<unknown> {
-    if (!this.config.hooks?.beforeRequest) return providerRequest;
-    const result = await this.config.hooks.beforeRequest(normalizedRequest, providerRequest);
+    const hooks = this.config.hooks;
+    if (!hooks?.beforeRequest) return providerRequest;
+    const result = await awaitCallerCode(() => hooks.beforeRequest!(normalizedRequest, providerRequest));
     return result ?? providerRequest;
   }
 
@@ -2393,7 +2429,7 @@ export class Membrane {
         if (PREFIX_REWRITING_NORMALIZE_EVENT_KINDS.has(event.kind)) prefixRewritten = true;
         // The caller's view of every repair, textifications included: without
         // it a result turned into text would reach the model unannounced.
-        this.config.hooks?.onNormalize?.(event);
+        runCallerCode(() => this.config.hooks?.onNormalize?.(event));
       },
       deferCacheBudgetCheck: true,
       participantMode: 'multiuser',
@@ -2685,7 +2721,7 @@ export class Membrane {
     let receiptEmitted = false;
     // The adapter's content-alteration reports for the attempt in flight.
     let attemptAlterations: unknown[] = [];
-    if (!useWireReceipt) normalizedRequest.onCacheWireReceipt?.(computeCacheWireReceipt(finalRequest));
+    if (!useWireReceipt) deliverCacheWireReceipt(normalizedRequest, finalRequest);
     const receiptGuard = useWireReceipt && normalizedRequest.onCacheWireReceipt
       ? this.wireReceiptGuard(adapterOptions.signal)
       : undefined;
@@ -2708,7 +2744,7 @@ export class Membrane {
           // so receipt queues stay aligned with the one accepted usage event.
           if (!receiptEmitted) {
             receiptEmitted = true;
-            receiptGuard?.emit(() => normalizedRequest.onCacheWireReceipt?.(computeCacheWireReceipt(wireRequest)));
+            receiptGuard?.emit(() => deliverCacheWireReceipt(normalizedRequest, wireRequest));
           }
         }
         adapterOptions.onRequest?.(wireRequest);
@@ -3100,7 +3136,7 @@ export class Membrane {
     },
     stopReason: StopReason
   ): void {
-    const warnLog = this.config.logger ?? console;
+    const warnLog = this.warnLogger();
 
     if (diagnostics.unclosedToolBlock) {
       warnLog.warn(
@@ -3393,7 +3429,7 @@ export class Membrane {
   ): import('./types/provider.js').ModelPricing | undefined {
     const servedModel = actualModel && actualModel !== requestedModel ? actualModel : undefined;
     const fromRegistry = (modelId: string | undefined) =>
-      modelId === undefined ? undefined : this.registry?.getPricing(modelId);
+      modelId === undefined ? undefined : runCallerCode(() => this.registry?.getPricing(modelId));
     const fromBuiltin = (modelId: string | undefined) =>
       modelId === undefined ? undefined : getDefaultPricing(modelId);
 
@@ -3618,7 +3654,7 @@ export class Membrane {
     // and a partial implementation would corrupt the turn instead of
     // retrying it. Fail LOUD and OFF rather than silently mis-retrying.
     if (toolMode !== 'native' && (options.refusalRetries ?? 0) > 0) {
-      (this.config.logger ?? console).warn(
+      this.warnLogger().warn(
         '[membrane] refusalRetries is ignored in XML tool mode ' +
         '(native-only for now) — the turn will surface the refusal as before.',
       );
@@ -3679,7 +3715,7 @@ export class Membrane {
     let consecutiveStalledResumptions = 0;
     let enteredViaResumption = false;
     let prevRoundStopSequence: string | undefined;
-    const warnLog = this.config.logger ?? console;
+    const warnLog = this.warnLogger();
 
     // Initialize parser from the formatter streamYielding selected, so the
     // parser and the build below read the same format.
