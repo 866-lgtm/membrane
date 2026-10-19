@@ -24,7 +24,8 @@
 // `max_tokens`, zero output tokens billed, and the cache entry refreshed. The
 // replay leaves out the messages after the request's last one-hour marker,
 // apart from what it takes to end where a user turn ends (below). A request
-// with no user message after that marker is replayed whole, as it was sent.
+// with no user message at or after that marker is replayed whole, as it was
+// sent.
 // A call is snapshotted only once the provider is known to have its prefix
 // (the adapter records at `message_start`, or once the SDK has a non-streamed
 // response): a request that failed before then isn't known to be cached, and
@@ -229,10 +230,11 @@ function isOneHourMarker(cc: { ttl?: unknown }): boolean {
  * `tools` or `messages`, or one message), walked in order and stopping at the
  * first it holds for. A marker sits on a block: an entry of `system` or
  * `tools`, a message's content block, or a block in another block's `content`
- * (a tool result's). Only those are walked, as membrane's marker budget walks
- * them, so JSON a tool was given, which can hold any key, isn't read as a
- * marker. Nor is a block inside a document's `source.content`: Anthropic's
- * documentation puts a document's marker on the document block itself.
+ * (a tool result's). Only those are walked, so JSON a tool was given, which
+ * can hold any key, isn't read as a marker. Nor is a block inside a document's
+ * `source.content`: Anthropic's documentation puts a document's marker on the
+ * document block itself, and membrane's marker budget doesn't count one there
+ * either.
  * Eligibility and the refresh's cut both ask here, so they agree on where a
  * request's markers are.
  */
@@ -259,9 +261,8 @@ function someCacheControl(node: unknown, found: (cc: { ttl?: unknown }) => boole
  * a tool call's results, since the API takes consecutive user messages as one
  * turn. It runs through the first user message at or after the last one-hour
  * marker's message, or from the start when the markers sit only on `system` or
- * `tools`, and through the user messages directly after that one. When no user
- * message comes after the marker, the run is every message, as the request was
- * sent.
+ * `tools`, and through the user messages directly after that one. When there's
+ * no such user message, the run is every message, as the request was sent.
  */
 export function messagesForRefresh(messages: readonly unknown[]): unknown[] {
   const isUser = (message: unknown) => (message as { role?: unknown } | null)?.role === 'user';

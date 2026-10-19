@@ -122,6 +122,11 @@ describe('messagesForRefresh', () => {
     expect(messagesForRefresh(messages)).toEqual(messages.slice(0, 3));
   });
 
+  it("leaves out an assistant message after the user message holding the last one-hour marker, though no user message follows it", () => {
+    const messages = [user(text('a')), assistant(text('b')), user(text('c', hour)), assistant(text('a prefill'))];
+    expect(messagesForRefresh(messages)).toEqual(messages.slice(0, 3));
+  });
+
   it('runs on through the next user message when the last one-hour marker is on an assistant message', () => {
     const messages = [user(text('a')), assistant(text('b', hour)), user(text('c')), assistant(text('d')), user(text('e'))];
     expect(messagesForRefresh(messages)).toEqual(messages.slice(0, 3));
@@ -137,12 +142,12 @@ describe('messagesForRefresh', () => {
     expect(messagesForRefresh(messages)).toEqual(messages);
   });
 
-  it('keeps every message when no user message follows the last one-hour marker', () => {
+  it('keeps every message when the last one-hour marker is on an assistant message with no user message after it', () => {
     const messages = [user(text('a')), assistant(text('b', hour))];
     expect(messagesForRefresh(messages)).toEqual(messages);
   });
 
-  it('keeps every message, the assistant messages after the marker among them, when no user message follows it', () => {
+  it("keeps the assistant messages after the marker's too, when the marker is on an assistant message with no user message after it", () => {
     const messages = [user(text('a')), assistant(text('b', hour)), assistant(text('c'))];
     expect(messagesForRefresh(messages)).toEqual(messages);
   });
@@ -210,6 +215,12 @@ describe('messagesForRefresh', () => {
     const document = { type: 'document', source: { type: 'content', content: [text('page', hour)] } };
     const messages = [user(text('a', hour)), assistant(text('b')), user(document), assistant(text('d')), user(text('e'))];
     expect(messagesForRefresh(messages)).toEqual(messages.slice(0, 1));
+  });
+
+  it('finds a one-hour marker on a document block itself', () => {
+    const document = { type: 'document', source: { type: 'text', media_type: 'text/plain', data: 'page' }, cache_control: hour };
+    const messages = [user(text('a', hour)), assistant(text('b')), user(document), assistant(text('d')), user(text('e'))];
+    expect(messagesForRefresh(messages)).toEqual(messages.slice(0, 3));
   });
 });
 
