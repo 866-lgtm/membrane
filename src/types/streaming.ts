@@ -226,16 +226,17 @@ export interface StreamOptions {
   progressTimeoutMs?: number;
 
   /**
-   * Whether membrane retries the call's failed provider calls itself.
-   * Default true: a provider call that fails with a retryable error before
-   * it delivered anything is sent again, in any round, on the `retry`
-   * config's schedules. With `false`, membrane sends each provider call
-   * once, whatever the error and whatever the config says: the first failure
-   * is thrown as it came, with the provider's advice on it (`retryable`, and
-   * a stated wait on `retryAfterMs`), and `hooks.onError`, which is asked
-   * before each retry, isn't asked. For a caller whose own layer retries. A
-   * refusal re-issue (`refusalRetries`) is asked for separately and isn't
-   * affected.
+   * Whether membrane retries the call's failed provider calls itself. Default
+   * true: a provider call that fails with a retryable error before it
+   * delivered anything is sent again, in any round, on the `retry` config's
+   * schedules. With `false`, membrane retries none of the call's failed
+   * requests, whatever the error and whatever the config says: the failure is
+   * thrown as it came, with the provider's advice on it (`retryable`, and a
+   * stated wait on `retryAfterMs`), and `hooks.onError`, which is asked
+   * before each retry, isn't asked. For a caller whose own layer retries. Two
+   * sends stay: a refusal re-issue, which the call asks for with
+   * `refusalRetries`, and the one resend with refreshed credentials that an
+   * adapter with a credential resolver makes after an HTTP 401.
    */
   retry?: boolean;
 
@@ -322,12 +323,14 @@ export interface CompleteOptions {
   /**
    * Whether membrane retries the call's failed request itself. Default true:
    * a request that fails with a retryable error is sent again on the `retry`
-   * config's schedules. With `false`, membrane sends it once, whatever the
-   * error and whatever the config says: the first failure is thrown as it
-   * came, with the provider's advice on it (`retryable`, and a stated wait on
-   * `retryAfterMs`), and `hooks.onError`, which is asked before each retry,
-   * isn't asked. For a caller whose own layer retries. A refusal re-issue
-   * (`refusalRetries`) is asked for separately and isn't affected.
+   * config's schedules. With `false`, membrane retries none of the call's
+   * failed requests, whatever the error and whatever the config says: the
+   * failure is thrown as it came, with the provider's advice on it
+   * (`retryable`, and a stated wait on `retryAfterMs`), and `hooks.onError`,
+   * which is asked before each retry, isn't asked. For a caller whose own
+   * layer retries. Two sends stay: a refusal re-issue, which the call asks
+   * for with `refusalRetries`, and the one resend with refreshed credentials
+   * that an adapter with a credential resolver makes after an HTTP 401.
    */
   retry?: boolean;
 

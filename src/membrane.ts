@@ -455,6 +455,8 @@ export class Membrane {
     // billed HTTP call; reporting only the surviving attempt's usage
     // under-reports the turn by one full call per retry.
     let discardedUsage: DiscardedAttemptsUsage | undefined;
+    // The waits before each pass that sent the request again, in order.
+    const retryDelaysMs: number[] = [];
 
     // One selection for the whole call: mode resolution and the build must
     // name the same formatter instance (see resolveActiveFormatter).
@@ -571,6 +573,7 @@ export class Membrane {
           response.details.usage.discardedAttempts =
             this.pricedDiscardedAttempts(discardedUsage, request.config.model);
         }
+        if (retryDelaysMs.length > 0) response.details.timing.retryDelaysMs = retryDelaysMs;
 
         // Call afterResponse hook
         const hooks = this.config.hooks;
@@ -628,6 +631,9 @@ export class Membrane {
           // MembraneError — rather than escaping the loop as a raw
           // DOMException whose shape no caller of complete() expects.
           const delay = this.calculateRetryDelay(tries, plan.overloaded, errorInfo);
+          // Reported only with a response: a cancellation ends the wait by
+          // throwing, so a wait that didn't happen is never reported.
+          retryDelaysMs.push(delay);
           try {
             await this.sleep(delay, options.signal);
           } catch (sleepError) {
@@ -2201,8 +2207,6 @@ export class Membrane {
     const state: { failure?: { error: unknown } } = {};
     return {
       signal: callerSignal ? AbortSignal.any([callerSignal, controller.signal]) : controller.signal,
-      /** The consumer's failure, once it has thrown: the call ends with it. */
-      get failure(): { error: unknown } | undefined { return state.failure; },
       emit(send: () => void): void {
         try {
           send();
@@ -2603,7 +2607,7 @@ export class Membrane {
        * is sent again without it, since there is nothing to discard.
        */
       onRetrying?: (info: { attempt: number; maxAttempts: number; category?: string }) => void;
-      /** See StreamOptions.retry: false sends the call once, whatever fails. */
+      /** See StreamOptions.retry: with false, retryPlan plans no retry. */
       retry?: boolean;
       /**
        * Starts with the post-hook/post-clamp input count. Wire-request
@@ -2712,7 +2716,8 @@ export class Membrane {
     let discardedUsage: DiscardedAttemptsUsage | undefined;
     let providerCalls = 0;
     // Sends since the last refusal re-issue, which starts the count again: the
-    // transport-error budget, and the attempts an error reports.
+    // transport-error budget, which the retry decision, its wait and onError
+    // read.
     let tries = 0;
     const retryDelaysMs: number[] = [];
     while (true) {
@@ -2742,10 +2747,10 @@ export class Membrane {
       };
       let attemptResult: ProviderResponse | undefined;
       let failure: { error: unknown } | undefined;
-      // Each send gets its own progress deadline, made here and cleaned up
+      // Each attempt gets its own progress deadline, made here and cleaned up
       // before anything decides whether to send it again: refusal re-issues
-      // and retries each get a new one, and time outside the send (the wait
-      // before a retry, tool execution) never counts.
+      // and retries each get a new one, and time outside the attempt (the
+      // wait before a retry, tool execution) never counts.
       const progress = createProgressDeadline(observedOptions.signal, progressTimeoutMs);
       try {
         const streamCall = this.adapter.stream(
@@ -3514,9 +3519,10 @@ export class Membrane {
    * code says the account is out of quota is not a rate limit in that sense:
    * it is classified non-retryable at the boundary, and gets no floor.
    *
-   * With the call's `retry: false` nothing is sent again, these floors
-   * included: the error goes to the caller. Nor is an error whose stated
-   * wait is longer than its schedule's maxRetryDelayMs.
+   * With the call's `retry: false` it returns undefined for every error,
+   * these floors included: the error goes to the caller. It does the same
+   * for an error whose stated wait is longer than its schedule's
+   * maxRetryDelayMs.
    */
   private retryPlan(
     errorInfo: ErrorInfo,

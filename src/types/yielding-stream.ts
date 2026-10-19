@@ -461,14 +461,14 @@ export interface YieldingStreamOptions {
    * Whether membrane retries the stream's failed provider calls itself.
    * Default true: a call that fails with a retryable error before it
    * delivered anything is sent again, in any round, on the `retry` config's
-   * schedules. With `false`, membrane sends each call once, whatever the
-   * error and whatever the config says: the first failure ends the stream
-   * with an `error` event, carrying the provider's advice (`retryable`, and a
-   * stated wait on `retryAfterMs`), and `hooks.onError`, which is asked
-   * before each retry, isn't asked. For a caller whose own layer retries,
-   * such as an agent framework that holds every agent on a model through a
-   * capacity storm and paces one organization's rate limits. A refusal
-   * re-issue (`refusalRetries`) is asked for separately and isn't affected.
+   * schedules. With `false`, membrane retries none of the call's failed
+   * requests, whatever the error and whatever the config says: the failure
+   * ends the stream with an `error` event, carrying the provider's advice
+   * (`retryable`, and a stated wait on `retryAfterMs`), and `hooks.onError`,
+   * which is asked before each retry, isn't asked. For a caller whose own
+   * layer retries. Two sends stay: a refusal re-issue, which the call asks
+   * for with `refusalRetries`, and the one resend with refreshed credentials
+   * that an adapter with a credential resolver makes after an HTTP 401.
    */
   retry?: boolean;
 

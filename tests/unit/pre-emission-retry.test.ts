@@ -388,34 +388,38 @@ describe('the wait before a retry ends when the stream is stopped', () => {
 
   it('cancel() while onError decides: the stream ends with aborted, and nothing is sent again', async () => {
     const adapter = new ScriptedNativeAdapter([{ fail: overloaded529 }, { text: 'zz never' }]);
-    let stream!: ReturnType<Membrane['streamYielding']>;
-    let returned!: () => void;
-    const onErrorReturned = new Promise<void>((resolve) => { returned = resolve; });
-    const membrane = native(adapter, {
-      ...SLOW,
-      hooks: {
-        onError: async () => {
-          stream.cancel();
-          await new Promise((resolve) => setTimeout(resolve, 0));
-          returned();
-          return 'retry' as const;
+    await withHeldWaits(async () => {
+      let stream!: ReturnType<Membrane['streamYielding']>;
+      let returned!: () => void;
+      const onErrorReturned = new Promise<void>((resolve) => { returned = resolve; });
+      const membrane = native(adapter, {
+        ...SLOW,
+        hooks: {
+          onError: async () => {
+            stream.cancel();
+            // setImmediate, which isn't faked, so only the wait's own timer is held.
+            await new Promise((resolve) => setImmediate(resolve));
+            returned();
+            return 'retry' as const;
+          },
         },
-      },
+      });
+      stream = membrane.streamYielding(NATIVE_REQUEST);
+      // Start the stream, and read it only once the runner is past onError: a
+      // consumer that hasn't drained sees whatever was queued after `aborted`.
+      const iterator = stream[Symbol.asyncIterator]();
+      await onErrorReturned;
+      await new Promise((resolve) => setImmediate(resolve));
+      const events: StreamEvent[] = [];
+      for (;;) {
+        const { value, done } = await iterator.next();
+        if (done) break;
+        events.push(value);
+      }
+      expect(events.map((e) => e.type)).toEqual(['aborted']);
     });
-    stream = membrane.streamYielding(NATIVE_REQUEST);
-    // Start the stream, and read it only once the runner is past onError: a
-    // consumer that hasn't drained sees whatever was queued after `aborted`.
-    const iterator = stream[Symbol.asyncIterator]();
-    await onErrorReturned;
-    await new Promise((resolve) => setTimeout(resolve, 0));
-    const events: StreamEvent[] = [];
-    for (;;) {
-      const { value, done } = await iterator.next();
-      if (done) break;
-      events.push(value);
-    }
-
-    expect(events.map((e) => e.type)).toEqual(['aborted']);
+    // Every timer left has run by now: a wait that outlived the cancel would
+    // have sent the call again.
     expect(adapter.sends).toBe(1);
   });
 
@@ -532,9 +536,55 @@ describe('the sends a call gets, on each entry point', () => {
     expect(error!.error).toMatchObject({ type: 'network' });
     expect(forYielding.sends).toBe(3);
   });
+
+  it.each(['complete', 'streamYielding'] as const)('%s(): the next send waits out the reported wait', async (entry) => {
+    // The base schedule is unjittered, so a 5xx waits exactly retryDelayMs.
+    // The wait's sleep sets the only timer on this path: the clock decides
+    // the second send, not the report of it.
+    const config = { retry: { maxRetries: 2, retryDelayMs: 1000, maxRetryDelayMs: 1000, backoffMultiplier: 1 } };
+    const adapter = new ScriptedNativeAdapter([{ fail: () => serverError('zz internal', 503) }, { text: 'zz recovered' }]);
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      const membrane = native(adapter, config);
+      const done = entry === 'complete'
+        ? membrane.complete(NATIVE_REQUEST)
+        : drive(membrane.streamYielding(NATIVE_REQUEST)).then((events) => ofType(events, 'complete')[0]!.response);
+      for (let hop = 0; hop < 50 && vi.getTimerCount() === 0; hop++) {
+        await new Promise((resolve) => setImmediate(resolve));
+      }
+      expect(vi.getTimerCount()).toBe(1);
+      expect(adapter.sends).toBe(1);
+      await vi.advanceTimersByTimeAsync(999);
+      expect(adapter.sends).toBe(1);
+      await vi.advanceTimersByTimeAsync(1);
+      const response = await done;
+      expect(adapter.sends).toBe(2);
+      expect(response.details.timing.attempts).toBe(2);
+      expect(response.details.timing.retryDelaysMs).toEqual([1000]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
 
 describe('a refusal re-issue starts the transport budget again', () => {
+  it.each(['complete', 'streamYielding'] as const)('%s(): after a re-issue, onError counts the failing sends from one again', async (entry) => {
+    const adapter = new ScriptedNativeAdapter([
+      { refuse: 'zz refused' },
+      { fail: overloaded529 },
+      { text: 'zz recovered' },
+    ]);
+    const onError = vi.fn(() => 'retry' as const);
+    const membrane = native(adapter, { ...SCHEDULES, hooks: { onError } });
+    if (entry === 'complete') await membrane.complete(NATIVE_REQUEST, { refusalRetries: 1 });
+    else await drive(membrane.streamYielding(NATIVE_REQUEST, { refusalRetries: 1 }));
+
+    expect(adapter.sends).toBe(3);
+    // One failed send since the re-issue. complete() used to count the
+    // call's passes, the refused one included: 2 here.
+    expect(onError.mock.calls.map((call) => call[1])).toEqual([1]);
+  });
+
   it('streamYielding(): a 529 after output on the re-issue is not retried', async () => {
     const adapter = new ScriptedNativeAdapter([
       { refuse: 'zz refused' },

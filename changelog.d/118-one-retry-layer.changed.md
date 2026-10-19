@@ -1,10 +1,12 @@
 - Membrane is now the one layer that retries. `AnthropicAdapter`'s SDK client
-  sends each request membrane makes once. Its own retries are off: two by
-  default, inside each of membrane's attempts, on a 408, 409, 429 or 5xx
-  response and on a connection failure. So with `retry: false` a failure
-  reaches the caller after one send, and `details.timing.attempts` and
-  `retryDelaysMs` count every send. The keepalive's replays keep the SDK's
-  default.
+  makes one attempt at each request membrane makes. Its own retries are off:
+  two by default, inside each of membrane's attempts, on a 408, 409, 429 or
+  5xx response and on a connection failure. So with `retry: false` a failure
+  reaches the caller after one send (two, when a credential resolver
+  refreshes after a 401), and a completed response's
+  `details.timing.attempts` and `retryDelaysMs` count every attempt and every
+  wait, none of them hidden inside the SDK. The keepalive's replays keep the
+  SDK's default.
 - What the SDK retried before delivery, membrane now retries on every adapter
   and entry point. A 5xx, a provider's 408 and a connection failure get
   `retry.maxRetries` attempts on the base schedule. **`retry.maxRetries` now

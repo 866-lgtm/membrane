@@ -32,7 +32,7 @@ export interface RetryConfig {
    * AnthropicAdapter turns its SDK client's own retries off for them, and
    * only the cache keepalive's background replays keep the SDK's. A caller
    * whose own layer retries passes `retry: false` on the call, which turns
-   * every one of membrane's retries off for it, these floors included.
+   * off every retry this config schedules for it, these floors included.
    */
   maxRetries: number;
 
@@ -49,8 +49,9 @@ export interface RetryConfig {
    * Separate, longer schedule for provider capacity errors (529
    * overloaded_error). Capacity storms last minutes, not seconds — the
    * standard schedule's 30s ceiling turns one into a dead turn. Overloaded
-   * retries are always attempted (mirroring the forced 429 retries), with
-   * jitter so a fleet backing off doesn't re-create the stampede in sync.
+   * retries are attempted whatever the base maxRetries says (mirroring the
+   * forced 429 retries), unless the call passes `retry: false`, with jitter
+   * so a fleet backing off doesn't re-create the stampede in sync.
    *
    * maxRetries: 0 here disables this dedicated policy entirely: 529s then
    * follow the base retry config like any other retryable server error, on
@@ -164,8 +165,13 @@ export interface MembraneHooks {
   ) => NormalizedResponse | Promise<NormalizedResponse>;
   
   /**
-   * Called on error, before retry decision
-   * Return 'retry' to retry, 'abort' to stop
+   * Called before each retry the `retry` config schedules: return 'retry' to
+   * let it, or 'abort' to end the call with that error. Not called for an
+   * error membrane won't retry, or when the call passes `retry: false`.
+   * `attempt` counts membrane's attempts at the failing request since its
+   * last refusal re-issue, as the retry budget does: 1 after its first
+   * failure. A credential resolver's resend after a 401 is part of the
+   * attempt it follows.
    */
   onError?: (
     error: ErrorInfo,
