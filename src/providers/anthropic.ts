@@ -433,9 +433,11 @@ export class AnthropicAdapter implements ProviderAdapter {
 
     try {
       const response = await this.createMessage(fullRequest, live, options?.signal);
-      // The provider has answered, so it has the request's prefix: only now
-      // can the keepalive hold it warm. A call that failed before an answer
-      // leaves the lineage's earlier snapshot as it was.
+      // The SDK has the provider's answer, so the provider has the request's
+      // prefix: only now can the keepalive hold it warm. It's recorded before
+      // membrane parses the answer, which can fail on an answer that arrived.
+      // A call that failed before the SDK had an answer, a body cut off in
+      // transit included, leaves the lineage's earlier snapshot as it was.
       this.cacheKeepalive?.record(
         fullRequest as unknown as Record<string, unknown>, headers, 'complete',
       );
@@ -635,14 +637,18 @@ export class AnthropicAdapter implements ProviderAdapter {
       for await (const event of stream) {
         sawEvent = true;
         resetIdleTimer();
+        // The provider has the request's prefix from its message_start on, so
+        // the keepalive can hold it warm across idle gaps (`stream: true` is
+        // dropped at replay time: transport, not cache key). A call that
+        // failed before this leaves the lineage's earlier snapshot as it was.
+        // It's recorded before the caller's onProgress runs, so a callback
+        // that throws can't lose a prefix the provider has.
+        if (event.type === 'message_start') {
+          this.cacheKeepalive?.record(fullRequest as unknown as Record<string, unknown>, headers, 'stream');
+        }
         // Every SDK event is progress; pings never reach this loop.
         options?.onProgress?.();
         if (event.type === 'message_start') {
-          // The provider has the request's prefix from here, so the keepalive
-          // can hold it warm across idle gaps (`stream: true` is dropped at
-          // replay time: transport, not cache key). A call that failed before
-          // this leaves the lineage's earlier snapshot as it was.
-          this.cacheKeepalive?.record(fullRequest as unknown as Record<string, unknown>, headers, 'stream');
           model = event.message.model;
           inputTransformations = (event.message as { input_transformations?: unknown }).input_transformations;
           const usage = event.message.usage as unknown as Record<string, unknown>;

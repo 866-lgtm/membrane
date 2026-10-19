@@ -4,18 +4,20 @@
  * complete lane once the response has arrived.
  *
  * Recorded before the send, a request whose call then failed was replayed
- * through its day, though the provider never cached it, and one the provider
- * refused had its replays refused too. Three refusals in a row stop the
- * keepalive for every lineage, so one refused request could turn it off for
- * the process. Now a call that fails before the provider has the prefix
- * leaves its lineage's earlier snapshot, and that snapshot's window, as they
- * were.
+ * through its day, though the provider wasn't known to have cached it, and
+ * one the provider refused for what its prefix holds had its replays refused
+ * too. Three refusals in a row stop the keepalive for every lineage, so one
+ * refused request could turn it off for the process. Now a call that fails
+ * before the provider is known to have the prefix leaves its lineage's
+ * earlier snapshot, and that snapshot's window, as they were. A failure is
+ * made where the real SDK makes it: a refused or undelivered stream fails at
+ * its iterator's first event, after messages.stream() has returned.
  *
  * The SDK client is a stub, so nothing leaves the process, and the clock is
  * faked.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { AnthropicAdapter } from '../../src/providers/anthropic.js';
+import { AnthropicAdapter, INTERLEAVED_THINKING_BETA } from '../../src/providers/anthropic.js';
 import type { CacheKeepaliveConfig, KeepaliveEvent } from '../../src/cache-keepalive.js';
 import { MembraneError } from '../../src/types/index.js';
 
@@ -79,7 +81,7 @@ function adapter(config: CacheKeepaliveConfig, create: (wire: any) => unknown, s
   client.withOptions = () => client;
   (a as any).client = client;
   const replays = () => sent.filter(w => w.max_tokens === 0);
-  return { a, events, replays };
+  return { a, events, replays, client };
 }
 
 const settle = (p: Promise<unknown>) => p.then(() => undefined, (e: unknown) => e);
@@ -92,29 +94,37 @@ afterEach(() => {
 });
 
 describe('the stream lane records a request at message_start', () => {
-  it('a call that fails before message_start leaves the earlier snapshot and its window', async () => {
+  it('a call that fails before message_start leaves the earlier snapshot, its touch and its window', async () => {
     let fail = false;
-    const { a, replays } = adapter({}, () => ({ ...answer, content: [], stop_reason: 'max_tokens', usage: readUsage }),
-      () => fail ? Promise.reject(unreachable()) : sdkStream([messageStart, ...rest]));
+    const { a, events, replays, client } = adapter({}, () => ({ ...answer, content: [], stop_reason: 'max_tokens', usage: readUsage }),
+      () => fail ? sdkStream([], unreachable()) : sdkStream([messageStart, ...rest]));
     await a.stream(request('Resident system A'), noCallbacks);
     await vi.advanceTimersByTimeAsync(50);
     fail = true;
     const error = await settle(a.stream(request('Resident system A', 2), noCallbacks));
     expect(error).toBeDefined();
+    expect(client.messages.stream).toHaveBeenCalledTimes(2);
     const [lineage, ...others] = a.cacheKeepalive!.getStatus();
     expect(others).toEqual([]);
-    // The window still runs from the call that reached the provider.
+    // Both the touch and the window still run from the call that reached the provider.
+    expect(lineage!.idleMs).toBe(50);
     expect(lineage!.realIdleMs).toBe(50);
-    await vi.advanceTimersByTimeAsync(200);
-    expect(replays().length).toBeGreaterThan(0);
+    // So the first refresh falls due refreshAfterMs after the earlier call, not after the failed one.
+    await vi.advanceTimersByTimeAsync(50);
+    expect(replays()).toHaveLength(1);
     // What's replayed is the request the provider had: one turn, not two.
     for (const wire of replays()) expect(wire.messages).toHaveLength(1);
+    // And the day ends maxIdleMs after the earlier call.
+    await vi.advanceTimersByTimeAsync(timing.maxIdleMs - 100);
+    expect(a.cacheKeepalive!.getStatus()).toEqual([]);
+    expect(events.filter(e => e.type === 'expired').map(e => (e as { idleMs: number }).idleMs)).toEqual([timing.maxIdleMs]);
   });
 
   it('a refused call is never recorded, so never replayed', async () => {
-    const { a, replays } = adapter({}, () => { throw refused(); }, () => Promise.reject(refused()));
+    const { a, replays, client } = adapter({}, () => { throw refused(); }, () => sdkStream([], refused()));
     const error = await settle(a.stream(request('Resident system B'), noCallbacks));
     expect(error).toBeInstanceOf(MembraneError);
+    expect(client.messages.stream).toHaveBeenCalledTimes(1);
     expect(a.cacheKeepalive!.getStatus()).toEqual([]);
     await vi.advanceTimersByTimeAsync(timing.maxIdleMs * 2);
     expect(replays()).toEqual([]);
@@ -135,8 +145,8 @@ describe('the stream lane records a request at message_start', () => {
     const isRefused = (wire: any) => JSON.stringify(wire.system).includes('Resident system F');
     const { a, events, replays } = adapter({},
       wire => { if (isRefused(wire)) throw refused(); return { ...answer, content: [], stop_reason: 'max_tokens', usage: readUsage }; },
-      wire => isRefused(wire) ? Promise.reject(refused()) : sdkStream([messageStart, ...rest]));
-    for (let i = 0; i < 3; i++) await settle(a.stream(request('Resident system F'), noCallbacks));
+      wire => isRefused(wire) ? sdkStream([], refused()) : sdkStream([messageStart, ...rest]));
+    for (let i = 0; i < 3; i++) expect(await settle(a.stream(request('Resident system F'), noCallbacks))).toBeInstanceOf(MembraneError);
     await a.stream(request('Resident system H'), noCallbacks);
     await vi.advanceTimersByTimeAsync(1000);
     expect(events.filter(e => e.type === 'error' || e.type === 'disabled')).toEqual([]);
@@ -145,13 +155,40 @@ describe('the stream lane records a request at message_start', () => {
     expect(events.filter(e => e.type === 'refreshed').length).toBeGreaterThan(3);
     expect(a.cacheKeepalive!.getStatus()).toHaveLength(1);
   });
+
+  it("a call whose onProgress throws at message_start is still recorded, since the provider had the prefix", async () => {
+    const { a } = adapter({}, () => ({ ...answer, content: [], stop_reason: 'max_tokens', usage: readUsage }),
+      () => sdkStream([messageStart, ...rest]));
+    const onProgress = () => { throw new Error('the caller'); };
+    const error = await settle(a.stream(request('Resident system J'), noCallbacks, { onProgress }));
+    expect(error).toBeDefined();
+    expect(a.cacheKeepalive!.getStatus()).toHaveLength(1);
+  });
+
+  it('records the headers before dynamicHeaders, beta headers included, so a replay never resends a stale stamp', async () => {
+    const a = new AnthropicAdapter({ apiKey: 'sk-test', cacheKeepalive: { enabled: false }, dynamicHeaders: () => ({ 'x-gate-debt-chunks': 42 }) });
+    const stream = vi.fn(async () => sdkStream([messageStart, ...rest]));
+    const client: any = { messages: { stream, create: vi.fn() } };
+    client.withOptions = () => client;
+    (a as any).client = client;
+    const record = vi.fn();
+    (a as any).cacheKeepalive = { record };
+    await a.stream({ ...request('Resident system I'), thinking: { type: 'adaptive' } }, noCallbacks);
+    // The call carries the request's beta header and the live stamp…
+    expect((stream.mock.calls[0] as any[])[1].headers).toEqual({ 'anthropic-beta': INTERLEAVED_THINKING_BETA, 'x-gate-debt-chunks': '42' });
+    // …and the record the beta header alone.
+    expect(record).toHaveBeenCalledTimes(1);
+    expect(record.mock.calls[0]![1]).toEqual({ 'anthropic-beta': INTERLEAVED_THINKING_BETA });
+    expect(record.mock.calls[0]![2]).toBe('stream');
+  });
 });
 
 describe('the complete lane records a request once the response has arrived', () => {
   it('a refused complete() is never recorded', async () => {
-    const { a, replays } = adapter({ lanes: ['complete'] }, () => { throw refused(); });
+    const { a, replays, client } = adapter({ lanes: ['complete'] }, () => { throw refused(); });
     const error = await settle(a.complete(request('Resident system D')));
     expect(error).toBeInstanceOf(MembraneError);
+    expect(client.messages.create).toHaveBeenCalledTimes(1);
     expect(a.cacheKeepalive!.getStatus()).toEqual([]);
     await vi.advanceTimersByTimeAsync(timing.maxIdleMs * 2);
     expect(replays()).toEqual([]);
@@ -165,5 +202,34 @@ describe('the complete lane records a request once the response has arrived', ()
     expect(a.cacheKeepalive!.getStatus()).toHaveLength(1);
     await vi.advanceTimersByTimeAsync(200);
     expect(replays().length).toBeGreaterThan(0);
+  });
+
+  it("a complete() whose answer membrane can't parse is still recorded, since the provider answered", async () => {
+    const { a } = adapter({ lanes: ['complete'] }, () => ({ ...answer, usage: undefined }));
+    const error = await settle(a.complete(request('Resident system K')));
+    expect(error).toBeDefined();
+    expect(a.cacheKeepalive!.getStatus()).toHaveLength(1);
+  });
+
+  it('a complete() that fails leaves the earlier snapshot, its touch and its window', async () => {
+    let fail = false;
+    const { a, replays, client } = adapter({ lanes: ['complete'] }, wire => {
+      if (wire.max_tokens === 0) return { ...answer, content: [], stop_reason: 'max_tokens', usage: readUsage };
+      if (fail) throw unreachable();
+      return answer;
+    });
+    await a.complete(request('Resident system L'));
+    await vi.advanceTimersByTimeAsync(50);
+    fail = true;
+    const error = await settle(a.complete(request('Resident system L', 2)));
+    expect(error).toBeDefined();
+    expect(client.messages.create).toHaveBeenCalledTimes(2);
+    const [lineage, ...others] = a.cacheKeepalive!.getStatus();
+    expect(others).toEqual([]);
+    expect(lineage!.idleMs).toBe(50);
+    expect(lineage!.realIdleMs).toBe(50);
+    await vi.advanceTimersByTimeAsync(200);
+    expect(replays().length).toBeGreaterThan(0);
+    for (const wire of replays()) expect(wire.messages).toHaveLength(1);
   });
 });
