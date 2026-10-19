@@ -2,18 +2,18 @@
  * Streamed tool calls whose `tool_calls` entries carry no `index`
  * (antra-tess/membrane#159, part 2).
  *
- * OpenAI sends `index` on every entry; some OpenAI-compatible servers leave it
- * out. Every entry without one (absent or `null`) used to go to slot 0, so two
- * calls became one: the second's id and name replaced the first's, and their
- * argument strings ran together. Now such an entry never takes a slot, and
- * one that carries nothing is dropped. It joins the call that has its id;
- * otherwise it starts a new call when it carries a name and the current call
- * (the one the last entry went to) has a different name, or has an id while
- * it carries a new one; otherwise it joins the current call. A call keeps the
- * first id and the first name a piece gives it. Entries with an index are
- * placed in their slots as before (stream-callback-errors.test.ts covers
- * them), and a slot's first entry takes over a call that began without an
- * index under its id.
+ * OpenAI's API spec requires `index` on every entry; some OpenAI-compatible
+ * servers are reported to leave it out. Every entry without one (absent or
+ * `null`) used to go to slot 0, so two calls became one: the second's id and
+ * name replaced the first's, and their argument strings ran together. Now such
+ * an entry never takes a slot, and one that carries nothing is dropped. Any
+ * other joins the call that has its id; otherwise it starts a new call when it
+ * carries a name and the current call (the one the last entry went to) has a
+ * different name, or has an id while it carries a new one; otherwise it joins
+ * the current call. A call keeps the first id and the first name a piece gives
+ * it. Entries with an index are placed in their slots as before
+ * (stream-callback-errors.test.ts covers them), and a slot's first entry takes
+ * over a call that began without an index under its id.
  */
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { OpenAIAdapter } from '../../src/providers/openai.js';
@@ -154,7 +154,7 @@ for (const [name, make] of adapters) {
       expect(await calls([[piece(undefined, 'zz_a', '{"x":')], [piece('call_a', 'zz_a', '1}')]])).toEqual([a]);
     });
 
-    it('an indexed call continued in its slot stays one call, as OpenAI streams it', async () => {
+    it('an indexed call continued in its slot stays one call, as on main', async () => {
       expect(await calls([[{ index: 0, ...piece('call_a', 'zz_a', '{"x":') }], [{ index: 0, ...piece(undefined, undefined, '1}') }]])).toEqual([a]);
     });
 

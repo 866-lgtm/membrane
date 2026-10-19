@@ -258,19 +258,19 @@ export interface StreamedToolCall {
  *
  * An entry with an `index` goes to that slot, as `streamIndex` reads it, and
  * one whose index names no slot is dropped. A slot's first entry takes over
- * the call that began without an index under its id, if one did. OpenAI
- * always sends an index, but some compatible servers leave it out, and every
- * entry without one went to slot 0, so two calls became one
- * (antra-tess/membrane#159). An entry whose `index` is absent or `null` never
- * takes a slot. If it carries no id, name or arguments it is dropped, and
- * otherwise it goes to the call that already has its id, if one does. Else it
- * starts a new call when it carries a name and the current call, the one the
- * last entry went to, has a different name, or has an id while the entry
- * carries a new one. Otherwise it goes to the current call. Every format seen
- * sends a call's name on its first piece, so a later piece that carries only
- * an id, even a new one, or only arguments stays with its call. `calls()`
- * gives the calls that have an index in index order, then the others in the
- * order they started.
+ * the call that began without an index under its id, if one did. OpenAI's
+ * API spec requires an index on each streamed tool call, but some compatible
+ * servers are reported to leave it out, and every entry without one went to
+ * slot 0, so two calls became one (antra-tess/membrane#159). An entry whose
+ * `index` is absent or `null` never takes a slot. If it carries no id, name
+ * or arguments it is dropped, and otherwise it goes to the call that already
+ * has its id, if one does. Else it starts a new call when it carries a name
+ * and the current call, the one the last entry went to, has a different
+ * name, or has an id while the entry carries a new one. Otherwise it goes to
+ * the current call. The rule assumes a call's first piece carries its name,
+ * so a later piece that carries only an id, even a new one, or only
+ * arguments stays with its call. `calls()` gives the calls that have an
+ * index in index order, then the others in the order they started.
  */
 export function streamedToolCalls(): { add(entry: unknown): void; calls(): StreamedToolCall[] } {
   const indexed: StreamedToolCall[] = [];
