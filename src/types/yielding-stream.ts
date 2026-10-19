@@ -149,9 +149,10 @@ export interface RoundReport {
   /**
    * The signed thinking this round's request sent back that failed the
    * provider's binding check, as the provider reported it: Anthropic's
-   * `input_transformations`, which come back when `thinking.blockBinding` is
-   * set. Absent when the response carried no report; both lists empty when
-   * it reported that nothing failed. This is the provider's account, beside
+   * `input_transformations`, which come back when the request carries the
+   * binding (`thinking.blockBinding`'s doc names the requests that don't).
+   * Absent when the response carried no report; both lists empty when it
+   * reported that nothing failed. This is the provider's account, beside
    * `altered`, which is membrane's: a dropped block was carried on the
    * request verbatim and removed before the model saw it. Entries of a type
    * membrane doesn't know are left out.
