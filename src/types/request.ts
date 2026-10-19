@@ -74,17 +74,26 @@ export interface GenerationConfig {
      * thinking-capable model on Bedrock may refuse the request with a 400.
      *
      * A request that carries no thinking config carries no binding, and the
-     * account's default applies there: thinking disabled on a model whose
-     * thinking can be turned off (Fable and Mythos think whatever `enabled`
-     * says, so they carry the binding whenever it's asked for), an enabled
-     * budget that can't fit under `maxTokens` (membrane then leaves thinking
-     * out), and a request the XML or completions formatter builds to end in
-     * an assistant prefill, including an XML continuation, which never sends
-     * thinking. A `thinking` object passed
-     * through `providerParams` replaces the one membrane builds, binding
-     * included, so give `block_binding` inside it; the beta follows the body
-     * that is sent. Left unset, nothing is sent, and the account's default
-     * applies, which isn't the same on every account.
+     * account's default applies there: thinking disabled (Fable and Mythos
+     * think whatever `enabled` says, so they carry the binding whenever it's
+     * asked for), an enabled budget that can't fit under `maxTokens`
+     * (membrane then leaves thinking out), and a request the XML or
+     * completions formatter builds to end in an assistant prefill, including
+     * an XML continuation, which never sends thinking. Thinking disabled
+     * doesn't mean a reply holds no thinking that binds: on 2026-10-19 Opus
+     * 5.5 and 5, Sonnet 5.5 and 5, and Haiku 5.5 each returned a signed
+     * thinking block to a request with no thinking config, and Opus 5.5,
+     * Sonnet 5.5 and Haiku 5.5 bind it. To carry the binding to such a model,
+     * ask for adaptive thinking (`enabled: true`, `type: 'adaptive'`, and
+     * `display: 'omitted'`, so the block comes back signature only, as it did
+     * with no config), which those three accepted with the binding in place of
+     * no config, reading the same cached prefix. As with any thinking config
+     * other than `disabled`, the Anthropic adapter then sends none of the
+     * caller's `temperature` or `topK`, and no `topP` below 0.95. A `thinking`
+     * object passed through `providerParams` replaces the one membrane builds,
+     * binding included, so give `block_binding` inside it; the beta follows
+     * the body that is sent. Left unset, nothing is sent, and the account's
+     * default applies, which isn't the same on every account.
      */
     blockBinding?: { prefixMismatchBehavior: 'error' | 'drop_block' };
   };
