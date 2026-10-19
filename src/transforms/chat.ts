@@ -61,7 +61,8 @@ export interface ChatTransformOptions {
 /**
  * Transform normalized request to chat format. Media in MCP's form is
  * converted to membrane's first (utils/mcp-media.ts), so it comes out as the
- * same media in membrane's form does.
+ * same media in membrane's form does. An image with no source object that
+ * isn't MCP's form, with neither `data` nor `mimeType`, is left out.
  */
 export function transformToChat(
   request: NormalizedRequest,

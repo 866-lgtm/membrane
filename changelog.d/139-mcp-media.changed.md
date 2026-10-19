@@ -15,8 +15,10 @@
   does, at the top of a message as inside a `tool_result` (see Fixed). The
   Responses formatter's own note for a `tool_result` image it can't carry is
   unchanged. The first request after upgrading carries the new text where a
-  history holds such an image under the formats note, so a provider's prompt
-  cache misses from that note on, once.
+  history holds such an image under the formats note and membrane writes the
+  note again, so a provider's prompt cache misses from that note on, once. An
+  xml tool loop's result stored with its raw text replays the note its turn
+  wrote.
 - In an xml tool loop's results, an image at a URL a provider would fetch
   gets a note that says so and gives the link, where it got the formats note
   above (#139). After: "[system: an image that belongs here was NOT shown to

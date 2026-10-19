@@ -587,7 +587,7 @@ describe('a round with media in MCP\'s form reports what the same round in membr
   });
 });
 
-describe('an image in MCP\'s form with empty data, or none, gets the note the same image in membrane\'s form gets, on every path', () => {
+describe('an image in MCP\'s form with empty data, or none, gets the note the same image in membrane\'s form gets, through each formatter and the Anthropic adapter\'s direct build', () => {
   const NO_DATA = '[system: an image that belongs here was NOT shown to you — it came without its data. You are not seeing this image.]';
   /** Empty data, which the API refuses as an image ("image cannot be empty"), and none. */
   const blank = (form: Form) => [form('image', '', 'image/png'), form('image', undefined as unknown as string, 'image/png')];

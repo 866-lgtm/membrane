@@ -1257,11 +1257,12 @@ function anthropicUrlImage(url: string): Anthropic.ImageBlockParam | Anthropic.T
  * leaves it out of a user turn, which has no place for one. A caller that
  * names no role gets that too, as it always got for a carrier. Media in
  * MCP's form is converted to membrane's first (utils/mcp-media.ts), at the
- * top of the turn and inside a `tool_result`, and a document that doesn't
- * convert, with no source after that, is left out. Nothing reports what it
- * leaves out: it has no alteration callback. It sees one turn, so a turn
- * whose only blocks pairing leaves out comes back empty, for the caller to
- * drop as NativeFormatter drops it.
+ * top of the turn and inside a `tool_result`. A document that doesn't
+ * convert, with no source after that, is left out, and so is an image with no
+ * source object that isn't MCP's form, with neither `data` nor `mimeType`.
+ * Nothing reports what it leaves out: it has no alteration callback. It sees
+ * one turn, so a turn whose only blocks pairing leaves out comes back empty,
+ * for the caller to drop as NativeFormatter drops it.
  */
 export function toAnthropicContent(
   blocks: ContentBlock[],

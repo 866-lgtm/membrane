@@ -4,8 +4,9 @@
   document, audio clip or video (#139). An image converts whatever its data
   and label, and is then read as any image is: a request that sends an image
   decides it by its data's header, and one with data that is missing or empty
-  gets the note that it came without its data (see Changed). A document, audio
-  clip or video converts only with data that isn't empty and a `mimeType` that
+  gets the note that it came without its data wherever the same image in
+  membrane's form gets it (see Changed). A document, audio clip or video
+  converts only with data that isn't empty and a `mimeType` that
   isn't empty. A media block with neither `data` nor `mimeType` isn't MCP's
   form and stays as it came; `toAnthropicContent` and `transformToChat` leave
   out such an image, where they threw a TypeError. Membrane converts MCP's
