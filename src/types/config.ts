@@ -110,6 +110,12 @@ export interface MediaConfig {
 // Hooks
 // ============================================================================
 
+/**
+ * Each hook is the caller's code: what one throws ends the call without a
+ * retry, as a MembraneError with `retryable: false`: the one it threw if it
+ * was a MembraneError, or else one classified from its error, with that
+ * error as `cause`.
+ */
 export interface MembraneHooks {
   /**
    * Called before sending a provider request. Return a replacement raw request,

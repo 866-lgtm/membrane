@@ -755,6 +755,48 @@ export function withRawRequest(error: MembraneError, rawRequest: unknown): Membr
 }
 
 /**
+ * What the caller's own code threw while membrane ran it: a hook, a request
+ * or stream callback, a receipt consumer or a header stamp, the code that
+ * observes or shapes a request or a response. It leaves membrane classified
+ * as before, its type read from its wording, but never retryable: resending
+ * the request can't fix the caller's code, and would pay for another provider
+ * call or run that code again. Membrane's own retries stop on it, and so does
+ * a caller's policy that reads `retryable`. A MembraneError stays the same
+ * object; any other error, or a frozen MembraneError that can't be marked,
+ * is wrapped, with the original as `cause`.
+ */
+export function callerCodeError(error: unknown): MembraneError {
+  if (error instanceof MembraneError) {
+    if (!error.retryable) return error;
+    try {
+      Object.defineProperty(error, 'retryable', { value: false, enumerable: true, writable: true, configurable: true });
+      return error;
+    } catch { /* Frozen: wrapped below, like any other error. */ }
+  }
+  const wrapped = new MembraneError({ ...classifyError(error), retryable: false });
+  Object.defineProperty(wrapped, 'cause', { value: error, writable: true, configurable: true });
+  return wrapped;
+}
+
+/** Run the caller's code: what it throws leaves as a callerCodeError. */
+export function runCallerCode<R>(run: () => R): R {
+  try {
+    return run();
+  } catch (error) {
+    throw callerCodeError(error);
+  }
+}
+
+/** Run caller code that membrane awaits, such as a hook or a tool executor. */
+export async function awaitCallerCode<R>(run: () => R | Promise<R>): Promise<R> {
+  try {
+    return await run();
+  } catch (error) {
+    throw callerCodeError(error);
+  }
+}
+
+/**
  * A cancellation is a TYPE, never a phrase. Matching 'abort' anywhere in a
  * message turned any error whose text merely contained it — a host tool
  * throwing "zz-tool policy aborted the run" — into a well-formed

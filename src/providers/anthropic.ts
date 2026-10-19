@@ -31,7 +31,7 @@ import {
   withRawRequest,
   unsupportedError,
 } from '../types/index.js';
-import { statusForProviderCode } from '../types/errors.js';
+import { runCallerCode, statusForProviderCode } from '../types/errors.js';
 import { flattenRootSchemaUnion } from './anthropic-tool-schema.js';
 import { isPlainObject } from '../utils/tool-schema.js';
 import { assertTerminalEventObserved, toolUseInputFromText, toolUseInputFromValue, isDeadlineAbort, deadlineTimeoutError } from './utils.js';
@@ -829,7 +829,7 @@ export class AnthropicAdapter implements ProviderAdapter {
    *  keepalive recorder receives the base headers BEFORE this merge, so
    *  replayed touches never carry a stale telemetry value. */
   private liveHeaders(base: Record<string, string> | undefined, lane: DynamicHeadersContext['lane']): Record<string, string> | undefined {
-    const dyn = this.dynamicHeaders?.({ lane });
+    const dyn = runCallerCode(() => this.dynamicHeaders?.({ lane }));
     if (!dyn) return base;
     const out: Record<string, string> = { ...(base ?? {}) };
     for (const [k, v] of Object.entries(dyn)) {
