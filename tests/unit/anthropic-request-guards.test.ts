@@ -163,6 +163,25 @@ describe('AnthropicAdapter: sampling-parameter model gate', () => {
     expect(captured[0].thinking).toEqual({ type: 'enabled', budget_tokens: 2048 });
   });
 
+  it('strips temperature, top_k and a top_p below 0.95 for an adaptive config too', async () => {
+    const { adapter, captured } = captureAdapter();
+    const thinking = { type: 'adaptive', display: 'omitted', block_binding: { prefix_mismatch_behavior: 'drop_block' } };
+
+    await adapter.complete({
+      ...baseRequest,
+      model: 'claude-sonnet-4-5',
+      temperature: 0.7,
+      topK: 40,
+      topP: 0.9,
+      thinking,
+    } as any);
+
+    expect(captured[0]).not.toHaveProperty('temperature');
+    expect(captured[0]).not.toHaveProperty('top_k');
+    expect(captured[0]).not.toHaveProperty('top_p');
+    expect(captured[0].thinking).toEqual(thinking);
+  });
+
   it('keeps temperature when thinking is explicitly disabled', async () => {
     const { adapter, captured } = captureAdapter();
 
