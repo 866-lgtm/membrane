@@ -64,6 +64,31 @@ function sdkStream(events: unknown[], failure?: Error) {
   };
 }
 
+/** A promise and the function that settles it. */
+function held() {
+  let release!: (value: unknown) => void;
+  const promise = new Promise((resolve) => { release = resolve; });
+  return { promise, release };
+}
+
+/** An SDK stream whose first event waits for `gate`, as a call waits for the
+ *  provider's first event. */
+function heldStream(gate: Promise<unknown>, events: unknown[]) {
+  const inner = sdkStream(events)[Symbol.asyncIterator]();
+  let waited = false;
+  return {
+    controller: { abort() { /* the stub has nothing to abort */ } },
+    [Symbol.asyncIterator]() {
+      return {
+        async next() {
+          if (!waited) { waited = true; await gate; }
+          return inner.next();
+        },
+      };
+    },
+  };
+}
+
 const adapters: AnthropicAdapter[] = [];
 /** An adapter whose SDK client is a stub. `create` answers both a complete()
  *  call and each keepalive replay, which the keepalive sends through it. */
@@ -143,10 +168,11 @@ describe('the stream lane records a request at message_start', () => {
 
   it("refused real calls don't trip the breaker for a healthy lineage beside them", async () => {
     const isRefused = (wire: any) => JSON.stringify(wire.system).includes('Resident system F');
-    const { a, events, replays } = adapter({},
+    const { a, events, replays, client } = adapter({},
       wire => { if (isRefused(wire)) throw refused(); return { ...answer, content: [], stop_reason: 'max_tokens', usage: readUsage }; },
       wire => isRefused(wire) ? sdkStream([], refused()) : sdkStream([messageStart, ...rest]));
     for (let i = 0; i < 3; i++) expect(await settle(a.stream(request('Resident system F'), noCallbacks))).toBeInstanceOf(MembraneError);
+    expect(client.messages.stream.mock.calls.filter(([wire]: any[]) => isRefused(wire))).toHaveLength(3);
     await a.stream(request('Resident system H'), noCallbacks);
     await vi.advanceTimersByTimeAsync(1000);
     expect(events.filter(e => e.type === 'error' || e.type === 'disabled')).toEqual([]);
@@ -154,6 +180,25 @@ describe('the stream lane records a request at message_start', () => {
     // More healthy refreshes than the breaker's limit of three failures.
     expect(events.filter(e => e.type === 'refreshed').length).toBeGreaterThan(3);
     expect(a.cacheKeepalive!.getStatus()).toHaveLength(1);
+  });
+
+  it('while a call waits for its first event, a refresh that falls due replays the earlier snapshot, once per refreshAfterMs of the wait', async () => {
+    let first: ReturnType<typeof held> | undefined;
+    const { a, replays } = adapter({}, () => ({ ...answer, content: [], stop_reason: 'max_tokens', usage: readUsage }),
+      () => first ? heldStream(first.promise, [messageStart, ...rest]) : sdkStream([messageStart, ...rest]));
+    await a.stream(request('Resident system G'), noCallbacks);
+    // The lineage's next call waits for its first event through two
+    // refreshes' worth of time: nothing touches the lineage at its send, so
+    // each refresh that falls due replays the earlier snapshot.
+    first = held();
+    const call = a.stream(request('Resident system G', 2), noCallbacks);
+    await vi.advanceTimersByTimeAsync(250);
+    expect(replays().map(wire => wire.messages.length)).toEqual([1, 1]);
+    // Once its message starts, the call is recorded, and the next refresh due replays it.
+    first.release(undefined);
+    await call;
+    await vi.advanceTimersByTimeAsync(200);
+    expect(replays().map(wire => wire.messages.length)).toEqual([1, 1, 2]);
   });
 
   it("a call whose onProgress throws at message_start is still recorded, since the provider had the prefix", async () => {
@@ -188,11 +233,6 @@ describe('a refresh acts only on the snapshot it replayed', () => {
   // the send, so a refresh can be out while the call records a newer request.
   const noRead = { input_tokens: 5, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 };
   const replyWith = (usage: object) => ({ ...answer, content: [], stop_reason: 'max_tokens', usage });
-  function held() {
-    let release!: (value: unknown) => void;
-    const promise = new Promise((resolve) => { release = resolve; });
-    return { promise, release };
-  }
 
   it('an ineffective refresh answering after a real call recorded a newer request leaves that request held', async () => {
     let hold: ReturnType<typeof held> | undefined;
