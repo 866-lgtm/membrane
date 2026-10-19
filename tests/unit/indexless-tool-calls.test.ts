@@ -9,11 +9,12 @@
  * an entry never takes a slot. It joins the call that has its id, or failing
  * that the current call (the one the last entry went to), unless it carries a
  * name and a new id while that call has an id. Entries with an index are placed
- * in their slots as before (stream-callback-errors.test.ts covers them), and
- * one whose id names a call that began without an index moves that call into
- * its slot. On every path, an entry that carries nothing is dropped, a piece
- * that names a tool other than its call's starts a call of its own, a call
- * keeps the first id a piece gives it, and no two calls come back under one id.
+ * in their slots as before (stream-callback-errors.test.ts covers them). In a
+ * slot a piece continues the call with its id, or else the last, and one whose
+ * id names a call that began without an index moves that call into its slot. On
+ * every path, an entry that carries nothing is dropped, a piece that names a
+ * tool other than its call's starts a call of its own, a call keeps the first
+ * id a piece gives it, and no two calls come back under one id.
  */
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { OpenAIAdapter } from '../../src/providers/openai.js';
@@ -209,6 +210,30 @@ for (const [name, make] of adapters) {
       expect(await calls([[at0('call_a', 'zz_first', '')], [at0('call_b', 'zz_second', '')], [at0(undefined, undefined, '{"y":')], [at0(undefined, undefined, '2}')]])).toEqual([
         { id: 'call_a', name: 'zz_first', input: {} },
         { id: 'call_b', name: 'zz_second', input: { y: 2 } },
+      ]);
+    });
+
+    it("in a slot two calls share, a piece with the earlier call's id and no name continues that call", async () => {
+      const at0 = (id: string | undefined, name: string | undefined, args: string) => ({ index: 0, ...piece(id, name, args) });
+      expect(await calls([[at0('call_a', 'zz_a', '')], [at0('call_b', 'zz_b', '')], [at0('call_a', undefined, '{"x":1}')]])).toEqual([
+        { id: 'call_a', name: 'zz_a', input: { x: 1 } },
+        { id: 'call_b', name: 'zz_b', input: {} },
+      ]);
+    });
+
+    it("in a slot two calls share, a piece with one call's id that names the other's tool starts a call of its own", async () => {
+      const at0 = (id: string | undefined, name: string | undefined, args: string) => ({ index: 0, ...piece(id, name, args) });
+      expect(await calls([[at0('call_a', 'zz_a', '')], [at0('call_b', 'zz_b', '')], [at0('call_a', 'zz_b', '{"y":2}')]])).toEqual([
+        { id: 'call_a', name: 'zz_a', input: {} },
+        { id: 'call_b', name: 'zz_b', input: {} },
+        { id: 'call_a_2', name: 'zz_b', input: { y: 2 } },
+      ]);
+    });
+
+    it('two calls in their own slots under one id come back with the second under an id of its own', async () => {
+      expect(await calls([[{ index: 0, ...piece('call_0', 'zz_a', '{"x":1}') }], [{ index: 1, ...piece('call_0', 'zz_b', '{"y":2}') }]])).toEqual([
+        { id: 'call_0', name: 'zz_a', input: { x: 1 } },
+        { id: 'call_0_2', name: 'zz_b', input: { y: 2 } },
       ]);
     });
   });

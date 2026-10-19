@@ -8,8 +8,10 @@
   entry went to, unless it carries a name and a new id while that call has an
   id; then it starts a new call. Calls without an index come after those with
   one, in the order they started. Entries with an `index` go to their slots
-  as before, and one that carries the id of a call that began without an
-  index moves that call into its slot, unless it names another tool.
+  as before. In a slot, a piece continues the call that has its id, or else
+  the last call there, and one that carries the id of a call that began
+  without an index moves that call into its slot, unless it names another
+  tool.
 - On the same three adapters, with or without an `index`, a piece that names
   a tool other than its call's starts a call of its own, and a call keeps the
   first id a piece gives it. A later piece's name and id replaced the call's,
@@ -18,22 +20,27 @@
   run together. They now come back as two calls, each with its own arguments.
   An entry that carries no id, name or arguments is dropped, with or without
   an `index`; one with an `index` opened an empty call. A stream that gives
-  each call its own `index` and sends each call's id and name once comes back
-  as before.
+  each call its own `index` and sends each call's id and name once, with no
+  two calls under one id, comes back as before.
 - No two tool calls in a response share an id, on the same three adapters. A
   call whose id an earlier call in the response already has, an empty one
   included, comes back as `<id>_<n>` (`call_<n>` for an empty id), and a
-  `[membrane]` warning names each. Two calls under one id made the native
-  formatter's tool-pair check refuse the turn that held them.
-- Three kinds of stream that came back as one call now come back as several:
+  `[membrane]` warning names each. Two calls under one id, as these adapters
+  returned for two calls in their own slots that a server gave one id or
+  none, made the native formatter's tool-pair check refuse the turn that held
+  them.
+- Four kinds of stream that came back as one call now come back as several:
   one call whose every piece repeats its name and changes its id, as one call
   per such piece; one whose first piece has no `index` and whose later pieces
-  carry index 0 without its id, as two; and one call that a later piece
-  renames midway through its arguments, as two whose halves don't parse. In
-  the first kind, a first piece with no arguments becomes an extra call with
-  `{}`. As before, these adapters merge two calls of the same tool sent with
-  no ids or with their names before their ids, distinct calls of one tool
-  given the same id or put in one slot, and a call whose first piece has its
-  id but no name into the call before it. When the earlier call's arguments
-  are empty, the merged call parses, and in the last case it runs the earlier
-  call's tool with the later call's arguments.
+  carry index 0 without its id, as two; one call that a later piece renames
+  midway through its arguments, as two whose halves don't parse; and a piece
+  that carries one call's id and names another call's tool, as a call of its
+  own, so that tool comes back twice. In the first kind, a first piece with
+  no arguments becomes an extra call with `{}`, and in the last, the other
+  call comes back with `{}` when it has no arguments of its own. As before,
+  these adapters merge two calls of the same tool sent with no ids or with
+  their names before their ids, distinct calls of one tool given the same id
+  or put in one slot, and a call whose first piece has its id but no name
+  into the call before it. When the earlier call's arguments are empty, the
+  merged call parses, and in the last case it runs the earlier call's tool
+  with the later call's arguments.

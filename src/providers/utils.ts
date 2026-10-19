@@ -258,28 +258,28 @@ export interface StreamedToolCall {
  * call's name, once set, never changes.
  *
  * An entry with an `index` goes to that slot, as `streamIndex` reads it, and
- * one whose index names no slot is dropped. It continues the call the slot
- * started last, or the call that began without an index under its id, which
- * moves into the slot, unless the entry names another tool. OpenAI's API spec
- * requires an index on each streamed tool call, but some compatible servers
- * are reported to leave it out, and every entry without one went to slot 0,
- * so two calls became one (antra-tess/membrane#159). An entry whose `index`
- * is absent or `null` never takes a slot. It goes to the call that already
- * has its id, if one does, or else to the current call, the one the last
- * entry went to, unless it brings a name and a new id while that call has an
- * id. The rule assumes a call's first piece carries its name, so a later
- * piece that carries only an id, even a new one, or only arguments stays with
- * its call.
+ * one whose index names no slot is dropped. It continues the slot's call that
+ * has its id, or the call that began without an index under its id, which
+ * moves into the slot, or else the call that joined the slot last, unless the
+ * entry names another tool. OpenAI's API spec requires an index on each
+ * streamed tool call, but some compatible servers are reported to leave it
+ * out, and every entry without one went to slot 0, so two calls became one
+ * (antra-tess/membrane#159). An entry whose `index` is absent or `null` never
+ * takes a slot. It goes to the call that already has its id, if one does, or
+ * else to the current call, the one the last entry went to, unless it brings
+ * a name and a new id while that call has an id. The rule assumes a call's
+ * first piece carries its name, so a later piece that carries only an id,
+ * even a new one, or only arguments stays with its call.
  *
  * `calls()` gives the calls that have an index in index order, those in one
- * slot in the order they started, then the others in the order they started.
- * No two of them share an id: a call whose id an earlier one in the list
- * holds, an empty id included, comes back under a new one, and a `[membrane]`
- * warning names each.
+ * slot in the order they joined it, then the others in the order they
+ * started. No two of them share an id: a call whose id an earlier one in the
+ * list holds, an empty id included, comes back under a new one, and a
+ * `[membrane]` warning names each.
  */
 export function streamedToolCalls(): { add(entry: unknown): void; calls(): StreamedToolCall[] } {
-  // Each slot holds the calls started in it, in order; its next piece
-  // continues the last.
+  // Each slot holds the calls that joined it, in order. A piece continues
+  // the one with its id, or else the last.
   const indexed: StreamedToolCall[][] = [];
   const unindexed: StreamedToolCall[] = [];
   const byId = new Map<unknown, StreamedToolCall>();
@@ -300,7 +300,7 @@ export function streamedToolCalls(): { add(entry: unknown): void; calls(): Strea
         const index = streamIndex(tc.index);
         if (index === undefined) return;
         slot = indexed[index] ??= [];
-        call = slot[slot.length - 1];
+        call = (tc.id ? slot.find((c) => c.id === tc.id) : undefined) ?? slot[slot.length - 1];
         // A call that began without an index and comes back with its id
         // and an index moves into that slot, rather than leaving two calls.
         const known = tc.id ? byId.get(tc.id) : undefined;
