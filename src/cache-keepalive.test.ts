@@ -6,6 +6,7 @@ import {
   messagesForRefresh,
   type KeepaliveEvent,
 } from './cache-keepalive.js';
+import { countWireCacheMarkers } from './utils/cache-marker-budget.js';
 
 /** A wire request shaped like what buildRequest() produces for a real turn. */
 function wire(overrides: Record<string, unknown> = {}): Record<string, unknown> {
@@ -72,15 +73,17 @@ describe('ineligibleReason', () => {
     }))).toBeNull();
   });
 
-  it("doesn't take a marker on a block inside a document's source content for one, as membrane's marker budget doesn't", () => {
+  it("accepts a request whose only one-hour marker is inside a document's source content exactly when membrane's marker budget counts it", () => {
     const document = {
       type: 'document',
       source: { type: 'content', content: [{ type: 'text', text: 'page', cache_control: { type: 'ephemeral', ttl: '1h' } }] },
     };
-    expect(ineligibleReason(wire({
+    const surfaces = {
       system: [{ type: 'text', text: 'You are a resident.' }],
       messages: [{ role: 'user', content: [document] }],
-    }))).toBe('no-cache-breakpoint');
+    };
+    const counted = countWireCacheMarkers(surfaces) > 0;
+    expect(ineligibleReason(wire(surfaces))).toBe(counted ? null : 'no-cache-breakpoint');
   });
 
   it('rejects a 5m-only request: poking a 5m entry every few minutes costs more than it saves', () => {
@@ -211,10 +214,11 @@ describe('messagesForRefresh', () => {
     expect(messagesForRefresh(messages)).toEqual(messages.slice(0, 3));
   });
 
-  it("doesn't take a marker inside a document's source content for one", () => {
+  it("takes a marker inside a document's source content for one exactly when membrane's marker budget counts it", () => {
     const document = { type: 'document', source: { type: 'content', content: [text('page', hour)] } };
     const messages = [user(text('a', hour)), assistant(text('b')), user(document), assistant(text('d')), user(text('e'))];
-    expect(messagesForRefresh(messages)).toEqual(messages.slice(0, 1));
+    const counted = countWireCacheMarkers({ messages: [user(document)] }) > 0;
+    expect(messagesForRefresh(messages)).toEqual(messages.slice(0, counted ? 3 : 1));
   });
 
   it('finds a one-hour marker on a document block itself', () => {

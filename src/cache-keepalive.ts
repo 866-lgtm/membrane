@@ -51,6 +51,7 @@
 // shape that can't tolerate `max_tokens: 0` is skipped outright rather than
 // "fixed up" — see `ineligibleReason()`.
 
+import { collectMarkedBlocks } from './utils/cache-marker-budget.js';
 import { createHash } from 'node:crypto';
 
 /** Vendor usage fields used by keepalive checks and spend observers. */
@@ -204,47 +205,22 @@ export function ineligibleReason(wire: Record<string, unknown>): string | null {
 }
 
 /**
- * Walk system + tools + messages for cache_control markers.
- *
- * This runs on each request the keepalive records, and `messages` on a large
- * resident is megabytes of blocks — so it short-circuits the moment it finds a
- * 1h marker, which is the answer in the overwhelmingly common case.
+ * The request's cache_control markers in system, tools and messages, as the
+ * cache-marker budget finds them (collectMarkedBlocks), so the keepalive and
+ * the budget agree on which breakpoints a request has. It reads every block
+ * rather than stopping at the first 1h marker, which costs well under a
+ * millisecond on a request of megabytes.
  */
 function scanCacheMarkers(wire: Record<string, unknown>): { any: boolean; oneHour: boolean } {
-  let any = false;
-  const oneHour = [wire.system, wire.tools, wire.messages].some((surface) =>
-    someCacheControl(surface, (cc) => {
-      any = true;
-      return isOneHourMarker(cc);
-    }));
+  const marked = collectMarkedBlocks({ system: wire.system, tools: wire.tools, messages: wire.messages });
+  const any = marked.length > 0;
+  const oneHour = marked.some((block) => isOneHourMarker(block.cache_control as { ttl?: unknown }));
   return { any, oneHour };
 }
 
 /** A `cache_control` value for the one-hour cache: one without a `ttl` is the five-minute cache's. */
 function isOneHourMarker(cc: { ttl?: unknown }): boolean {
   return (cc.ttl ?? '5m') === '1h';
-}
-
-/**
- * Whether `found` holds for a `cache_control` in `node` (a request's `system`,
- * `tools` or `messages`, or one message), walked in order and stopping at the
- * first it holds for. A marker sits on a block: an entry of `system` or
- * `tools`, a message's content block, or a block in another block's `content`
- * (a tool result's). Only those are walked, so JSON a tool was given, which
- * can hold any key, isn't read as a marker. Nor is a block inside a document's
- * `source.content`: Anthropic's documentation puts a document's marker on the
- * document block itself, and membrane's marker budget doesn't count one there
- * either.
- * Eligibility and the refresh's cut both ask here, so they agree on where a
- * request's markers are.
- */
-function someCacheControl(node: unknown, found: (cc: { ttl?: unknown }) => boolean): boolean {
-  if (Array.isArray(node)) return node.some((item) => someCacheControl(item, found));
-  if (!node || typeof node !== 'object') return false;
-  const block = node as { cache_control?: unknown; content?: unknown };
-  if (block.cache_control && typeof block.cache_control === 'object'
-    && found(block.cache_control as { ttl?: unknown })) return true;
-  return someCacheControl(block.content, found);
 }
 
 /**
@@ -263,12 +239,17 @@ function someCacheControl(node: unknown, found: (cc: { ttl?: unknown }) => boole
  * marker's message, or from the start when the markers sit only on `system` or
  * `tools`, and through the user messages directly after that one. When there's
  * no such user message, the run is every message, as the request was sent.
+ * A message's markers are the ones the cache-marker budget finds in it
+ * (collectMarkedBlocks), as for eligibility above, so the cut and the budget
+ * agree on where a request's breakpoints are.
  */
 export function messagesForRefresh(messages: readonly unknown[]): unknown[] {
   const isUser = (message: unknown) => (message as { role?: unknown } | null)?.role === 'user';
+  const holdsOneHourMarker = (message: unknown) =>
+    collectMarkedBlocks({ messages: [message] }).some((block) => isOneHourMarker(block.cache_control as { ttl?: unknown }));
   let from = 0;
   for (let index = messages.length - 1; index >= 0; index--) {
-    if (someCacheControl(messages[index], isOneHourMarker)) {
+    if (holdsOneHourMarker(messages[index])) {
       from = index;
       break;
     }
