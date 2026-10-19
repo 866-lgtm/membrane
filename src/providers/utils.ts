@@ -241,6 +241,29 @@ export function streamIndex(value: unknown, absent = 0): number | undefined {
 }
 
 /**
+ * The slot a streamed Chat Completions `tool_calls` entry goes to, given the
+ * calls placed so far. An entry with an `index` goes where `streamIndex`
+ * puts it. OpenAI always sends one, but some compatible servers leave it out,
+ * and every entry without one went to slot 0, so two calls with different
+ * ids became one (antra-tess/membrane#159). An entry whose `index` is absent
+ * or `null` now starts a new call only when it carries an id that no call has
+ * and the newest call already has an id. Otherwise it joins the call that has
+ * its id, so a server that repeats a call's id on every piece doesn't split
+ * the call, or else the newest call, so a piece without an id continues it
+ * and an id that arrives after the call's name fills it in.
+ */
+export function toolCallSlot(calls: ReadonlyArray<{ id?: unknown } | undefined>, entry: { index?: unknown; id?: unknown }): number | undefined {
+  if (entry.index !== undefined && entry.index !== null) return streamIndex(entry.index);
+  const newest = calls.length - 1;
+  if (entry.id) {
+    const own = calls.findIndex(call => call?.id === entry.id);
+    if (own !== -1) return own;
+    if (newest >= 0 && calls[newest]?.id) return calls.length;
+  }
+  return Math.max(newest, 0);
+}
+
+/**
  * Whether a parsed SSE frame, or a decoded Bedrock event, is an event: a JSON
  * object. `null`, a number, a string, a boolean or an array carries none, so
  * the adapters drop its frame before they report progress.

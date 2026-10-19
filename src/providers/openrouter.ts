@@ -27,7 +27,7 @@ import {
 } from '../types/index.js';
 import { isRawItemCarrier } from '../utils/fidelity.js';
 import { convertMcpMedia } from '../utils/mcp-media.js';
-import { toolUseInputFromText, textOnlyToolResultContent, openAIImagePart, createCombinedSignal, SSELineParser, isDeadlineAbort, deadlineTimeoutError, throwOnStreamErrorFrame, assertTerminalEventObserved, streamIndex, isEventObject } from './utils.js';
+import { toolUseInputFromText, textOnlyToolResultContent, openAIImagePart, createCombinedSignal, SSELineParser, isDeadlineAbort, deadlineTimeoutError, throwOnStreamErrorFrame, assertTerminalEventObserved, toolCallSlot, isEventObject } from './utils.js';
 
 // ============================================================================
 // Types
@@ -329,11 +329,11 @@ export class OpenRouterAdapter implements ProviderAdapter {
         if (Array.isArray(delta?.tool_calls)) {
           for (const tc of delta.tool_calls) {
             // An entry that isn't an object, or whose index isn't an array
-            // index (streamIndex: 0 when absent, and a string of digits with no
-            // leading zero counts, as array keys always took one), can't be
-            // placed, so it's dropped.
+            // index (streamIndex: a string of digits with no leading zero
+            // counts, as array keys always took one), can't be placed, so it's
+            // dropped. One with no index goes where toolCallSlot says.
             if (!tc || typeof tc !== 'object' || Array.isArray(tc)) continue;
-            const index = streamIndex(tc.index);
+            const index = toolCallSlot(toolCalls, tc);
             if (index === undefined) continue;
             if (!toolCalls[index]) {
               toolCalls[index] = {
