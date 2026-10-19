@@ -34,7 +34,7 @@ import {
   networkError,
   withRawRequest,
 } from '../types/index.js';
-import { createCombinedSignal, SSELineParser, toolUseInputFromText, isDeadlineAbort, deadlineTimeoutError, throwOnStreamErrorFrame } from './utils.js';
+import { createCombinedSignal, SSELineParser, toolUseInputFromText, isDeadlineAbort, deadlineTimeoutError, throwOnStreamErrorFrame, isEventObject } from './utils.js';
 
 // ============================================================================
 // Provider-native Responses API types
@@ -330,7 +330,10 @@ export class OpenAIResponsesAPIAdapter implements ProviderAdapter {
         } catch {
           return;
         }
-        // A parsed provider event is progress (comments never reach here).
+        // JSON that isn't an object (`null`, a number, a string, an array)
+        // carries no event, so its frame is dropped, as on the other adapters.
+        if (!isEventObject(event)) return;
+        // A provider event is progress (comments never reach here).
         options?.onProgress?.();
         events.push(event);
 
