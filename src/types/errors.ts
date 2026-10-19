@@ -766,11 +766,13 @@ export function withRawRequest(error: MembraneError, rawRequest: unknown): Membr
  *
  * A MembraneError that already says it isn't retryable leaves as itself.
  * Anything else, a retryable MembraneError included, is wrapped, with the
- * original as `cause`, so the caller's own objects are never changed. The
+ * original as `cause`, so this never marks an error the caller still holds.
+ * (complete() and stream() may still attach their request to one that
+ * leaves as itself, as they do to any MembraneError that has none.) The
  * wrapper keeps the type membrane reads from the error, but nothing a
  * provider's response would state (an HTTP status, a provider code, a wait),
- * since no response to this call stands behind it, and no request:
- * complete() and stream() attach their own as it leaves.
+ * since no response to this call stands behind it, and no request taken from
+ * the caller's error, which would be another call's.
  */
 export function callerCodeError(error: unknown): MembraneError {
   if (error instanceof MembraneError && !error.retryable) return error;
@@ -786,7 +788,13 @@ export function callerCodeError(error: unknown): MembraneError {
   return wrapped;
 }
 
-/** Run the caller's code: what it throws leaves as a callerCodeError. */
+/**
+ * Run the caller's code: what it throws leaves as a callerCodeError. Wrap
+ * each call membrane makes into the caller's code, since the rule covers
+ * those calls. A getter membrane reads outside them, such as on the caller's
+ * hooks or on a value its code returned, is a read, not a call, and its
+ * error is classified as before.
+ */
 export function runCallerCode<R>(run: () => R): R {
   try {
     return run();

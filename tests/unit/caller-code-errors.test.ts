@@ -1,14 +1,15 @@
 /**
  * An error the caller's own code throws is never resent (#160).
  *
- * Membrane runs the caller's code that observes or shapes a request or a
- * response: hooks, request and stream callbacks, receipt consumers and header
- * stamps. Before, what that code threw was classified by its wording like a
- * provider's error, so "rate limit" in a callback's message made membrane send
- * the request again, up to five times, paying for each response that had
- * already arrived or running the caller's code again. Now it leaves membrane
- * as the same classification with `retryable: false`, and with the original
- * as `cause` when it wasn't a MembraneError, so membrane's own retries stop,
+ * Membrane runs the caller's code beside each call: hooks, request and
+ * stream callbacks, receipt consumers, header stamps, the configured logger
+ * and a registry's pricing. Before, what that code threw was classified by
+ * its wording like a provider's error, so "rate limit" in a callback's
+ * message made membrane send the request again, up to five times, paying for
+ * each response that had already arrived or running the caller's code again.
+ * Now it leaves membrane with `retryable: false`: as itself when it was a
+ * MembraneError that already said so, or else wrapped, with the type membrane
+ * reads from it and the original as `cause`. So membrane's own retries stop,
  * and so does a caller's policy that reads `retryable`. A provider's own
  * error keeps its classification, before and after the caller's code runs.
  */
@@ -215,16 +216,6 @@ describe('the caller\'s code before the send runs once', () => {
       expect(error.retryable).toBe(false);
     });
 
-    it(`${path}: a getter on the record dynamicHeaders returns`, async () => {
-      let runs = 0;
-      const record = { get 'x-zz-stamp'() { runs++; throw callerError(); } };
-      const { adapter, create } = anthropic({ dynamicHeaders: () => record });
-      const error = await rejection(call(path, new Membrane(adapter, noDelay), request()));
-      expect(runs).toBe(1);
-      expect(create).not.toHaveBeenCalled();
-      expect(error.retryable).toBe(false);
-    });
-
     it(`${path}: onCacheWireReceipt is called with the request as this, as before`, async () => {
       const req = request();
       let seen: unknown;
@@ -323,6 +314,62 @@ describe('the configured logger and a model registry run beside the call, so com
   });
 });
 
+describe('the configured logger\'s other warning sites: what its warn() throws leaves not retryable', () => {
+  /** Each round opens another XML block and stops on a stop sequence, so the
+   *  loop resumes until its resumption cap warns (as in continuation-spin-guards). */
+  class EverDeeper extends CountingAdapter {
+    override async stream(req: any, callbacks: any): Promise<any> {
+      this.streamCalls++;
+      const round = '<' + 'function_calls>\n<invoke name="round-content-padding">';
+      callbacks.onChunk(round);
+      return { content: [text(round)], stopReason: 'stop_sequence', usage: { inputTokens: 1, outputTokens: 1 }, model: req.model, rawRequest: req, raw: {} };
+    }
+  }
+  const xml = () => request({ toolMode: 'xml' });
+  const throwingLogger = () => {
+    const logger = { runs: 0, debug() {}, info() {}, error() {}, warn: () => { logger.runs++; throw callerError(); } };
+    return logger;
+  };
+
+  it('stream(), warning at the XML loop\'s resumption cap', async () => {
+    const logger = throwingLogger();
+    const adapter = new EverDeeper();
+    const membrane = new Membrane(adapter, { ...noDelay, logger });
+    const error = await rejection(membrane.stream(xml(), { onChunk: () => {}, maxResumptionRounds: 2 }));
+    expect(logger.runs).toBe(1);
+    expect(adapter.streamCalls).toBe(3);
+    expect(error.retryable).toBe(false);
+  });
+
+  it('streamYielding(), warning at the XML loop\'s resumption cap', async () => {
+    const logger = throwingLogger();
+    const adapter = new EverDeeper();
+    let error: unknown;
+    for await (const event of new Membrane(adapter, { ...noDelay, logger }).streamYielding(xml(), { maxResumptionRounds: 3 })) {
+      if (event.type === 'error') error = event.error;
+    }
+    expect(logger.runs).toBe(1);
+    expect(adapter.streamCalls).toBe(4);
+    expect(error).toBeInstanceOf(MembraneError);
+    expect((error as MembraneError).retryable).toBe(false);
+  });
+
+  it('streamYielding(), warning that XML mode ignores refusalRetries, which it does before returning the stream', () => {
+    const logger = throwingLogger();
+    const adapter = new CountingAdapter();
+    let thrown: unknown;
+    try {
+      new Membrane(adapter, { ...noDelay, logger }).streamYielding(xml(), { refusalRetries: 1 });
+    } catch (error) {
+      thrown = error;
+    }
+    expect(logger.runs).toBe(1);
+    expect(adapter.streamCalls).toBe(0);
+    expect(thrown).toBeInstanceOf(MembraneError);
+    expect((thrown as MembraneError).retryable).toBe(false);
+  });
+});
+
 describe('stream() after emission: the caller\'s error is not retryable, a provider\'s keeps its classification', () => {
   it('onChunk throws after the first chunk', async () => {
     const adapter = new CountingAdapter();
@@ -400,7 +447,7 @@ describe('stream() after emission: the caller\'s error is not retryable, a provi
     });
   }
 
-  it('a caller\'s AbortError still ends stream() as a cancellation, as before', async () => {
+  it('a caller\'s AbortError from onChunk still ends stream() with an AbortedResponse, as before', async () => {
     const stop = Object.assign(new Error('zz the caller stopped'), { name: 'AbortError' });
     let chunks = 0;
     const result: any = await new Membrane(new CountingAdapter(), noDelay).stream(request(), { onChunk: () => { if (++chunks === 2) throw stop; } });

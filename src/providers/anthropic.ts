@@ -831,17 +831,13 @@ export class AnthropicAdapter implements ProviderAdapter {
   }
 
   /** Base headers + the live dynamicHeaders stamp. Request time only: the
-   *  keepalive recorder receives the base headers BEFORE this merge, so
+   *  keepalive recorder receives the base headers without this stamp, so
    *  replayed touches never carry a stale telemetry value. */
   private liveHeaders(base: Record<string, string> | undefined, lane: DynamicHeadersContext['lane']): Record<string, string> | undefined {
-    // Reading the returned record runs the caller's getters too.
-    const dyn = runCallerCode(() => {
-      const record = this.dynamicHeaders?.({ lane });
-      return record && Object.entries(record);
-    });
+    const dyn = runCallerCode(() => this.dynamicHeaders?.({ lane }));
     if (!dyn) return base;
     const out: Record<string, string> = { ...(base ?? {}) };
-    for (const [k, v] of dyn) {
+    for (const [k, v] of Object.entries(dyn)) {
       if (v !== null && v !== undefined && v !== '') out[k] = String(v);
     }
     return Object.keys(out).length ? out : undefined;

@@ -23,8 +23,9 @@
 - **Stream callbacks:** a stream callback's error ends the call once it
   reaches membrane. The OpenAI, OpenAI-compatible, OpenAI-completions,
   OpenRouter and Bedrock adapters' stream handlers still catch it and go on.
-  An error the caller's code throws named `AbortError` still ends `stream()`
-  and `streamYielding()` as a cancellation.
+  An error the caller's code throws named `AbortError` keeps the type
+  `abort`, so membrane treats it as any other abort thrown at the same
+  point, as it did before.
 - **`streamYielding()` consumers:** an error the caller's code throws, such
   as a `beforeRequest` hook's or an `onCacheWireReceipt` consumer's, now
   reaches the `error` event as that `MembraneError`, where it used to be the
