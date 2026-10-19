@@ -1,11 +1,13 @@
 /**
  * Membrane is the one layer that retries.
  *
- *  - AnthropicAdapter's SDK client sends each request a call makes once: its
- *    own retries (two by default, invisible to membrane) are off on them, so
- *    with `retry: false` a 429 reaches the caller after one send, and
- *    `details.timing.attempts` and `retryDelaysMs` count every send. The
- *    cache keepalive's background replays keep the SDK's retries.
+ *  - AnthropicAdapter's SDK client makes one attempt at each request a call
+ *    makes: its own retries (two by default, invisible to membrane) are off
+ *    on them, so with `retry: false` a 429 reaches the caller after one send,
+ *    and `details.timing.attempts` and `retryDelaysMs` count every attempt.
+ *    The cache keepalive's background replays keep the SDK's retries.
+ *  - `retry: false` leaves a credential resolver's one resend after a 401,
+ *    which is part of the attempt it follows.
  *  - What the SDK used to retry before delivery, membrane retries: a 5xx, a
  *    provider's 408 and a connection failure get the base schedule, three
  *    attempts by default, on every entry point. `maxRetries` still sets it.
@@ -149,7 +151,7 @@ describe('membrane retries what the SDK used to, before delivery, on every entry
   });
 });
 
-describe('AnthropicAdapter sends each request once', () => {
+describe('AnthropicAdapter makes one attempt at each request', () => {
   const overloadedBody = JSON.stringify({ type: 'error', error: { type: 'overloaded_error', message: 'zz overloaded' } });
   const adapter = () => new AnthropicAdapter({ apiKey: 'zz-key', cacheKeepalive: { enabled: false } });
   const wire: ProviderRequest = { model: 'zz-model', messages: [{ role: 'user', content: 'zz go' }], maxTokens: 16 };
@@ -190,6 +192,48 @@ describe('AnthropicAdapter sends each request once', () => {
     });
     expect(fetch).toHaveBeenCalledTimes(1);
   });
+
+  it.each(['complete', 'stream', 'streamYielding'] as const)(
+    '%s(): retry: false leaves a credential resolver its one resend after a 401, and retries nothing after it',
+    async (entry) => {
+      // Every send is a 401 that says x-should-retry: true, which membrane's
+      // schedule would retry without the switch.
+      const authorizations: string[] = [];
+      const fetch = vi.fn(async (_url: unknown, init?: { headers?: HeadersInit }) => {
+        authorizations.push(new Headers(init?.headers).get('authorization') ?? '');
+        return new Response(
+          JSON.stringify({ type: 'error', error: { type: 'authentication_error', message: 'zz expired' } }),
+          { status: 401, headers: { 'content-type': 'application/json', 'x-should-retry': 'true' } },
+        );
+      });
+      vi.stubGlobal('fetch', fetch);
+      const refreshes: boolean[] = [];
+      const a = new AnthropicAdapter({
+        cacheKeepalive: { enabled: false },
+        credentials: async ({ forceRefresh }) => {
+          refreshes.push(forceRefresh);
+          return { token: forceRefresh ? 'zz-new' : 'zz-old' };
+        },
+      });
+      const m = new Membrane(a, { formatter: new NativeFormatter(), ...FAST });
+      let thrown: unknown;
+      if (entry === 'complete') {
+        thrown = await m.complete(REQUEST, { retry: false }).then(() => undefined, (e) => e);
+      } else if (entry === 'stream') {
+        thrown = await m.stream(REQUEST, { retry: false }).then(() => undefined, (e) => e);
+      } else {
+        const events: StreamEvent[] = [];
+        for await (const event of m.streamYielding(REQUEST, { retry: false })) events.push(event);
+        const last = events.at(-1);
+        thrown = last?.type === 'error' ? last.error : undefined;
+      }
+
+      expect(thrown).toMatchObject({ type: 'auth', httpStatus: 401 });
+      expect(fetch).toHaveBeenCalledTimes(2);
+      expect(refreshes).toEqual([false, true]);
+      expect(authorizations).toEqual(['Bearer zz-old', 'Bearer zz-new']);
+    },
+  );
 });
 
 describe("AnthropicAdapter's watchdog expiry is a deadline", () => {

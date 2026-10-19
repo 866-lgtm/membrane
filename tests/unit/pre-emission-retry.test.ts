@@ -585,6 +585,20 @@ describe('a refusal re-issue starts the transport budget again', () => {
     expect(onError.mock.calls.map((call) => call[1])).toEqual([1]);
   });
 
+  it.each(['complete', 'streamYielding'] as const)('%s(): retry: false leaves the re-issue the call asks for', async (entry) => {
+    // A re-issue resends a request that succeeded with a refusal, which
+    // retry: false doesn't turn off: it turns off the retries the `retry`
+    // config schedules.
+    const adapter = new ScriptedNativeAdapter([{ refuse: 'zz refused' }, { text: 'zz answered' }]);
+    const membrane = native(adapter);
+    const response = entry === 'complete'
+      ? await membrane.complete(NATIVE_REQUEST, { retry: false, refusalRetries: 1 })
+      : ofType(await drive(membrane.streamYielding(NATIVE_REQUEST, { retry: false, refusalRetries: 1 })), 'complete')[0]!.response;
+
+    expect(adapter.sends).toBe(2);
+    expect(response.stopReason).toBe('end_turn');
+  });
+
   it('streamYielding(): a 529 after output on the re-issue is not retried', async () => {
     const adapter = new ScriptedNativeAdapter([
       { refuse: 'zz refused' },

@@ -233,9 +233,8 @@ export interface StreamOptions {
    * requests, whatever the error and whatever the config says: the failure is
    * thrown as it came, with the provider's advice on it (`retryable`, and a
    * stated wait on `retryAfterMs`), and `hooks.onError`, which is asked
-   * before each retry, isn't asked. For a caller whose own layer retries. Two
-   * sends stay: a refusal re-issue, which the call asks for with
-   * `refusalRetries`, and the one resend with refreshed credentials that an
+   * before each retry, isn't asked. For a caller whose own layer retries. One
+   * other send stays: the one resend with refreshed credentials that an
    * adapter with a credential resolver makes after an HTTP 401.
    */
   retry?: boolean;
