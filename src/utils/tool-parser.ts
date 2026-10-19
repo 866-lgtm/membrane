@@ -745,12 +745,45 @@ export interface ToolDefinitionForPrompt {
      * `type="undefined"` or a type the parser will not apply.
      */
     type?: string;
-    /** The declaration also admits null: renders `nullable="true"`. */
+    /**
+     * The declaration admits null, and no `enum` or `const` beside its type
+     * leaves null out: renders `nullable="true"`.
+     */
     nullable?: boolean;
     description?: string;
     required?: boolean;
     enum?: string[];
   }>;
+}
+
+/**
+ * Whether the instructions tell the model a parameter admits null (#150).
+ *
+ * The reading takes the type's word for it ({@link ParameterDeclaration}'s
+ * `nullable`), and so does the parse. The instructions also consult an `enum`
+ * or `const` beside that type: OpenAPI 3.0.3 says of `nullable` that "Other
+ * Schema Object constraints retain their defined behavior, and therefore may
+ * disallow the use of `null` as a value", and JSON Schema's `enum` admits
+ * only its listed values. So `{type: ["string", "null"], enum: ["a", "b"]}`
+ * and `{type: "string", nullable: true, enum: ["a", "b"]}` are NOT marked:
+ * null is a value the schema doesn't accept, and the instructions shouldn't
+ * invite it. The parse is left as it is: a written null for such a parameter
+ * is invalid for the schema whether it reaches the tool as null or as the
+ * text "null". Every declaring node is consulted, so a parameter declared in
+ * several root variants is marked only when none of them lists an enum or
+ * const without null.
+ */
+function instructedNullable(declaration: ParameterDeclaration): boolean {
+  if (!declaration.nullable) return false;
+  return declaration.declaredBy.every(node => {
+    if (typeof node !== 'object' || node === null || Array.isArray(node)) return true;
+    const own = node as Record<string, unknown>;
+    if (Object.hasOwn(own, 'enum') && Array.isArray(own.enum) && !own.enum.includes(null)) {
+      return false;
+    }
+    if (Object.hasOwn(own, 'const') && own.const !== null) return false;
+    return true;
+  });
 }
 
 /**
@@ -770,7 +803,7 @@ export function toolDefinitionForPrompt(tool: ToolDefinition): ToolDefinitionFor
         name,
         {
           type: declaration.type,
-          nullable: declaration.nullable || undefined,
+          nullable: instructedNullable(declaration) || undefined,
           description: declaration.description,
           required: declaration.required,
           enum: declaration.enum,
@@ -796,7 +829,8 @@ export function formatToolDefinitions(tools: ToolDefinitionForPrompt[]): string 
       if (param.type) attrs.push(`type="${escapeXml(param.type)}"`);
       if (param.nullable) attrs.push('nullable="true"');
       if (param.required) attrs.push('required="true"');
-      if (param.enum) attrs.push(`enum="${param.enum.join(',')}"`);
+      // `String` prints a null member as `null`; `join` alone printed it as an empty item (#150).
+      if (param.enum) attrs.push(`enum="${param.enum.map(String).join(',')}"`);
       
       parts.push(`<parameter ${attrs.join(' ')}>`);
       if (param.description) {

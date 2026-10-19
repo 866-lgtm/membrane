@@ -428,13 +428,15 @@ describe("OpenAPI's nullable: true beside a type (#143)", () => {
     expect(doc).toContain('<parameter name="fld7" type="string">');
   });
 
-  it('reads `nullable: true` beside an enum without consulting the enum', () => {
+  it('parses `nullable: true` beside an enum without consulting the enum, but does not mark it (#150)', () => {
     // As for every `type` here, the enum beside it isn't read for what the
-    // parameter admits, so null is admitted though the enum doesn't list it,
-    // as it already was for `{type: ['string', 'null'], enum: [...]}`.
+    // parameter admits, so the parse delivers null though the enum doesn't
+    // list it, as it already did for `{type: ['string', 'null'], enum: [...]}`.
+    // The instructions do consult the enum: null is a value this schema
+    // doesn't accept, so the model isn't told it may send one.
     expect(parseParam(tool, 'fld8', 'null')).toBeNull();
     expect(renderedTools(tool)).toContain(
-      '<parameter name="fld8" type="string" nullable="true" enum="zz-a,zz-b">'
+      '<parameter name="fld8" type="string" enum="zz-a,zz-b">'
     );
   });
 
@@ -464,6 +466,61 @@ describe("OpenAPI's nullable: true beside a type (#143)", () => {
     expect(doc).toContain('<parameter name="fld1" type="string" enum="zz-a,zz-b">');
     expect(doc).toContain('<parameter name="fld2">');
     expect(doc).toContain('<parameter name="fld3" type="string">');
+  });
+});
+
+describe('an enum or const beside a type that admits null (#150)', () => {
+  // The type says null is admitted; the enum or const beside it may leave null
+  // out, and the specifications let it decide (OpenAPI 3.0.3 on `nullable`:
+  // other constraints "may disallow the use of null as a value"; JSON Schema
+  // 2020-12 §6.1.2 on `enum`). Main marked `nullable="true"` from the type
+  // alone, and printed a null enum member as an empty item, `enum="a,b,"`.
+  const tool = toolWith('zz_enum_nullable_tool', {
+    type: 'object',
+    properties: {
+      fld1: { type: ['string', 'null'], enum: ['zz-a', 'zz-b'] } as never,
+      fld2: { type: ['string', 'null'], enum: ['zz-a', 'zz-b', null] } as never,
+      fld3: { type: 'string', nullable: true, enum: ['zz-a', 'zz-b'] } as never,
+      fld4: { type: ['string', 'null'], const: 'zz-a' } as never,
+      fld5: { type: ['string', 'null'], const: null } as never,
+      fld6: { type: ['integer', 'null'], enum: [1, 2, null] } as never,
+    },
+  });
+
+  it('does not mark a parameter nullable when its enum leaves null out', () => {
+    const doc = renderedTools(tool);
+    expect(doc).toContain('<parameter name="fld1" type="string" enum="zz-a,zz-b">');
+    expect(doc).not.toContain('name="fld1" type="string" nullable="true"');
+  });
+
+  it('marks it nullable when the enum lists null, and prints that member as `null`', () => {
+    const doc = renderedTools(tool);
+    expect(doc).toContain('<parameter name="fld2" type="string" nullable="true" enum="zz-a,zz-b,null">');
+    expect(doc).toContain('<parameter name="fld6" type="integer" nullable="true" enum="1,2,null">');
+    expect(doc).not.toContain('enum="zz-a,zz-b,"');
+  });
+
+  it("does not mark OpenAPI's `nullable: true` beside an enum without null", () => {
+    const doc = renderedTools(tool);
+    expect(doc).toContain('<parameter name="fld3" type="string" enum="zz-a,zz-b">');
+    expect(doc).not.toContain('name="fld3" type="string" nullable="true"');
+  });
+
+  it('consults a sibling const the same way', () => {
+    const doc = renderedTools(tool);
+    expect(doc).toContain('<parameter name="fld4" type="string">');
+    expect(doc).toContain('<parameter name="fld5" type="string" nullable="true">');
+  });
+
+  it('keeps the parse as it was: a written null still follows the type', () => {
+    const { result, messages } = captureWarnings(() => [
+      parseParam(tool, 'fld1', 'null'),
+      parseParam(tool, 'fld2', 'null'),
+      parseParam(tool, 'fld3', 'null'),
+      parseParam(tool, 'fld1', 'zz-a'),
+    ]);
+    expect(result).toEqual([null, null, null, 'zz-a']);
+    expect(messages).toHaveLength(0);
   });
 });
 
