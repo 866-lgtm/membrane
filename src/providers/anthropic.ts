@@ -49,13 +49,20 @@ import { CacheKeepalive, type CacheKeepaliveConfig } from '../cache-keepalive.js
  * non-retryable, so a single stray `temperature` kills the whole turn.
  * Mirrors the `noTemperatureSupport` gate in the OpenAI provider.
  *
- * This is the always-on-thinking / reasoning-forward tier, which removes the
- * sampling parameters from the API surface entirely (Sonnet 5 rejects only
- * non-default values). Everything else — Haiku 4.5, Sonnet 4.6, Opus 4.6 and
- * older — ACCEPTS `temperature`, so it must NOT be listed here.
+ * Most of these are the always-on-thinking / reasoning-forward tier, which
+ * removes the sampling parameters from the API surface entirely (Sonnet 5
+ * rejects only non-default values). Haiku 5.5 is listed on a measurement,
+ * below. Everything else — Haiku 4.5, Sonnet 4.6, Opus 4.6 and older —
+ * ACCEPTS `temperature`, so it must NOT be listed here.
  *
  *   - Opus 4.7 / Opus 4.8 / Sonnet 5 / Fable 5 / Mythos 5 / Mythos preview:
  *     documented 400 on any sampling parameter.
+ *   - Haiku 5.5: measured against the Messages API on 2026-10-19, with no
+ *     thinking config. `temperature` 0.2, `top_k` 40, and `top_p` 0.9 and 0.95
+ *     were each refused with a 400 ("`temperature` is deprecated for this
+ *     model", and likewise for the other two); `top_p` 0.99 was accepted.
+ *     Sonnet 5.5, which `claude-sonnet-5` matches, answered `top_p` 0.9 and
+ *     0.99 the same way. A listed model loses every `top_p`, 0.99 included.
  *
  * NB: claude-haiku-4-5 was previously listed here on the strength of a single
  * "observed 400 in production when temperature is sent" anecdote. Haiku 4.5
@@ -72,6 +79,7 @@ const NO_TEMPERATURE_MODELS = [
   'claude-opus-4-7',
   'claude-opus-4-8',
   'claude-sonnet-5',
+  'claude-haiku-5-5',
   'claude-fable-5',
   'claude-mythos-5',
   'claude-mythos-preview',

@@ -147,6 +147,28 @@ describe('AnthropicAdapter: sampling-parameter model gate', () => {
     expect(captured[1].temperature).toBe(0.7);             // sonnet-4-5: kept
   });
 
+  it('strips temperature, top_p and top_k for claude-haiku-5-5, each on its own', async () => {
+    // With no thinking config, the API refused temperature 0.2, top_k 40 and
+    // top_p 0.9 for Haiku 5.5 with a 400 ("`temperature` is deprecated for
+    // this model", and likewise for the other two), and took a top_p of 0.99.
+    // A listed model loses every top_p, 0.99 included, at the top level and
+    // through `extra`. Each is sent on its own, since a top_p beside a
+    // temperature is dropped anyway.
+    const { adapter, captured } = captureAdapter();
+
+    await adapter.complete({ ...baseRequest, model: 'claude-haiku-5-5', temperature: 0.2 } as any);
+    await adapter.complete({ ...baseRequest, model: 'claude-haiku-5-5', topP: 0.9 } as any);
+    await adapter.complete({ ...baseRequest, model: 'claude-haiku-5-5', topK: 40 } as any);
+    await adapter.complete({ ...baseRequest, model: 'claude-haiku-5-5', topP: 0.99 } as any);
+    await adapter.complete({ ...baseRequest, model: 'claude-haiku-5-5', extra: { top_p: 0.99 } } as any);
+
+    expect(captured[0]).not.toHaveProperty('temperature');
+    expect(captured[1]).not.toHaveProperty('top_p');
+    expect(captured[2]).not.toHaveProperty('top_k');
+    expect(captured[3]).not.toHaveProperty('top_p');
+    expect(captured[4]).not.toHaveProperty('top_p');
+  });
+
   it('strips temperature/top_k when extended thinking is enabled (any model)', async () => {
     const { adapter, captured } = captureAdapter();
 
