@@ -32,6 +32,7 @@ import type {
 import { responsesToolOutput } from '../providers/responses-input.js';
 
 import { imageForRequest, urlImageForRequest } from '../utils/image-media.js';
+import { convertMcpMedia } from '../utils/mcp-media.js';
 import { carriesAnthropicServerBlock } from '../utils/anthropic-server-blocks.js';
 
 export const OPENAI_RESPONSES_ITEMS_METADATA_KEY = 'openaiResponsesItems';
@@ -102,6 +103,10 @@ export class OpenAIResponsesFormatter implements PrefillFormatter {
   readonly reportsAlterations = true;
 
   buildMessages(messages: NormalizedMessage[], options: BuildOptions): BuildResult {
+    // Media in MCP's form becomes membrane's first, for a caller that builds
+    // messages directly. Membrane's own builds have converted it already and
+    // get the same array back (utils/mcp-media.ts).
+    messages = convertMcpMedia(messages);
     const items: NativeItem[] = [];
     let hasImportedItems = false;
 

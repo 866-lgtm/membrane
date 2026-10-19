@@ -1203,9 +1203,11 @@ function toAnthropicToolResultContent(
     if (block.type === 'text') {
       out.push({ type: 'text', text: block.text });
     } else if (block.type === 'image') {
-      const image = block.source.type === 'base64'
+      // An image with no source object, someone else's shape that isn't
+      // MCP's form, has nothing to send and is left out.
+      const image = block.source?.type === 'base64'
         ? anthropicImage(block.source.data, block.source.mediaType ?? (block.source as { media_type?: string }).media_type)
-        : block.source.type === 'url' ? anthropicUrlImage(block.source.url) : undefined;
+        : block.source?.type === 'url' ? anthropicUrlImage(block.source.url) : undefined;
       if (image?.type === 'text') onPlaceholder?.();
       if (image) out.push(image);
     }
@@ -1296,17 +1298,19 @@ export function toAnthropicContent(
       }
         
       case 'image':
-        if (block.source.type === 'base64') {
+        // An image with no source object, someone else's shape that isn't
+        // MCP's form, has nothing to send and is left out.
+        if (block.source?.type === 'base64') {
           result.push(anthropicImage(block.source.data, block.source.mediaType ?? (block.source as { media_type?: string }).media_type));
-        } else if (block.source.type === 'url') {
+        } else if (block.source?.type === 'url') {
           result.push(anthropicUrlImage(block.source.url));
         }
         break;
         
       case 'document':
-        // One in MCP's form that didn't convert has no source for a document
-        // block to carry. An image always converts (utils/mcp-media.ts), and
-        // audio or video meets the error below in either form.
+        // One with no source object, MCP's form that didn't convert or
+        // someone else's shape, has nothing for a document block to carry.
+        // Audio or video meets the error below in either form.
         if (isSourcelessMedia(block)) break;
         result.push({
           type: 'document',

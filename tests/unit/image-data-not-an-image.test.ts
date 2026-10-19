@@ -656,13 +656,13 @@ describe('round reports name a message whose image became the placeholder', () =
     expect([...fidelity.altered]).toEqual([1]);
   });
 
-  // An MCP-shaped image (data and mimeType, no source) is decided by its data
-  // in the native builder, so a PNG is carried. The Responses tool output
-  // gives an image with no source a note, as on main, so there it alters its
-  // message too.
+  // An MCP-shaped image (data and mimeType, no source) becomes membrane's
+  // form where the formatter takes its messages (utils/mcp-media.ts), so a
+  // PNG is carried by either builder. On main the Responses tool output gave
+  // it the note for an image with no source, and altered its message too.
   it.each([
     ['native', () => new NativeFormatter(), [3]],
-    ['Responses', () => new OpenAIResponsesFormatter(), [3, 4]],
+    ['Responses', () => new OpenAIResponsesFormatter(), [3]],
   ] as const)('the %s formatter names a tool result whose image became the placeholder, and not one whose image is a PNG', (_name, create, altered) => {
     const fidelity = new FidelityNotes();
     create().buildMessages([

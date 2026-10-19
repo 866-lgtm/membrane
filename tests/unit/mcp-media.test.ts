@@ -1,11 +1,13 @@
 /**
  * Media in MCP's form, `{ type, data, mimeType }` with no `source`
- * (membrane#139). Membrane converts it to its own form where content enters
- * it (utils/mcp-media.ts): a request carrying it is the request the same
+ * (membrane#139). Membrane converts it to its own form wherever it takes
+ * content (utils/mcp-media.ts): a request carrying it is the request the same
  * media in membrane's form gives, on every path, with the same round report,
  * and what membrane hands back stays as the caller gave it. A media block
  * with no source object that can't convert is a source each reader can't
- * represent: left out and reported, or noted, rather than failing the request.
+ * represent: left out and reported, or noted, rather than failing the request,
+ * except where membrane's form fails too: toAnthropicContent gives audio or
+ * video the error it gives them in membrane's form.
  */
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -179,7 +181,7 @@ describe('the rule: what converts, and what stays as it was', () => {
     expect(convertMcpMedia([{ toolUseId: 't', content: [block] }])).toEqual([{ toolUseId: 't', content: [converted] }]);
   });
 
-  it('an image in MCP\'s form with no mimeType, or an empty one, becomes membrane\'s with no mediaType, at any depth, since every request decides an image by its header', () => {
+  it('an image in MCP\'s form with no mimeType, or an empty one, becomes membrane\'s with no mediaType, at any depth, since every request that sends an image decides it by its header', () => {
     const block = { type: 'image', data: PNG, annotations: { audience: ['user'] } };
     const converted = { type: 'image', source: { type: 'base64', data: PNG } };
     const nested = (inner: unknown) => ({ type: 'tool_result', toolUseId: 't', content: [text('t'), inner] });
@@ -188,7 +190,14 @@ describe('the rule: what converts, and what stays as it was', () => {
     expect(convertMcpMedia([{ ...block, mimeType: '' }])).toStrictEqual([converted]);
   });
 
-  it('an image in MCP\'s form converts whatever its data, since every request notes data that is missing, empty or no image', () => {
+  it('a media block with neither data nor mimeType is someone else\'s shape, not MCP\'s form, and stays as it came', () => {
+    const others = [{ type: 'image' }, { type: 'image', image_url: 'https://example.com/a.png' }, { type: 'audio', url: 'https://example.com/a.wav' }];
+    expect(convertMcpMedia(others)).toBe(others);
+    const result = { type: 'tool_result', toolUseId: 't', content: others };
+    expect(convertMcpMedia([result])[0]).toBe(result);
+  });
+
+  it('an image in MCP\'s form converts whatever its data, since every request that sends an image notes data that is missing, empty or no image', () => {
     const converted = (data: unknown) => ({ type: 'image', source: { type: 'base64', data, mediaType: 'image/png' } });
     expect(convertMcpMedia([
       { type: 'image', data: '', mimeType: 'image/png' },
@@ -310,6 +319,21 @@ describe('every path that builds a request carries MCP\'s form as it carries mem
     expect(reported[0]).toBe(handed);
   });
 
+  it('streamYielding() through the Responses formatter, which sends such an image in a tool_result as it sends membrane\'s', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const sent = async (form: Form) => {
+      const adapter = new ScriptedResponses();
+      const request = { messages: history(form), config, promptCaching: false } as NormalizedRequest;
+      await turn('streamYielding', new Membrane(adapter as ProviderAdapter, { formatter: new OpenAIResponsesFormatter() }), request);
+      return adapter.sent;
+    };
+    const handed = await sent(mcp);
+    expect(handed).toEqual(await sent(ours));
+    // On 0.6.0 the formatter gave its note that the request couldn't carry one in MCP's form here.
+    const output = handed[0].input.find((item: any) => item.type === 'function_call_output');
+    expect(output.output).toContainEqual({ type: 'input_image', image_url: `data:image/png;base64,${PNG}` });
+  });
+
   it.each(DIRECT)('%s\'s request built directly, at the top of a message and in a tool_result', (_name, make, built) => {
     const wire = (form: Form) => [
       { role: 'user', content: [text('look'), form('image', PNG, 'image/png')] },
@@ -337,6 +361,49 @@ describe('every path that builds a request carries MCP\'s form as it carries mem
     expect(reported[0]).toBe(handed);
   });
 
+  it('Bedrock\'s request built directly reports the block the caller handed in for an image with a sourceUrl and for a tool_result', () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const notAnImage = Buffer.from('not an image').toString('base64');
+    // Each converts, so the build works on a copy, and goes as the formats note.
+    const linked = mcp('image', notAnImage, 'image/png', { sourceUrl: 'https://example.com/a.png' });
+    const result = { type: 'tool_result', tool_use_id: 'shot', content: [text('here'), mcp('image', notAnImage, 'image/png')] };
+    const reported: unknown[] = [];
+    const sent = DIRECT[0]![2](DIRECT[0]![1](), [
+      { role: 'user', content: [text('look'), linked] },
+      { role: 'assistant', content: [{ type: 'tool_use', id: 'shot', name: 'noop', input: {} }] },
+      { role: 'user', content: [result] },
+    ], (block: unknown) => reported.push(block));
+    expect(JSON.stringify(sent)).not.toContain('sourceUrl');
+    expect(reported).toHaveLength(2);
+    expect(reported[0]).toBe(linked);
+    expect(reported[1]).toBe(result);
+  });
+
+  it('the Responses adapter in subscription mode sends an image given by image_url, which isn\'t MCP\'s form, as the URL image it reads', () => {
+    const linked = { type: 'image', image_url: 'https://example.com/a.png' };
+    const sent = JSON.stringify(DIRECT[5]![2](DIRECT[5]![1](), [
+      { role: 'user', content: [text('look'), linked] },
+      { role: 'assistant', content: [{ type: 'tool_use', id: 'shot', name: 'noop', input: {} }] },
+      { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'shot', content: [text('here'), linked] }] },
+    ]));
+    expect(sent.split('"type":"input_image","image_url":"https://example.com/a.png"')).toHaveLength(3);
+    expect(sent).not.toContain('it came without its data');
+  });
+
+  it('the Responses adapter in subscription mode reports a standalone tool_result it was handed, not the copy it converted', () => {
+    const handed = { type: 'tool_result', toolUseId: 'shot', isError: true, content: [text('failed'), mcp('image', PNG, 'image/png')] };
+    const reported: unknown[] = [];
+    const sent = DIRECT[5]![2](DIRECT[5]![1](), [
+      { role: 'user', content: [text('go')] },
+      { type: 'tool_use', id: 'shot', name: 'noop', input: {} },
+      handed,
+    ], (block: unknown) => reported.push(block));
+    // A function_call_output has no error flag, so the build reports the result.
+    expect(JSON.stringify(sent)).toContain(PNG);
+    expect(reported).toEqual([handed]);
+    expect(reported[0]).toBe(handed);
+  });
+
   it('the OpenAI image adapter\'s request, which attaches the image for an edit and numbers it in the transcript', async () => {
     const sent = async (form: Form) => {
       const fetchMock = vi.fn().mockImplementation(async () => new Response(JSON.stringify({ created: 1, data: [{ b64_json: PNG }] }), {
@@ -359,6 +426,23 @@ describe('every path that builds a request carries MCP\'s form as it carries mem
     expect(handed.url).toContain('images/edits');
     expect(handed.image).toBe(PNG);
     expect(handed.prompt).toContain('[Image 1]');
+  });
+
+  it.each([
+    ['the anthropic-xml formatter, xml tool mode', () => new AnthropicXmlFormatter({ unsupportedMedia: 'strip' }), 'xml'],
+    ['the anthropic-xml formatter, native tool mode', () => new AnthropicXmlFormatter(), 'native'],
+    ['the native formatter', () => new NativeFormatter(), undefined],
+    ['the Responses formatter', () => new OpenAIResponsesFormatter(), undefined],
+    // It reads no image data, so it builds the same either way without a step.
+    ['the completions formatter', () => new CompletionsFormatter(), undefined],
+  ] as const)('%s called directly builds MCP\'s form as it builds membrane\'s, at the top of a message and in a tool_result', (_name, make, toolMode) => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const options = { participantMode: 'simple', assistantParticipant: 'Claude', humanParticipant: 'User', ...(toolMode ? { toolMode, tools: [noop] } : {}) } as any;
+    const handed = history(mcp);
+    const before = structuredClone(handed);
+    const built = make().buildMessages(handed, options);
+    expect(JSON.stringify(built)).toBe(JSON.stringify(make().buildMessages(history(ours), options)));
+    expect(handed).toEqual(before);
   });
 
   it('the exported converters toAnthropicContent and transformToChat, at the top of a turn and in a tool_result', () => {
@@ -434,7 +518,7 @@ describe('every path that builds a request carries MCP\'s form as it carries mem
   });
 });
 
-describe('an image in MCP\'s form with no mimeType is sent as the same image with one, since every request decides an image by its header', () => {
+describe('an image in MCP\'s form with no mimeType is sent as the same image with one, since every request that sends an image decides it by its header', () => {
   const png = (labelled: boolean) => (labelled ? mcp('image', PNG, 'image/png') : { type: 'image', data: PNG });
   /** A PNG at the top of a message and inside a tool_result. */
   const holding = (labelled: boolean): NormalizedMessage[] => [
@@ -587,14 +671,13 @@ describe('a media block with no source object that doesn\'t convert is a source 
     expect(sent).not.toContain('"data":""');
   });
 
-  it('a formatter called directly, past the conversion, takes an image with no source object at the top of a message as such a source too', () => {
-    const messages = [{ participant: 'User', content: [text('look'), mcp('image', PNG, 'image/png')] }] as NormalizedMessage[];
+  it('a formatter called directly takes an image with no source object and neither of MCP\'s fields, someone else\'s shape, at the top of a message as such a source', () => {
+    const messages = [{ participant: 'User', content: [text('look'), { type: 'image' }] }] as NormalizedMessage[];
     for (const formatter of [new AnthropicXmlFormatter(), new NativeFormatter(), new OpenAIResponsesFormatter()]) {
       const sent = JSON.stringify(formatter.buildMessages(messages, { participantMode: 'simple', assistantParticipant: 'Claude', humanParticipant: 'User' } as any).messages);
       expect(sent).toContain('look');
       // Left out: no image of any provider's shape, nor the block as it came.
       expect(sent).not.toMatch(/"type":"(image|input_image|image_url)"/);
-      expect(sent).not.toContain(PNG);
     }
   });
 
@@ -618,16 +701,32 @@ describe('a media block with no source object that doesn\'t convert is a source 
     expect(reported[top.length]).toBe(result);
   });
 
-  it('Bedrock built directly leaves them out at the top of a message, and reports each block it was handed', () => {
+  it('Bedrock built directly leaves them out, at the top of a message and in a tool_result, and reports each block it was handed', () => {
     const adapter = new BedrockAdapter({ accessKeyId: 'x', secretAccessKey: 'y', region: 'us-east-1' }) as any;
     const top = unconvertible();
+    const result = { type: 'tool_result', tool_use_id: 'shot', content: [text('here'), mcp('image', PNG, 'image/png'), ...unconvertible()] };
     const reported: unknown[] = [];
     const built = adapter.buildRequest({ model: 'claude-sonnet-4-5', maxTokens: 64, messages: [
       { role: 'user', content: [text('look'), ...top, mcp('image', PNG, 'image/png')] },
+      { role: 'assistant', content: [{ type: 'tool_use', id: 'shot', name: 'noop', input: {} }] },
+      { role: 'user', content: [result] },
     ] }, undefined, (block: unknown) => reported.push(block));
-    expect(built.messages[0].content).toEqual([text('look'), { type: 'image', source: { type: 'base64', data: PNG, media_type: 'image/png' } }]);
-    expect(reported).toHaveLength(top.length);
+    const image = { type: 'image', source: { type: 'base64', data: PNG, media_type: 'image/png' } };
+    expect(built.messages[0].content).toEqual([text('look'), image]);
+    expect(built.messages[2].content[0].content).toEqual([text('here'), image]);
+    expect(reported).toHaveLength(top.length + 1);
     top.forEach((block, i) => expect(reported[i]).toBe(block));
+    expect(reported[top.length]).toBe(result);
+  });
+
+  it('the exported converters leave out an image with no source object and neither of MCP\'s fields, where they threw, at the top of a turn and in a tool_result', () => {
+    const others = [{ type: 'image' }, { type: 'image', image_url: 'https://example.com/a.png' }];
+    const content = [text('look'), ...others, { type: 'tool_result', toolUseId: 'shot', content: [text('here'), ...others] }] as ContentBlock[];
+    expect(toAnthropicContent(content, { role: 'user' })).toEqual([
+      text('look'), { type: 'tool_result', tool_use_id: 'shot', content: [text('here')], is_error: undefined },
+    ]);
+    const chat = transformToChat({ messages: [{ participant: 'User', content }], config } as NormalizedRequest);
+    expect(chat.messages[0]!.content.map((part) => part.type)).toEqual(['text', 'tool_result']);
   });
 
   it('toAnthropicContent leaves out a document that doesn\'t convert, where it threw, and audio that doesn\'t meets the error audio meets in membrane\'s form', () => {

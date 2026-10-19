@@ -39,6 +39,7 @@ import { IncrementalXmlParser } from '../utils/stream-parser.js';
 import { assertCacheMarkersWithinLimit, clampCacheMarkers } from '../utils/cache-marker-budget.js';
 import { lastCacheableBlockIndex } from './native.js';
 import { imageForRequest, isAcceptedImage } from '../utils/image-media.js';
+import { convertMcpMedia } from '../utils/mcp-media.js';
 import { holdsContent, isRawItemCarrier } from '../utils/fidelity.js';
 
 // ============================================================================
@@ -236,6 +237,10 @@ export class AnthropicXmlFormatter implements PrefillFormatter {
   // ==========================================================================
 
   buildMessages(messages: NormalizedMessage[], options: BuildOptions): BuildResult {
+    // Media in MCP's form becomes membrane's first, for a caller that builds
+    // messages directly. Membrane's own builds have converted it already and
+    // get the same array back (utils/mcp-media.ts).
+    messages = convertMcpMedia(messages);
     // Native mode is a native conversation, not an XML transcript with a tools
     // array attached. Keep explicit XML's prefill/continuation protocol separate.
     if ((options.toolMode ?? this.config.toolMode) === 'native') {

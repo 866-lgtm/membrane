@@ -6,22 +6,28 @@
   decides it by its data's header, and one with data that is missing or empty
   gets the note that it came without its data (see Changed). A document, audio
   clip or video converts only with data that isn't empty and a `mimeType` that
-  isn't empty. Membrane converts it wherever it takes content: the messages
-  of `complete()`, `stream()` and `streamYielding()`, rebuilt each round of a
-  native tool loop; the request built directly by each adapter that reads
-  membrane's content blocks, `AnthropicAdapter`, `BedrockAdapter`,
-  `OpenAIAdapter`, `OpenAICompatibleAdapter`, `OpenRouterAdapter`,
-  `GeminiAdapter`, the image adapter `OpenAIResponsesAdapter`, and
-  `OpenAIResponsesAPIAdapter` in subscription mode; and the exported
-  `toAnthropicContent` and `transformToChat`. An xml tool loop's
-  results, which `formatToolResults` and the split that sends a result's
-  images render each round, already read an image in MCP's form by its data.
+  isn't empty. A media block with neither `data` nor `mimeType` isn't MCP's
+  form and stays as it came; `toAnthropicContent` and `transformToChat` leave
+  out such an image, where they threw a TypeError. Membrane converts MCP's
+  form wherever it takes content: the messages of `complete()`, `stream()`
+  and `streamYielding()`, rebuilt each round of a native tool loop; the
+  messages a caller hands `AnthropicXmlFormatter`, `NativeFormatter` or
+  `OpenAIResponsesFormatter` directly; the request built directly by each
+  adapter that reads membrane's content blocks, `AnthropicAdapter`,
+  `BedrockAdapter`, `OpenAIAdapter`, `OpenAICompatibleAdapter`,
+  `OpenRouterAdapter`, `GeminiAdapter`, the image adapter
+  `OpenAIResponsesAdapter`, and `OpenAIResponsesAPIAdapter` in subscription
+  mode; and the exported `toAnthropicContent` and `transformToChat`. An xml
+  tool loop's results, which `formatToolResults` and the split that sends a
+  result's images render each round, already read an image in MCP's form by
+  its data.
   The block keeps its other fields, apart from MCP's `annotations` and
   `_meta`, which no request carries. The caller's messages and the executor's
   results stay as they were, and a round's report names what it would for the
   same media in membrane's form. Inside a `tool_result`, the anthropic-xml and
   native formatters already read such an image by its data, and send it as
-  before. Before:
+  before, and the Responses formatter now sends it, where it gave its note
+  that the request couldn't carry it. Before:
   - at the top of a message, the anthropic-xml formatter in either tool mode,
     the native formatter and the Responses formatter threw a TypeError on
     such an image, and the anthropic-xml formatter in native tool mode and
@@ -51,13 +57,14 @@
   xml tool mode, still meets `unsupportedMedia` at the top of a message, as
   in membrane's form. `toAnthropicContent` leaves out such a document, where
   it threw a TypeError, and gives such audio or video the error it gives
-  audio or video in membrane's form. Inside a `tool_result` nothing changes:
-  the xml renderers leave it out, and the native formatter passes it on,
-  which the Anthropic adapter leaves out as it does any block it has no
-  tool-result form for. A message the Anthropic or Bedrock adapter's direct
-  build leaves with no block is dropped, as the build drops any message it
-  leaves empty, and where dropping it would change the request's final role,
-  the build refuses.
+  audio or video in membrane's form. Inside a `tool_result` the xml renderers
+  leave it out, and the native formatter passes it on, which the Anthropic
+  adapter leaves out as it does any block it has no tool-result form for, as
+  before; `BedrockAdapter`'s request built directly now leaves it out there
+  too and reports the result, where it sent it as it was. A message the
+  Anthropic or Bedrock adapter's direct build leaves with no block is
+  dropped, as the build drops any message it leaves empty, and where dropping
+  it would change the request's final role, the build refuses.
 - An image in a base64 `data:` URL whose payload escapes characters, such as
   its padding as `%3D`, is percent-decoded before its bytes are read, as the
   fetch spec's `data:` URL processor decodes it, wherever membrane reads a

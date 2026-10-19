@@ -35,6 +35,7 @@ import type {
 } from './types.js';
 import { normalizeToolPairs, mergeConsecutiveRoles } from './normalize-tool-pairs.js';
 import { imageForRequest, toolResultContentForRequest } from '../utils/image-media.js';
+import { convertMcpMedia } from '../utils/mcp-media.js';
 import { assertCacheMarkersWithinLimit, countWireCacheMarkers } from '../utils/cache-marker-budget.js';
 import { anthropicServerBlockFor, unpairedServerBlocks } from '../utils/anthropic-server-blocks.js';
 
@@ -202,6 +203,10 @@ export class NativeFormatter implements PrefillFormatter {
   // ==========================================================================
 
   buildMessages(messages: NormalizedMessage[], options: BuildOptions): BuildResult {
+    // Media in MCP's form becomes membrane's first, for a caller that builds
+    // messages directly. Membrane's own builds have converted it already and
+    // get the same array back (utils/mcp-media.ts).
+    messages = convertMcpMedia(messages);
     const {
       participantMode,
       assistantParticipant,

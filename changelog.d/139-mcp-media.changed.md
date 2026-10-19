@@ -38,7 +38,7 @@
   its `[Image: …]` note, and any other gets the note its bytes call for. A
   split round stored before this change, whose result held one beside an
   image the split sent, replays with it sent too, beside the formats note
-  that turn wrote.
+  that turn wrote, and nothing reports it.
 - A stored tool result that xml tool mode re-renders without its raw text
   keeps an image with a URL source, and gives it the note the live results
   give: the link note, or for a `data:` URL, what its bytes call for (#139).

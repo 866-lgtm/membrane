@@ -517,11 +517,17 @@ export class BedrockAdapter implements ProviderAdapter {
               return stripCacheTtl(toWireImage(block, () => onContentAltered?.(original)));
             }
             if (block.type === 'tool_result' && Array.isArray(block.content)) {
-              let substituted = false;
-              const content = block.content.map((inner: any) =>
-                inner?.type === 'image' ? toWireImage(inner, () => { substituted = true; }) : inner,
-              );
-              if (substituted) onContentAltered?.(original);
+              let altered = false;
+              // Media with no source object has no form the API takes here
+              // either: left out, and the result reported, as at the top.
+              const content = block.content.flatMap((inner: any) => {
+                if (isSourcelessMedia(inner)) {
+                  altered = true;
+                  return [];
+                }
+                return [inner?.type === 'image' ? toWireImage(inner, () => { altered = true; }) : inner];
+              });
+              if (altered) onContentAltered?.(original);
               return stripCacheTtl({ ...block, content });
             }
             return stripCacheTtl(block);

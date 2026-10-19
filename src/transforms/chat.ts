@@ -130,7 +130,7 @@ function transformContent(blocks: ContentBlock[]): ChatContent[] {
   for (const block of blocks) {
     if (isTextContent(block)) {
       result.push({ type: 'text', text: block.text });
-    } else if (block.type === 'image' && block.source.type === 'base64') {
+    } else if (block.type === 'image' && block.source?.type === 'base64') {
       result.push({
         type: 'image',
         source: {
