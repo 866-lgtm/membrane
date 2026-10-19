@@ -7,11 +7,11 @@
   call now ends at once with a `MembraneError` whose `retryable` is `false`:
   the caller's own if it already said so, or else a new one classified from
   its error as before, with that error as its `cause` and no `httpStatus`,
-  `providerErrorCode` or `retryAfterMs`, nor a wrapped `MembraneError`'s
-  `rawError` or `rawRequest`, since no response to this call stands behind
-  them. What builds, sends or reads the call keeps its classification: an
-  adapter and the transport, a credential resolver, a formatter and its
-  parser. Before:
+  `providerErrorCode` or `retryAfterMs`, since no response to this call
+  stands behind them, nor a wrapped `MembraneError`'s `rawError` or
+  `rawRequest`, which would be another call's. What builds, sends or reads
+  the call keeps its classification: an adapter and the transport, a
+  credential resolver, a formatter and its parser. Before:
   - An error that read like a rate limit made `complete()` send the request
     up to five times when it came from `onResponse`, `afterResponse`, the
     logger or the registry, paying again for a response that had already
