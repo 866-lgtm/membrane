@@ -22,6 +22,10 @@
 // We snapshot the exact wire request of each real call and replay it verbatim
 // with `max_tokens: 0`, which runs prefill only: content `[]`, stop_reason
 // `max_tokens`, zero output tokens billed, and the cache entry refreshed.
+// A call is snapshotted only once the provider has its prefix (the adapter
+// records at `message_start`, or once a non-streamed response arrives): a
+// request that failed before then left nothing in the cache to hold, and one
+// the provider refused would have its replays refused too.
 //
 // ⚠️ THE REPLAY MUST BE BYTE-IDENTICAL ABOVE THE LAST BREAKPOINT.
 // Prompt caching is a prefix match, and the API's invalidation hierarchy means
@@ -257,7 +261,8 @@ export class CacheKeepalive {
     if (!this.cfg.enabled) this.stopped = true;
   }
 
-  /** Record a real outbound request. Cheap; called on every LLM call. */
+  /** Record a real request the provider has begun to answer, so its prefix
+   *  is cached. Cheap; called once per call that gets that far. */
   record(
     wire: Record<string, unknown>,
     headers: Record<string, string> | undefined,

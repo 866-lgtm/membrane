@@ -429,15 +429,16 @@ export class AnthropicAdapter implements ProviderAdapter {
     options?.onRequest?.(fullRequest);
 
     const headers = this.betaHeaders(request, anthropicRequest);
-    // Before the keepalive records the request: a dynamicHeaders that throws
-    // ends the call before the send, leaving nothing to replay.
     const live = this.liveHeaders(headers, 'complete');
-    this.cacheKeepalive?.record(
-      fullRequest as unknown as Record<string, unknown>, headers, 'complete',
-    );
 
     try {
       const response = await this.createMessage(fullRequest, live, options?.signal);
+      // The provider has answered, so it has the request's prefix: only now
+      // can the keepalive hold it warm. A call that failed before an answer
+      // leaves the lineage's earlier snapshot as it was.
+      this.cacheKeepalive?.record(
+        fullRequest as unknown as Record<string, unknown>, headers, 'complete',
+      );
 
       return this.parseResponse(response, fullRequest);
     } catch (error) {
@@ -459,17 +460,8 @@ export class AnthropicAdapter implements ProviderAdapter {
     assertMessagePrefillSupported(fullRequest.model, fullRequest.messages, options, this.name, fullRequest);
     options?.onRequest?.(fullRequest);
 
-    // Before the keepalive records the request: a dynamicHeaders that throws
-    // ends the call before the send, leaving nothing to replay.
-    const live = this.liveHeaders(this.betaHeaders(request, anthropicRequest), 'stream');
-
-    // Snapshot the primary lane's prefix so it can be held warm across idle
-    // gaps. `stream: true` is dropped at replay time (transport, not cache key).
-    this.cacheKeepalive?.record(
-      fullRequest as unknown as Record<string, unknown>,
-      this.betaHeaders(request, anthropicRequest),
-      'stream',
-    );
+    const headers = this.betaHeaders(request, anthropicRequest);
+    const live = this.liveHeaders(headers, 'stream');
 
     // Idle timeout: abort on transport silence after the first SDK event.
     // The SDK's timeout only covers the initial HTTP response headers;
@@ -646,6 +638,11 @@ export class AnthropicAdapter implements ProviderAdapter {
         // Every SDK event is progress; pings never reach this loop.
         options?.onProgress?.();
         if (event.type === 'message_start') {
+          // The provider has the request's prefix from here, so the keepalive
+          // can hold it warm across idle gaps (`stream: true` is dropped at
+          // replay time: transport, not cache key). A call that failed before
+          // this leaves the lineage's earlier snapshot as it was.
+          this.cacheKeepalive?.record(fullRequest as unknown as Record<string, unknown>, headers, 'stream');
           model = event.message.model;
           inputTransformations = (event.message as { input_transformations?: unknown }).input_transformations;
           const usage = event.message.usage as unknown as Record<string, unknown>;
