@@ -7,11 +7,16 @@
  * them in `source`: `{ type: 'base64', data, mediaType }`. A host that stores
  * MCP results without converting them hands membrane the first form, and the
  * request builders read the second: at the top of a message the formatters
- * threw on the first. So membrane converts where content enters it, and
+ * threw on the first. So membrane converts wherever it takes content, and
  * every request builder after that point reads one form:
  * `Membrane`'s request build (`transformRequest`, which every path's messages
- * go through, the native tool loop's each round), and the Anthropic adapter's
- * request sanitizer, for a caller that builds a request directly. The xml
+ * go through, the native tool loop's each round); each adapter's request
+ * built directly that reads membrane's content blocks (Anthropic, Bedrock,
+ * OpenAI, OpenAI-compatible, OpenRouter, Gemini, and the Responses adapter
+ * in subscription mode, whose API mode takes native items as they are); and
+ * the exported converters `toAnthropicContent` and `transformToChat`. The
+ * completions adapter reads no media data, and the image adapter reads
+ * MCP's form itself, so neither converts. The xml
  * document's tool results (`formatToolResults` and
  * `formatToolResultsForSplitTurn`, which take an xml tool loop's results each
  * round) read their images through `toolResultImage`, which takes MCP's form
@@ -25,15 +30,17 @@
  * The rule: a media block (image, document, audio or video) with no `source`
  * object becomes `{ ...rest, source: { type: 'base64', data, mediaType } }`,
  * keeping its other fields, its `mimeType` as the `mediaType` where that's a
- * string that isn't empty. An image converts whatever its data and label:
- * every request builder that sends an image decides its data through
- * imageForRequest, which sends what the data's header shows, whatever label
- * it came with, and notes data that is missing, empty or no image it can
- * carry. Nothing decides a document, audio or video that way, since their
- * builders send the source as it is, so one of those converts only with data
- * that isn't empty and a `mimeType`. One that doesn't is left as it is, and
- * the readers membrane runs after the conversion treat it as a source they
- * can't represent.
+ * string that isn't empty. MCP's `annotations` and `_meta` are protocol
+ * metadata, which no request has a place for and an API that rejects extra
+ * inputs refuses, so they don't go with it. An image converts whatever its
+ * data and label: every request builder that sends an image decides its data
+ * through imageForRequest, which sends what the data's header shows,
+ * whatever label it came with, and notes data that is missing, empty or no
+ * image it can carry. Nothing decides a document, audio or video that way,
+ * since their builders send the source as it is, so one of those converts
+ * only with data that isn't empty and a `mimeType`. One that doesn't is left
+ * as it is, and the readers membrane runs after the conversion treat it as a
+ * source they can't represent.
  */
 
 const MEDIA_TYPES: ReadonlySet<unknown> = new Set(['image', 'document', 'audio', 'video']);
@@ -70,6 +77,28 @@ export function isSourcelessMedia(block: unknown): boolean {
   return isRecord(block) && MEDIA_TYPES.has(block.type) && !isRecord(block.source);
 }
 
+/**
+ * For a builder that reports blocks from inside a reader it hands converted
+ * messages: the caller's block at the place in `messages` where `converted`
+ * (convertMcpMedia's result for them) holds `block`, or `block` itself where
+ * nothing converted. So a report names what the caller handed in, as one
+ * about the same media in membrane's form would. Message content blocks only,
+ * the blocks such a reader reports.
+ */
+export function blockHandedIn(messages: unknown[], converted: unknown[]): (block: unknown) => unknown {
+  const handedIn = new Map<unknown, unknown>();
+  converted.forEach((message, i) => {
+    const before = messages[i];
+    if (message === before || !isRecord(message) || !isRecord(before)) return;
+    if (!Array.isArray(message.content) || !Array.isArray(before.content)) return;
+    const original = before.content;
+    message.content.forEach((block, j) => {
+      if (block !== original[j]) handedIn.set(block, original[j]);
+    });
+  });
+  return (block) => (handedIn.has(block) ? handedIn.get(block) : block);
+}
+
 function convertedItem(item: unknown): unknown {
   if (!isRecord(item)) return item;
   if (Array.isArray(item.content)) {
@@ -77,7 +106,7 @@ function convertedItem(item: unknown): unknown {
     return content === item.content ? item : { ...item, content };
   }
   if (!MEDIA_TYPES.has(item.type) || isRecord(item.source)) return item;
-  const { data, mimeType, ...rest } = item;
+  const { data, mimeType, annotations: _annotations, _meta, ...rest } = item;
   const mediaType = typeof mimeType === 'string' && mimeType !== '' ? mimeType : undefined;
   // imageForRequest decides an image's data wherever a request carries it;
   // other media go with their source as it is.

@@ -7,6 +7,7 @@ import { AnthropicAdapter } from '../../src/providers/anthropic.js';
 import { OpenAIResponsesAdapter } from '../../src/providers/openai-responses.js';
 import { formatToolResultsForSplitTurn } from '../../src/utils/tool-parser.js';
 import { imageForRequest, GEMINI_IMAGE_TYPES } from '../../src/utils/image-media.js';
+import { openAIImagePart } from '../../src/providers/utils.js';
 import type { ContentBlock, NormalizedMessage, NormalizedRequest, ProviderAdapter } from '../../src/types/index.js';
 
 // Real 1x1 PNG; other signature tests only exercise header recognition.
@@ -298,5 +299,31 @@ describe('review follow-ups', () => {
     expect(imageForRequest(42, 'image/png').placeholder?.text).toContain('it came without its data');
     expect(imageForRequest('AAAAAAAAAAAA', 7).placeholder?.text).not.toContain('labelled');
     expect(imageForRequest({}, null).placeholder?.text).toContain('NOT shown to you');
+  });
+});
+
+describe('a base64 data: URL whose payload escapes its padding', () => {
+  // `=` escaped as `%3D`, which a URL may do. The fetch spec's data: URL
+  // processor percent-decodes the payload before it decodes the base64.
+  const ESCAPED = `data:image/png;base64,${PNG.replace(/==$/, '%3D%3D')}`;
+  const sent = { type: 'image', source: { type: 'base64', media_type: 'image/png', data: PNG } };
+
+  it('is sent as the image it holds in an xml split, where its escaped text went as the image data', () => {
+    const split = formatToolResultsForSplitTurn([
+      { toolUseId: 'u', content: [{ type: 'image', source: { type: 'url', url: ESCAPED } }] } as any,
+    ]);
+    expect(split.images).toEqual([sent]);
+  });
+
+  it('is sent as the image it holds on the native path, and as a data: URL without the escapes', () => {
+    const adapter = new AnthropicAdapter({ apiKey: 'test', cacheKeepalive: { enabled: false } }) as any;
+    const built = adapter.buildRequest({ model: 'claude-sonnet-4-5', maxTokens: 64, messages: [
+      { role: 'user', content: [{ type: 'text', text: 'look' }, { type: 'image', source: { type: 'url', url: ESCAPED } }] },
+      { role: 'assistant', content: [{ type: 'tool_use', id: 'shot', name: 'noop', input: {} }] },
+      { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'shot', content: [{ type: 'image', source: { type: 'url', url: ESCAPED } }] }] },
+    ] });
+    expect(built.messages[0].content[1]).toEqual(sent);
+    expect(built.messages[2].content[0].content).toEqual([sent]);
+    expect(openAIImagePart({ type: 'url', url: ESCAPED })).toEqual({ type: 'image_url', image_url: { url: `data:image/png;base64,${PNG}` } });
   });
 });

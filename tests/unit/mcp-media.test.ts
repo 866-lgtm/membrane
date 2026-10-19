@@ -10,8 +10,14 @@
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { Membrane } from '../../src/membrane.js';
-import { AnthropicAdapter } from '../../src/providers/anthropic.js';
+import { AnthropicAdapter, toAnthropicContent } from '../../src/providers/anthropic.js';
+import { BedrockAdapter } from '../../src/providers/bedrock.js';
+import { GeminiAdapter } from '../../src/providers/gemini.js';
+import { OpenAIAdapter } from '../../src/providers/openai.js';
+import { OpenAICompatibleAdapter } from '../../src/providers/openai-compatible.js';
+import { OpenRouterAdapter } from '../../src/providers/openrouter.js';
 import { OpenAIResponsesAPIAdapter } from '../../src/providers/openai-responses-api.js';
+import { transformToChat } from '../../src/transforms/chat.js';
 import { NativeFormatter } from '../../src/formatters/native.js';
 import { AnthropicXmlFormatter } from '../../src/formatters/anthropic-xml.js';
 import { OpenAIResponsesFormatter } from '../../src/formatters/openai-responses.js';
@@ -19,6 +25,7 @@ import { CompletionsFormatter } from '../../src/formatters/completions.js';
 import { convertMcpMedia } from '../../src/utils/mcp-media.js';
 import { formatToolResults, formatToolResultsForSplitTurn } from '../../src/utils/tool-parser.js';
 import type {
+  ContentBlock,
   NormalizedMessage,
   NormalizedRequest,
   ProviderAdapter,
@@ -41,10 +48,13 @@ afterEach(() => {
 const PNG = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg==';
 const SVG = Buffer.from('<svg xmlns="http://www.w3.org/2000/svg"/>').toString('base64');
 const WAV = 'UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQAAAAA=';
+const PDF = Buffer.from('%PDF-1.4\n%%EOF\n').toString('base64');
 
 const text = (value: string) => ({ type: 'text', text: value });
-/** One piece of media in MCP's form, or in membrane's. */
-const mcp = (type: string, data: string, mimeType: string, extra: object = {}) => ({ type, data, mimeType, ...extra });
+/** One piece of media in MCP's form, with the annotations and _meta an MCP
+ *  server may send beside it, which no request carries; or in membrane's. */
+const mcp = (type: string, data: string, mimeType: string, extra: object = {}) =>
+  ({ type, data, mimeType, annotations: { audience: ['user'], priority: 0.5 }, _meta: { server: 'test' }, ...extra });
 const ours = (type: string, data: string, mediaType: string, extra: object = {}) => ({ type, ...extra, source: { type: 'base64', data, mediaType } });
 
 /** MCP's form or membrane's: what each test runs twice, once each way. */
@@ -157,9 +167,9 @@ async function turn(
 }
 
 describe('the rule: what converts, and what stays as it was', () => {
-  it.each(['image', 'document', 'audio', 'video'])('a %s block in MCP\'s form becomes membrane\'s, keeping its other fields, at any depth', (type) => {
-    const block = mcp(type, 'AAAA', 'x/y', { annotations: { audience: ['user'] }, _meta: { n: 1 } });
-    const converted = ours(type, 'AAAA', 'x/y', { annotations: { audience: ['user'] }, _meta: { n: 1 } });
+  it.each(['image', 'document', 'audio', 'video'])('a %s block in MCP\'s form becomes membrane\'s, keeping its other fields but MCP\'s annotations and _meta, at any depth', (type) => {
+    const block = mcp(type, 'AAAA', 'x/y', { annotations: { audience: ['user'] }, _meta: { n: 1 }, cache_control: { type: 'ephemeral' } });
+    const converted = ours(type, 'AAAA', 'x/y', { cache_control: { type: 'ephemeral' } });
     const nested = (inner: unknown) => ({ type: 'tool_result', toolUseId: 't', content: [text('t'), inner] });
     expect(convertMcpMedia([block])).toEqual([converted]);
     // In a tool_result, in one inside that, in a message, and in a ToolResult.
@@ -170,7 +180,7 @@ describe('the rule: what converts, and what stays as it was', () => {
 
   it('an image in MCP\'s form with no mimeType, or an empty one, becomes membrane\'s with no mediaType, at any depth, since every request decides an image by its header', () => {
     const block = { type: 'image', data: PNG, annotations: { audience: ['user'] } };
-    const converted = { type: 'image', annotations: { audience: ['user'] }, source: { type: 'base64', data: PNG } };
+    const converted = { type: 'image', source: { type: 'base64', data: PNG } };
     const nested = (inner: unknown) => ({ type: 'tool_result', toolUseId: 't', content: [text('t'), inner] });
     expect(convertMcpMedia([block])).toStrictEqual([converted]);
     expect(convertMcpMedia([nested(block)])).toStrictEqual([nested(converted)]);
@@ -218,6 +228,28 @@ describe('the rule: what converts, and what stays as it was', () => {
     expect((out[left.length] as any).content[1]).toEqual(ours('image', PNG, 'image/png'));
   });
 });
+
+/**
+ * Each adapter besides Anthropic's whose request built directly reads
+ * membrane's content blocks: how to make one, what its built request holds
+ * the messages in, and whether it reports what it alters. The Responses
+ * adapter reads them in subscription mode; in API mode it takes native items
+ * as they are.
+ */
+const DIRECT: Array<[string, () => any, (adapter: any, messages: unknown[], report?: (block: unknown) => void) => unknown, boolean]> = [
+  ['Bedrock', () => new BedrockAdapter({ accessKeyId: 'x', secretAccessKey: 'y', region: 'us-east-1' }),
+    (adapter, messages, report) => adapter.buildRequest({ model: 'claude-sonnet-4-5', maxTokens: 64, messages }, undefined, report).messages, true],
+  ['OpenAI', () => new OpenAIAdapter({ apiKey: 'test' }),
+    (adapter, messages) => adapter.buildRequest({ model: 'gpt-5.4', maxTokens: 64, messages }).messages, false],
+  ['OpenAI-compatible', () => new OpenAICompatibleAdapter({ apiKey: 'test', baseURL: 'http://localhost:1' }),
+    (adapter, messages) => adapter.buildRequest({ model: 'local', maxTokens: 64, messages }).messages, false],
+  ['OpenRouter', () => new OpenRouterAdapter({ apiKey: 'test' }),
+    (adapter, messages) => adapter.buildRequest({ model: 'openai/gpt-5.4', maxTokens: 64, messages }).messages, false],
+  ['Gemini', () => new GeminiAdapter({ apiKey: 'test' }),
+    (adapter, messages) => adapter.buildRequest({ model: 'gemini-3-pro', maxTokens: 64, messages }).contents, false],
+  ['the Responses adapter in subscription mode', () => new OpenAIResponsesAPIAdapter({ mode: 'subscription', credentials: {} as any }),
+    (adapter, messages, report) => adapter.buildRequest({ model: 'gpt-5.4', maxTokens: 64, messages }, report).input, true],
+];
 
 describe('every path that builds a request carries MCP\'s form as it carries membrane\'s', () => {
   /** What reaches Anthropic's transport from `complete()`. */
@@ -275,6 +307,50 @@ describe('every path that builds a request carries MCP\'s form as it carries mem
     expect(built.messages[0].content[1]).toMatchObject({ type: 'text' });
     expect(reported).toHaveLength(1);
     expect(reported[0]).toBe(handed);
+  });
+
+  it.each(DIRECT)('%s\'s request built directly, at the top of a message and in a tool_result', (_name, make, built) => {
+    const wire = (form: Form) => [
+      { role: 'user', content: [text('look'), form('image', PNG, 'image/png')] },
+      { role: 'assistant', content: [{ type: 'tool_use', id: 'shot', name: 'noop', input: {} }] },
+      // A tool_result as either builder names its call.
+      { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'shot', toolUseId: 'shot', content: [text('here'), form('image', PNG, 'image/png')] }] },
+    ];
+    const messages = wire(mcp);
+    const before = structuredClone(messages);
+    const sent = built(make(), messages);
+    expect(sent).toEqual(built(make(), wire(ours)));
+    // The image at the top goes, in the form this API takes it.
+    expect(JSON.stringify(sent)).toContain(PNG);
+    expect(messages).toEqual(before);
+  });
+
+  it.each(DIRECT.filter(([, , , reports]) => reports))('%s\'s request built directly reports the block the caller handed in, not the copy it converted', (_name, make, built) => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    // Data that is no accepted image: it converts, then goes as the formats note.
+    const handed = mcp('image', Buffer.from('not an image').toString('base64'), 'image/png');
+    const reported: unknown[] = [];
+    const sent = built(make(), [{ role: 'user', content: [text('look'), handed] }], (block: unknown) => reported.push(block));
+    expect(JSON.stringify(sent)).toContain('its data is not a JPEG, PNG, GIF or WebP image');
+    expect(reported).toHaveLength(1);
+    expect(reported[0]).toBe(handed);
+  });
+
+  it('the exported converters toAnthropicContent and transformToChat, at the top of a turn and in a tool_result', () => {
+    const turn = (form: Form) => [
+      text('look'), form('image', PNG, 'image/png'), form('document', PDF, 'application/pdf'),
+      { type: 'tool_result', toolUseId: 'shot', content: [text('here'), form('image', PNG, 'image/png')] },
+    ];
+    const handed = turn(mcp);
+    const before = structuredClone(handed);
+    const anthropic = toAnthropicContent(handed as ContentBlock[], { role: 'user' });
+    expect(anthropic).toEqual(toAnthropicContent(turn(ours) as ContentBlock[], { role: 'user' }));
+    expect(anthropic[1]).toEqual({ type: 'image', source: { type: 'base64', media_type: 'image/png', data: PNG } });
+    expect(anthropic[3]).toMatchObject({ type: 'tool_result', content: [text('here'), { type: 'image', source: { type: 'base64', media_type: 'image/png', data: PNG } }] });
+    const chat = (content: unknown[]) => transformToChat({ messages: [{ participant: 'User', content }], config } as NormalizedRequest);
+    expect(chat(handed)).toEqual(chat(turn(ours)));
+    expect(chat(handed).messages[0]!.content[1]).toEqual({ type: 'image', source: { type: 'base64', data: PNG, mediaType: 'image/png' } });
+    expect(handed).toEqual(before);
   });
 
   it('the exported xml result renderers, which take an xml tool loop\'s results each round', () => {
@@ -517,24 +593,64 @@ describe('a media block with no source object that doesn\'t convert is a source 
     expect(reported[top.length]).toBe(result);
   });
 
-  it('the Anthropic adapter built directly drops a message it left empty, and refuses when that message was the last, since the final role would change', () => {
-    vi.spyOn(console, 'warn').mockImplementation(() => {});
-    const adapter = new AnthropicAdapter({ apiKey: 'test', cacheKeepalive: { enabled: false } }) as any;
-    const lone = { type: 'audio', data: WAV }; // no mimeType: can't convert
+  it('Bedrock built directly leaves them out at the top of a message, and reports each block it was handed', () => {
+    const adapter = new BedrockAdapter({ accessKeyId: 'x', secretAccessKey: 'y', region: 'us-east-1' }) as any;
+    const top = unconvertible();
     const reported: unknown[] = [];
     const built = adapter.buildRequest({ model: 'claude-sonnet-4-5', maxTokens: 64, messages: [
+      { role: 'user', content: [text('look'), ...top, mcp('image', PNG, 'image/png')] },
+    ] }, undefined, (block: unknown) => reported.push(block));
+    expect(built.messages[0].content).toEqual([text('look'), { type: 'image', source: { type: 'base64', data: PNG, media_type: 'image/png' } }]);
+    expect(reported).toHaveLength(top.length);
+    top.forEach((block, i) => expect(reported[i]).toBe(block));
+  });
+
+  it('toAnthropicContent leaves out a document that doesn\'t convert, where it threw, and audio that doesn\'t meets the error audio meets in membrane\'s form', () => {
+    const documents = [{ type: 'document', data: PDF }, { type: 'document', mimeType: 'application/pdf' }];
+    const content = [
+      text('look'), ...documents,
+      { type: 'tool_result', toolUseId: 'shot', content: [text('here'), ...documents, ...unconvertible()] },
+    ] as ContentBlock[];
+    expect(toAnthropicContent(content, { role: 'user' })).toEqual([
+      text('look'), { type: 'tool_result', tool_use_id: 'shot', content: [text('here')], is_error: undefined },
+    ]);
+    // No Anthropic block carries audio, in either form.
+    const refusal = (block: unknown) => {
+      try {
+        toAnthropicContent([text('look'), block] as ContentBlock[], { role: 'user' });
+      } catch (error) {
+        return (error as Error).message;
+      }
+      return 'no error';
+    };
+    for (const block of unconvertible()) expect(refusal(block)).toBe(refusal(ours('audio', WAV, 'audio/wav')));
+    expect(refusal(ours('audio', WAV, 'audio/wav'))).toContain('Anthropic has no representation for a "audio" content block');
+  });
+
+  it.each([
+    ['the Anthropic adapter', (messages: unknown[], report: (block: unknown) => void) =>
+      (new AnthropicAdapter({ apiKey: 'test', cacheKeepalive: { enabled: false } }) as any)
+        .buildRequest({ model: 'claude-sonnet-4-5', maxTokens: 64, messages }, report)],
+    ['Bedrock', (messages: unknown[], report: (block: unknown) => void) =>
+      (new BedrockAdapter({ accessKeyId: 'x', secretAccessKey: 'y', region: 'us-east-1' }) as any)
+        .buildRequest({ model: 'claude-sonnet-4-5', maxTokens: 64, messages }, undefined, report)],
+  ])('%s built directly drops a message it left empty, and refuses when that message was the last, since the final role would change', (_name, build) => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const lone = { type: 'audio', data: WAV }; // no mimeType: can't convert
+    const reported: unknown[] = [];
+    const built = build([
       { role: 'user', content: [lone] },
       { role: 'assistant', content: [text('ok')] },
       { role: 'user', content: [text('next')] },
-    ] }, (block: unknown) => reported.push(block));
+    ], (block: unknown) => reported.push(block));
     expect(built.messages).toEqual([{ role: 'assistant', content: [text('ok')] }, { role: 'user', content: [text('next')] }]);
     expect(reported).toHaveLength(1);
     expect(reported[0]).toBe(lone);
-    expect(() => adapter.buildRequest({ model: 'claude-sonnet-4-5', maxTokens: 64, messages: [
+    expect(() => build([
       { role: 'user', content: [text('look')] },
       { role: 'assistant', content: [text('ok')] },
       { role: 'user', content: [{ type: 'audio', data: WAV }] },
-    ] }, () => {})).toThrow("Removing empty final user content would change the request's final role to assistant.");
+    ], () => {})).toThrow("Removing empty final user content would change the request's final role to assistant.");
   });
 
   // With the images these renderers had no data for before either: a URL

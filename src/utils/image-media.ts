@@ -150,19 +150,19 @@ export type UrlImageForRequest =
  * was labelled with, and whether its bytes came as base64 (the alternative is
  * percent-encoded). Undefined for any other URL, whose image is at the URL.
  * A `data:` URL without the comma that starts its data holds none: its data
- * is empty.
+ * is empty. The payload is percent-decoded first, a base64 one too, as the
+ * fetch spec's `data:` URL processor decodes it: a URL may escape base64's
+ * padding as `%3D`. Valid base64 holds no `%`, so it comes through as it is.
  */
 export function dataUrlImage(url: unknown): { data: string; declared: string | undefined; base64: boolean } | undefined {
   if (typeof url !== 'string' || !/^data:/i.test(url)) return undefined;
   const head = DATA_URL.exec(url);
   if (!head) return { data: '', declared: url.slice(5).split(';')[0] || undefined, base64: false };
   const [type = '', ...params] = head[1]!.split(';');
-  const payload = url.slice(head[0].length);
+  const payload = url.slice(head[0].length)
+    .replace(/%([0-9a-f]{2})/gi, (_, hex: string) => String.fromCharCode(parseInt(hex, 16)));
   const base64 = params.some((param) => param.trim().toLowerCase() === 'base64');
-  const data = base64
-    ? payload
-    : Buffer.from(payload.replace(/%([0-9a-f]{2})/gi, (_, hex: string) => String.fromCharCode(parseInt(hex, 16))), 'latin1')
-      .toString('base64');
+  const data = base64 ? payload : Buffer.from(payload, 'latin1').toString('base64');
   return { data, declared: type || undefined, base64 };
 }
 
@@ -180,8 +180,10 @@ export function urlImageForRequest(url: string): UrlImageForRequest {
   const image = imageForRequest(inline.data, inline.declared);
   if (image.placeholder) return { placeholder: image.placeholder };
   // A URL already labelled by its header goes out as it came; only one whose
-  // label disagrees, or whose bytes are percent-encoded, is rewritten.
-  const labelled = inline.base64 && inline.declared?.trim().toLowerCase() === image.mediaType;
+  // label disagrees, or whose bytes are percent-encoded, base64 ones with an
+  // escape among them included, is rewritten.
+  const labelled = inline.base64 && inline.declared?.trim().toLowerCase() === image.mediaType
+    && url.endsWith(`,${inline.data}`);
   return { url: labelled ? url : `data:${image.mediaType};base64,${inline.data}`, mediaType: image.mediaType, data: inline.data };
 }
 

@@ -1253,10 +1253,13 @@ function anthropicUrlImage(url: string): Anthropic.ImageBlockParam | Anthropic.T
  * calls, as NativeFormatter keeps them there; without it, every lone one is
  * left out. In any other role a server block is left out, as NativeFormatter
  * leaves it out of a user turn, which has no place for one. A caller that
- * names no role gets that too, as it always got for a carrier. Nothing
- * reports what it leaves out: it has no alteration callback. It sees one
- * turn, so a turn whose only blocks pairing leaves out comes back empty, for
- * the caller to drop as NativeFormatter drops it.
+ * names no role gets that too, as it always got for a carrier. Media in
+ * MCP's form is converted to membrane's first (utils/mcp-media.ts), at the
+ * top of the turn and inside a `tool_result`, and a document that doesn't
+ * convert, with no source after that, is left out. Nothing reports what it
+ * leaves out: it has no alteration callback. It sees one turn, so a turn
+ * whose only blocks pairing leaves out comes back empty, for the caller to
+ * drop as NativeFormatter drops it.
  */
 export function toAnthropicContent(
   blocks: ContentBlock[],
@@ -1269,7 +1272,7 @@ export function toAnthropicContent(
   // the model produced (see utils/anthropic-server-blocks.ts). In an
   // assistant turn, swap it in before the empty-text cleanup, which would
   // drop the carrier as empty text; in any other, leave it out.
-  const swapped = blocks.flatMap((block): Array<ContentBlock | AnthropicServerBlock> => {
+  const swapped = convertMcpMedia(blocks).flatMap((block): Array<ContentBlock | AnthropicServerBlock> => {
     const serverBlock = anthropicServerBlockFor(block);
     if (serverBlock === undefined) return [block];
     return options.role === 'assistant' ? [serverBlock] : [];
@@ -1301,6 +1304,10 @@ export function toAnthropicContent(
         break;
         
       case 'document':
+        // One in MCP's form that didn't convert has no source for a document
+        // block to carry. An image always converts (utils/mcp-media.ts), and
+        // audio or video meets the error below in either form.
+        if (isSourcelessMedia(block)) break;
         result.push({
           type: 'document',
           source: {

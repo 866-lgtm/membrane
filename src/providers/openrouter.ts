@@ -26,6 +26,7 @@ import {
   withRawRequest,
 } from '../types/index.js';
 import { isRawItemCarrier } from '../utils/fidelity.js';
+import { convertMcpMedia } from '../utils/mcp-media.js';
 import { toolUseInputFromText, textOnlyToolResultContent, openAIImagePart, createCombinedSignal, SSELineParser, isDeadlineAbort, deadlineTimeoutError, throwOnStreamErrorFrame, assertTerminalEventObserved } from './utils.js';
 
 // ============================================================================
@@ -408,7 +409,10 @@ export class OpenRouterAdapter implements ProviderAdapter {
   }
 
   private buildRequest(request: ProviderRequest): any {
-    const messages = this.convertMessages(request.messages as any[]);
+    // Media in MCP's form becomes membrane's first, for a caller that builds
+    // a request directly (Membrane's own builds have converted it already,
+    // utils/mcp-media.ts).
+    const messages = this.convertMessages(convertMcpMedia(request.messages as any[]));
     
     const params: any = {
       model: request.model,
