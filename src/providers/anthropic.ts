@@ -238,9 +238,10 @@ export interface AnthropicAdapterConfig {
 
   /**
    * Prompt-cache keepalive: hold this agent's cached prefix warm across idle
-   * gaps by replaying the last request with `max_tokens: 0`, which refreshes
-   * the entry's TTL at cache-READ price instead of letting it expire into a
-   * 2x cache write on the next wake. See `../cache-keepalive.ts`.
+   * gaps by replaying the last request, through its last one-hour cache
+   * marker, with `max_tokens: 0`, which refreshes the entry's TTL at
+   * cache-READ price instead of letting it expire into a 2x cache write on
+   * the next wake. See `../cache-keepalive.ts`.
    * Pass `{ enabled: false }` to turn off.
    */
   cacheKeepalive?: CacheKeepaliveConfig;

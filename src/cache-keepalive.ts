@@ -19,9 +19,11 @@
 //
 // HOW
 // ---
-// We snapshot the exact wire request of each real call and replay it verbatim
-// with `max_tokens: 0`, which runs prefill only: content `[]`, stop_reason
-// `max_tokens`, zero output tokens billed, and the cache entry refreshed.
+// We snapshot the exact wire request of each real call and replay it with
+// `max_tokens: 0`, which runs prefill only: content `[]`, stop_reason
+// `max_tokens`, zero output tokens billed, and the cache entry refreshed. The
+// replay leaves out the messages after the request's last one-hour marker,
+// apart from what it takes to end on a user message (below).
 // A call is snapshotted only once the provider is known to have its prefix
 // (the adapter records at `message_start`, or once the SDK has a non-streamed
 // response): a request that failed before then isn't known to be cached, and
@@ -38,10 +40,14 @@
 // check the usage numbers, so `refresh()` below checks them on every single
 // poke and disables the lineage rather than quietly burning 20x.
 //
-// Hence: we never rewrite the snapshot. We change `max_tokens` (not part of the
-// cache key) and drop `stream` (a transport concern), and nothing else. Any
-// request shape that can't tolerate `max_tokens: 0` is skipped outright rather
-// than "fixed up" — see `ineligibleReason()`.
+// Hence: we never rewrite the snapshot. A replay changes `max_tokens` (not part
+// of the cache key), drops `stream` (a transport concern), and leaves out the
+// messages after the run that holds the last one-hour marker (see
+// `messagesForRefresh()`), and nothing else. What it leaves out is under no
+// one-hour marker, so no entry we keep warm holds it, and a replay would only
+// pay for it as input, or write it again for a five-minute marker. Any request
+// shape that can't tolerate `max_tokens: 0` is skipped outright rather than
+// "fixed up" — see `ineligibleReason()`.
 
 import { createHash } from 'node:crypto';
 
@@ -219,7 +225,7 @@ function scanCacheMarkers(wire: Record<string, unknown>): { any: boolean; oneHou
     const cc = obj.cache_control as { ttl?: string } | undefined;
     if (cc && typeof cc === 'object') {
       any = true;
-      if ((cc.ttl ?? '5m') === '1h') {
+      if (isOneHourMarker(cc)) {
         oneHour = true;
         return;
       }
@@ -231,6 +237,56 @@ function scanCacheMarkers(wire: Record<string, unknown>): { any: boolean; oneHou
   visit(wire.tools);
   visit(wire.messages);
   return { any, oneHour };
+}
+
+/** A `cache_control` value for the one-hour cache: one without a `ttl` is the five-minute cache's. */
+function isOneHourMarker(cc: { ttl?: unknown }): boolean {
+  return (cc.ttl ?? '5m') === '1h';
+}
+
+/**
+ * Whether `node` holds a one-hour marker anywhere in it: on a block, on a block
+ * nested in its `content`, or deeper in its structure, such as in a document's
+ * `source.content`. The eligibility scan above walks only `content` and stops at
+ * the first one-hour marker. This one looks everywhere, since a refresh that
+ * left out a message whose marker it couldn't see would read less than the
+ * request cached.
+ */
+function holdsOneHourMarker(node: unknown): boolean {
+  if (Array.isArray(node)) return node.some(holdsOneHourMarker);
+  if (!node || typeof node !== 'object') return false;
+  const cc = (node as { cache_control?: unknown }).cache_control;
+  if (cc && typeof cc === 'object' && isOneHourMarker(cc as { ttl?: unknown })) return true;
+  return Object.values(node).some(holdsOneHourMarker);
+}
+
+/**
+ * The messages a refresh replays: the shortest leading run of the recorded
+ * messages that holds every one-hour marker and ends on a user message.
+ *
+ * A cache entry is written up to a marker, so nothing after the last one-hour
+ * marker is kept warm by replaying it. A replay pays for it as input every
+ * time, and writes it again where a five-minute marker covers it, which has
+ * expired by the time a refresh comes, 45 minutes after the last touch by
+ * default.
+ * The run ends on a user message, so that no model's rule against a trailing
+ * assistant message refuses the refresh: it runs through the first user message
+ * at or after the last one-hour marker's message, or from the start when the
+ * markers sit only on `system` or `tools`. When no user message comes after
+ * the marker, the run is every message, as the request was sent.
+ */
+export function messagesForRefresh(messages: readonly unknown[]): unknown[] {
+  let from = 0;
+  for (let index = messages.length - 1; index >= 0; index--) {
+    if (holdsOneHourMarker(messages[index])) {
+      from = index;
+      break;
+    }
+  }
+  for (let index = from; index < messages.length; index++) {
+    if ((messages[index] as { role?: unknown } | null)?.role === 'user') return messages.slice(0, index + 1);
+  }
+  return messages.slice();
 }
 
 /**
@@ -351,9 +407,12 @@ export class CacheKeepalive {
       if (!wire || typeof wire !== 'object' || Array.isArray(wire)) {
         throw new Error('Keepalive request must serialize to a JSON object');
       }
-      // Only max_tokens (not part of the cache key) and stream (transport)
-      // differ from the recorded wire request — see file header.
-      payload = { ...wire as Record<string, unknown>, max_tokens: 0 };
+      // Only max_tokens (not part of the cache key), stream (transport) and the
+      // messages after the last one-hour marker's run differ from the recorded
+      // wire request — see file header.
+      const recorded = wire as Record<string, unknown>;
+      payload = { ...recorded, max_tokens: 0 };
+      if (Array.isArray(recorded.messages)) payload.messages = messagesForRefresh(recorded.messages);
       delete payload.stream;
       const res = await this.send(payload, lin.headers);
       this.reportCall({
