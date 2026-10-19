@@ -9,8 +9,9 @@ import type { ModelPricing } from '../types/provider.js';
  * to `CostBreakdown.pricingAsOf`, so a caller can see how old the number it is
  * billing against is instead of trusting a prose header. Currently-published
  * rows were read off the provider's own price page on the date their section
- * names (each section's comment names the page): Anthropic's and OpenAI's on
- * {@link DEFAULT_PRICING_LAST_VERIFIED}, Google's on
+ * names, unless the row gives a later date of its own (each section's comment
+ * names the page): Anthropic's on {@link ANTHROPIC_PRICING_LAST_VERIFIED},
+ * OpenAI's on {@link DEFAULT_PRICING_LAST_VERIFIED} and Google's on
  * {@link GOOGLE_PRICING_LAST_VERIFIED}. A row for a RETIRED model carries the
  * date its rate was last published instead — claude-3-5-sonnet is dated
  * 2025-07-01 because it is no longer listed anywhere to verify against, and
@@ -36,10 +37,15 @@ import type { ModelPricing } from '../types/provider.js';
  * specific row always wins over a more general one and rows may be listed in
  * any order.
  */
+
+/** The date the OpenAI section's rows were read off OpenAI's price page. */
 export const DEFAULT_PRICING_LAST_VERIFIED = '2026-08-25';
 
 /** The date the Google section's rows were read off Google's price page. */
 export const GOOGLE_PRICING_LAST_VERIFIED = '2026-10-14';
+
+/** The date the Anthropic section's rows were read off Anthropic's price page. */
+export const ANTHROPIC_PRICING_LAST_VERIFIED = '2026-10-19';
 
 /**
  * Google states when a rate changes as a date ("through November 30, 2026",
@@ -96,71 +102,105 @@ const GEMINI_3_6_FLASH: Omit<PricedRow, 'prefix'> = {
 
 export const PRICING_TABLE: readonly PricingRow[] = [
   // --------------------------------------------------------------------------
-  // Anthropic — https://docs.claude.com/en/docs/about-claude/pricing
-  // Retrieved 2026-08-25. Cache-write column is the 5-minute TTL bucket; the
-  // 1-hour bucket costs more and this table has no field for it.
+  // Anthropic — https://platform.claude.com/docs/en/about-claude/pricing
+  // Retrieved 2026-10-19 (ANTHROPIC_PRICING_LAST_VERIFIED). Cache-write column
+  // is the 5-minute TTL bucket; the 1-hour bucket costs more and this table has
+  // no field for it.
   // --------------------------------------------------------------------------
   {
+    // Fable 5.1 and Mythos 5.1 read their cache at 0.025x, a quarter of the
+    // 5 pair's rate.
+    prefix: 'claude-fable-5-1',
+    pricing: { inputPerMillion: 10, outputPerMillion: 50, cacheWritePerMillion: 12.50, cacheReadPerMillion: 0.25, currency: 'USD', asOf: ANTHROPIC_PRICING_LAST_VERIFIED },
+  },
+  {
+    prefix: 'claude-mythos-5-1',
+    pricing: { inputPerMillion: 10, outputPerMillion: 50, cacheWritePerMillion: 12.50, cacheReadPerMillion: 0.25, currency: 'USD', asOf: ANTHROPIC_PRICING_LAST_VERIFIED },
+  },
+  {
+    // Mythos 5 prices as Fable 5 does.
+    prefix: 'claude-mythos-5',
+    pricing: { inputPerMillion: 10, outputPerMillion: 50, cacheWritePerMillion: 12.50, cacheReadPerMillion: 1, currency: 'USD', asOf: ANTHROPIC_PRICING_LAST_VERIFIED },
+  },
+  {
     prefix: 'claude-fable-5',
-    pricing: { inputPerMillion: 10, outputPerMillion: 50, cacheWritePerMillion: 12.50, cacheReadPerMillion: 1, currency: 'USD', asOf: DEFAULT_PRICING_LAST_VERIFIED },
+    pricing: { inputPerMillion: 10, outputPerMillion: 50, cacheWritePerMillion: 12.50, cacheReadPerMillion: 1, currency: 'USD', asOf: ANTHROPIC_PRICING_LAST_VERIFIED },
   },
   {
     prefix: 'claude-opus-5',
-    pricing: { inputPerMillion: 5, outputPerMillion: 25, cacheWritePerMillion: 6.25, cacheReadPerMillion: 0.50, currency: 'USD', asOf: DEFAULT_PRICING_LAST_VERIFIED },
+    pricing: { inputPerMillion: 5, outputPerMillion: 25, cacheWritePerMillion: 6.25, cacheReadPerMillion: 0.50, currency: 'USD', asOf: ANTHROPIC_PRICING_LAST_VERIFIED },
+  },
+  {
+    // Opus 5.5 reads its cache at 0.05x.
+    prefix: 'claude-opus-5-5',
+    pricing: { inputPerMillion: 4, outputPerMillion: 20, cacheWritePerMillion: 5, cacheReadPerMillion: 0.20, currency: 'USD', asOf: ANTHROPIC_PRICING_LAST_VERIFIED },
   },
   {
     prefix: 'claude-sonnet-5',
-    pricing: { inputPerMillion: 2, outputPerMillion: 10, cacheWritePerMillion: 2.50, cacheReadPerMillion: 0.20, currency: 'USD', asOf: DEFAULT_PRICING_LAST_VERIFIED },
+    pricing: { inputPerMillion: 2, outputPerMillion: 10, cacheWritePerMillion: 2.50, cacheReadPerMillion: 0.20, currency: 'USD', asOf: ANTHROPIC_PRICING_LAST_VERIFIED },
+  },
+  {
+    // Sonnet 5.5 reads its cache at 0.05x.
+    prefix: 'claude-sonnet-5-5',
+    pricing: { inputPerMillion: 2, outputPerMillion: 10, cacheWritePerMillion: 2.50, cacheReadPerMillion: 0.10, currency: 'USD', asOf: ANTHROPIC_PRICING_LAST_VERIFIED },
   },
   // Opus 4.5 through 4.8 all price identically to Opus 5.
   {
     prefix: 'claude-opus-4-8',
-    pricing: { inputPerMillion: 5, outputPerMillion: 25, cacheWritePerMillion: 6.25, cacheReadPerMillion: 0.50, currency: 'USD', asOf: DEFAULT_PRICING_LAST_VERIFIED },
+    pricing: { inputPerMillion: 5, outputPerMillion: 25, cacheWritePerMillion: 6.25, cacheReadPerMillion: 0.50, currency: 'USD', asOf: ANTHROPIC_PRICING_LAST_VERIFIED },
   },
   {
     prefix: 'claude-opus-4-7',
-    pricing: { inputPerMillion: 5, outputPerMillion: 25, cacheWritePerMillion: 6.25, cacheReadPerMillion: 0.50, currency: 'USD', asOf: DEFAULT_PRICING_LAST_VERIFIED },
+    pricing: { inputPerMillion: 5, outputPerMillion: 25, cacheWritePerMillion: 6.25, cacheReadPerMillion: 0.50, currency: 'USD', asOf: ANTHROPIC_PRICING_LAST_VERIFIED },
   },
   {
     // Was priced here at 15/75 — the retired Opus 4 rate, 3x the real one.
     prefix: 'claude-opus-4-6',
-    pricing: { inputPerMillion: 5, outputPerMillion: 25, cacheWritePerMillion: 6.25, cacheReadPerMillion: 0.50, currency: 'USD', asOf: DEFAULT_PRICING_LAST_VERIFIED },
+    pricing: { inputPerMillion: 5, outputPerMillion: 25, cacheWritePerMillion: 6.25, cacheReadPerMillion: 0.50, currency: 'USD', asOf: ANTHROPIC_PRICING_LAST_VERIFIED },
   },
   {
     prefix: 'claude-opus-4-5',
-    pricing: { inputPerMillion: 5, outputPerMillion: 25, cacheWritePerMillion: 6.25, cacheReadPerMillion: 0.50, currency: 'USD', asOf: DEFAULT_PRICING_LAST_VERIFIED },
+    pricing: { inputPerMillion: 5, outputPerMillion: 25, cacheWritePerMillion: 6.25, cacheReadPerMillion: 0.50, currency: 'USD', asOf: ANTHROPIC_PRICING_LAST_VERIFIED },
   },
   {
     // Retired except on Bedrock and Google Cloud; also covers Opus 4.1, which
     // is priced identically.
     prefix: 'claude-opus-4',
-    pricing: { inputPerMillion: 15, outputPerMillion: 75, cacheWritePerMillion: 18.75, cacheReadPerMillion: 1.50, currency: 'USD', asOf: DEFAULT_PRICING_LAST_VERIFIED },
+    pricing: { inputPerMillion: 15, outputPerMillion: 75, cacheWritePerMillion: 18.75, cacheReadPerMillion: 1.50, currency: 'USD', asOf: ANTHROPIC_PRICING_LAST_VERIFIED },
   },
   {
     prefix: 'claude-sonnet-4-6',
-    pricing: { inputPerMillion: 3, outputPerMillion: 15, cacheWritePerMillion: 3.75, cacheReadPerMillion: 0.30, currency: 'USD', asOf: DEFAULT_PRICING_LAST_VERIFIED },
+    pricing: { inputPerMillion: 3, outputPerMillion: 15, cacheWritePerMillion: 3.75, cacheReadPerMillion: 0.30, currency: 'USD', asOf: ANTHROPIC_PRICING_LAST_VERIFIED },
   },
   {
     prefix: 'claude-sonnet-4-5',
-    pricing: { inputPerMillion: 3, outputPerMillion: 15, cacheWritePerMillion: 3.75, cacheReadPerMillion: 0.30, currency: 'USD', asOf: DEFAULT_PRICING_LAST_VERIFIED },
+    pricing: { inputPerMillion: 3, outputPerMillion: 15, cacheWritePerMillion: 3.75, cacheReadPerMillion: 0.30, currency: 'USD', asOf: ANTHROPIC_PRICING_LAST_VERIFIED },
   },
   {
     // Retired except on Bedrock and Google Cloud.
     prefix: 'claude-sonnet-4',
-    pricing: { inputPerMillion: 3, outputPerMillion: 15, cacheWritePerMillion: 3.75, cacheReadPerMillion: 0.30, currency: 'USD', asOf: DEFAULT_PRICING_LAST_VERIFIED },
+    pricing: { inputPerMillion: 3, outputPerMillion: 15, cacheWritePerMillion: 3.75, cacheReadPerMillion: 0.30, currency: 'USD', asOf: ANTHROPIC_PRICING_LAST_VERIFIED },
+  },
+  {
+    // Prompts up to 100,000 tokens. Over that, Haiku 5.5 costs $0.50 input,
+    // $2.50 output, $0.625 for a 5-minute write and $0.05 for a hit, and this
+    // table has no field for a prompt-length tier, so a longer prompt is priced
+    // low.
+    prefix: 'claude-haiku-5-5',
+    pricing: { inputPerMillion: 0.10, outputPerMillion: 0.50, cacheWritePerMillion: 0.125, cacheReadPerMillion: 0.01, currency: 'USD', asOf: ANTHROPIC_PRICING_LAST_VERIFIED },
   },
   {
     // Was priced here at 0.80/4 — the retired Haiku 3.5 rate.
     prefix: 'claude-haiku-4-5',
-    pricing: { inputPerMillion: 1, outputPerMillion: 5, cacheWritePerMillion: 1.25, cacheReadPerMillion: 0.10, currency: 'USD', asOf: DEFAULT_PRICING_LAST_VERIFIED },
+    pricing: { inputPerMillion: 1, outputPerMillion: 5, cacheWritePerMillion: 1.25, cacheReadPerMillion: 0.10, currency: 'USD', asOf: ANTHROPIC_PRICING_LAST_VERIFIED },
   },
   {
     // Retired except on Bedrock and Google Cloud.
     prefix: 'claude-3-5-haiku',
-    pricing: { inputPerMillion: 0.80, outputPerMillion: 4, cacheWritePerMillion: 1, cacheReadPerMillion: 0.08, currency: 'USD', asOf: DEFAULT_PRICING_LAST_VERIFIED },
+    pricing: { inputPerMillion: 0.80, outputPerMillion: 4, cacheWritePerMillion: 1, cacheReadPerMillion: 0.08, currency: 'USD', asOf: ANTHROPIC_PRICING_LAST_VERIFIED },
   },
   {
-    // Fully retired: no longer listed on the price page as of 2026-08-25, so
+    // Fully retired: no longer listed on the price page as of 2026-10-19, so
     // this is the last published rate rather than a current one.
     prefix: 'claude-3-5-sonnet',
     pricing: { inputPerMillion: 3, outputPerMillion: 15, cacheWritePerMillion: 3.75, cacheReadPerMillion: 0.30, currency: 'USD', asOf: '2025-07-01' },
