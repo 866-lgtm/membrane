@@ -513,11 +513,12 @@ describe('through Membrane', () => {
     retry: { maxRetries: 3, retryDelayMs: 1, maxRetryDelayMs: 2 },
   });
 
-  it('a callback that fails after emission ends the call after one send, though its error is retryable', async () => {
+  it("a callback that fails after emission ends the call after one send, and its error isn't retryable", async () => {
     const fetch = vi.fn(async () => sseResponse([chat('hello'), chat(' world', 'stop'), '[DONE]']).response);
     vi.stubGlobal('fetch', fetch);
-    const error = await settle(membrane().stream(request, { onChunk: () => { throw new Error('zz 429 rate limit'); } }));
-    expect(error).toMatchObject({ type: 'rate_limit', retryable: true });
+    const thrown = new Error('zz 429 rate limit');
+    const error = await settle(membrane().stream(request, { onChunk: () => { throw thrown; } }));
+    expect(error).toMatchObject({ type: 'rate_limit', retryable: false, cause: thrown });
     expect(fetch).toHaveBeenCalledTimes(1);
   });
 

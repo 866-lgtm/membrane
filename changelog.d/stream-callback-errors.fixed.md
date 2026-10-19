@@ -6,11 +6,13 @@
   the adapter's error boundary, as it already did on the Anthropic, Gemini and
   Responses API adapters. The provider's response body is cancelled rather
   than left unread, on Gemini too. The error is typed by `classifyError` like
-  any other, a plain `Error` by its message: most are `unknown` and not
-  retryable, while one whose code reads as a network failure, such as
-  `EPIPE` from a callback writing to a closed pipe, is typed `network` and
-  retryable. With stop sequences, text held back for a possible stop isn't
-  handed to a callback that has thrown.
+  any other, a plain `Error` by its message: most are `unknown`, while one
+  whose code reads as a network failure, such as `EPIPE` from a callback
+  writing to a closed pipe, is typed `network`. Called on an adapter directly,
+  such an error is retryable; through `Membrane` it isn't, as no error from
+  the caller's code is (see the entry on the caller's code). With stop
+  sequences, text held back for a possible stop isn't handed to a callback
+  that has thrown.
 - What these adapters can't read is still dropped. A data line that isn't
   JSON, or whose JSON isn't an object (`null`, a number, a string, an array),
   drops its frame, on Gemini and the Responses API too, where `data: null`
