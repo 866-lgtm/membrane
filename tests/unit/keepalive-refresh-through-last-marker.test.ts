@@ -1,5 +1,6 @@
 /**
- * A keepalive refresh replays its request only through the last one-hour cache marker.
+ * A keepalive refresh replays its request only through the last one-hour cache marker and the end of
+ * the user turn at or after it.
  *
  * Driven through the real `Membrane` with `NativeFormatter` and the real `AnthropicAdapter` and its
  * keepalive; only the SDK client is a stub. The turn is shaped as a host sends it when its context

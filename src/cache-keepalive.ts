@@ -23,7 +23,8 @@
 // `max_tokens: 0`, which runs prefill only: content `[]`, stop_reason
 // `max_tokens`, zero output tokens billed, and the cache entry refreshed. The
 // replay leaves out the messages after the request's last one-hour marker,
-// apart from what it takes to end where a user turn ends (below).
+// apart from what it takes to end where a user turn ends (below). A request
+// with no user message after that marker is replayed whole, as it was sent.
 // A call is snapshotted only once the provider is known to have its prefix
 // (the adapter records at `message_start`, or once the SDK has a non-streamed
 // response): a request that failed before then isn't known to be cached, and
@@ -227,21 +228,21 @@ function isOneHourMarker(cc: { ttl?: unknown }): boolean {
  * Whether `found` holds for a `cache_control` in `node` (a request's `system`,
  * `tools` or `messages`, or one message), walked in order and stopping at the
  * first it holds for. A marker sits on a block: an entry of `system` or
- * `tools`, a message's content block, a block in another block's `content`
- * (a tool result's), or a block in a document's `source.content`. Only those
- * are walked, so JSON that a tool was given, which can hold any key, isn't
- * read as a marker. Eligibility and the refresh's cut both ask here, so they
- * agree on where a request's markers are.
+ * `tools`, a message's content block, or a block in another block's `content`
+ * (a tool result's). Only those are walked, as membrane's marker budget walks
+ * them, so JSON a tool was given, which can hold any key, isn't read as a
+ * marker. Nor is a block inside a document's `source.content`: Anthropic's
+ * documentation puts a document's marker on the document block itself.
+ * Eligibility and the refresh's cut both ask here, so they agree on where a
+ * request's markers are.
  */
 function someCacheControl(node: unknown, found: (cc: { ttl?: unknown }) => boolean): boolean {
   if (Array.isArray(node)) return node.some((item) => someCacheControl(item, found));
   if (!node || typeof node !== 'object') return false;
-  const block = node as { cache_control?: unknown; content?: unknown; source?: unknown };
+  const block = node as { cache_control?: unknown; content?: unknown };
   if (block.cache_control && typeof block.cache_control === 'object'
     && found(block.cache_control as { ttl?: unknown })) return true;
-  if (someCacheControl(block.content, found)) return true;
-  const source = block.source as { content?: unknown } | null | undefined;
-  return typeof source === 'object' && source !== null && someCacheControl(source.content, found);
+  return someCacheControl(block.content, found);
 }
 
 /**
@@ -273,7 +274,6 @@ export function messagesForRefresh(messages: readonly unknown[]): unknown[] {
   }
   let end = from;
   while (end < messages.length && !isUser(messages[end])) end++;
-  if (end === messages.length) return messages.slice();
   while (end + 1 < messages.length && isUser(messages[end + 1])) end++;
   return messages.slice(0, end + 1);
 }
