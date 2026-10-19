@@ -8,13 +8,14 @@
  * name replaced the first's, and their argument strings ran together. Now such
  * an entry never takes a slot. It joins the call that has its id, or failing
  * that the current call (the one the last entry went to), unless it carries a
- * name and a new id while that call has an id. Entries with an index are placed
- * in their slots as before (stream-callback-errors.test.ts covers them). In a
- * slot a piece continues the call with its id, or else the last, and one whose
- * id names a call that began without an index moves that call into its slot. On
- * every path, an entry that carries nothing is dropped, a piece that names a
+ * name and a new id while that call has an id. Entries with an index go to
+ * their slots as on main, which stream-callback-errors.test.ts covers. What
+ * this change adds for them is tested here: in a slot a piece continues the
+ * latest call with its id, or else the last, a call that began without an index
+ * moves into its slot by its id, and a slot can hold calls of different tools.
+ * On every path, an entry that carries nothing is dropped, a piece that names a
  * tool other than its call's starts a call of its own, a call keeps the first
- * id a piece gives it, and no two calls come back under one id.
+ * id a piece gives it, and every call comes back under an id of its own.
  */
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { OpenAIAdapter } from '../../src/providers/openai.js';
@@ -22,7 +23,8 @@ import { OpenAICompatibleAdapter } from '../../src/providers/openai-compatible.j
 import { OpenRouterAdapter } from '../../src/providers/openrouter.js';
 import type { ProviderAdapter, ProviderRequest } from '../../src/types/index.js';
 
-afterEach(() => { vi.unstubAllGlobals(); });
+// A warning test that fails before its mockRestore() would leave console.warn spied for the tests after it.
+afterEach(() => { vi.unstubAllGlobals(); vi.restoreAllMocks(); });
 
 const wire: ProviderRequest = { model: 'zz-review-model', messages: [{ role: 'user', content: 'go' }], maxTokens: 16 };
 
@@ -54,6 +56,8 @@ for (const [name, make] of adapters) {
     };
     const a = { id: 'call_a', name: 'zz_a', input: { x: 1 } };
     const b = { id: 'call_b', name: 'zz_b', input: { y: 2 } };
+    /** The warnings that name ids the assembler gave. */
+    const given = (warn: { mock: { calls: unknown[][] } }) => warn.mock.calls.map((args) => String(args[0])).filter((line) => line.includes('ids given'));
 
     it('calls with different ids and names stay separate calls, in one delta or across deltas', async () => {
       expect(await calls([
@@ -69,11 +73,36 @@ for (const [name, make] of adapters) {
       ]);
     });
 
-    it('calls with no ids but different names stay separate calls, the second under an id of its own', async () => {
+    it('calls with no ids but different names stay separate calls, each under an id of its own', async () => {
       expect(await calls([[piece(undefined, 'zz_a', '{"x":1}')], [piece(undefined, 'zz_b', '{"y":2}')]])).toEqual([
-        { id: '', name: 'zz_a', input: { x: 1 } },
+        { id: 'call_1', name: 'zz_a', input: { x: 1 } },
         { id: 'call_2', name: 'zz_b', input: { y: 2 } },
       ]);
+    });
+
+    it('a call with no id comes back under one of its own, and the warning names it', async () => {
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      expect(await calls([[piece(undefined, 'zz_a', '{"x":1}')]])).toEqual([{ id: 'call_1', name: 'zz_a', input: { x: 1 } }]);
+      expect(given(warn)).toEqual(['[membrane] The server repeated or left out a streamed tool call\'s id; ids given: "" as call_1']);
+      warn.mockRestore();
+    });
+
+    it('calls that each have an id of their own keep them, and nothing is warned', async () => {
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      expect(await calls([[piece('call_a', 'zz_a', '{"x":1}')], [piece('call_b', 'zz_b', '{"y":2}')]])).toEqual([a, b]);
+      expect(given(warn)).toEqual([]);
+      warn.mockRestore();
+    });
+
+    it('three calls under one id come back as x, x_2 and x_3, named in one warning', async () => {
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      expect((await calls([[piece('x', 'zz_a', '{"a":1}')], [piece('x', 'zz_b', '{"b":2}')], [piece('x', 'zz_c', '{"c":3}')]])).map((c: { id: string }) => c.id)).toEqual(['x', 'x_2', 'x_3']);
+      expect(given(warn)).toEqual(['[membrane] The server repeated or left out a streamed tool call\'s id; ids given: "x" as x_2, "x" as x_3']);
+      warn.mockRestore();
+    });
+
+    it('a new id skips one that a later call has', async () => {
+      expect((await calls([[piece('x', 'zz_a', '{"a":1}')], [piece('x', 'zz_b', '{"b":2}')], [piece('x_2', 'zz_c', '{"c":3}')]])).map((c: { id: string }) => c.id)).toEqual(['x', 'x_3', 'x_2']);
     });
 
     it('an index of null counts as none', async () => {
@@ -126,8 +155,7 @@ for (const [name, make] of adapters) {
         { id: 'call_0', name: 'zz_first', input: {} },
         { id: 'call_0_2', name: 'zz_second', input: { y: 2 } },
       ]);
-      const minted = warn.mock.calls.map((args) => String(args[0])).filter((line) => line.includes('ids made unique'));
-      expect(minted).toEqual(['[membrane] The server repeated or left out a streamed tool call\'s id; ids made unique: "call_0" as call_0_2']);
+      expect(given(warn)).toEqual(['[membrane] The server repeated or left out a streamed tool call\'s id; ids given: "call_0" as call_0_2']);
       warn.mockRestore();
     });
 
@@ -146,7 +174,7 @@ for (const [name, make] of adapters) {
       const large = { index: 100_000_000, ...piece('call_z', 'zz_z', '{}') };
       const started = performance.now();
       const placed = await calls([[large], [piece('call_a', 'zz_a', '{"x":1}')]]);
-      // A walk of the 10^8 slots below it took about 8 s (the first round's toolCallSlot); placing takes well under 1 s.
+      // A scan of the 10^8 slots below it, in place of the id lookup, took about 8 s; placing takes well under 1 s.
       expect(performance.now() - started).toBeLessThan(1000);
       expect(placed).toEqual([{ id: 'call_z', name: 'zz_z', input: {} }, a]);
     });
@@ -228,6 +256,34 @@ for (const [name, make] of adapters) {
         { id: 'call_b', name: 'zz_b', input: {} },
         { id: 'call_a_2', name: 'zz_b', input: { y: 2 } },
       ]);
+    });
+
+    it("in a slot, a piece with an id two of its calls share continues the later of them", async () => {
+      const at0 = (id: string | undefined, name: string | undefined, args: string) => ({ index: 0, ...piece(id, name, args) });
+      expect(await calls([[at0('shared', 'zz_a', '')], [at0('shared', 'zz_b', '')], [at0('shared', undefined, '{"y":2}')]])).toEqual([
+        { id: 'shared', name: 'zz_a', input: {} },
+        { id: 'shared_2', name: 'zz_b', input: { y: 2 } },
+      ]);
+    });
+
+    it("an indexed piece continues its slot's call with its id rather than moving in a call without an index under the same id", async () => {
+      const at0 = (id: string | undefined, name: string | undefined, args: string) => ({ index: 0, ...piece(id, name, args) });
+      expect(await calls([[at0('shared', 'zz_a', '')], [piece('shared', 'zz_b', '')], [at0('shared', undefined, '{"x":1}')]])).toEqual([
+        { id: 'shared', name: 'zz_a', input: { x: 1 } },
+        { id: 'shared_2', name: 'zz_b', input: {} },
+      ]);
+    });
+
+    it("a continuation with an empty id continues its slot's last call", async () => {
+      const at0 = (id: string | undefined, name: string | undefined, args: string) => ({ index: 0, ...piece(id, name, args) });
+      expect(await calls([[at0(undefined, 'zz_a', '{"x":1}')], [at0('call_b', 'zz_b', '{"y":')], [{ index: 0, id: '', function: { arguments: '2}' } }]])).toEqual([
+        { id: 'call_1', name: 'zz_a', input: { x: 1 } },
+        b,
+      ]);
+    });
+
+    it('an entry that carries only empty arguments opens no call, with or without an index', async () => {
+      expect(await calls([[{ function: { arguments: '' } }], [{ index: 0, function: { arguments: '' } }], [piece('call_a', 'zz_a', '{"x":1}')]])).toEqual([a]);
     });
 
     it('two calls in their own slots under one id come back with the second under an id of its own', async () => {
