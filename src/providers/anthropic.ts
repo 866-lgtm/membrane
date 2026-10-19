@@ -184,6 +184,56 @@ export function thinkingEnabled(request: ProviderRequest): boolean {
 }
 
 // ============================================================================
+// Response diagnostics
+// ============================================================================
+//
+// The stream loop consumes a fixed set of fields. What the API sends beyond
+// them — a new field on message_start or message_delta, an event or delta
+// type this adapter doesn't read — used to vanish, so a response that broke
+// its contract (2026-10-19: tool calls stopped with end_turn) left nothing to
+// diagnose it from or report it with. The stream path now keeps, on `raw`:
+//   id               message_start's message id
+//   request_id       the `request-id` response header (what support asks for)
+//   provider_events  { message_start: the event, its message without
+//                      `content`; message_delta: the event verbatim;
+//                      unhandled: events and deltas the loop doesn't read,
+//                      first UNHANDLED_EVENTS_MAX of them; unhandled_omitted:
+//                      the count past that cap }
+// Content is never duplicated: block payloads stay in `content` only.
+// message_stop is not kept: the loop ends on message_delta, by design (the
+// teardown after it adds latency and carries no data).
+
+/** Events and deltas kept in raw.provider_events.unhandled, at most. */
+const UNHANDLED_EVENTS_MAX = 20;
+/** JSON characters one kept provider event may take before it's truncated. */
+const PROVIDER_EVENT_MAX_CHARS = 4096;
+
+/**
+ * A JSON-safe copy of a provider event, bounded: one whose JSON exceeds
+ * PROVIDER_EVENT_MAX_CHARS keeps its `type`, a `truncated` flag and the first
+ * PROVIDER_EVENT_MAX_CHARS characters of its JSON.
+ */
+export function boundedProviderEvent(event: unknown): unknown {
+  const type = (event as { type?: unknown } | null | undefined)?.type;
+  let json: string | undefined;
+  try {
+    json = JSON.stringify(event);
+  } catch {
+    return { type, unserializable: true };
+  }
+  if (json === undefined) return null;
+  if (json.length <= PROVIDER_EVENT_MAX_CHARS) return JSON.parse(json);
+  return { type, truncated: true, json: json.slice(0, PROVIDER_EVENT_MAX_CHARS) };
+}
+
+/** The SDK's request id: MessageStream.request_id, or a parsed response's `_request_id`. */
+function sdkRequestId(holder: unknown, key: 'request_id' | '_request_id'): string | undefined {
+  if (holder === null || typeof holder !== 'object') return undefined;
+  const id = (holder as Record<string, unknown>)[key];
+  return typeof id === 'string' && id !== '' ? id : undefined;
+}
+
+// ============================================================================
 // Adapter Configuration
 // ============================================================================
 
@@ -555,6 +605,16 @@ export class AnthropicAdapter implements ProviderAdapter {
       // The thinking-binding report: final in message_start, replaced by a
       // message_delta's after a server-side model fallback.
       let inputTransformations: unknown;
+      // Diagnostics kept on raw (see "Response diagnostics" above).
+      let messageId: string | undefined;
+      let messageStartEvent: unknown;
+      let messageDeltaEvent: unknown;
+      const unhandledEvents: unknown[] = [];
+      let unhandledOmitted = 0;
+      const noteUnhandled = (event: unknown): void => {
+        if (unhandledEvents.length < UNHANDLED_EVENTS_MAX) unhandledEvents.push(boundedProviderEvent(event));
+        else unhandledOmitted++;
+      };
 
       // Content block tracking — finalized on content_block_stop
       const contentBlocks: Record<string, unknown>[] = [];
@@ -647,6 +707,11 @@ export class AnthropicAdapter implements ProviderAdapter {
         options?.onProgress?.();
         if (event.type === 'message_start') {
           model = event.message.model;
+          messageId = typeof event.message.id === 'string' && event.message.id ? event.message.id : undefined;
+          {
+            const { content: _content, ...messageWithoutContent } = event.message as unknown as Record<string, unknown>;
+            messageStartEvent = boundedProviderEvent({ ...event, message: messageWithoutContent });
+          }
           inputTransformations = (event.message as { input_transformations?: unknown }).input_transformations;
           const usage = event.message.usage as unknown as Record<string, unknown>;
           inputTokens = typeof usage.input_tokens === 'number' ? usage.input_tokens : 0;
@@ -701,12 +766,18 @@ export class AnthropicAdapter implements ProviderAdapter {
             }
           } else if ((event.delta as { type: string }).type === 'input_json_delta') {
             currentBlockInputJson += (event.delta as { partial_json: string }).partial_json;
+          } else {
+            // A delta type this loop doesn't read (citations_delta, or one
+            // the API added): kept for diagnosis instead of dropped unseen.
+            noteUnhandled(event);
           }
 
         } else if (event.type === 'content_block_stop') {
           // Finalize block — use event.index for defensive correctness
           finalizeContentBlock((event as { index: number }).index, true);
           openBlockIndex = -1;
+          // A stop has carried only type and index; anything more is new.
+          if (Object.keys(event).some((key) => key !== 'type' && key !== 'index')) noteUnhandled(event);
 
         } else if (event.type === 'message_delta') {
           // All content blocks are finalized by the time message_delta arrives.
@@ -720,6 +791,7 @@ export class AnthropicAdapter implements ProviderAdapter {
           stopReason = delta.stop_reason ?? 'end_turn';
           providerStopReason = delta.stop_reason ?? undefined;
           sawTerminalEvent = true;
+          messageDeltaEvent = boundedProviderEvent(event);
           const fallback = (event as { input_transformations?: unknown }).input_transformations;
           if (Array.isArray(fallback)) inputTransformations = fallback;
           stopSequence = delta.stop_sequence ?? undefined;
@@ -740,6 +812,9 @@ export class AnthropicAdapter implements ProviderAdapter {
             cacheReadTokens = deltaUsage.cache_read_input_tokens;
           }
           break;
+        } else {
+          // An event type this loop doesn't read (pings never reach it).
+          noteUnhandled(event);
         }
       }
 
@@ -764,11 +839,17 @@ export class AnthropicAdapter implements ProviderAdapter {
       // closed mid-turn, and stopReason is still its 'end_turn' initialiser.
       assertTerminalEventObserved(sawTerminalEvent, 'Anthropic', fullRequest);
 
+      // The SDK's MessageStream records the request-id header on connect,
+      // before its first event.
+      const requestId = sdkRequestId(stream, 'request_id');
+
       return {
         content: contentBlocks,
         stopReason,
         providerStopReason,
         stopSequence,
+        ...(messageId ? { responseId: messageId } : {}),
+        ...(requestId ? { requestId } : {}),
         usage: {
           inputTokens,
           outputTokens,
@@ -800,6 +881,14 @@ export class AnthropicAdapter implements ProviderAdapter {
             ...(serviceTier ? { service_tier: serviceTier } : {}),
           },
           ...(Array.isArray(inputTransformations) ? { input_transformations: inputTransformations } : {}),
+          ...(messageId ? { id: messageId } : {}),
+          ...(requestId ? { request_id: requestId } : {}),
+          provider_events: {
+            ...(messageStartEvent !== undefined ? { message_start: messageStartEvent } : {}),
+            ...(messageDeltaEvent !== undefined ? { message_delta: messageDeltaEvent } : {}),
+            ...(unhandledEvents.length ? { unhandled: unhandledEvents } : {}),
+            ...(unhandledOmitted ? { unhandled_omitted: unhandledOmitted } : {}),
+          },
         },
       };
 
@@ -1054,7 +1143,13 @@ export class AnthropicAdapter implements ProviderAdapter {
   }
 
   private parseResponse(response: Anthropic.Message, rawRequest: unknown): ProviderResponse {
+    // The SDK attaches the request-id header as a non-enumerable
+    // `_request_id`, so it never reached a serialized raw response.
+    const requestId = sdkRequestId(response, '_request_id');
+    const responseId = typeof response.id === 'string' && response.id ? response.id : undefined;
     return {
+      ...(responseId ? { responseId } : {}),
+      ...(requestId ? { requestId } : {}),
       content: response.content,
       stopReason: response.stop_reason ?? 'end_turn',
       providerStopReason: response.stop_reason ?? undefined,
@@ -1072,7 +1167,7 @@ export class AnthropicAdapter implements ProviderAdapter {
       ),
       model: response.model,
       rawRequest,
-      raw: response,
+      raw: requestId ? { ...response, request_id: requestId } : response,
     };
   }
 
