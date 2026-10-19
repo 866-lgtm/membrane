@@ -522,6 +522,15 @@ describe('through Membrane', () => {
     expect(fetch).toHaveBeenCalledTimes(1);
   });
 
+  it("a callback error with code EPIPE after emission is typed network, and isn't retryable either", async () => {
+    const fetch = vi.fn(async () => sseResponse([chat('hello'), chat(' world', 'stop'), '[DONE]']).response);
+    vi.stubGlobal('fetch', fetch);
+    const epipe = Object.assign(new Error('write EPIPE'), { code: 'EPIPE' });
+    const error = await settle(membrane().stream(request, { onChunk: () => { throw epipe; } }));
+    expect(error).toMatchObject({ type: 'network', retryable: false, cause: epipe });
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
   it('a callback that fails on text held for a stop sequence, delivered as the stream ends, fails the call', async () => {
     // "hello Z" could begin "ZZSTOP", so "Z" is held until the stream ends.
     vi.stubGlobal('fetch', vi.fn(async () => sseResponse([chat('hello Z', 'stop'), '[DONE]']).response));

@@ -19,8 +19,9 @@
   - Thrown before the send, it made `complete()` and `stream()` run the hook
     or callback again on each attempt.
   - Thrown after `stream()` had emitted, it ended the call but still said
-    `retryable: true`, and what the `onError` hook threw left as it was.
-    Either way, a caller's policy could resend the request.
+    `retryable: true`, unless the adapter's stream handler caught it (see
+    the entry on stream callbacks), and what the `onError` hook threw left
+    as it was. Either way, a caller's policy could resend the request.
 - **`AbortError`:** an error the caller's code throws named `AbortError`
   keeps the type `abort`, so membrane treats it as any other abort thrown at
   the same point, as it did before.
