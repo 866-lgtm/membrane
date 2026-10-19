@@ -12,11 +12,11 @@
  * `Membrane`'s request build (`transformRequest`, which every path's messages
  * go through, the native tool loop's each round); each adapter's request
  * built directly that reads membrane's content blocks (Anthropic, Bedrock,
- * OpenAI, OpenAI-compatible, OpenRouter, Gemini, and the Responses adapter
- * in subscription mode, whose API mode takes native items as they are); and
- * the exported converters `toAnthropicContent` and `transformToChat`. The
- * completions adapter reads no media data, and the image adapter reads
- * MCP's form itself, so neither converts. The xml
+ * OpenAI, OpenAI-compatible, OpenRouter, Gemini, the OpenAI image adapter,
+ * and the Responses adapter in subscription mode, whose API mode takes
+ * native items as they are); and the exported converters
+ * `toAnthropicContent` and `transformToChat`. The completions adapter reads
+ * no image data, so it doesn't convert. The xml
  * document's tool results (`formatToolResults` and
  * `formatToolResultsForSplitTurn`, which take an xml tool loop's results each
  * round) read their images through `toolResultImage`, which takes MCP's form

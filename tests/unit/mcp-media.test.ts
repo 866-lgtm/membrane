@@ -17,6 +17,7 @@ import { OpenAIAdapter } from '../../src/providers/openai.js';
 import { OpenAICompatibleAdapter } from '../../src/providers/openai-compatible.js';
 import { OpenRouterAdapter } from '../../src/providers/openrouter.js';
 import { OpenAIResponsesAPIAdapter } from '../../src/providers/openai-responses-api.js';
+import { OpenAIResponsesAdapter } from '../../src/providers/openai-responses.js';
 import { transformToChat } from '../../src/transforms/chat.js';
 import { NativeFormatter } from '../../src/formatters/native.js';
 import { AnthropicXmlFormatter } from '../../src/formatters/anthropic-xml.js';
@@ -334,6 +335,30 @@ describe('every path that builds a request carries MCP\'s form as it carries mem
     expect(JSON.stringify(sent)).toContain('its data is not a JPEG, PNG, GIF or WebP image');
     expect(reported).toHaveLength(1);
     expect(reported[0]).toBe(handed);
+  });
+
+  it('the OpenAI image adapter\'s request, which attaches the image for an edit and numbers it in the transcript', async () => {
+    const sent = async (form: Form) => {
+      const fetchMock = vi.fn().mockImplementation(async () => new Response(JSON.stringify({ created: 1, data: [{ b64_json: PNG }] }), {
+        headers: { 'content-type': 'application/json' },
+      }));
+      vi.stubGlobal('fetch', fetchMock);
+      const messages = [{ role: 'user', participant: 'User', content: [text('make it blue'), form('image', PNG, 'image/png')] }];
+      const before = structuredClone(messages);
+      await new OpenAIResponsesAdapter({ apiKey: 'test', promptFormat: 'transcript' })
+        .complete({ model: 'gpt-image-1', maxTokens: 64, messages } as ProviderRequest);
+      expect(messages).toEqual(before);
+      const [url, init] = fetchMock.mock.calls[0]! as [string, RequestInit];
+      // A generation, with no image to edit, goes as JSON; an edit as a form with the image.
+      if (!(init.body instanceof FormData)) return { url, prompt: JSON.parse(String(init.body)).prompt, image: null };
+      const file = init.body.get('image[]') as File | null;
+      return { url, prompt: init.body.get('prompt'), image: file && Buffer.from(await file.arrayBuffer()).toString('base64') };
+    };
+    const handed = await sent(mcp);
+    expect(handed).toEqual(await sent(ours));
+    expect(handed.url).toContain('images/edits');
+    expect(handed.image).toBe(PNG);
+    expect(handed.prompt).toContain('[Image 1]');
   });
 
   it('the exported converters toAnthropicContent and transformToChat, at the top of a turn and in a tool_result', () => {

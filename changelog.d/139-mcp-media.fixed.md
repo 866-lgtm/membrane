@@ -11,8 +11,9 @@
   native tool loop; the request built directly by each adapter that reads
   membrane's content blocks, `AnthropicAdapter`, `BedrockAdapter`,
   `OpenAIAdapter`, `OpenAICompatibleAdapter`, `OpenRouterAdapter`,
-  `GeminiAdapter`, and `OpenAIResponsesAPIAdapter` in subscription mode; and
-  the exported `toAnthropicContent` and `transformToChat`. An xml tool loop's
+  `GeminiAdapter`, the image adapter `OpenAIResponsesAdapter`, and
+  `OpenAIResponsesAPIAdapter` in subscription mode; and the exported
+  `toAnthropicContent` and `transformToChat`. An xml tool loop's
   results, which `formatToolResults` and the split that sends a result's
   images render each round, already read an image in MCP's form by its data.
   The block keeps its other fields, apart from MCP's `annotations` and
@@ -32,10 +33,10 @@
     of a message and in a `tool_result`, which the API refuses;
   - the requests built directly by `OpenAIAdapter`, `OpenAICompatibleAdapter`,
     `OpenRouterAdapter` and `GeminiAdapter` left such an image at the top of
-    a message out, with no note and no report, and the one
-    `OpenAIResponsesAPIAdapter` built in subscription mode left it out and
-    reported its message altered, and gave one in a `tool_result` the note
-    for an image it can't carry;
+    a message out, with no note and no report, `OpenAIResponsesAdapter`
+    attached none to an image edit, and the one `OpenAIResponsesAPIAdapter`
+    built in subscription mode left it out and reported its message altered,
+    and gave one in a `tool_result` the note for an image it can't carry;
   - `toAnthropicContent` threw a TypeError on such an image, at the top of
     the turn and in a `tool_result`, and on such a document at the top, and
     `transformToChat` threw one on such an image at the top of a message.
