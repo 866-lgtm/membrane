@@ -3,8 +3,10 @@ import {
   CacheKeepalive,
   ineligibleReason,
   lineageKey,
+  messagesForRefresh,
   type KeepaliveEvent,
 } from './cache-keepalive.js';
+import { countWireCacheMarkers } from './utils/cache-marker-budget.js';
 
 /** A wire request shaped like what buildRequest() produces for a real turn. */
 function wire(overrides: Record<string, unknown> = {}): Record<string, unknown> {
@@ -56,6 +58,34 @@ describe('ineligibleReason', () => {
     expect(ineligibleReason(aux)).toBe('no-cache-breakpoint');
   });
 
+  it('accepts a request whose only one-hour marker is on its system prompt', () => {
+    expect(ineligibleReason(wire({ messages: [{ role: 'user', content: [{ type: 'text', text: 'hello' }] }] }))).toBeNull();
+  });
+
+  it('accepts a request whose only one-hour marker is on its last tool', () => {
+    expect(ineligibleReason(wire({
+      system: [{ type: 'text', text: 'You are a resident.' }],
+      tools: [
+        { name: 'a', input_schema: { type: 'object' } },
+        { name: 'b', input_schema: { type: 'object' }, cache_control: { type: 'ephemeral', ttl: '1h' } },
+      ],
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'hello' }] }],
+    }))).toBeNull();
+  });
+
+  it("treats a request whose only one-hour marker is inside a document's source content as membrane's marker budget does", () => {
+    const document = {
+      type: 'document',
+      source: { type: 'content', content: [{ type: 'text', text: 'page', cache_control: { type: 'ephemeral', ttl: '1h' } }] },
+    };
+    const surfaces = {
+      system: [{ type: 'text', text: 'You are a resident.' }],
+      messages: [{ role: 'user', content: [document] }],
+    };
+    const counted = countWireCacheMarkers(surfaces) > 0;
+    expect(ineligibleReason(wire(surfaces))).toBe(counted ? null : 'no-cache-breakpoint');
+  });
+
   it('rejects a 5m-only request: poking a 5m entry every few minutes costs more than it saves', () => {
     const short = wire({
       system: [{ type: 'text', text: 's', cache_control: { type: 'ephemeral' } }],
@@ -78,6 +108,123 @@ describe('lineageKey', () => {
       lineageKey(wire({ system: [{ type: 'text', text: 'different agent' }] })),
     );
     expect(lineageKey(wire())).not.toBe(lineageKey(wire({ tools: [{ name: 't' }] })));
+  });
+});
+
+describe('messagesForRefresh', () => {
+  const hour = { type: 'ephemeral', ttl: '1h' };
+  const fiveMinutes = { type: 'ephemeral' };
+  const text = (body: string, cacheControl?: object) => ({
+    type: 'text', text: body, ...(cacheControl ? { cache_control: cacheControl } : {}),
+  });
+  const user = (...content: object[]) => ({ role: 'user', content });
+  const assistant = (...content: object[]) => ({ role: 'assistant', content });
+
+  it('ends on the user message that holds the last one-hour marker', () => {
+    const messages = [user(text('a', hour)), assistant(text('b')), user(text('c', hour)), assistant(text('d')), user(text('e'))];
+    expect(messagesForRefresh(messages)).toEqual(messages.slice(0, 3));
+  });
+
+  it("leaves out an assistant message after the user message holding the last one-hour marker, though no user message follows it", () => {
+    const messages = [user(text('a')), assistant(text('b')), user(text('c', hour)), assistant(text('a prefill'))];
+    expect(messagesForRefresh(messages)).toEqual(messages.slice(0, 3));
+  });
+
+  it('runs on through the next user message when the last one-hour marker is on an assistant message', () => {
+    const messages = [user(text('a')), assistant(text('b', hour)), user(text('c')), assistant(text('d')), user(text('e'))];
+    expect(messagesForRefresh(messages)).toEqual(messages.slice(0, 3));
+  });
+
+  it('keeps the messages through the first user message when only system or tools carry a marker', () => {
+    const messages = [assistant(text('a context prefix')), user(text('a')), assistant(text('b')), user(text('c'))];
+    expect(messagesForRefresh(messages)).toEqual(messages.slice(0, 2));
+  });
+
+  it('keeps every message when the last one carries the last one-hour marker', () => {
+    const messages = [user(text('a')), assistant(text('b')), user(text('c', hour))];
+    expect(messagesForRefresh(messages)).toEqual(messages);
+  });
+
+  it('keeps every message when the last one-hour marker is on an assistant message with no user message after it', () => {
+    const messages = [user(text('a')), assistant(text('b', hour))];
+    expect(messagesForRefresh(messages)).toEqual(messages);
+  });
+
+  it("keeps the assistant messages after the marker's too, when the marker is on an assistant message with no user message after it", () => {
+    const messages = [user(text('a')), assistant(text('b', hour)), assistant(text('c'))];
+    expect(messagesForRefresh(messages)).toEqual(messages);
+  });
+
+  it("takes every user message of the turn that closes the run, so a tool call's results aren't split", () => {
+    const messages = [
+      user(text('a')),
+      assistant({ type: 'tool_use', id: 't1', name: 'read', input: {} }, { type: 'tool_use', id: 't2', name: 'read', input: {}, cache_control: hour }),
+      user({ type: 'tool_result', tool_use_id: 't1', content: 'one' }),
+      user({ type: 'tool_result', tool_use_id: 't2', content: 'two' }),
+      assistant(text('d')),
+      user(text('e')),
+    ];
+    expect(messagesForRefresh(messages)).toEqual(messages.slice(0, 4));
+  });
+
+  it('takes the closing turn to the end of the request, through each of its user messages', () => {
+    const messages = [
+      user(text('a')),
+      assistant(
+        { type: 'tool_use', id: 't1', name: 'read', input: {} },
+        { type: 'tool_use', id: 't2', name: 'read', input: {} },
+        { type: 'tool_use', id: 't3', name: 'read', input: {}, cache_control: hour },
+      ),
+      user({ type: 'tool_result', tool_use_id: 't1', content: 'one' }),
+      user({ type: 'tool_result', tool_use_id: 't2', content: 'two' }),
+      user({ type: 'tool_result', tool_use_id: 't3', content: 'three' }),
+    ];
+    expect(messagesForRefresh(messages)).toEqual(messages);
+  });
+
+  it("finds a one-hour marker on a message's second block", () => {
+    const messages = [user(text('a', hour)), assistant(text('b')), user(text('c'), text('d', hour)), assistant(text('e')), user(text('f'))];
+    expect(messagesForRefresh(messages)).toEqual(messages.slice(0, 3));
+  });
+
+  it("doesn't take a cache_control in a tool's input for a marker", () => {
+    const messages = [
+      user(text('a', hour)),
+      assistant({ type: 'tool_use', id: 't', name: 'send', input: { body: { cache_control: hour } } }),
+      user({ type: 'tool_result', tool_use_id: 't', content: 'sent' }),
+      assistant(text('d')),
+      user(text('e')),
+    ];
+    expect(messagesForRefresh(messages)).toEqual(messages.slice(0, 1));
+  });
+
+  it('leaves out a five-minute marker after the last one-hour marker', () => {
+    const messages = [user(text('a', hour)), assistant(text('b')), user(text('c', fiveMinutes))];
+    expect(messagesForRefresh(messages)).toEqual(messages.slice(0, 1));
+  });
+
+  it('finds a one-hour marker nested in a tool result', () => {
+    const messages = [
+      user(text('a')),
+      assistant({ type: 'tool_use', id: 't', name: 'read', input: {} }),
+      user({ type: 'tool_result', tool_use_id: 't', content: [text('r', hour)] }),
+      assistant(text('d')),
+      user(text('e')),
+    ];
+    expect(messagesForRefresh(messages)).toEqual(messages.slice(0, 3));
+  });
+
+  it("reads a marker inside a document's source content as membrane's marker budget does", () => {
+    const document = { type: 'document', source: { type: 'content', content: [text('page', hour)] } };
+    const messages = [user(text('a', hour)), assistant(text('b')), user(document), assistant(text('d')), user(text('e'))];
+    const counted = countWireCacheMarkers({ messages: [user(document)] }) > 0;
+    expect(messagesForRefresh(messages)).toEqual(messages.slice(0, counted ? 3 : 1));
+  });
+
+  it('finds a one-hour marker on a document block itself', () => {
+    const document = { type: 'document', source: { type: 'text', media_type: 'text/plain', data: 'page' }, cache_control: hour };
+    const messages = [user(text('a', hour)), assistant(text('b')), user(document), assistant(text('d')), user(text('e'))];
+    expect(messagesForRefresh(messages)).toEqual(messages.slice(0, 3));
   });
 });
 
@@ -124,7 +271,7 @@ describe('CacheKeepalive', () => {
     ka.stop();
   });
 
-  it('replays max_tokens:0 without stream, and changes nothing else', async () => {
+  it('replays max_tokens:0 without stream, and changes nothing else when nothing follows the last one-hour marker', async () => {
     const send = vi.fn().mockResolvedValue(hit);
     const { ka } = setup(send);
     const original = wire();
@@ -145,6 +292,29 @@ describe('CacheKeepalive', () => {
     delete expected.stream;
     expect(JSON.stringify(payload)).toBe(JSON.stringify(expected));
     expect(payload.model).toBe('claude-fable-5');
+    ka.stop();
+  });
+
+  it('replays only through the last one-hour marker, leaving every message it keeps as recorded', async () => {
+    const send = vi.fn().mockResolvedValue(hit);
+    const receipts: Array<{ request: Record<string, unknown> }> = [];
+    const { ka } = setup(send, { onCall: (call: { request: Record<string, unknown> }) => { receipts.push(call); } });
+    const marked = { role: 'user', content: [{ type: 'text', text: 'the compiled window', cache_control: { type: 'ephemeral', ttl: '1h' } }] };
+    const call = { role: 'assistant', content: [{ type: 'tool_use', id: 'toolu_1', name: 'read', input: { path: 'a' } }] };
+    const result = { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'toolu_1', content: 'x'.repeat(5_000) }] };
+    const original = wire({ messages: [marked, call, result] });
+    ka.record(original, undefined, 'stream');
+    await vi.advanceTimersByTimeAsync(50 * 60_000);
+
+    const payload = send.mock.calls[0]![0] as Record<string, unknown>;
+    const expected: Record<string, unknown> = { ...original, messages: [marked], max_tokens: 0 };
+    delete expected.stream;
+    expect(JSON.stringify(payload)).toBe(JSON.stringify(expected));
+    // The receipt carries the payload sent, cut as it was.
+    expect(JSON.stringify(receipts[0]!.request)).toBe(JSON.stringify(expected));
+    // A second refresh sends the same.
+    await vi.advanceTimersByTimeAsync(50 * 60_000);
+    expect(JSON.stringify(send.mock.calls[1]![0])).toBe(JSON.stringify(expected));
     ka.stop();
   });
 
