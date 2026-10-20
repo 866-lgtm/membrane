@@ -892,6 +892,8 @@ export class AnthropicXmlFormatter implements PrefillFormatter {
     // Each parameter's type, nullability and requiredness come from the SAME
     // reading of the schema the XML parameter parser applies, so what the model
     // is told a parameter is and how its value is parsed cannot drift apart.
+    // One difference is deliberate: a null the schema's other keywords leave
+    // out isn't marked, though the parser still reads it (#150).
     return formatToolDefinitions(tools.map(toolDefinitionForPrompt));
   }
 
