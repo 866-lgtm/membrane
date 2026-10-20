@@ -190,13 +190,14 @@ export interface MembraneHooks {
    * while building a request (see `NormalizeEvent`), including a stray or
    * duplicate tool result turned into text, whose `recoveredChars` says how
    * much of it the model now reads as text. It runs synchronously inside the
-   * build, once per event of every build: each attempt and each tool-loop
-   * round rebuilds, so a repair the history keeps needing is reported each
-   * time. A hook that throws fails the build, before anything is sent. A
-   * promise it returns isn't awaited, so its rejection is the caller's to
-   * handle. Only NativeFormatter's builds normalize, AnthropicXmlFormatter's
-   * native mode included; the XML, completions and Responses builds report
-   * none.
+   * build, once per event of every build: each tool-loop round rebuilds, and
+   * so does each attempt of `complete()`, so a repair the history keeps
+   * needing is reported each time. A streaming path's retry sends the round's
+   * request as built, with no new build. A hook that throws fails the build,
+   * before anything is sent. A promise it returns isn't awaited, so its
+   * rejection is the caller's to handle. Only NativeFormatter's builds
+   * normalize, AnthropicXmlFormatter's native mode included; the XML,
+   * completions and Responses builds report none.
    */
   onNormalize?: (event: NormalizeEvent) => void;
 }

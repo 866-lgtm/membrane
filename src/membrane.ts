@@ -446,6 +446,15 @@ function resolveRetryFields<T extends { [K in keyof T]: number }>(
 }
 
 /**
+ * The re-issues a call's `refusalRetries` asks for: a finite number of at
+ * least 0, and none for anything else, as for the call's other numeric
+ * options, so a `NaN` can't keep re-issuing while the model keeps refusing.
+ */
+function refusalBudget(asked: number | undefined): number {
+  return typeof asked === 'number' && Number.isFinite(asked) ? Math.max(0, asked) : 0;
+}
+
+/**
  * The longest stated wait (`retry-after`) membrane waits out on a schedule
  * whose own ceiling is shorter: a minute. AnthropicAdapter's SDK client, whose
  * retries membrane took over, waited out a stated wait under a minute (SDK
@@ -599,7 +608,7 @@ export class Membrane {
         // should see the attempt that actually stands, not the discarded one.
         if (
           response.stopReason === 'refusal' &&
-          refusalRetriesUsed < Math.max(0, options.refusalRetries ?? 0)
+          refusalRetriesUsed < refusalBudget(options.refusalRetries)
         ) {
           refusalRetriesUsed++;
           tries = 0;
@@ -2752,7 +2761,7 @@ export class Membrane {
 
     // Retries are only safe when the caller can discard the abandoned
     // attempt, so they require BOTH a budget and an onRetrying hook.
-    const maxAttempts = onRetrying ? Math.max(0, refusalRetries ?? 0) : 0;
+    const maxAttempts = onRetrying ? refusalBudget(refusalRetries) : 0;
     let retried = 0;
     // Every re-issued attempt was a completed, billed provider call. The
     // caller's usage accumulator only ever sees the surviving result, so the
@@ -3531,7 +3540,11 @@ export class Membrane {
     const { retryDelayMs, backoffMultiplier, maxRetryDelayMs } = overloaded
       ? this.retryConfig.overloaded
       : this.retryConfig;
-    const delay = Math.min(retryDelayMs * Math.pow(backoffMultiplier, attempt - 1), maxRetryDelayMs);
+    // A zero base delay stays zero: times a power that overflowed to
+    // Infinity it would be NaN, which would discard a stated wait below.
+    const delay = retryDelayMs === 0
+      ? 0
+      : Math.min(retryDelayMs * Math.pow(backoffMultiplier, attempt - 1), maxRetryDelayMs);
     // Equal jitter on the overloaded schedule only: a capacity storm is
     // exactly the case where a fleet retrying in sync re-creates the
     // stampede it's backing off from. [delay/2, delay) keeps the wait long.
@@ -3541,8 +3554,10 @@ export class Membrane {
     // still caps it. So a zero or negative wait (a 429 with retry_after_ms:
     // -1000) loses to the backoff and can't make the loop spin. Keep the
     // max(): never trust a stated wait alone to pace retries.
+    // A NaN stated wait counts as none. Membrane's own parsers never give
+    // one; another adapter's error might.
     const retryAfterMs = errorInfo?.retryAfterMs;
-    if (retryAfterMs === undefined) return backoffMs;
+    if (retryAfterMs === undefined || Number.isNaN(retryAfterMs)) return backoffMs;
     return Math.min(this.statedWaitCeiling(overloaded), Math.max(backoffMs, retryAfterMs));
   }
 

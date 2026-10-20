@@ -7,8 +7,10 @@
  *    lists the waits (`retryDelaysMs`); cancel(), the caller's signal and a
  *    consumer that stops reading end a wait.
  *  - stream() retries a later round's call too, where it used to end the turn.
- *  - `retry: false` sends each call once, on complete(), stream() and
- *    streamYielding(), whatever fails.
+ *  - With `retry: false`, membrane retries none of a call's failed requests,
+ *    on complete(), stream() and streamYielding(), whatever fails. A refusal
+ *    re-issue the call asks for, and a credential resolver's resend after a
+ *    401, still go out.
  */
 
 import { describe, it, expect, vi } from 'vitest';
@@ -655,7 +657,7 @@ describe('a refusal re-issue starts the transport budget again', () => {
   });
 });
 
-describe('retry: false sends each call once, whatever fails', () => {
+describe('retry: false: membrane retries none of a call\'s failed requests, whatever fails', () => {
   // With base retries configured, so nothing here is left out by the config.
   // No stated wait over a ceiling either: that one reaches the caller anyway.
   const RETRYING = { retry: { ...SCHEDULES.retry, maxRetries: 3 } };
@@ -747,6 +749,24 @@ describe('retry: false sends each call once, whatever fails', () => {
     const events = await drive(membrane.streamYielding(NATIVE_REQUEST, { retry: false }));
     expect(ofType(events, 'error')).toHaveLength(1);
     expect(onError).not.toHaveBeenCalled();
+  });
+});
+
+describe('refusalRetries that isn\'t a finite number asks for no re-issue', () => {
+  it.each([[NaN], [Infinity]])('complete(): %s re-issues nothing', async (asked) => {
+    const adapter = new ScriptedNativeAdapter([{ refuse: 'zz refused' }, { text: 'zz never' }]);
+    const response = await native(adapter).complete(NATIVE_REQUEST, { refusalRetries: asked });
+
+    expect(adapter.sends).toBe(1);
+    expect(response.stopReason).toBe('refusal');
+  });
+
+  it.each([[NaN], [Infinity]])('streamYielding(): %s re-issues nothing', async (asked) => {
+    const adapter = new ScriptedNativeAdapter([{ refuse: 'zz refused' }, { text: 'zz never' }]);
+    const events = await drive(native(adapter).streamYielding(NATIVE_REQUEST, { refusalRetries: asked }));
+
+    expect(adapter.sends).toBe(1);
+    expect(ofType(events, 'retrying')).toHaveLength(0);
   });
 });
 

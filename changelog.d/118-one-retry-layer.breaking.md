@@ -1,31 +1,35 @@
 - **Callers without a retry layer of their own:** `retry.maxRetries` now
   defaults to 3 (it was 0). A 5xx, a provider's 408 or a connection failure
-  before anything was delivered gets three sends on the base schedule, with
+  before anything was delivered gets three attempts on the base schedule, with
   waits of 1 and 2 seconds, on every adapter. On `AnthropicAdapter` those three
-  sends were already made, inside its SDK client, and are now membrane's,
+  attempts were already made, inside its SDK client, and are now membrane's,
   counted in `details.timing.attempts` and cancellable; on the other adapters
-  it was one send.
+  it was one attempt.
   - **Migration:** none, to keep a call working. `retry: { maxRetries: 1 }`
-    keeps one send for these errors, and `retry: false` on a call turns off
-    every retry membrane would make on it.
+    keeps one attempt for these errors, and `retry: false` on a call turns off
+    every retry the `retry` config schedules for it.
   - **Siblings:** connectome-host builds the `Membrane` its agents use, and
     0.10.2 depends on `^0.5.87`, which admits no 0.6.x. agent-framework and
     context-manager build none: their calls run on the `Membrane` their host
     passes in, so the host's range decides, whatever their own (agent-framework
-    0.23.1's `^0.5.87`, context-manager 0.17.1's `^0.6.0`). context-manager
-    calls `complete()` without `retry`.
-  - **Unchanged:** what a call whose first send succeeds sends and returns. A
-    call that has delivered anything is never sent again.
+    0.23.1's `^0.5.87`, context-manager 0.17.1's `^0.6.0`).
+  - **Unchanged:** what a call whose first attempt succeeds sends and returns.
+    A call that has delivered anything isn't retried after a failure.
 - **Callers with a retry layer of their own,** such as a framework that
   retries its turns under a policy of its own: pass `retry: false` on each
   call. Otherwise membrane's schedules run inside each of your attempts, up to
-  seven sends of a 529 over five to ten minutes, and a stated wait of up to a
-  minute is spent inside membrane, out of your layer's sight.
+  seven attempts at a 529 over five to ten minutes, and a stated wait of up to
+  a minute is spent inside membrane, out of your layer's sight. That includes
+  `streamYielding()`, which didn't retry before, and a 529 after a refusal
+  re-issue, which gets a whole schedule again.
   - **Migration:** `retry: false` on `complete()`, `stream()` or
-    `streamYielding()`. A failure then reaches you after one send, as it came,
-    with `retryable` and any stated wait on `retryAfterMs`. Two sends stay: a
-    refusal re-issue you ask for with `refusalRetries`, and a credential
-    resolver's one resend after a 401.
+    `streamYielding()`. A failure then reaches you after one attempt, as it
+    came, with `retryable` and any stated wait on `retryAfterMs`. Two sends
+    stay: a refusal re-issue you ask for with `refusalRetries`, and a
+    credential resolver's one resend after a 401. If your layer takes over
+    capacity errors, give a 529 a schedule of its own: membrane's overloaded
+    schedule waits a capacity storm out for minutes, and a few retries
+    seconds apart end the call inside it.
   - **Siblings:** agent-framework retries its turns so, and context-manager's
     compression lane has a backoff of its own that also paces on a stated
     wait. Neither passes `retry` today. Both call through the `Membrane` their
@@ -73,4 +77,5 @@
   - **Siblings:** connectome-host, which builds the `Membrane` its agents use,
     already refuses a recipe's `agent.retry` by the same rule, so no recipe it
     loads today is refused here.
-  - **Unchanged:** a config whose fields are numbers of at least 0, or absent.
+  - **Unchanged:** a config whose fields are finite numbers of at least 0, or
+    absent.

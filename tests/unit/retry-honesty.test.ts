@@ -87,12 +87,11 @@ describe('calculateRetryDelay honors retry-after (MAJOR-2)', () => {
     adapter.queueResponse('zz-recovered');
     const membrane = new Membrane(adapter, { retry: { maxRetries: 2, retryDelayMs: 1, maxRetryDelayMs: 40 } });
 
-    const startedAt = Date.now();
+    // Not sent back inside the stated wait. Parked on it, the call would time
+    // the test out.
     await expect(membrane.complete(zzRequest)).rejects.toMatchObject({
       type: 'rate_limit', retryAfterMs: 60_001,
     });
-    // Not parked on the stated wait, and not sent back inside it.
-    expect(Date.now() - startedAt).toBeLessThan(2_000);
     expect(adapter.completeCalls).toBe(1);
   });
 
@@ -112,9 +111,55 @@ describe('calculateRetryDelay honors retry-after (MAJOR-2)', () => {
     adapter.queueResponse('zz-recovered');
     const membrane = new Membrane(adapter, { retry: { maxRetries: 2, retryDelayMs: 1, maxRetryDelayMs: 30_000 } });
 
-    const startedAt = Date.now();
+    const response = await membrane.complete(zzRequest);
+    expect(response.details.timing.retryDelaysMs).toEqual([1]);
+  });
+
+  it('a NaN stated wait counts as none: the backoff stands', async () => {
+    const adapter = new FailingAdapter(1, () => rateLimit(NaN));
+    adapter.queueResponse('zz-recovered');
+    const membrane = new Membrane(adapter, { retry: { retryDelayMs: 20, backoffMultiplier: 1 } });
+
+    const response = await membrane.complete(zzRequest);
+    expect(response.details.timing.retryDelaysMs).toEqual([20]);
+  });
+
+  it('a zero base delay stays zero when the backoff overflows, so a stated wait still stands', async () => {
+    // 1e308 squared is Infinity, so the third wait's backoff would be 0 times
+    // Infinity, which is NaN.
+    const adapter = new FailingAdapter(3, () => rateLimit(50));
+    adapter.queueResponse('zz-recovered');
+    const membrane = new Membrane(adapter, { retry: { retryDelayMs: 0, backoffMultiplier: 1e308 } });
+
+    const response = await membrane.complete(zzRequest);
+    expect(adapter.completeCalls).toBe(4);
+    expect(response.details.timing.retryDelaysMs).toEqual([50, 50, 50]);
+  });
+
+  it('complete(): a call that succeeds at its first send lists no waits', async () => {
+    const adapter = new FailingAdapter(0, () => rateLimit(1));
+    adapter.queueResponse('zz-first');
+    const response = await new Membrane(adapter).complete(zzRequest);
+    expect(adapter.completeCalls).toBe(1);
+    expect(response.details.timing.retryDelaysMs).toBeUndefined();
+  });
+
+  it('complete(): afterResponse sees the waits', async () => {
+    const adapter = new FailingAdapter(1, () => serverError('zz internal', 503));
+    adapter.queueResponse('zz-recovered');
+    let seen: number[] | undefined;
+    const membrane = new Membrane(adapter, {
+      retry: { retryDelayMs: 1, backoffMultiplier: 1 },
+      hooks: {
+        afterResponse: (response) => {
+          seen = response.details.timing.retryDelaysMs;
+          return response;
+        },
+      },
+    });
+
     await membrane.complete(zzRequest);
-    expect(Date.now() - startedAt).toBeLessThan(1_000);
+    expect(seen).toEqual([1]);
   });
 
   it('honors retry-after on the streaming retry path too', async () => {
@@ -166,6 +211,8 @@ describe('a stated wait of up to a minute is waited out, whatever the schedule\'
   });
 
   it('so is one stating exactly a minute', async () => {
+    // Membrane's ceiling is inclusive. The SDK's check was strict (under a
+    // minute), so at exactly a minute it slept its own short backoff instead.
     const adapter = new FailingAdapter(1, () => rateLimit(60_000));
     adapter.queueResponse('zz-recovered');
     const response = await completeAcrossOneWait(new Membrane(adapter), adapter, 60_000);

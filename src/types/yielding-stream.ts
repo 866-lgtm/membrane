@@ -442,7 +442,8 @@ export interface YieldingStreamOptions {
 
   /**
    * Re-issue an attempt that ends with `stop_reason: 'refusal'`, up to this
-   * many times. Default 0 (off).
+   * many times. Default 0 (off); a value that isn't a finite number asks for
+   * none.
    *
    * Enabling it means the stream can emit `RetryingEvent` — **consumers MUST
    * handle it and discard what they have received for the call**, or two

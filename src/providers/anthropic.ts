@@ -443,8 +443,9 @@ export class AnthropicAdapter implements ProviderAdapter {
 
     try {
       // Membrane is the one retry layer (see Membrane's retryPlan): the SDK
-      // client sends this request once. The keepalive's replays, which also
-      // go through createMessage, keep the SDK's default.
+      // client makes one attempt at this request, a credential resolver's
+      // resend after a 401 inside it. The keepalive's replays, which also go
+      // through createMessage, keep the SDK's default.
       const response = await this.createMessage(fullRequest, live, options?.signal, { maxRetries: 0 });
       // The SDK has the provider's answer, so the provider has the request's
       // prefix: only now can the keepalive hold it warm. It's recorded before
@@ -1098,8 +1099,9 @@ export class AnthropicAdapter implements ProviderAdapter {
   private handleError(error: unknown, rawRequest?: unknown): MembraneError {
     const typed = this.typeError(error, rawRequest);
     // The API can say whether a failure is worth sending again, and the SDK
-    // obeyed that before its own rules. Membrane is the one retry layer now
-    // (the SDK client sends each request once), so the advice decides
+    // obeyed that before its own rules. Membrane is the one retry layer for a
+    // call's requests now (the SDK client makes one attempt at each; only the
+    // keepalive's replays keep its retries), so the advice decides
     // `retryable` here.
     const advice = error instanceof Anthropic.APIError ? error.headers?.get?.('x-should-retry') : undefined;
     if ((advice === 'true' || advice === 'false') && typed.retryable !== (advice === 'true')) {
