@@ -7,7 +7,7 @@
  *     JSON type its declaration admits;
  *   - the XML tool-definition renderer (formatters/anthropic-xml.ts, through
  *     `toolDefinitionForPrompt`) tells the model each parameter's type,
- *     nullability and requiredness;
+ *     nullability, requiredness and the values it takes;
  *   - the Anthropic native wire (providers/anthropic-tool-schema.ts) merges a
  *     root-level union into one object schema.
  *
@@ -17,7 +17,9 @@
  * `type` admits null while its other keywords (an `enum`, a `const`, a
  * combinator or a `$ref`) leave null out admits no null, and a parameter is
  * marked nullable only where null survives that; the parser still reads a
- * written null by the type alone (#150). The native flattening shares
+ * written null by the type alone (#150). The renderer also lists the values
+ * a parameter's declaring nodes, `$ref`s and branches name ({@link valuesBy}),
+ * which the parser doesn't read. The native flattening shares
  * {@link rootUnionOf} (which root unions
  * merge into one parameter list) and {@link effectiveRequiredKeys} (which of
  * their keys are required), so the two wires agree on which parameters exist
@@ -368,6 +370,149 @@ function admittedByKeywords(node: Record<string, unknown>, context: ReadContext)
 }
 
 // ============================================================================
+// Values, for the tool instructions
+// ============================================================================
+
+/** A value the instructions can print: JSON's string, number, boolean or null. */
+type Scalar = string | number | boolean | null;
+
+function isScalar(value: unknown): value is Scalar {
+  return value === null || ['string', 'number', 'boolean'].includes(typeof value);
+}
+
+/**
+ * The values a schema node admits, when the schema names them (shelf-963): a
+ * list; `undefined` when it names none, so the node takes values no list
+ * holds (a `type` alone, a branch with no list of its own); or UNREADABLE
+ * when something that would narrow them can't be read (a `$ref` that cycles
+ * or does not resolve, a keyword of the wrong shape, a listed value that isn't
+ * a string, number, boolean or null). UNREADABLE wins every combination, so a
+ * cycle reads the same from any entry point. Read only for the tool
+ * instructions' `enum`; the parser never reads it.
+ */
+type Values = readonly Scalar[] | undefined | typeof UNREADABLE;
+
+interface ValuesContext {
+  /** The instructions' kinds reading, whose root the `$ref`s resolve against. */
+  kinds: ReadContext;
+  /** `$ref`s being read on the current path: meeting one again is a cycle. */
+  inProgress: Set<string>;
+  /** `$ref`s already read, so a definition shared along many paths is read once. */
+  settled: Map<string, Values>;
+}
+
+/** Each value once, where it first appears, so one schema always renders the same list. */
+function firstOccurrences(values: Iterable<Scalar>): Scalar[] {
+  return [...new Set(values)];
+}
+
+/** Values both admit, in the first's order; a node with no list doesn't narrow. */
+function valuesInBoth(a: Values, b: Values): Values {
+  if (a === UNREADABLE || b === UNREADABLE) return UNREADABLE;
+  if (a === undefined) return b;
+  if (b === undefined) return a;
+  const inB = new Set(b);
+  return a.filter(value => inB.has(value));
+}
+
+/** `anyOf`: a value any branch admits, provided every branch has a list. */
+function valuesInAny(each: readonly Values[]): Values {
+  if (each.includes(UNREADABLE)) return UNREADABLE;
+  if (each.includes(undefined)) return undefined;
+  return firstOccurrences((each as readonly (readonly Scalar[])[]).flat());
+}
+
+/** `oneOf`: a value exactly one branch admits, since one that several admit fails it. */
+function valuesInOne(each: readonly Values[]): Values {
+  if (each.includes(UNREADABLE)) return UNREADABLE;
+  if (each.includes(undefined)) return undefined;
+  const admitting = new Map<Scalar, number>();
+  for (const list of each as readonly (readonly Scalar[])[]) {
+    for (const value of list) admitting.set(value, (admitting.get(value) ?? 0) + 1);
+  }
+  return [...admitting].filter(([, count]) => count === 1).map(([value]) => value);
+}
+
+/** The values of kinds a reading admits; all of them when it can't say which. */
+function valuesOfKinds(values: readonly Scalar[], admitted: Admitted): readonly Scalar[] {
+  if (typeof admitted === 'string') return values;
+  return values.filter(value => {
+    const kinds = kindOfValue(value);
+    return typeof kinds !== 'string' && [...kinds].every(kind => admitted.has(kind));
+  });
+}
+
+function valuesByRef(ref: unknown, context: ValuesContext): Values {
+  if (typeof ref !== 'string') return UNREADABLE;
+  if (context.settled.has(ref)) return context.settled.get(ref);
+  // A cycle names no list, from any entry point.
+  if (context.inProgress.has(ref)) return UNREADABLE;
+  // The kinds reading's resolution, so both readings follow a ref to one node.
+  const target = refTarget(context.kinds.root, ref);
+  if (target === undefined) return UNREADABLE;
+  context.inProgress.add(ref);
+  const values = valuesBy(target, context);
+  context.inProgress.delete(ref);
+  context.settled.set(ref, values);
+  return values;
+}
+
+/**
+ * The values one schema node admits, for the tool instructions (shelf-963).
+ *
+ * `enum` lists its values, `const` one value, and a `type` that admits only
+ * null the value null. A node's keywords all apply at once, so their lists
+ * intersect, and the kinds its keywords admit, as the instructions' reading
+ * reads them, keep only the values of those kinds. `anyOf` lists the values
+ * any branch admits and `oneOf` those exactly one branch admits, provided
+ * every branch has a list; `allOf` lists the values its listing branches
+ * share; `$ref` lists its target's, through chains of any length. Keywords
+ * that constrain neither kinds nor values, such as `pattern`, `minimum` or
+ * `not`, aren't read, as the kinds reading doesn't read them.
+ */
+function valuesBy(node: unknown, context: ValuesContext): Values {
+  if (node === false) return [];
+  if (node === true) return undefined;
+  if (!isPlainObject(node)) return UNREADABLE;
+  let values: Values;
+  if (Object.hasOwn(node, 'enum')) {
+    const listed = node.enum;
+    values = Array.isArray(listed) && listed.every(isScalar) ? firstOccurrences(listed) : UNREADABLE;
+  }
+  if (Object.hasOwn(node, 'const')) {
+    values = valuesInBoth(values, isScalar(node.const) ? [node.const] : UNREADABLE);
+  }
+  for (const [key, combine] of [['anyOf', valuesInAny], ['oneOf', valuesInOne]] as const) {
+    if (!Object.hasOwn(node, key)) continue;
+    const branches = node[key];
+    values = valuesInBoth(
+      values,
+      Array.isArray(branches) ? combine(branches.map(branch => valuesBy(branch, context))) : UNREADABLE
+    );
+  }
+  if (Object.hasOwn(node, 'allOf')) {
+    const branches = node.allOf;
+    if (!Array.isArray(branches)) return UNREADABLE;
+    for (const branch of branches) values = valuesInBoth(values, valuesBy(branch, context));
+  }
+  if (Object.hasOwn(node, '$ref')) values = valuesInBoth(values, valuesByRef(node.$ref, context));
+  const typeKinds = Object.hasOwn(node, 'type')
+    ? admittedByTypeKeyword(node.type, ownField(node, 'nullable'))
+    : ANY;
+  if (values === undefined) {
+    // A type that admits only null is a list of one, which the node's other
+    // keywords may still rule out.
+    const onlyNull = typeof typeKinds !== 'string' && typeKinds.size === 1 && typeKinds.has('null');
+    if (!onlyNull) return undefined;
+    values = [null];
+  }
+  if (values === UNREADABLE) return UNREADABLE;
+  // The type and the other keywords filter apart, so one that can't be read
+  // leaves the other's filter standing.
+  return valuesOfKinds(valuesOfKinds(values, typeKinds), admittedByKeywords(node, context.kinds));
+}
+
+// ============================================================================
 // Parameter declarations
 // ============================================================================
 
@@ -407,8 +552,16 @@ export interface ParameterDeclaration {
   required: boolean;
   /** From the first schema node that declares the parameter. */
   description?: string;
-  /** From the first schema node that declares the parameter. */
-  enum?: string[];
+  /**
+   * The values the tool instructions list for the parameter, from its own
+   * `enum` or `const`, or behind a `$ref`, in branches, or across root
+   * alternatives, combined as the kinds are
+   * ({@link valuesBy}). Only values of kinds the instructions' reading admits,
+   * where it can name them, and null only where the parameter is marked
+   * nullable. Absent when no list can be named, when a listed value isn't a
+   * string, number, boolean or null, or when the list would be empty.
+   */
+  enum?: Array<string | number | boolean | null>;
   /** Every schema node that declares the parameter, in reading order. */
   declaredBy: unknown[];
 }
@@ -502,6 +655,11 @@ export function readToolSchema(inputSchema: unknown): ToolSchemaReading {
       settled: new Map(),
       forInstructions: true,
     };
+    const valuesContext: ValuesContext = {
+      kinds: instructionsContext,
+      inProgress: new Set(),
+      settled: new Map(),
+    };
     const required = new Set(
       effectiveRequiredKeys(ownField(inputSchema, 'required'), readCombinators)
     );
@@ -520,18 +678,45 @@ export function readToolSchema(inputSchema: unknown): ToolSchemaReading {
       }
       return admitted;
     };
+    // The same combination for values: the root and allOf alternatives apply
+    // at once, and anyOf/oneOf alternatives are alternatives. A root oneOf
+    // unites too, as the kinds do: whether a call fits exactly one
+    // alternative turns on its other parameters, which this one can't see.
+    const valuesByEntry = (entry: {
+      root?: unknown;
+      alternatives: Map<RootUnionKey, unknown[]>;
+    }): Values => {
+      let values: Values = entry.root === undefined ? undefined : valuesBy(entry.root, valuesContext);
+      for (const [key, nodes] of entry.alternatives) {
+        const each = nodes.map(node => valuesBy(node, valuesContext));
+        values = valuesInBoth(
+          values,
+          key === 'allOf' ? each.reduce<Values>(valuesInBoth, undefined) : valuesInAny(each)
+        );
+      }
+      return values;
+    };
 
     for (const [name, entry] of declarations) {
       const admitted = admittedByEntry(entry, parseContext);
-      const first = entry.declaredBy[0];
-      const description = ownField(first, 'description');
-      const enumValues = ownField(first, 'enum');
+      const instructed = admittedByEntry(entry, instructionsContext);
+      const instructedKind = declaredKind(instructed);
+      const values = valuesByEntry(entry);
+      // Only values of kinds the line's other attributes admit, and null only
+      // where it marks the parameter nullable.
+      const listed =
+        values === undefined || values === UNREADABLE
+          ? []
+          : valuesOfKinds(values, instructed).filter(
+              value => value !== null || instructedKind.nullable
+            );
+      const description = ownField(entry.declaredBy[0], 'description');
       parameters.set(name, {
         ...declaredKind(admitted),
-        instructedNullable: declaredKind(admittedByEntry(entry, instructionsContext)).nullable,
+        instructedNullable: instructedKind.nullable,
         required: required.has(name),
         description: typeof description === 'string' ? description : undefined,
-        enum: Array.isArray(enumValues) ? (enumValues as string[]) : undefined,
+        enum: listed.length > 0 ? [...listed] : undefined,
         declaredBy: entry.declaredBy,
       });
     }
