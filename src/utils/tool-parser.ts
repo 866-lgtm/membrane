@@ -750,6 +750,10 @@ export interface ToolDefinitionForPrompt {
     nullable?: boolean;
     description?: string;
     required?: boolean;
+    /**
+     * The reading's `enum`, each value as `String()` prints it: the values the
+     * tool instructions list for the parameter.
+     */
     enum?: string[];
   }>;
 }
@@ -760,7 +764,9 @@ export interface ToolDefinitionForPrompt {
  * ({@link readToolSchema}): the type the model is told a parameter has is the
  * type its value is parsed by, and a parameter the parser cannot type states
  * none. Its null mark is the reading's `instructedNullable`, which keywords
- * that leave null out withhold though the parse admits null (#150).
+ * that leave null out withhold though the parse admits null (#150), and its
+ * `enum` lists the values the reading finds behind `$ref`s, in branches and
+ * across root alternatives as well as on the declaring node.
  */
 export function toolDefinitionForPrompt(tool: ToolDefinition): ToolDefinitionForPrompt {
   const { parameters } = readToolSchema(tool.inputSchema);
@@ -775,7 +781,7 @@ export function toolDefinitionForPrompt(tool: ToolDefinition): ToolDefinitionFor
           nullable: declaration.instructedNullable || undefined,
           description: declaration.description,
           required: declaration.required,
-          enum: declaration.enum,
+          enum: declaration.enum?.map(String),
         },
       ])
     ),
