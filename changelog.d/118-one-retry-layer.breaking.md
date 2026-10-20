@@ -71,11 +71,15 @@
   of at least 0 is now refused when the `Membrane` is constructed, with a
   `RangeError` naming the field (a `TypeError` for a value that isn't a
   number). A field given as `undefined` takes its default. Before, an explicit
-  `undefined` replaced the default. As `maxRetries`, `undefined`, `NaN`, −1
-  and `null` meant no retries at all, `Infinity` meant retrying without end
-  while the error lasted, and a numeric string was read as its number.
+  `undefined` replaced the default. As `maxRetries`, `undefined` and `NaN`
+  meant no retries at all, a 429's and a 529's included. −1 and `null` meant
+  none for other errors, as 0 does, while a 429 and a 529 kept their own
+  schedules. `Infinity` meant retrying without end while the error lasted,
+  and a numeric string was read as its number.
   - **Migration:** pass a finite number of at least 0, or leave the field out.
-    A caller that passed `Infinity` to keep retrying chooses a bound.
+    A caller that passed `Infinity` to keep retrying chooses a bound, and one
+    that passed `undefined` or `NaN` to turn every retry off passes
+    `retry: false` on its calls.
   - **Siblings:** connectome-host, which builds the `Membrane` its agents use,
     already refuses a recipe's `agent.retry` by the same rule, so no recipe it
     loads today is refused here.
