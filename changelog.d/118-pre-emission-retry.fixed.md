@@ -17,8 +17,3 @@
 - On `complete()`, a refusal re-issue (`refusalRetries`) no longer spends the
   retry budget for transport errors: after a re-issue, a 529 or 429 gets the
   whole schedule again, as it does on the streaming paths.
-- `hooks.onError` is now asked before each retry on `streamYielding()` too.
-  On every entry point, its `attempt` counts the attempts at the failing
-  request since its last refusal re-issue, the count the retry budget reads.
-  It used to count every pass of the whole call, refusal re-issues included,
-  so after a re-issue it now starts again from 1.

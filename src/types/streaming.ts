@@ -262,7 +262,11 @@ export interface StreamOptions {
   /** Called for structured block events (thinking, tool_use, tool_result) */
   onBlock?: OnBlockCallback;
 
-  /** Called with raw provider request before sending (for logging) */
+  /**
+   * Called with raw provider request before each send (for logging). A
+   * request membrane sends again after a failure calls it again, so it counts
+   * sends, not rounds.
+   */
   onRequest?: OnRequestCallback;
 
   /** Called with raw provider response after each API call (for logging) */
@@ -349,7 +353,10 @@ export interface CompleteOptions {
   /** Request ID for correlation */
   requestId?: string;
 
-  /** Called with raw provider request before sending (for logging) */
+  /**
+   * Called with raw provider request before each send (for logging). A
+   * request membrane sends again after a failure calls it again.
+   */
   onRequest?: OnRequestCallback;
 
   /** Called with raw provider response after API call (for logging) */

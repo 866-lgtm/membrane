@@ -407,6 +407,54 @@ function parseUpToStop(
   return { found, head: text.slice(0, cut), emissions: taken ? parser.processChunk(taken).emissions : [] };
 }
 
+/**
+ * The retry config a Membrane runs on: each field the caller gave, and the
+ * default for each field left out. A field given as `undefined` counts as left
+ * out, as the optional fields of `MembraneConfig.retry` invite
+ * (`{ maxRetries: opts.maxRetries }` with the option unset). Any other value
+ * must be a finite number of at least 0, or the constructor throws, naming
+ * the field: a `NaN` attempt bound compares false with every count, so it
+ * would retry without end, and a `NaN` delay waits about a millisecond.
+ */
+function resolveRetryConfig(given: MembraneConfig['retry']): RetryConfig {
+  const { overloaded, ...base } = given ?? {};
+  const { overloaded: overloadedDefaults, ...baseDefaults } = DEFAULT_RETRY_CONFIG;
+  return {
+    ...resolveRetryFields(baseDefaults, base, 'retry'),
+    overloaded: resolveRetryFields(overloadedDefaults, overloaded, 'retry.overloaded'),
+  };
+}
+
+function resolveRetryFields<T extends { [K in keyof T]: number }>(
+  defaults: T,
+  given: Partial<T> | undefined,
+  path: string,
+): T {
+  const resolved = { ...defaults };
+  for (const key of Object.keys(defaults) as (keyof T & string)[]) {
+    const value: unknown = given?.[key];
+    if (value === undefined) continue;
+    if (typeof value !== 'number') {
+      throw new TypeError(`[membrane] ${path}.${key} must be a number, got ${value === null ? 'null' : typeof value}`);
+    }
+    if (!Number.isFinite(value) || value < 0) {
+      throw new RangeError(`[membrane] ${path}.${key} must be a finite number of at least 0, got ${value}`);
+    }
+    resolved[key] = value as T[typeof key];
+  }
+  return resolved;
+}
+
+/**
+ * The longest stated wait (`retry-after`) membrane waits out on a schedule
+ * whose own ceiling is shorter: a minute. AnthropicAdapter's SDK client, whose
+ * retries membrane took over, waited out a stated wait under a minute (SDK
+ * 0.52's `retryRequest`). A schedule's `maxRetryDelayMs` caps membrane's own
+ * backoff, a different question; where it is longer than a minute, stated
+ * waits are waited out up to it, as on the overloaded schedule.
+ */
+const STATED_WAIT_CEILING_MS = 60_000;
+
 export class Membrane {
   private adapter: ProviderAdapter;
   private registry?: ModelRegistry;
@@ -420,11 +468,7 @@ export class Membrane {
   ) {
     this.adapter = adapter;
     this.registry = config.registry;
-    this.retryConfig = {
-      ...DEFAULT_RETRY_CONFIG,
-      ...config.retry,
-      overloaded: { ...DEFAULT_RETRY_CONFIG.overloaded, ...config.retry?.overloaded },
-    };
+    this.retryConfig = resolveRetryConfig(config.retry);
     this.config = config;
     // Use provided formatter or default to AnthropicXmlFormatter
     this.formatter = config.formatter ?? new AnthropicXmlFormatter();
@@ -3477,11 +3521,11 @@ export class Membrane {
    * The server's own `retry-after` outranks our backoff when it is longer:
    * retrying inside a window the provider has already told us to wait out
    * burns the whole attempt budget on guaranteed failures. A stated wait
-   * longer than maxRetryDelayMs isn't retried at all (see retryPlan), so a
-   * hostile or absurd retry-after cannot park the call; the min() below keeps
-   * that bound here too. The error a caller receives carries the provider's
-   * stated wait as stated (retryAfterMs): pacing across calls is the
-   * caller's.
+   * longer than the schedule's stated-wait ceiling (statedWaitCeiling) isn't
+   * retried at all (see retryPlan), so a hostile or absurd retry-after cannot
+   * park the call; the min() below keeps that bound here too. The error a
+   * caller receives carries the provider's stated wait as stated
+   * (retryAfterMs): pacing across calls is the caller's.
    */
   private calculateRetryDelay(attempt: number, overloaded = false, errorInfo?: ErrorInfo): number {
     const { retryDelayMs, backoffMultiplier, maxRetryDelayMs } = overloaded
@@ -3493,13 +3537,22 @@ export class Membrane {
     // stampede it's backing off from. [delay/2, delay) keeps the wait long.
     const backoffMs = overloaded ? Math.floor(delay / 2 + Math.random() * (delay / 2)) : delay;
 
-    // A stated wait can only lengthen the backoff, and the ceiling still caps
-    // it. So a zero or negative wait (a 429 with retry_after_ms: -1000) loses
-    // to the backoff and can't make the loop spin. Keep the max(): never trust
-    // a stated wait alone to pace retries.
+    // A stated wait can only lengthen the backoff, and the stated-wait ceiling
+    // still caps it. So a zero or negative wait (a 429 with retry_after_ms:
+    // -1000) loses to the backoff and can't make the loop spin. Keep the
+    // max(): never trust a stated wait alone to pace retries.
     const retryAfterMs = errorInfo?.retryAfterMs;
     if (retryAfterMs === undefined) return backoffMs;
-    return Math.min(maxRetryDelayMs, Math.max(backoffMs, retryAfterMs));
+    return Math.min(this.statedWaitCeiling(overloaded), Math.max(backoffMs, retryAfterMs));
+  }
+
+  /**
+   * The longest stated wait a schedule waits out: a minute, or the schedule's
+   * maxRetryDelayMs where that's longer (see STATED_WAIT_CEILING_MS).
+   */
+  private statedWaitCeiling(overloaded: boolean): number {
+    const { maxRetryDelayMs } = overloaded ? this.retryConfig.overloaded : this.retryConfig;
+    return Math.max(STATED_WAIT_CEILING_MS, maxRetryDelayMs);
   }
 
   /**
@@ -3521,8 +3574,8 @@ export class Membrane {
    *
    * With the call's `retry: false` it returns undefined for every error,
    * these floors included: the error goes to the caller. It does the same
-   * for an error whose stated wait is longer than its schedule's
-   * maxRetryDelayMs.
+   * for an error whose stated wait is longer than its schedule's stated-wait
+   * ceiling: a minute, or the schedule's maxRetryDelayMs where that's longer.
    */
   private retryPlan(
     errorInfo: ErrorInfo,
@@ -3539,13 +3592,14 @@ export class Membrane {
       : overloaded
         ? Math.max(this.retryConfig.maxRetries, this.retryConfig.overloaded.maxRetries)
         : this.retryConfig.maxRetries;
-    if (attempt >= maxAttempts) return undefined;
-    // A stated wait longer than the schedule's ceiling can't be waited out
-    // here, and retrying at the ceiling would send the call back inside the
-    // window the provider named. The caller gets the error, with the stated
-    // wait on retryAfterMs.
-    const { maxRetryDelayMs } = overloaded ? this.retryConfig.overloaded : this.retryConfig;
-    if (errorInfo.retryAfterMs !== undefined && errorInfo.retryAfterMs > maxRetryDelayMs) return undefined;
+    // Written to fail closed: a bound that compares false with every count
+    // ends the retries rather than letting them run on.
+    if (!(attempt < maxAttempts)) return undefined;
+    // A stated wait longer than the schedule's stated-wait ceiling isn't
+    // waited out here, and retrying at the ceiling would send the call back
+    // inside the window the provider named. The caller gets the error, with
+    // the stated wait on retryAfterMs.
+    if (errorInfo.retryAfterMs !== undefined && errorInfo.retryAfterMs > this.statedWaitCeiling(overloaded)) return undefined;
     return { overloaded, maxAttempts };
   }
 

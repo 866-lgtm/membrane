@@ -11,10 +11,10 @@
  * exactly as transparent to retry as the 529 membrane already retries there.
  */
 
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { Membrane } from '../../src/membrane.js';
 import { MockAdapter } from '../../src/providers/mock.js';
-import { MembraneError } from '../../src/types/errors.js';
+import { MembraneError, serverError } from '../../src/types/errors.js';
 import type { NormalizedRequest } from '../../src/types/index.js';
 import type { ProviderRequest, ProviderRequestOptions, ProviderResponse } from '../../src/types/provider.js';
 import type { StreamCallbacks } from '../../src/types/streaming.js';
@@ -82,14 +82,14 @@ describe('calculateRetryDelay honors retry-after (MAJOR-2)', () => {
     expect(elapsedMs).toBeGreaterThanOrEqual(150);
   });
 
-  it('gives the caller a stated wait longer than maxRetryDelayMs instead of retrying inside it', async () => {
-    const adapter = new FailingAdapter(1, () => rateLimit(60_000));
+  it('gives the caller a stated wait longer than a minute and than maxRetryDelayMs instead of retrying inside it', async () => {
+    const adapter = new FailingAdapter(1, () => rateLimit(60_001));
     adapter.queueResponse('zz-recovered');
     const membrane = new Membrane(adapter, { retry: { maxRetries: 2, retryDelayMs: 1, maxRetryDelayMs: 40 } });
 
     const startedAt = Date.now();
     await expect(membrane.complete(zzRequest)).rejects.toMatchObject({
-      type: 'rate_limit', retryAfterMs: 60_000,
+      type: 'rate_limit', retryAfterMs: 60_001,
     });
     // Not parked on the stated wait, and not sent back inside it.
     expect(Date.now() - startedAt).toBeLessThan(2_000);
@@ -125,6 +125,128 @@ describe('calculateRetryDelay honors retry-after (MAJOR-2)', () => {
     const startedAt = Date.now();
     await membrane.stream(zzRequest, { onChunk: () => {} });
     expect(Date.now() - startedAt).toBeGreaterThanOrEqual(150);
+  });
+});
+
+/**
+ * Runs complete() on fake timers until the first send's failure has set its
+ * wait, checks the second send waits the whole of it, and returns the response.
+ */
+async function completeAcrossOneWait(membrane: Membrane, adapter: FailingAdapter, waitMs: number) {
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+  try {
+    const done = membrane.complete(zzRequest);
+    for (let hop = 0; hop < 50 && vi.getTimerCount() === 0; hop++) {
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+    expect(vi.getTimerCount()).toBe(1);
+    expect(adapter.completeCalls).toBe(1);
+    await vi.advanceTimersByTimeAsync(waitMs - 1);
+    expect(adapter.completeCalls).toBe(1);
+    await vi.advanceTimersByTimeAsync(1);
+    // The mock adapter's own simulated latency is a timer too.
+    await vi.runAllTimersAsync();
+    const response = await done;
+    expect(adapter.completeCalls).toBe(2);
+    return response;
+  } finally {
+    vi.useRealTimers();
+  }
+}
+
+describe('a stated wait of up to a minute is waited out, whatever the schedule\'s backoff ceiling', () => {
+  // The base schedule caps membrane's own backoff at 30 s. A provider's stated
+  // wait is another matter: AnthropicAdapter's SDK client waited out one under
+  // a minute before membrane took its retries over, so membrane does too.
+  it('a 429 stating 45 s is waited out on the default schedule', async () => {
+    const adapter = new FailingAdapter(1, () => rateLimit(45_000));
+    adapter.queueResponse('zz-recovered');
+    const response = await completeAcrossOneWait(new Membrane(adapter), adapter, 45_000);
+    expect(response.details.timing.retryDelaysMs).toEqual([45_000]);
+  });
+
+  it('so is one stating exactly a minute', async () => {
+    const adapter = new FailingAdapter(1, () => rateLimit(60_000));
+    adapter.queueResponse('zz-recovered');
+    const response = await completeAcrossOneWait(new Membrane(adapter), adapter, 60_000);
+    expect(response.details.timing.retryDelaysMs).toEqual([60_000]);
+  });
+
+  it('a ceiling set above a minute waits stated waits out up to it', async () => {
+    const adapter = new FailingAdapter(1, () => rateLimit(90_000));
+    adapter.queueResponse('zz-recovered');
+    const membrane = new Membrane(adapter, { retry: { maxRetryDelayMs: 120_000 } });
+    const response = await completeAcrossOneWait(membrane, adapter, 90_000);
+    expect(response.details.timing.retryDelaysMs).toEqual([90_000]);
+
+    const longer = new FailingAdapter(1, () => rateLimit(120_001));
+    longer.queueResponse('zz-never');
+    await expect(new Membrane(longer, { retry: { maxRetryDelayMs: 120_000 } }).complete(zzRequest))
+      .rejects.toMatchObject({ type: 'rate_limit', retryAfterMs: 120_001 });
+    expect(longer.completeCalls).toBe(1);
+  });
+});
+
+describe('the retry config: a field left out takes its default, and a value that can\'t bound a retry is refused', () => {
+  const FAST = { retryDelayMs: 1, maxRetryDelayMs: 2, backoffMultiplier: 1 };
+
+  it('a field given as undefined takes its default', async () => {
+    // A 5xx gets retry.maxRetries attempts, three by default. Before, the
+    // undefined replaced the default and the call retried without end.
+    const adapter = new FailingAdapter(10, () => serverError('zz internal', 503));
+    adapter.queueResponse('zz-never');
+    const membrane = new Membrane(adapter, { retry: { ...FAST, maxRetries: undefined } });
+    await expect(membrane.complete(zzRequest)).rejects.toMatchObject({ type: 'server' });
+    expect(adapter.completeCalls).toBe(3);
+  });
+
+  it('so does a field of the overloaded schedule', async () => {
+    // A 529 gets overloaded.maxRetries attempts, seven by default.
+    const adapter = new FailingAdapter(10, () => serverError('zz overloaded', 529));
+    adapter.queueResponse('zz-never');
+    const membrane = new Membrane(adapter, { retry: { overloaded: { ...FAST, maxRetries: undefined } } });
+    await expect(membrane.complete(zzRequest)).rejects.toMatchObject({ httpStatus: 529 });
+    expect(adapter.completeCalls).toBe(7);
+  });
+
+  it('a delay given as undefined takes its default, not a wait of about a millisecond', async () => {
+    // The base schedule is unjittered, so a 5xx waits exactly retryDelayMs.
+    const adapter = new FailingAdapter(1, () => serverError('zz internal', 503));
+    adapter.queueResponse('zz-recovered');
+    const membrane = new Membrane(adapter, { retry: { retryDelayMs: undefined, maxRetryDelayMs: undefined } });
+    const response = await completeAcrossOneWait(membrane, adapter, 1000);
+    expect(response.details.timing.retryDelaysMs).toEqual([1000]);
+  });
+
+  const fields = [
+    'maxRetries', 'retryDelayMs', 'backoffMultiplier', 'maxRetryDelayMs',
+    'overloaded.maxRetries', 'overloaded.retryDelayMs', 'overloaded.backoffMultiplier', 'overloaded.maxRetryDelayMs',
+  ];
+  const retryWith = (field: string, value: unknown) => {
+    const [first, second] = field.split('.');
+    return (second ? { [first!]: { [second]: value } } : { [first!]: value }) as never;
+  };
+
+  it.each(fields)('retry.%s = NaN is refused at construction, naming the field', (field) => {
+    expect(() => new Membrane(new MockAdapter(), { retry: retryWith(field, NaN) }))
+      .toThrow(new RangeError(`[membrane] retry.${field} must be a finite number of at least 0, got NaN`));
+  });
+
+  it.each([[Infinity], [-1]])('retry.maxRetries = %s is refused at construction', (value) => {
+    expect(() => new Membrane(new MockAdapter(), { retry: retryWith('maxRetries', value) })).toThrow(RangeError);
+  });
+
+  it.each([['3', 'string'], [null, 'null']])('retry.maxRetries = %j is refused as not a number', (value, shown) => {
+    expect(() => new Membrane(new MockAdapter(), { retry: retryWith('maxRetries', value) }))
+      .toThrow(new TypeError(`[membrane] retry.maxRetries must be a number, got ${shown}`));
+  });
+
+  it('0 is a bound: a 5xx is sent once', async () => {
+    const adapter = new FailingAdapter(10, () => serverError('zz internal', 503));
+    adapter.queueResponse('zz-never');
+    const membrane = new Membrane(adapter, { retry: { maxRetries: 0, retryDelayMs: 0 } });
+    await expect(membrane.complete(zzRequest)).rejects.toMatchObject({ type: 'server' });
+    expect(adapter.completeCalls).toBe(1);
   });
 });
 

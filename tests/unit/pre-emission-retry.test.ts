@@ -750,43 +750,83 @@ describe('retry: false sends each call once, whatever fails', () => {
   });
 });
 
-describe('a stated wait longer than the ceiling is given to the caller, not retried inside', () => {
-  // SCHEDULES caps the base wait at 3 ms and the overloaded one at 40 ms.
-  it('streamYielding(): a 429 asking for longer ends the stream at once', async () => {
-    const adapter = new ScriptedNativeAdapter([{ fail: () => rateLimited429(5_000) }, { text: 'zz never' }]);
+describe('a stated wait longer than its ceiling is given to the caller, not retried inside', () => {
+  // A schedule waits out a stated wait up to a minute, or up to its own
+  // maxRetryDelayMs where that's longer. SCHEDULES caps both schedules' own
+  // backoff in milliseconds, so both stated-wait ceilings here are a minute;
+  // LONG_OVERLOADED gives the overloaded schedule its default cap of 5 minutes.
+  const LONG_OVERLOADED = {
+    retry: { ...SCHEDULES.retry, overloaded: { ...SCHEDULES.retry.overloaded, maxRetryDelayMs: 300_000 } },
+  };
+  const overloadedFor = (retryAfterMs: number) => () =>
+    new MembraneError({ ...overloaded529().toErrorInfo(), retryAfterMs });
+
+  it('streamYielding(): a 429 asking for longer than a minute ends the stream at once', async () => {
+    const adapter = new ScriptedNativeAdapter([{ fail: () => rateLimited429(60_001) }, { text: 'zz never' }]);
     const events = await drive(native(adapter).streamYielding(NATIVE_REQUEST));
 
     expect(adapter.sends).toBe(1);
-    expect(ofType(events, 'error')[0]!.error).toMatchObject({ retryAfterMs: 5_000 });
+    expect(ofType(events, 'error')[0]!.error).toMatchObject({ retryAfterMs: 60_001 });
   });
 
   it('stream(): the same', async () => {
-    const adapter = new ScriptedNativeAdapter([{ fail: () => rateLimited429(5_000) }, { text: 'zz never' }]);
-    await expect(native(adapter).stream(NATIVE_REQUEST)).rejects.toMatchObject({ retryAfterMs: 5_000 });
+    const adapter = new ScriptedNativeAdapter([{ fail: () => rateLimited429(60_001) }, { text: 'zz never' }]);
+    await expect(native(adapter).stream(NATIVE_REQUEST)).rejects.toMatchObject({ retryAfterMs: 60_001 });
     expect(adapter.sends).toBe(1);
+  });
+
+  it('streamYielding(): a 429 asking for less than a minute is waited out, though the base cap is 3 ms', async () => {
+    const adapter = new ScriptedNativeAdapter([{ fail: () => rateLimited429(45_000) }, { text: 'zz recovered' }]);
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      const done = drive(native(adapter).streamYielding(NATIVE_REQUEST));
+      for (let hop = 0; hop < 50 && vi.getTimerCount() === 0; hop++) {
+        await new Promise((resolve) => setImmediate(resolve));
+      }
+      expect(vi.getTimerCount()).toBe(1);
+      await vi.advanceTimersByTimeAsync(44_999);
+      expect(adapter.sends).toBe(1);
+      await vi.advanceTimersByTimeAsync(1);
+      const events = await done;
+      expect(adapter.sends).toBe(2);
+      expect(ofType(events, 'complete')[0]!.response.details.timing.retryDelaysMs).toEqual([45_000]);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('a 429 is held to the base ceiling, not the overloaded one', async () => {
-    // 20 ms is over the base ceiling and under the overloaded one.
-    const adapter = new ScriptedNativeAdapter([{ fail: () => rateLimited429(20) }, { text: 'zz never' }]);
-    const events = await drive(native(adapter).streamYielding(NATIVE_REQUEST));
+    // Two minutes is over the base ceiling (a minute) and under the overloaded one (5 minutes).
+    const adapter = new ScriptedNativeAdapter([{ fail: () => rateLimited429(120_000) }, { text: 'zz never' }]);
+    const events = await drive(native(adapter, LONG_OVERLOADED).streamYielding(NATIVE_REQUEST));
 
     expect(adapter.sends).toBe(1);
-    expect(ofType(events, 'error')[0]!.error).toMatchObject({ retryAfterMs: 20 });
+    expect(ofType(events, 'error')[0]!.error).toMatchObject({ retryAfterMs: 120_000 });
   });
 
   it('a 529 is held to the overloaded ceiling', async () => {
-    const overloadedFor = (retryAfterMs: number) => () =>
-      new MembraneError({ ...overloaded529().toErrorInfo(), retryAfterMs });
-    const over = new ScriptedNativeAdapter([{ fail: overloadedFor(41) }, { text: 'zz never' }]);
-    await expect(native(over).complete(NATIVE_REQUEST)).rejects.toMatchObject({ httpStatus: 529 });
+    const over = new ScriptedNativeAdapter([{ fail: overloadedFor(300_001) }, { text: 'zz never' }]);
+    await expect(native(over, LONG_OVERLOADED).complete(NATIVE_REQUEST)).rejects.toMatchObject({ httpStatus: 529 });
     expect(over.sends).toBe(1);
 
     // At the ceiling it is waited out: the wait is the stated one.
-    const at = new ScriptedNativeAdapter([{ fail: overloadedFor(40) }, { text: 'zz ok' }]);
-    const events = await drive(native(at).streamYielding(NATIVE_REQUEST));
-    expect(at.sends).toBe(2);
-    const [complete] = ofType(events, 'complete');
-    expect(complete!.response.details.timing.retryDelaysMs).toEqual([40]);
+    const at = new ScriptedNativeAdapter([{ fail: overloadedFor(300_000) }, { text: 'zz ok' }]);
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      const done = drive(native(at, LONG_OVERLOADED).streamYielding(NATIVE_REQUEST));
+      for (let hop = 0; hop < 50 && vi.getTimerCount() === 0; hop++) {
+        await new Promise((resolve) => setImmediate(resolve));
+      }
+      expect(vi.getTimerCount()).toBe(1);
+      await vi.advanceTimersByTimeAsync(299_999);
+      expect(at.sends).toBe(1);
+      await vi.advanceTimersByTimeAsync(1);
+      const events = await done;
+      expect(at.sends).toBe(2);
+      const [complete] = ofType(events, 'complete');
+      expect(complete!.response.details.timing.retryDelaysMs).toEqual([300_000]);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

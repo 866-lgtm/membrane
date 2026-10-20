@@ -466,9 +466,10 @@ export interface YieldingStreamOptions {
    * ends the stream with an `error` event, carrying the provider's advice
    * (`retryable`, and a stated wait on `retryAfterMs`), and `hooks.onError`,
    * which is asked before each retry, isn't asked. For a caller whose own
-   * layer retries. Two sends stay: a refusal re-issue, which the call asks
-   * for with `refusalRetries`, and the one resend with refreshed credentials
-   * that an adapter with a credential resolver makes after an HTTP 401.
+   * layer retries. Two sends stay: a refusal re-issue, which a call in native
+   * tool mode asks for with `refusalRetries`, and the one resend with
+   * refreshed credentials that an adapter with a credential resolver makes
+   * after an HTTP 401.
    */
   retry?: boolean;
 

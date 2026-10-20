@@ -42,7 +42,11 @@ export interface RetryConfig {
   /** Backoff multiplier (default: 2) */
   backoffMultiplier: number;
 
-  /** Maximum retry delay (default: 30000) */
+  /**
+   * Longest wait of membrane's own backoff (default: 30000). A provider's
+   * stated wait (`retry-after`) is waited out up to a minute, or up to this
+   * where it's longer; a longer one goes to the caller, on `retryAfterMs`.
+   */
   maxRetryDelayMs: number;
 
   /**
@@ -72,7 +76,10 @@ export interface OverloadedRetryConfig {
   /** Backoff multiplier (default: 2) */
   backoffMultiplier: number;
 
-  /** Maximum overloaded retry delay (default: 300000 — 5 minutes) */
+  /**
+   * Longest overloaded retry delay (default: 300000 — 5 minutes). A stated
+   * wait is waited out up to this, or up to a minute where that's longer.
+   */
   maxRetryDelayMs: number;
 }
 
