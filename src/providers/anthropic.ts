@@ -35,7 +35,7 @@ import {
 import { runCallerCode, statusForProviderCode } from '../types/errors.js';
 import { flattenRootSchemaUnion } from './anthropic-tool-schema.js';
 import { isPlainObject } from '../utils/tool-schema.js';
-import { assertTerminalEventObserved, toolUseInputFromText, toolUseInputFromValue, isDeadlineAbort, deadlineTimeoutError, isToolCallBlock } from './utils.js';
+import { assertTerminalEventObserved, toolUseInputFromText, toolUseInputFromValue, isDeadlineAbort, deadlineTimeoutError, isToolCallBlock, isToolCallArgumentsDelta } from './utils.js';
 import { fetchWithCredentials, validateCredential, type CredentialContext, type CredentialResolver } from './credentials.js';
 import { CacheKeepalive, type CacheKeepaliveConfig } from '../cache-keepalive.js';
 
@@ -213,9 +213,9 @@ export function thinkingEnabled(request: ProviderRequest): boolean {
 // Blocks: the API sends each block's start, deltas and stop before the next
 // block's start, and a tool call's deltas carry only its arguments. The
 // first block event out of that order (a start while a block is open, or at
-// an index other than the next; a delta or stop for a block other than the
-// open one; a delta a tool call can't take) stops the loop applying block
-// events, with one
+// an index other than the next; a delta or stop while no block is open, or
+// for a block other than the open one; a delta a tool call can't take) stops
+// the loop applying block events, with one
 // warning: a block still open is finalized as cut off, that event and every
 // later block event are kept in unhandled, and every tool_use block in the
 // response is marked (unparseableInput), so the end_turn gate runs none of
@@ -666,7 +666,7 @@ export class AnthropicAdapter implements ProviderAdapter {
       let openBlockIndex = -1;
       // Block events come in the API's order: a start while no block is open,
       // at the next index, then that block's deltas (a tool call's carry only
-      // its arguments, isToolCallBlock) and its stop. A
+      // its arguments: isToolCallBlock, isToolCallArgumentsDelta) and its stop. A
       // stream that ends with a block open, as a max_tokens cut does, is in
       // order. Once an event isn't, the stream can't vouch for which call any
       // arguments belong to: see breakBlockOrder.
@@ -800,11 +800,12 @@ export class AnthropicAdapter implements ProviderAdapter {
           }
 
         } else if (event.type === 'content_block_delta') {
-          // In order only for the open block, and for a tool call only as its
-          // arguments (isToolCallBlock).
+          // In order only for the open block, so only while one is open (with
+          // none, openBlockIndex is -1, which an event's index can be too),
+          // and for a tool call only as its arguments.
           if (
-            blockOrderBroken || event.index !== openBlockIndex ||
-            (isToolCallBlock(contentBlocks[openBlockIndex]) && (event.delta as { type: string }).type !== 'input_json_delta')
+            blockOrderBroken || openBlockIndex < 0 || event.index !== openBlockIndex ||
+            (isToolCallBlock(contentBlocks[openBlockIndex]) && !isToolCallArgumentsDelta(event.delta))
           ) {
             breakBlockOrder(event);
           } else if (event.delta.type === 'text_delta') {
@@ -840,9 +841,9 @@ export class AnthropicAdapter implements ProviderAdapter {
           }
 
         } else if (event.type === 'content_block_stop') {
-          // In order only for the open block.
+          // In order only for the open block, so only while one is open.
           const stopped = (event as { index: number }).index;
-          if (blockOrderBroken || stopped !== openBlockIndex) {
+          if (blockOrderBroken || openBlockIndex < 0 || stopped !== openBlockIndex) {
             breakBlockOrder(event);
           } else {
             finalizeContentBlock(stopped, true);

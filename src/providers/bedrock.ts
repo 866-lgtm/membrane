@@ -27,7 +27,7 @@ import {
   withRawRequest,
 } from '../types/index.js';
 import { stripEmptyTextRequest } from '../utils/empty-text.js';
-import { createCombinedSignal, isDeadlineAbort, deadlineTimeoutError, assertTerminalEventObserved, toolUseInputFromText, toolUseInputFromValue, streamIndex, isEventObject, isToolCallBlock } from './utils.js';
+import { createCombinedSignal, isDeadlineAbort, deadlineTimeoutError, assertTerminalEventObserved, toolUseInputFromText, toolUseInputFromValue, streamIndex, isEventObject, isToolCallBlock, isToolCallArgumentsDelta } from './utils.js';
 import {
   INTERLEAVED_THINKING_BETA,
   THINKING_BINDING_BETA,
@@ -716,13 +716,15 @@ export class BedrockAdapter implements ProviderAdapter {
     // max_tokens never gets one, as in the Anthropic adapter.
     const stoppedBlocks = new Set<number>();
     let currentBlockIndex = -1;
-    // Block events come in the API's order, as the Anthropic adapter holds
-    // them to: a start while no block is open, for an index not used yet,
-    // then that block's deltas (a tool call's carry only its arguments,
-    // isToolCallBlock) and its stop. A stream that ends with a block open, as
-    // a max_tokens cut does, is in order. A block event after message_delta
-    // isn't applied: the Anthropic adapter stops reading there, so a block
-    // still open is cut off in both. The first event that isn't in order
+    // Block events come in the API's order: a start while no block is open,
+    // at the next index, then that block's deltas (a tool call's carry only
+    // its arguments: isToolCallBlock, isToolCallArgumentsDelta) and its stop.
+    // A start above the next index is placed, as it always was, and the slots
+    // it skips fail the call below as lost blocks; the Anthropic adapter takes
+    // that start as out of order instead. A stream that ends with a block
+    // open, as a max_tokens cut does, is in order. Reading stops at
+    // message_delta, as in the Anthropic adapter, so a block still open there
+    // is cut off in both. The first event that isn't in order
     // means the stream can't vouch for which call any arguments belong to:
     // no later block event is applied, a block still open stays unstopped
     // (marked below), and every tool_use block in the response is marked,
@@ -732,7 +734,7 @@ export class BedrockAdapter implements ProviderAdapter {
     // always was: until the next start, the deltas and stop after it join no
     // block rather than breaking block order, and a later block still fails
     // the call over the block the message lost. A start while a block is
-    // open, or for an index already used, breaks block order whatever it
+    // open, or at an index below the next, breaks block order whatever it
     // names.
     let skippedStart = false;
     const blockOpen = (): boolean =>
@@ -765,7 +767,7 @@ export class BedrockAdapter implements ProviderAdapter {
     let buffer = new Uint8Array(0);
 
     try {
-      while (true) {
+      read: while (true) {
         const { done, value } = await reader.read();
         if (done) break;
 
@@ -891,11 +893,7 @@ export class BedrockAdapter implements ProviderAdapter {
                 );
               }
 
-              if (sawTerminalEvent && (eventData.type === 'content_block_start' || eventData.type === 'content_block_delta' || eventData.type === 'content_block_stop')) {
-                // After message_delta a block event isn't applied, as the
-                // Anthropic adapter, which stops reading there, applies none:
-                // a block still open stays unstopped, and is marked below.
-              } else if (eventData.type === 'message_start' && eventData.message) {
+              if (eventData.type === 'message_start' && eventData.message) {
                 // Cache metrics ride the same usage objects as on the direct
                 // API. Dropping them (pre-2026-07-31) made caching look
                 // permanently inert on Bedrock streams: complete() surfaced
@@ -912,16 +910,18 @@ export class BedrockAdapter implements ProviderAdapter {
                   cacheReadTokens = startUsage.cache_read_input_tokens;
                 }
               } else if (eventData.type === 'content_block_start') {
-                // Order first: a start while a block is open, or for an index
-                // already used, breaks block order whatever it names. Then a
-                // block whose index names no slot (an absent index is slot 0,
-                // as streamIndex reads it), or that isn't an object, an array
-                // included, can't be placed: it's skipped, with the warning,
-                // and its deltas and stop join no block.
+                // Order first: a start while a block is open, or at an index
+                // below the next (one already used, or a slot a start above
+                // the next skipped), breaks block order whatever it names.
+                // Then a block whose index names no slot (an absent index is
+                // slot 0, as streamIndex reads it), or that isn't an object,
+                // an array included, can't be placed: it's skipped, with the
+                // warning, and its deltas and stop join no block, though a
+                // text delta's text still streams.
                 const startIndex = streamIndex(eventData.index);
                 const startBlock: unknown = eventData.content_block;
-                if (blockOrderBroken || blockOpen() || (startIndex !== undefined && contentBlocks[startIndex] !== undefined)) {
-                  breakBlockOrder('a content_block_start while a block is open or for an index already used');
+                if (blockOrderBroken || blockOpen() || (startIndex !== undefined && startIndex < contentBlocks.length)) {
+                  breakBlockOrder('a content_block_start while a block is open or at an index below the next');
                 } else if (startIndex === undefined || startBlock === null || typeof startBlock !== 'object' || Array.isArray(startBlock)) {
                   console.warn('[membrane:bedrock] Skipping malformed stream event:', 'a content_block_start that names no block');
                   currentBlockIndex = -1;
@@ -936,8 +936,9 @@ export class BedrockAdapter implements ProviderAdapter {
                 const deltaIndex = streamIndex((eventData as { index?: unknown }).index, currentBlockIndex);
                 if (blockOrderBroken || (!skippedStart && (!blockOpen() || deltaIndex !== currentBlockIndex))) {
                   breakBlockOrder('a content_block_delta for a block other than the open one');
-                } else if (blockOpen() && isToolCallBlock(contentBlocks[currentBlockIndex]) && eventData.delta?.type !== 'input_json_delta') {
-                  // A tool call's deltas carry only its arguments.
+                } else if (isToolCallBlock(contentBlocks[currentBlockIndex]) && !isToolCallArgumentsDelta(eventData.delta)) {
+                  // A tool call's deltas carry only its arguments. (After a
+                  // skipped start currentBlockIndex is -1, which holds no block.)
                   breakBlockOrder('a content_block_delta that a tool call can\'t take');
                 } else if (eventData.delta?.type === 'text_delta' && eventData.delta.text) {
                   fullText += eventData.delta.text;
@@ -977,8 +978,9 @@ export class BedrockAdapter implements ProviderAdapter {
                 if (skippedStart) {
                   // After a skipped start no block is open. A stop joins no
                   // block, as the skipped block's deltas do, whatever index it
-                  // names: nothing is applied or reported. (A block it names
-                  // can only be one already stopped.)
+                  // names, the skipped start's own slot included: nothing is
+                  // applied or reported, and a slot no block filled still
+                  // fails the call below.
                 } else if (blockOrderBroken || !blockOpen() || blockIdx !== currentBlockIndex) {
                   // A stop for no block, or for a block never started,
                   // included.
@@ -1034,6 +1036,9 @@ export class BedrockAdapter implements ProviderAdapter {
 
           // Remove processed message from buffer
           buffer = buffer.slice(totalLength);
+          // message_delta ends the message: as in the Anthropic adapter,
+          // nothing after it is read, and the finally lets the body go.
+          if (sawTerminalEvent) break read;
         }
       }
     } finally {
@@ -1141,8 +1146,9 @@ export class BedrockAdapter implements ProviderAdapter {
       if (block.type === 'text' && block.text) {
         content.push({ type: 'text', text: block.text });
       } else if (block.type === 'tool_use' && block.id && block.name) {
-        // The stream assembly's marker, which keeps the text as it came, wins
-        // over the value's JSON.
+        // The stream assembly's marker wins over the value's JSON: it holds
+        // the arguments as they came, or after a break in block order as JSON
+        // when they had parsed (ToolUseContent.unparseableInput).
         content.push({
           type: 'tool_use',
           id: block.id,

@@ -2044,9 +2044,9 @@ export class Membrane {
             // `input` reaches callers as the object ToolUseContent promises,
             // whatever the adapter gave.
             ...toolUseInputFromValue(item.input),
-            // Arguments that weren't a JSON object: the adapter's marker, with
-            // the text as it came, so a consumer can refuse the block instead
-            // of trusting `input`.
+            // The adapter's marker, present when `input` isn't the model's
+            // arguments (ToolUseContent.unparseableInput), so a consumer can
+            // refuse the block instead of trusting `input`.
             ...(item.unparseableInput !== undefined ? { unparseableInput: item.unparseableInput } : {}),
             ...(item.rawItem ? { rawItem: item.rawItem } : {}),
           });

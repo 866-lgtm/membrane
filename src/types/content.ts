@@ -157,12 +157,13 @@ export interface ToolUseContent {
    * than text (Gemini's, or an `input` that isn't an object), it holds that
    * value as JSON. It is also set on every tool_use block of a streamed
    * Anthropic or Bedrock response whose block events broke the API's order
-   * (a block started while another was open or at an index other than the
-   * next, an event for a block other than the open one, or a delta a tool
-   * call can't take), holding the arguments the
+   * (a block started while another was open or out of index order, a delta
+   * or stop while no block was open or for a block other than the open one,
+   * or a delta a tool call can't take), holding the arguments the
    * call had, as JSON when they had parsed: such a stream can't vouch for
    * which call any arguments belong to, so none of its calls is taken as
-   * complete.
+   * complete. (In Bedrock a start above the next index fails the call
+   * instead, over the block it skipped.)
    * `input` is then `{}`, or for a streamed Anthropic or Bedrock call
    * whatever its content_block_start carried: a wire-valid tool call with
    * empty arguments, indistinguishable from a genuine no-arg call
