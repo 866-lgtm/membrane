@@ -35,6 +35,6 @@
   server tool calls as they streamed, since they ran on the API's side: one
   that stopped keeps its input. Citations are the exception to "not
   applied": the SDK appends each one to the `citations` array a text block's
-  start carried, which the adapter's block shares, so one still lands there.
-  A stream that ends with a block open, as a `max_tokens` cut does, is in
-  order, as before.
+  start carried, which the adapter's block shares, so one still lands there
+  when the start carried an array. A stream that ends with a block open, as
+  a `max_tokens` cut does, is in order, as before.

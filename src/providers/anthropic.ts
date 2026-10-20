@@ -225,7 +225,9 @@ export function thinkingEnabled(request: ProviderRequest): boolean {
 // input, and one still open is marked as cut off, as before. Citations are
 // the exception to "not applied": the SDK appends each one to the array a
 // text block's start carried, which this loop's copy of the block shares, so
-// a citation lands in such a block whatever the order. A stream in order is
+// a citation lands in such a block whatever the order (a start whose
+// citations is null or absent shares none, and the SDK's new array isn't the
+// loop's). A stream in order is
 // unchanged, and so is one that ends with a block open, as a max_tokens cut
 // does.
 // message_stop is not kept: the loop ends on message_delta, by design (the
