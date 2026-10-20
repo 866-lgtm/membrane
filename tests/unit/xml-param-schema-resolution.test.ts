@@ -29,7 +29,7 @@ import { readToolSchema } from '../../src/utils/tool-schema.js';
 import { AnthropicXmlFormatter } from '../../src/formatters/anthropic-xml.js';
 import type { ToolDefinition, NormalizedMessage } from '../../src/types/index.js';
 
-/** Every tool this file builds, for the check that the two readings agree (shelf-963). */
+/** Every tool this file builds with `toolWith`, for the check that the two readings agree. */
 const fixtures: ToolDefinition[] = [];
 
 function toolWith(name: string, inputSchema: ToolDefinition['inputSchema']): ToolDefinition {
@@ -633,7 +633,7 @@ describe('an enum or const beside a type that admits null (#150)', () => {
   });
 });
 
-describe('values behind a $ref, in branches and across root alternatives (shelf-963)', () => {
+describe('values behind a $ref, in branches and across root alternatives', () => {
   const color = { enum: ['zz-red', 'zz-green'], title: 'Color', type: 'string' };
   const tool = toolWith('zz_values_tool', {
     type: 'object',
@@ -1533,8 +1533,8 @@ describe("enum values the attribute can't show exactly (#176)", () => {
   });
 });
 
-describe("the instructions' values and the kinds reading agree (shelf-963)", () => {
-  // Runs last, over every tool this file builds, so the values the line lists
+describe("the instructions' values and the kinds reading agree", () => {
+  // Runs last, over every tool `toolWith` builds, so the values the line lists
   // can't drift from what its type and nullable mark say. A parameter of
   // several kinds renders no type, so its kinds aren't checked here; its own
   // tests pin its list.
