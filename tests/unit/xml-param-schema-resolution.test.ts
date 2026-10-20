@@ -890,6 +890,10 @@ describe('values behind a $ref, in branches and across root alternatives (shelf-
     expect(renderedTools(diamond)).toContain('<parameter name="fld1" type="string" enum="zz-a,zz-b">');
   });
 
+  // 300,000 values is the point: a union that spread them into `push` would
+  // throw RangeError past about 125,000 on Node 24. Reading them takes under
+  // a second alone but took longer than vitest's 5 s default on a loaded host,
+  // so the test states its own timeout.
   it('reads a very long enum whole', () => {
     const long = Array.from({ length: 300000 }, (_, index) => `zz-${index}`);
     const reading = readToolSchema({
@@ -898,7 +902,7 @@ describe('values behind a $ref, in branches and across root alternatives (shelf-
     });
     expect(reading.failure).toBeUndefined();
     expect(reading.parameters.get('fld1')?.enum).toHaveLength(300001);
-  });
+  }, 30_000);
 
   it('leaves the parse as it was', () => {
     const { result, messages } = captureWarnings(() => [
