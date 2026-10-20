@@ -22,6 +22,11 @@
 // We snapshot the exact wire request of each real call and replay it verbatim
 // with `max_tokens: 0`, which runs prefill only: content `[]`, stop_reason
 // `max_tokens`, zero output tokens billed, and the cache entry refreshed.
+// A call is snapshotted only once the provider is known to have its prefix
+// (the adapter records at `message_start`, or once the SDK has a non-streamed
+// response): a request that failed before then isn't known to be cached, and
+// one the provider refused for what its prefix holds would have its replays
+// refused too.
 //
 // ⚠️ THE REPLAY MUST BE BYTE-IDENTICAL ABOVE THE LAST BREAKPOINT.
 // Prompt caching is a prefix match, and the API's invalidation hierarchy means
@@ -192,9 +197,9 @@ export function ineligibleReason(wire: Record<string, unknown>): string | null {
 /**
  * Walk system + tools + messages for cache_control markers.
  *
- * This runs on every outbound request, and `messages` on a large resident is
- * megabytes of blocks — so it short-circuits the moment it finds a 1h marker,
- * which is the answer in the overwhelmingly common case.
+ * This runs on each request the keepalive records, and `messages` on a large
+ * resident is megabytes of blocks — so it short-circuits the moment it finds a
+ * 1h marker, which is the answer in the overwhelmingly common case.
  */
 function scanCacheMarkers(wire: Record<string, unknown>): { any: boolean; oneHour: boolean } {
   let any = false;
@@ -257,7 +262,8 @@ export class CacheKeepalive {
     if (!this.cfg.enabled) this.stopped = true;
   }
 
-  /** Record a real outbound request. Cheap; called on every LLM call. */
+  /** Record a real request the provider is known to have begun answering, so
+   *  its prefix is cached. Cheap; called once per call that gets that far. */
   record(
     wire: Record<string, unknown>,
     headers: Record<string, string> | undefined,
@@ -310,6 +316,10 @@ export class CacheKeepalive {
       const now = Date.now();
       for (const [key, lin] of [...this.lineages]) {
         if (this.stopped) break;
+        // An earlier poke of this tick took a round trip, and a real call may
+        // have replaced this key's lineage meanwhile (fresh, so not due) or an
+        // ineligible shape dropped it: act only on the one still recorded.
+        if (this.lineages.get(key) !== lin) continue;
         // The keepalive window is measured from the last REAL request, so pokes
         // can never extend their own mandate.
         if (now - lin.lastRealAt >= this.cfg.maxIdleMs) {
@@ -368,7 +378,9 @@ export class CacheKeepalive {
           writeTokens: wrote,
         });
         if (lin.ineffective >= this.cfg.maxIneffective) {
-          this.lineages.delete(key);
+          // Only this lineage: a real call during the poke may have recorded a
+          // fresh one under the same key, which keeps its keepalive.
+          if (this.lineages.get(key) === lin) this.lineages.delete(key);
         } else {
           lin.lastTouchAt = Date.now();
         }
