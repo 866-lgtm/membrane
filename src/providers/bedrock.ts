@@ -27,7 +27,7 @@ import {
   withRawRequest,
 } from '../types/index.js';
 import { stripEmptyTextRequest } from '../utils/empty-text.js';
-import { createCombinedSignal, isDeadlineAbort, deadlineTimeoutError, assertTerminalEventObserved, toolUseInputFromText, toolUseInputFromValue, streamIndex, isEventObject } from './utils.js';
+import { createCombinedSignal, isDeadlineAbort, deadlineTimeoutError, assertTerminalEventObserved, toolUseInputFromText, toolUseInputFromValue, streamIndex, isEventObject, isToolCallBlock } from './utils.js';
 import {
   INTERLEAVED_THINKING_BETA,
   THINKING_BINDING_BETA,
@@ -718,8 +718,11 @@ export class BedrockAdapter implements ProviderAdapter {
     let currentBlockIndex = -1;
     // Block events come in the API's order, as the Anthropic adapter holds
     // them to: a start while no block is open, for an index not used yet,
-    // then that block's deltas and its stop. A stream that ends with a block
-    // open, as a max_tokens cut does, is in order. The first event that isn't
+    // then that block's deltas (a tool call's carry only its arguments,
+    // isToolCallBlock) and its stop. A stream that ends with a block open, as
+    // a max_tokens cut does, is in order. A block event after message_delta
+    // isn't applied: the Anthropic adapter stops reading there, so a block
+    // still open is cut off in both. The first event that isn't in order
     // means the stream can't vouch for which call any arguments belong to:
     // no later block event is applied, a block still open stays unstopped
     // (marked below), and every tool_use block in the response is marked,
@@ -888,7 +891,11 @@ export class BedrockAdapter implements ProviderAdapter {
                 );
               }
 
-              if (eventData.type === 'message_start' && eventData.message) {
+              if (sawTerminalEvent && (eventData.type === 'content_block_start' || eventData.type === 'content_block_delta' || eventData.type === 'content_block_stop')) {
+                // After message_delta a block event isn't applied, as the
+                // Anthropic adapter, which stops reading there, applies none:
+                // a block still open stays unstopped, and is marked below.
+              } else if (eventData.type === 'message_start' && eventData.message) {
                 // Cache metrics ride the same usage objects as on the direct
                 // API. Dropping them (pre-2026-07-31) made caching look
                 // permanently inert on Bedrock streams: complete() surfaced
@@ -929,6 +936,9 @@ export class BedrockAdapter implements ProviderAdapter {
                 const deltaIndex = streamIndex((eventData as { index?: unknown }).index, currentBlockIndex);
                 if (blockOrderBroken || (!skippedStart && (!blockOpen() || deltaIndex !== currentBlockIndex))) {
                   breakBlockOrder('a content_block_delta for a block other than the open one');
+                } else if (blockOpen() && isToolCallBlock(contentBlocks[currentBlockIndex]) && eventData.delta?.type !== 'input_json_delta') {
+                  // A tool call's deltas carry only its arguments.
+                  breakBlockOrder('a content_block_delta that a tool call can\'t take');
                 } else if (eventData.delta?.type === 'text_delta' && eventData.delta.text) {
                   fullText += eventData.delta.text;
                   callbacks.onChunk(eventData.delta.text);

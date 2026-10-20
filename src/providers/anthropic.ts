@@ -35,7 +35,7 @@ import {
 import { runCallerCode, statusForProviderCode } from '../types/errors.js';
 import { flattenRootSchemaUnion } from './anthropic-tool-schema.js';
 import { isPlainObject } from '../utils/tool-schema.js';
-import { assertTerminalEventObserved, toolUseInputFromText, toolUseInputFromValue, isDeadlineAbort, deadlineTimeoutError } from './utils.js';
+import { assertTerminalEventObserved, toolUseInputFromText, toolUseInputFromValue, isDeadlineAbort, deadlineTimeoutError, isToolCallBlock } from './utils.js';
 import { fetchWithCredentials, validateCredential, type CredentialContext, type CredentialResolver } from './credentials.js';
 import { CacheKeepalive, type CacheKeepaliveConfig } from '../cache-keepalive.js';
 
@@ -211,9 +211,11 @@ export function thinkingEnabled(request: ProviderRequest): boolean {
 // a type the loop reads.
 //
 // Blocks: the API sends each block's start, deltas and stop before the next
-// block's start. The first block event out of that order (a start while a
-// block is open, or for an index already used; a delta or stop for a block
-// other than the open one) stops the loop applying block events, with one
+// block's start, and a tool call's deltas carry only its arguments. The
+// first block event out of that order (a start while a block is open, or at
+// an index other than the next; a delta or stop for a block other than the
+// open one; a delta a tool call can't take) stops the loop applying block
+// events, with one
 // warning: a block still open is finalized as cut off, that event and every
 // later block event are kept in unhandled, and every tool_use block in the
 // response is marked (unparseableInput), so the end_turn gate runs none of
@@ -661,7 +663,8 @@ export class AnthropicAdapter implements ProviderAdapter {
       // straight to message_delta — no content_block_stop at all.
       let openBlockIndex = -1;
       // Block events come in the API's order: a start while no block is open,
-      // for an index not used yet, then that block's deltas and its stop. A
+      // at the next index, then that block's deltas (a tool call's carry only
+      // its arguments, isToolCallBlock) and its stop. A
       // stream that ends with a block open, as a max_tokens cut does, is in
       // order. Once an event isn't, the stream can't vouch for which call any
       // arguments belong to: see breakBlockOrder.
@@ -781,8 +784,9 @@ export class AnthropicAdapter implements ProviderAdapter {
           serviceTier = typeof usage.service_tier === 'string' ? usage.service_tier : undefined;
 
         } else if (event.type === 'content_block_start') {
-          // In order only while no block is open, for an index not used yet.
-          if (blockOrderBroken || openBlockIndex >= 0 || contentBlocks[event.index] !== undefined) {
+          // In order only while no block is open, at the next index: that one
+          // condition also refuses an index skipped, negative or not a number.
+          if (blockOrderBroken || openBlockIndex >= 0 || event.index !== contentBlocks.length) {
             breakBlockOrder(event);
           } else {
             currentBlockIndex = event.index;
@@ -794,8 +798,12 @@ export class AnthropicAdapter implements ProviderAdapter {
           }
 
         } else if (event.type === 'content_block_delta') {
-          // In order only for the open block.
-          if (blockOrderBroken || event.index !== openBlockIndex) {
+          // In order only for the open block, and for a tool call only as its
+          // arguments (isToolCallBlock).
+          if (
+            blockOrderBroken || event.index !== openBlockIndex ||
+            (isToolCallBlock(contentBlocks[openBlockIndex]) && (event.delta as { type: string }).type !== 'input_json_delta')
+          ) {
             breakBlockOrder(event);
           } else if (event.delta.type === 'text_delta') {
             const chunk = event.delta.text;

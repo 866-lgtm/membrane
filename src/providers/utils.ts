@@ -1,5 +1,6 @@
 import { TimeoutAbortError, errorFromProviderStatus, networkError } from '../types/errors.js';
 import { imageForRequest, urlImageForRequest } from '../utils/image-media.js';
+import { isAnthropicServerBlock } from '../utils/anthropic-server-blocks.js';
 
 interface StreamErrorFrameFields {
   code?: unknown;
@@ -238,6 +239,20 @@ export function streamIndex(value: unknown, absent = 0): number | undefined {
   if (value === undefined || value === null) return absent;
   const index = typeof value === 'string' && /^(?:0|[1-9]\d*)$/.test(value) ? Number(value) : value;
   return typeof index === 'number' && Number.isInteger(index) && index >= 0 && index <= MAX_ARRAY_INDEX ? index : undefined;
+}
+
+/**
+ * Whether a streamed content block is a tool call: a client tool's
+ * (tool_use), or a server tool's (server_tool_use, mcp_tool_use: an
+ * Anthropic server block that carries an input). The API streams only its
+ * arguments to it, as input_json_delta, so the stream adapters take any
+ * other delta for it as out of the API's block order. Text and thinking
+ * blocks have gained delta types (citations_delta, signature_delta), so no
+ * such check is made of them.
+ */
+export function isToolCallBlock(block: unknown): boolean {
+  if (block === null || typeof block !== 'object') return false;
+  return (block as { type?: unknown }).type === 'tool_use' || (isAnthropicServerBlock(block) && 'input' in block);
 }
 
 /**

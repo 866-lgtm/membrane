@@ -157,8 +157,9 @@ export interface ToolUseContent {
    * than text (Gemini's, or an `input` that isn't an object), it holds that
    * value as JSON. It is also set on every tool_use block of a streamed
    * Anthropic or Bedrock response whose block events broke the API's order
-   * (a block started while another was open or at an index already used, or
-   * an event for a block other than the open one), holding the arguments the
+   * (a block started while another was open or at an index other than the
+   * next, an event for a block other than the open one, or a delta a tool
+   * call can't take), holding the arguments the
    * call had, as JSON when they had parsed: such a stream can't vouch for
    * which call any arguments belong to, so none of its calls is taken as
    * complete.

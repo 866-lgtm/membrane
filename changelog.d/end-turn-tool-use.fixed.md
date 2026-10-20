@@ -17,19 +17,24 @@
   `toolUseIds`, `treatedAsToolUse`, `model`, `messageId`, `requestId`),
   which keeps the round's own stop token. `details.stop` describes the
   response's final round. The Anthropic and Bedrock stream adapters now hold
-  block events to the API's order: a start while no block is open, for an
-  index not used yet, then that block's deltas and its stop. The first event
-  out of that order (such as a block left open when the next one starts, a
-  late stop or delta, or a second start for an index) means the stream can't
-  vouch for which call any arguments belong to: no later block event is
-  applied, a block still open is finalized as cut off, and every `tool_use`
-  block in the response is marked (`unparseableInput`; one not already
-  marked also gets `input` `{}`), so the gate runs none of them on an
-  `end_turn` round, and on a `tool_use` round the caller gets them marked.
-  Each adapter warns once, and the Anthropic adapter keeps those events in
-  `raw.provider_events.unhandled`. The marking leaves server tool calls as
-  they streamed, since they ran on the API's side: one that stopped keeps
-  its input. Citations are the exception to "not applied": the SDK appends
-  each one to the `citations` array a text block's start carried, which the
-  adapter's block shares, so one still lands there. A stream that ends with
-  a block open, as a `max_tokens` cut does, is in order, as before.
+  block events to the API's order: a start while no block is open, at the
+  next index (in Bedrock, at an index not used yet), then that block's
+  deltas, a tool call's being only its arguments, and its stop. The first
+  event out of that order (such as a block left open when the next one
+  starts, a late stop or delta, a second start for an index, or a text delta
+  in a tool call) means the stream can't vouch for which call any arguments
+  belong to: no later block event is applied, a block still open is
+  finalized as cut off, and every `tool_use` block in the response is marked
+  (`unparseableInput`; one not already marked also gets `input` `{}`), so
+  the gate runs none of them on an `end_turn` round, and on a `tool_use`
+  round the caller gets them marked. Each adapter warns once, and the
+  Anthropic adapter keeps those events in `raw.provider_events.unhandled`.
+  Neither adapter applies a block event after `message_delta`: the Anthropic
+  adapter stops reading there, and Bedrock leaves them unapplied, so a call
+  still open at that point is marked as cut off in both. The marking leaves
+  server tool calls as they streamed, since they ran on the API's side: one
+  that stopped keeps its input. Citations are the exception to "not
+  applied": the SDK appends each one to the `citations` array a text block's
+  start carried, which the adapter's block shares, so one still lands there.
+  A stream that ends with a block open, as a `max_tokens` cut does, is in
+  order, as before.

@@ -93,6 +93,7 @@ const toolUseEnd = { type: 'message_delta', delta: { stop_reason: 'tool_use', st
 const toolStart = (index: number, id: string) => ({ type: 'content_block_start', index, content_block: { type: 'tool_use', id, name: 'zz_lookup', input: {} } });
 const argsDelta = (index: number, partial_json: string) => ({ type: 'content_block_delta', index, delta: { type: 'input_json_delta', partial_json } });
 const blockStop = (index: number) => ({ type: 'content_block_stop', index });
+const textDelta = (index: number, text: string) => ({ type: 'content_block_delta', index, delta: { type: 'text_delta', text } });
 
 /**
  * Block events out of the API's order, each stream with what it must leave:
@@ -130,6 +131,10 @@ const outOfOrder: Array<[string, unknown[], Array<{ id: string; unparseableInput
   ['a stop for a block never started, and a call after it',
     [toolStart(0, 'toolu_zz_a'), argsDelta(0, '{"query":"a"}'), blockStop(0), blockStop(1), toolStart(1, 'toolu_zz_b'), argsDelta(1, '{"query":"b"}'), blockStop(1)],
     [{ id: 'toolu_zz_a', unparseableInput: '{"query":"a"}' }], 4, ['toolu_zz_a', 'toolu_zz_a']],
+  // A tool call's deltas carry only its arguments (Anarchid's R1-1).
+  ['a text delta in a tool call',
+    [toolStart(0, 'toolu_zz_a'), textDelta(0, '{"query":"x"}'), blockStop(0)],
+    [{ id: 'toolu_zz_a', unparseableInput: '' }], 2, ['toolu_zz_a']],
 ];
 
 function finalText(id: string) {
@@ -491,6 +496,43 @@ describe('tool calls the provider stopped with end_turn', () => {
     expect(warnings.filter((w) => w.includes('every tool_use block in the response is marked'))).toHaveLength(1);
   });
 
+  // A start is in order only at the next index (Anarchid's R1-3): before, a
+  // skipped index left a hole that parsing the content threw on, and a start
+  // at -1 dropped its block unseen.
+  it.each([
+    ['skips an index', 2],
+    ['is negative', -1],
+    ['is a string', '1'],
+  ])('a start whose index %s breaks block order: the call before it is marked, and nothing throws', async (_name, index) => {
+    const warnings = captureWarnings();
+    const later = completeToolCall(index as number, 'toolu_zz_b', '{"query":"b"}');
+    const { res, chunks } = await anthropicStream([messageStart('msg_zz_76'), ...completeToolCall(0, 'toolu_zz_a', '{"query":"a"}'), ...later, endTurnDelta]);
+    expect(res.content).toEqual([{ type: 'tool_use', id: 'toolu_zz_a', name: 'zz_lookup', input: {}, unparseableInput: '{"query":"a"}' }]);
+    expect(res.raw.provider_events.unhandled).toEqual(later);
+    expect(chunks).toEqual([]);
+    expect(warnings.filter((w) => w.includes('every tool_use block in the response is marked'))).toHaveLength(1);
+  });
+
+  it('a text delta in a server tool call breaks block order too: the call, still open, is marked as cut off, and nothing is streamed', async () => {
+    const warnings = captureWarnings();
+    const { res, chunks } = await anthropicStream([
+      messageStart('msg_zz_75'),
+      { type: 'content_block_start', index: 0, content_block: { type: 'server_tool_use', id: 'srvtoolu_zz_t', name: 'web_search', input: {} } },
+      textDelta(0, 'zz text'), blockStop(0),
+      endTurnDelta,
+    ]);
+    expect(res.content).toEqual([{ type: 'server_tool_use', id: 'srvtoolu_zz_t', name: 'web_search', input: {}, unparseableInput: '' }]);
+    expect(chunks).toEqual([]);
+    expect(warnings.filter((w) => w.includes('every tool_use block in the response is marked'))).toHaveLength(1);
+  });
+
+  it('a stop after message_delta is never read: the call still open there is marked as cut off, as in Bedrock, with no warning', async () => {
+    const warnings = captureWarnings();
+    const { res } = await anthropicStream([messageStart('msg_zz_77'), toolStart(0, 'toolu_zz_l'), argsDelta(0, '{"query":"a"}'), endTurnDelta, blockStop(0)]);
+    expect(res.content).toEqual([{ type: 'tool_use', id: 'toolu_zz_l', name: 'zz_lookup', input: {}, unparseableInput: '{"query":"a"}' }]);
+    expect(warnings.filter((w) => w.includes('block order'))).toEqual([]);
+  });
+
   it('a server tool call that finished before a break keeps its input: it ran on the API\'s side; the tool_use call beside it is marked', async () => {
     captureWarnings();
     const { res } = await anthropicStream([
@@ -685,6 +727,20 @@ describe('the Bedrock adapter: block events out of order', () => {
     // Each call applied is reported at its start, and at its stop when that was applied; nothing after the break is.
     expect(reported).toEqual(bedrockReports);
     expect(warnings.filter((w) => w.includes('every tool_use block in the response is marked'))).toHaveLength(1);
+  });
+
+  // As in the Anthropic adapter, which stops reading at message_delta
+  // (Anarchid's R1-2): before, a stop there finished the call, unmarked.
+  it.each([
+    ['a stop', [toolStart(0, 'toolu_zz_l'), argsDelta(0, '{"query":"a"}'), endTurnDelta, blockStop(0)],
+      [{ type: 'tool_use', id: 'toolu_zz_l', name: 'zz_lookup', input: {}, unparseableInput: '{"query":"a"}' }]],
+    ['a start, its arguments and its stop', [...completeToolCall(0, 'toolu_zz_l', '{"query":"a"}'), endTurnDelta, ...completeToolCall(1, 'toolu_zz_m', '{"query":"b"}')],
+      [{ type: 'tool_use', id: 'toolu_zz_l', name: 'zz_lookup', input: { query: 'a' } }]],
+  ])('%s after message_delta is not applied: a call still open there is marked as cut off, with no warning', async (_name, events, expected) => {
+    const warnings = captureWarnings();
+    const res = await bedrockStream([messageStart('msg_zz_84'), ...events]);
+    expect(res.content).toEqual(expected);
+    expect(warnings.filter((w) => w.includes('block order') || w.includes('every tool_use block'))).toEqual([]);
   });
 
   it.each([
