@@ -8,11 +8,12 @@
   - **Migration:** none, to keep a call working. `retry: { maxRetries: 1 }`
     keeps one send for these errors, and `retry: false` on a call turns off
     every retry membrane would make on it.
-  - **Siblings:** context-manager 0.17.1 depends on `^0.6.0`, which admits a
-    0.6.x patch, and calls `complete()` without `retry`, under a backoff of its
-    own. agent-framework 0.23.1 and connectome-host 0.10.2 depend on
-    `^0.5.87`, which admits no 0.6.x. Released as a minor, this reaches each
-    sibling when it raises its range.
+  - **Siblings:** connectome-host builds the `Membrane` its agents use, and
+    0.10.2 depends on `^0.5.87`, which admits no 0.6.x. agent-framework and
+    context-manager build none: their calls run on the `Membrane` their host
+    passes in, so the host's range decides, whatever their own (agent-framework
+    0.23.1's `^0.5.87`, context-manager 0.17.1's `^0.6.0`). context-manager
+    calls `complete()` without `retry`.
   - **Unchanged:** what a call whose first send succeeds sends and returns. A
     call that has delivered anything is never sent again.
 - **Callers with a retry layer of their own,** such as a framework that
@@ -25,8 +26,10 @@
     with `retryable` and any stated wait on `retryAfterMs`. Two sends stay: a
     refusal re-issue you ask for with `refusalRetries`, and a credential
     resolver's one resend after a 401.
-  - **Siblings:** agent-framework retries its turns so, and its range
-    (`^0.5.87`) admits no 0.6.x.
+  - **Siblings:** agent-framework retries its turns so, and context-manager's
+    compression lane has a backoff of its own that also paces on a stated
+    wait. Neither passes `retry` today. Both call through the `Membrane` their
+    host passes in, and connectome-host's `^0.5.87` admits no 0.6.x.
   - **Unchanged:** the error your layer receives, and how it is classified.
 - **`hooks.onError` users:** it is now asked before each retry on
   `streamYielding()` too, and on every entry point its `attempt` counts the
@@ -43,8 +46,8 @@
   connect timeout the same way as a timeout on a request already sent, which
   membrane doesn't spend another deadline on.
   - **Migration:** retry a `timeout` yourself where a stalled connect is likely.
-  - **Siblings:** context-manager's `^0.6.0` admits a 0.6.x patch;
-    agent-framework's and connectome-host's `^0.5.87` admit no 0.6.x.
+  - **Siblings:** connectome-host, which builds the `Membrane` the other two
+    call through, depends on `^0.5.87`, which admits no 0.6.x.
   - **Unchanged:** on the other adapters, on Node, a connect timeout is
     retried like any connection failure.
 - **Callers who relied on the 429 floor's five attempts:** an error whose
@@ -57,8 +60,8 @@
   a minute, though the base schedule's own backoff stops at 30 seconds.
   - **Migration:** pace on `retryAfterMs`, or raise `retry.maxRetryDelayMs`
     to have longer stated waits waited out.
-  - **Siblings:** context-manager's `^0.6.0` admits a 0.6.x patch;
-    agent-framework's and connectome-host's `^0.5.87` admit no 0.6.x.
+  - **Siblings:** connectome-host, which builds the `Membrane` the other two
+    call through, depends on `^0.5.87`, which admits no 0.6.x.
   - **Unchanged:** a 429 that states no wait still gets five attempts.
 - **Callers who build the `retry` config:** a field that isn't a finite number
   of at least 0 is now refused when the `Membrane` is constructed, with a

@@ -263,9 +263,10 @@ export interface StreamOptions {
   onBlock?: OnBlockCallback;
 
   /**
-   * Called with raw provider request before each send (for logging). A
-   * request membrane sends again after a failure calls it again, so it counts
-   * sends, not rounds.
+   * Called with raw provider request before each attempt (for logging). A
+   * request membrane retries after a failure calls it again, so it counts
+   * attempts, not rounds. A credential resolver's resend after an HTTP 401 is
+   * part of the attempt it follows, and doesn't call it again.
    */
   onRequest?: OnRequestCallback;
 
@@ -354,8 +355,9 @@ export interface CompleteOptions {
   requestId?: string;
 
   /**
-   * Called with raw provider request before each send (for logging). A
-   * request membrane sends again after a failure calls it again.
+   * Called with raw provider request before each attempt (for logging). A
+   * request membrane retries after a failure calls it again; a credential
+   * resolver's resend after an HTTP 401 doesn't.
    */
   onRequest?: OnRequestCallback;
 
