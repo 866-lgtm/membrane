@@ -311,8 +311,8 @@ export interface CompleteOptions {
 
   /**
    * Re-issue the request when it ends with `stop_reason: 'refusal'`, up to
-   * this many times. Default 0 (off); a value that isn't a finite number
-   * asks for none.
+   * this many times. Default 0 (off); a value that isn't a finite number of
+   * at least 0 asks for none.
    *
    * Safe and invisible on this path: nothing has been emitted to the caller
    * yet, so a discarded attempt leaves no trace beyond its output tokens

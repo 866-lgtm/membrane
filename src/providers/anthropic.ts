@@ -538,7 +538,9 @@ export class AnthropicAdapter implements ProviderAdapter {
       const stream = await session.client.messages.stream(anthropicRequest, {
         signal: session.signal,
         headers: live,
-        // Membrane is the one retry layer: the SDK client sends this once.
+        // Membrane is the one retry layer: the SDK client makes one attempt
+        // at this request, a credential resolver's resend after a 401 inside
+        // it.
         maxRetries: 0,
       });
 

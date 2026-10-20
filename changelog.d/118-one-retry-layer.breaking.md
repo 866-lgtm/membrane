@@ -45,8 +45,8 @@
   - **Siblings:** none of the three sets `hooks.onError`.
   - **Unchanged:** returning `'abort'` ends the call with the error.
 - **`AnthropicAdapter` callers who relied on its SDK client's retries of a
-  connect timeout:** a connect timeout now reaches you after one send, as a
-  retryable `timeout`, where the SDK sent it three times. The SDK reports a
+  connect timeout:** a connect timeout now reaches you after one attempt, as
+  a retryable `timeout`, where the SDK made three. The SDK reports a
   connect timeout the same way as a timeout on a request already sent, which
   membrane doesn't spend another deadline on.
   - **Migration:** retry a `timeout` yourself where a stalled connect is likely.

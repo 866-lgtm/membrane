@@ -770,6 +770,27 @@ describe('refusalRetries that isn\'t a finite number asks for no re-issue', () =
   });
 });
 
+describe('a refusal re-issue in a later round re-issues that round only', () => {
+  it('streamYielding(): the earlier round stands, and only the refused attempt is dropped', async () => {
+    const adapter = new ScriptedNativeAdapter([
+      { text: 'zz round one', toolCall: 'zz_call_1' },
+      { refuse: 'zz refused' },
+      { text: 'zz round two' },
+    ]);
+    const events = await drive(native(adapter).streamYielding(NATIVE_REQUEST, { refusalRetries: 1 }));
+
+    expect(adapter.sends).toBe(3);
+    const order = events.map((e) => e.type);
+    // The retrying event belongs to the second round: the first had already
+    // ended with its tool calls.
+    expect(order.indexOf('retrying')).toBeGreaterThan(order.indexOf('tool-calls'));
+    const [complete] = ofType(events, 'complete');
+    expect(complete!.response.rawAssistantText).toContain('zz round one');
+    expect(complete!.response.rawAssistantText).toContain('zz round two');
+    expect(complete!.response.rawAssistantText).not.toContain('zz refused');
+  });
+});
+
 describe('a stated wait longer than its ceiling is given to the caller, not retried inside', () => {
   // A schedule waits out a stated wait up to a minute, or up to its own
   // maxRetryDelayMs where that's longer. SCHEDULES caps both schedules' own

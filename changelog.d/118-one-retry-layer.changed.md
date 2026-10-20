@@ -1,9 +1,10 @@
 - Membrane is now the one layer that retries. `AnthropicAdapter`'s SDK client
   makes one attempt at each request membrane makes. Its own retries are off:
   two by default, inside each of membrane's attempts, on a 408, 409, 429 or
-  5xx response and on a connection failure. So with `retry: false` a failure
-  reaches the caller after one send (two, when a credential resolver
-  refreshes after a 401), and a completed response's
+  5xx response and on a connection failure. So with `retry: false` membrane
+  retries none of a call's failed requests: a failure reaches the caller
+  after one attempt at the request that failed, inside which a credential
+  resolver may resend once after a 401. A completed response's
   `details.timing.attempts` and `retryDelaysMs` count every attempt and every
   wait, none of them hidden inside the SDK. The keepalive's replays keep the
   SDK's default.

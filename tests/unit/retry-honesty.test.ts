@@ -239,7 +239,7 @@ describe('the retry config: a field left out takes its default, and a value that
 
   it('a field given as undefined takes its default', async () => {
     // A 5xx gets retry.maxRetries attempts, three by default. Before, the
-    // undefined replaced the default and the call retried without end.
+    // undefined replaced the default and the call wasn't retried at all.
     const adapter = new FailingAdapter(10, () => serverError('zz internal', 503));
     adapter.queueResponse('zz-never');
     const membrane = new Membrane(adapter, { retry: { ...FAST, maxRetries: undefined } });
