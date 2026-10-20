@@ -7,7 +7,8 @@
  *     JSON type its declaration admits;
  *   - the XML tool-definition renderer (formatters/anthropic-xml.ts, through
  *     `toolDefinitionForPrompt`) tells the model each parameter's type,
- *     nullability, requiredness and the values it takes;
+ *     nullability, requiredness and, where it can show each exactly, the
+ *     values it takes;
  *   - the Anthropic native wire (providers/anthropic-tool-schema.ts) merges a
  *     root-level union into one object schema.
  *
@@ -19,8 +20,8 @@
  * marked nullable only where null survives that; the parser still reads a
  * written null by the type alone (#150). The renderer also lists the values
  * a parameter's declaring nodes, `$ref`s and branches name ({@link valuesBy}),
- * which the parser doesn't read. The native flattening shares
- * {@link rootUnionOf} (which root unions
+ * where it can show each exactly, and the parser doesn't read them. The native
+ * flattening shares {@link rootUnionOf} (which root unions
  * merge into one parameter list) and {@link effectiveRequiredKeys} (which of
  * their keys are required), so the two wires agree on which parameters exist
  * and which are required. They deliberately differ on one thing: the native
@@ -553,9 +554,10 @@ export interface ParameterDeclaration {
   /** From the first schema node that declares the parameter. */
   description?: string;
   /**
-   * The values the tool instructions list for the parameter, from its own
-   * `enum` or `const`, or behind a `$ref`, in branches, or across root
-   * alternatives, combined as the kinds are
+   * The values the reading lists for the parameter, which the tool
+   * instructions print where they can show each exactly: from its own `enum`
+   * or `const`, or behind a `$ref`, in branches, or across root alternatives,
+   * combined as the kinds are
    * ({@link valuesBy}). Only values of kinds the instructions' reading admits,
    * where it can name them, and null only where the parameter is marked
    * nullable. Absent when no list can be named, when a listed value isn't a

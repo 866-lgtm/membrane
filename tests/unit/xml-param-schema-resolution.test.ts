@@ -19,7 +19,12 @@
  */
 
 import { describe, it, expect, vi } from 'vitest';
-import { parseToolCalls, parseAccumulatedIntoBlocks, toolDefinitionForPrompt } from '../../src/utils/tool-parser.js';
+import {
+  parseToolCalls,
+  parseAccumulatedIntoBlocks,
+  toolDefinitionForPrompt,
+  formatToolDefinitions,
+} from '../../src/utils/tool-parser.js';
 import { readToolSchema } from '../../src/utils/tool-schema.js';
 import { AnthropicXmlFormatter } from '../../src/formatters/anthropic-xml.js';
 import type { ToolDefinition, NormalizedMessage } from '../../src/types/index.js';
@@ -1439,6 +1444,90 @@ function isOfType(value: unknown, type: string): boolean {
       return false;
   }
 }
+
+describe("enum values the attribute can't show exactly (#176)", () => {
+  // Each list puts the value it can't show second, so the check has to read
+  // every value.
+  const withheld: Record<string, string[]> = {
+    fld1: ['zz-a', 'say "hi"'],
+    fld2: ['zz-a', 'x,y'],
+    fld3: ['zz-a', 'line1\nline2'],
+    fld4: ['zz-a', 'line1\rline2'],
+    fld5: ['zz-a', 'zz\tb'],
+    fld6: ['zz-a', 'zz-b\u0085'],
+    fld7: ['zz-a', 'line1\u2028line2'],
+    fld8: ['zz-a', 'line1\u2029line2'],
+    fld9: ['zz-a', 'zz-\uD800'],
+    fld10: ['zz-a', ''],
+    fld11: ['zz-a', ' zz-padded'],
+    fld12: ['zz-a', 'zz-padded '],
+  };
+  const tool = toolWith('zz_exact_tool', {
+    type: 'object',
+    properties: {
+      ...Object.fromEntries(
+        Object.entries(withheld).map(([name, values]) => [name, { type: 'string', enum: values }])
+      ),
+      fld1: { type: 'string', enum: withheld.fld1, description: 'zz-quote-description' },
+      fld13: { type: 'string', enum: ['R&D', "it's", 'a<b', 'a>b'] },
+      fld14: { type: 'string', enum: ['read only', 'read write'] },
+      fld15: { type: 'string', enum: ['zz-red', 'zz-green'] },
+    },
+  } as never);
+
+  it('lists nothing where a value holds a quote, a comma, a control character, a separator or a lone surrogate', () => {
+    const doc = renderedTools(tool);
+    for (const name of ['fld1', 'fld2', 'fld3', 'fld4', 'fld5', 'fld6', 'fld7', 'fld8', 'fld9']) {
+      expect(doc).toContain(`<parameter name="${name}" type="string">`);
+    }
+  });
+
+  it('lists nothing where a value is empty or has whitespace at either end', () => {
+    const doc = renderedTools(tool);
+    for (const name of ['fld10', 'fld11', 'fld12']) {
+      expect(doc).toContain(`<parameter name="${name}" type="string">`);
+    }
+  });
+
+  it('keeps the type and the description of a parameter it lists nothing for', () => {
+    expect(renderedTools(tool)).toContain('<parameter name="fld1" type="string">\nzz-quote-description\n</parameter>');
+  });
+
+  it('prints every other list raw, as the model should write its values', () => {
+    // The parser keeps an entity the model copies, so `&amp;` here would be
+    // sent as `&amp;`.
+    const doc = renderedTools(tool);
+    expect(doc).toContain(`<parameter name="fld13" type="string" enum="R&D,it's,a<b,a>b">`);
+    expect(doc).toContain('<parameter name="fld14" type="string" enum="read only,read write">');
+    expect(doc).toContain('<parameter name="fld15" type="string" enum="zz-red,zz-green">');
+  });
+
+  it('prints a hand-built list of other kinds by String, and no empty list', () => {
+    const doc = formatToolDefinitions([
+      {
+        name: 'zz_hand_tool',
+        description: 'zz',
+        parameters: {
+          fld1: { enum: [1, null] as unknown as string[] },
+          fld2: { type: 'string', enum: [] },
+        },
+      },
+    ]);
+    expect(doc).toContain('<parameter name="fld1" enum="1,null">');
+    expect(doc).toContain('<parameter name="fld2" type="string">');
+  });
+
+  it('keeps an entity the model writes in a string value', () => {
+    expect(parseParam(tool, 'fld13', 'R&amp;D')).toBe('R&amp;D');
+  });
+
+  it('still hands toolDefinitionForPrompt every value', () => {
+    const { parameters } = toolDefinitionForPrompt(tool);
+    for (const [name, values] of Object.entries(withheld)) {
+      expect(parameters[name]!.enum, name).toEqual(values);
+    }
+  });
+});
 
 describe("the instructions' values and the kinds reading agree (shelf-963)", () => {
   // Runs last, over every tool this file builds, so the values the line lists
