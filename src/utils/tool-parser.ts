@@ -215,7 +215,8 @@ function withoutFraming(value: string): string {
  *
  * What happens next depends on the parameter's declaration, as
  * {@link readToolSchema} reads it — the same reading the XML tool
- * instructions are rendered from:
+ * instructions are rendered from, except that they withhold a null the
+ * schema's other keywords leave out (#150):
  *   - typed `string` → the text as written, less one layout newline on each
  *                 side ({@link withoutFraming}). No JSON.parse, no trim: an
  *                 exact-match edit tool must be able to send leading and
@@ -745,7 +746,7 @@ export interface ToolDefinitionForPrompt {
      * `type="undefined"` or a type the parser will not apply.
      */
     type?: string;
-    /** The declaration also admits null: renders `nullable="true"`. */
+    /** The reading's `instructedNullable` (#150): renders `nullable="true"`. */
     nullable?: boolean;
     description?: string;
     required?: boolean;
@@ -758,7 +759,8 @@ export interface ToolDefinitionForPrompt {
  * input schema by the same reading the XML parameter parser applies
  * ({@link readToolSchema}): the type the model is told a parameter has is the
  * type its value is parsed by, and a parameter the parser cannot type states
- * none.
+ * none. Its null mark is the reading's `instructedNullable`, which keywords
+ * that leave null out withhold though the parse admits null (#150).
  */
 export function toolDefinitionForPrompt(tool: ToolDefinition): ToolDefinitionForPrompt {
   const { parameters } = readToolSchema(tool.inputSchema);
@@ -770,7 +772,7 @@ export function toolDefinitionForPrompt(tool: ToolDefinition): ToolDefinitionFor
         name,
         {
           type: declaration.type,
-          nullable: declaration.nullable || undefined,
+          nullable: declaration.instructedNullable || undefined,
           description: declaration.description,
           required: declaration.required,
           enum: declaration.enum,
@@ -796,7 +798,8 @@ export function formatToolDefinitions(tools: ToolDefinitionForPrompt[]): string 
       if (param.type) attrs.push(`type="${escapeXml(param.type)}"`);
       if (param.nullable) attrs.push('nullable="true"');
       if (param.required) attrs.push('required="true"');
-      if (param.enum) attrs.push(`enum="${param.enum.join(',')}"`);
+      // `String` prints a null member as `null`; `join` alone printed it as an empty item (#150).
+      if (param.enum) attrs.push(`enum="${param.enum.map(String).join(',')}"`);
       
       parts.push(`<parameter ${attrs.join(' ')}>`);
       if (param.description) {

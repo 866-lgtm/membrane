@@ -217,7 +217,7 @@ describe('the caller\'s code before the send runs once', () => {
       expect(error.retryable).toBe(false);
     });
 
-    it(`${path}: the Anthropic adapter's dynamicHeaders, before the keepalive records the request`, async () => {
+    it(`${path}: the Anthropic adapter's dynamicHeaders, before the send`, async () => {
       let runs = 0;
       const { adapter, create } = anthropic({ dynamicHeaders: () => { runs++; throw callerError(); } });
       const record = vi.fn();

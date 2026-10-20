@@ -13,7 +13,12 @@
  *
  * The parser and the renderer both read through {@link readToolSchema}, so
  * what the model is told about a parameter and how its value is parsed are one
- * reading. The native flattening shares {@link rootUnionOf} (which root unions
+ * reading, with one deliberate difference. For the renderer, a node whose
+ * `type` admits null while its other keywords (an `enum`, a `const`, a
+ * combinator or a `$ref`) leave null out admits no null, and a parameter is
+ * marked nullable only where null survives that; the parser still reads a
+ * written null by the type alone (#150). The native flattening shares
+ * {@link rootUnionOf} (which root unions
  * merge into one parameter list) and {@link effectiveRequiredKeys} (which of
  * their keys are required), so the two wires agree on which parameters exist
  * and which are required. They deliberately differ on one thing: the native
@@ -212,9 +217,9 @@ function kindOfValue(value: unknown): Admitted {
 /**
  * What a `type` keyword admits, with OpenAPI's `nullable: true` beside it
  * adding null. Only the boolean `true` counts, and only beside a `type`, the
- * one place OpenAPI 3.0.3 gives it effect. A sibling `enum` or `const` isn't
- * consulted, as for every `type` in this reading, though OpenAPI lets those
- * disallow null.
+ * one place OpenAPI 3.0.3 gives it effect. The node's other keywords aren't
+ * consulted here; the instructions' reading consults them for null alone
+ * ({@link admittedBy}).
  */
 function admittedByTypeKeyword(type: unknown, nullable: unknown): Admitted {
   const names = typeof type === 'string' ? [type] : Array.isArray(type) ? type : undefined;
@@ -226,6 +231,12 @@ function admittedByTypeKeyword(type: unknown, nullable: unknown): Admitted {
     admitted = unionOf(admitted, new Set(kinds));
   }
   return nullable === true ? unionOf(admitted, new Set(['null'])) : admitted;
+}
+
+/** What a reading admits, less null; a sentinel stays as it is. */
+function withoutNull(admitted: Admitted): Admitted {
+  if (typeof admitted === 'string' || !admitted.has('null')) return admitted;
+  return new Set([...admitted].filter(kind => kind !== 'null'));
 }
 
 /** `$ref` spellings resolved against the tool's own inputSchema. */
@@ -252,6 +263,12 @@ interface ReadContext {
   inProgress: Set<string>;
   /** `$ref`s already read, so a definition shared along many paths is read once. */
   settled: Map<string, Admitted>;
+  /**
+   * Read for the tool instructions: a typed node whose other keywords leave
+   * null out admits no null (#150). The parse reads without it, in a context
+   * of its own, since `settled` holds this reading's results.
+   */
+  forInstructions?: boolean;
 }
 
 function admittedByRef(ref: unknown, context: ReadContext): Admitted {
@@ -281,14 +298,31 @@ function admittedByRef(ref: unknown, context: ReadContext): Admitted {
  * `const` admit the kinds of their values, `anyOf`/`oneOf` the union of their
  * branches, `allOf` the intersection, and `$ref` its target inside the tool's
  * own `definitions`/`$defs`, followed through chains of any length.
+ *
+ * Read for the instructions (#150), a typed node admits null only where its
+ * other keywords admit it too: every keyword of a node applies at once, and
+ * OpenAPI 3.0.3 says of `nullable` that "Other Schema Object constraints
+ * retain their defined behavior, and therefore may disallow the use of `null`
+ * as a value". So `{type: ["string", "null"], enum: ["a", "b"]}` admits no
+ * null there, and neither does such a node behind a `$ref`, in a branch or in
+ * a root alternative. Other keywords that can't be read leave the type's null.
  */
 function admittedBy(node: unknown, context: ReadContext): Admitted {
   if (node === true) return ANY;
   if (node === false) return NOTHING;
   if (!isPlainObject(node)) return UNREADABLE;
 
-  if (Object.hasOwn(node, 'type')) return admittedByTypeKeyword(node.type, ownField(node, 'nullable'));
+  if (Object.hasOwn(node, 'type')) {
+    const admitted = admittedByTypeKeyword(node.type, ownField(node, 'nullable'));
+    if (!context.forInstructions) return admitted;
+    const others = admittedByKeywords(node, context);
+    return typeof others !== 'string' && !others.has('null') ? withoutNull(admitted) : admitted;
+  }
+  return admittedByKeywords(node, context);
+}
 
+/** What a node's kind-bearing keywords other than `type` admit together. */
+function admittedByKeywords(node: Record<string, unknown>, context: ReadContext): Admitted {
   let admitted: Admitted = ANY;
   if (Object.hasOwn(node, 'enum')) {
     const values = node.enum;
@@ -360,6 +394,15 @@ export interface ParameterDeclaration {
    * `enum` mixing null with values of several kinds.
    */
   nullable: boolean;
+  /**
+   * Whether the tool instructions mark the parameter `nullable="true"`:
+   * `nullable`, read again with each typed node's other keywords (an `enum`,
+   * a `const`, a combinator or a `$ref`) also able to leave null out, and
+   * combined through `$ref`s, branches and root alternatives as the parse
+   * combines them (#150). The parse follows `nullable`, so a written null
+   * still reaches the tool as null where the two differ.
+   */
+  instructedNullable: boolean;
   /** Unconditionally required, with root-combinator semantics. */
   required: boolean;
   /** From the first schema node that declares the parameter. */
@@ -452,12 +495,20 @@ export function readToolSchema(inputSchema: unknown): ToolSchemaReading {
       }
     }
 
-    const context: ReadContext = { root: inputSchema, inProgress: new Set(), settled: new Map() };
+    const parseContext: ReadContext = { root: inputSchema, inProgress: new Set(), settled: new Map() };
+    const instructionsContext: ReadContext = {
+      root: inputSchema,
+      inProgress: new Set(),
+      settled: new Map(),
+      forInstructions: true,
+    };
     const required = new Set(
       effectiveRequiredKeys(ownField(inputSchema, 'required'), readCombinators)
     );
-
-    for (const [name, entry] of declarations) {
+    const admittedByEntry = (
+      entry: { root?: unknown; alternatives: Map<RootUnionKey, unknown[]> },
+      context: ReadContext
+    ): Admitted => {
       let admitted: Admitted =
         entry.root === undefined ? ANY : admittedBy(entry.root, context);
       for (const [key, nodes] of entry.alternatives) {
@@ -467,11 +518,17 @@ export function readToolSchema(inputSchema: unknown): ToolSchemaReading {
           key === 'allOf' ? each.reduce(intersectionOf, ANY) : each.reduce(unionOf, NOTHING)
         );
       }
+      return admitted;
+    };
+
+    for (const [name, entry] of declarations) {
+      const admitted = admittedByEntry(entry, parseContext);
       const first = entry.declaredBy[0];
       const description = ownField(first, 'description');
       const enumValues = ownField(first, 'enum');
       parameters.set(name, {
         ...declaredKind(admitted),
+        instructedNullable: declaredKind(admittedByEntry(entry, instructionsContext)).nullable,
         required: required.has(name),
         description: typeof description === 'string' ? description : undefined,
         enum: Array.isArray(enumValues) ? (enumValues as string[]) : undefined,
