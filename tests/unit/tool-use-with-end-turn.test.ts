@@ -100,7 +100,7 @@ const serverCalls: Array<[string, Record<string, unknown>]> = [
   ['server_tool_use', { type: 'server_tool_use', id: 'srvtoolu_zz_t', name: 'web_search', input: {} }],
   ['mcp_tool_use', { type: 'mcp_tool_use', id: 'mcptoolu_zz_t', name: 'zz_tool', server_name: 'zz_server', input: {} }],
 ];
-/** A server tool call whose start carries no input, which the API always sends. */
+/** A server tool call whose start carries no input, though the API always sends one. */
 const serverCallWithoutInput = { type: 'server_tool_use', id: 'srvtoolu_zz_t', name: 'web_search' };
 
 /**
@@ -111,9 +111,9 @@ const serverCallWithoutInput = { type: 'server_tool_use', id: 'srvtoolu_zz_t', n
  * adapter reports each call applied at its start and once finished, a call
  * left open included, so its trace follows from the calls). These tests script
  * the SDK's stream, so its MessageStream doesn't run here, but each stream but
- * two is one it delivers: it parses every tool block's argument buffer as it
+ * three is one it delivers: it parses every tool block's argument buffer as it
  * grows, so a fragment that left one invalid would throw there, before the
- * adapter. The two it doesn't are marked; Bedrock reads its stream itself.
+ * adapter. The three it doesn't are marked; Bedrock reads its stream itself.
  */
 const outOfOrder: Array<[string, unknown[], Array<{ id: string; unparseableInput: string }>, number, string[]]> = [
   ['a start while a block is open',
@@ -156,12 +156,19 @@ const outOfOrder: Array<[string, unknown[], Array<{ id: string; unparseableInput
   ['arguments as a partial_json that is a number',
     [toolStart(0, 'toolu_zz_a'), { type: 'content_block_delta', index: 0, delta: { type: 'input_json_delta', partial_json: 5 } }, blockStop(0)],
     [{ id: 'toolu_zz_a', unparseableInput: '' }], 2, ['toolu_zz_a']],
+  ['a delta of another type carrying partial_json',
+    [toolStart(0, 'toolu_zz_a'), { type: 'content_block_delta', index: 0, delta: { type: 'zz_delta', partial_json: '{"query":"x"}' } }, blockStop(0)],
+    [{ id: 'toolu_zz_a', unparseableInput: '' }], 2, ['toolu_zz_a']],
   // The SDK doesn't deliver these two: it parses the call's buffer and throws.
   ['an input_json_delta with no partial_json',
     [toolStart(0, 'toolu_zz_a'), { type: 'content_block_delta', index: 0, delta: { type: 'input_json_delta' } }, blockStop(0)],
     [{ id: 'toolu_zz_a', unparseableInput: '' }], 2, ['toolu_zz_a']],
   ['arguments under another key',
     [toolStart(0, 'toolu_zz_a'), { type: 'content_block_delta', index: 0, delta: { type: 'input_json_delta', json: '{"query":"x"}' } }, blockStop(0)],
+    [{ id: 'toolu_zz_a', unparseableInput: '' }], 2, ['toolu_zz_a']],
+  // Nor this one: it reads the delta's type first.
+  ['a delta event with no delta',
+    [toolStart(0, 'toolu_zz_a'), { type: 'content_block_delta', index: 0 }, blockStop(0)],
     [{ id: 'toolu_zz_a', unparseableInput: '' }], 2, ['toolu_zz_a']],
 ];
 
@@ -787,17 +794,35 @@ describe('the Bedrock adapter: block events out of order', () => {
     expect(warnings.filter((w) => w.includes('block order') || w.includes('every tool_use block'))).toEqual([]);
   });
 
+  // Reading stops at the frame message_delta came in, whatever follows it in
+  // the same chunk, and the body is let go while the provider holds it open.
   // Before, Bedrock read on: a second message_delta set the stop reason and
-  // usage again, and an error event failed a finished response.
+  // usage again, an error event failed a finished response, a message_start
+  // set the input tokens again, and a stream left open was waited on.
   it.each([
     ['a second message_delta', { type: 'message_delta', delta: { stop_reason: 'tool_use', stop_sequence: null }, usage: { output_tokens: 9 } }],
     ['an error event', { type: 'error', error: { type: 'overloaded_error', message: 'zz overloaded' } }],
-  ])('%s after message_delta is not read: the first stop reason and usage stand', async (_name, late) => {
+    ['a message_start', { type: 'message_start', message: { usage: { input_tokens: 99 } } }],
+  ])('%s after message_delta, in the same chunk, is not read, and the body is let go while it is still open', async (_name, late) => {
     captureWarnings();
-    const res = await bedrockStream([messageStart('msg_zz_87'), ...completeToolCall(0, 'toolu_zz_l', '{"query":"a"}'), endTurnDelta, late]);
+    let cancelled = false;
+    const frames = [{ type: 'message_start', message: { usage: { input_tokens: 10 } } }, ...completeToolCall(0, 'toolu_zz_l', '{"query":"a"}')].map(chunkFrame);
+    const ending = [endTurnDelta, late].map(chunkFrame);
+    const chunk = new Uint8Array(ending.reduce((length, frame) => length + frame.length, 0));
+    ending.reduce((at, frame) => { chunk.set(frame, at); return at + frame.length; }, 0);
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) { for (const frame of frames) controller.enqueue(frame); controller.enqueue(chunk); },
+      cancel() { cancelled = true; },
+    });
+    vi.stubGlobal('fetch', vi.fn(async () => ({ ok: true, status: 200, body })));
+    const res: any = await new BedrockAdapter({ accessKeyId: 'zz-key', secretAccessKey: 'zz-secret', region: 'us-west-2' }).stream(
+      { model: 'anthropic.claude-zz-v1:0', messages: [{ role: 'user', content: 'zz prompt' }], maxTokens: 64 } as any,
+      { onChunk: () => {} } as any,
+    );
     expect(res.stopReason).toBe('end_turn');
-    expect(res.usage.outputTokens).toBe(5);
+    expect(res.usage).toMatchObject({ inputTokens: 10, outputTokens: 5 });
     expect(res.content).toEqual([{ type: 'tool_use', id: 'toolu_zz_l', name: 'zz_lookup', input: { query: 'a' } }]);
+    await vi.waitFor(() => expect(cancelled).toBe(true));
   });
 
   it('a start below the next index, in a slot an earlier start skipped, breaks block order, and the call fails over the block the message lost', async () => {
