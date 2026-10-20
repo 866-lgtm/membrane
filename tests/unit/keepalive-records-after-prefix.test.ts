@@ -24,12 +24,20 @@ import { MembraneError } from '../../src/types/index.js';
 const START = Date.parse('2026-10-19T00:00:00Z');
 const timing = { refreshAfterMs: 100, checkIntervalMs: 100, maxIdleMs: 10_000 };
 
-/** A request whose one-hour cache marker makes it one the keepalive holds. */
+/**
+ * A request whose one-hour cache markers make it one the keepalive holds. Its last message carries one,
+ * as a host's last compiled message does, so a refresh replays every message, and a test can tell one
+ * snapshot from another by how many turns it has.
+ */
 function request(system: string, turns = 1) {
+  const hour = { type: 'ephemeral', ttl: '1h' };
   return {
     model: 'claude-opus-4-1', maxTokens: 1024,
-    system: [{ type: 'text', text: system, cache_control: { type: 'ephemeral', ttl: '1h' } }],
-    messages: Array.from({ length: turns }, (_, i) => ({ role: 'user', content: [{ type: 'text', text: `turn ${i}` }] })),
+    system: [{ type: 'text', text: system, cache_control: hour }],
+    messages: Array.from({ length: turns }, (_, i) => ({
+      role: 'user',
+      content: [{ type: 'text', text: `turn ${i}`, ...(i === turns - 1 ? { cache_control: hour } : {}) }],
+    })),
   } as any;
 }
 
@@ -316,7 +324,7 @@ describe('a refresh acts only on the snapshot it replayed', () => {
     hold = held();
     await vi.advanceTimersByTimeAsync(100);
     expect(replays().map(isQ)).toEqual([false]);
-    await a.stream({ ...request('Resident system Q', 2), thinking: { type: 'enabled', budget_tokens: 512 } }, noCallbacks);
+    await a.stream({ ...request('Resident system Q', 2), maxTokens: 2048, thinking: { type: 'enabled', budget_tokens: 1024 } }, noCallbacks);
     expect(events.filter(e => e.type === 'skipped').map(e => (e as { reason: string }).reason)).toEqual(['legacy-thinking-budget']);
     const replay = hold;
     hold = undefined;
