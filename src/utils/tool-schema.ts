@@ -383,11 +383,11 @@ function isScalar(value: unknown): value is Scalar {
 
 /**
  * The values a schema node admits, when the schema names them: a list;
- * `undefined` when it names none, so the node takes values no list holds (a
- * `type` that admits more than null, a branch with no list of its own); or
- * UNREADABLE when something that would narrow them can't be read (a `$ref`
- * that cycles or does not resolve, an `enum`, combinator or `$ref` of the
- * wrong shape, a listed value that isn't a string, number, boolean or null).
+ * `undefined` when it names none (as for any `type` but one that admits only
+ * null, or a branch with no list of its own); or UNREADABLE when something
+ * that would narrow them can't be read (a `$ref` that cycles or does not
+ * resolve, an `enum`, combinator or `$ref` of the wrong shape, a listed value
+ * that isn't a string, number, boolean or null).
  * A `type` that can't be read narrows nothing, so it leaves the list as the
  * other keywords give it. UNREADABLE wins every combination, so a
  * cycle reads the same from any entry point. Read only for the tool
