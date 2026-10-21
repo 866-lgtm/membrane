@@ -18,6 +18,15 @@
  * The other three pin behavior the first fix already had: fromGeminiParts
  * keeps interleaved parts in order, and a thought before a function call is
  * a thinking block on complete() and stream(), with the call still parsed.
+ *
+ * Five more came from the house's review, and one test got stronger. Three
+ * fail at 4d11ad1, the head that review read: a thought image is kept out of
+ * the answer's images on complete() and stream(), and toGeminiParts sends
+ * only text and tool calls, not a redacted_thinking block or an image. Two
+ * pin behavior already there: a thought part with empty or no text adds
+ * nothing, and complete() on an all-thought response. The Membrane stream
+ * test now also checks that the answer reaches rawAssistantText and onChunk
+ * whole.
  */
 import { describe, it, expect, afterEach, vi } from 'vitest';
 import { GeminiAdapter, fromGeminiParts, toGeminiParts } from '../../src/providers/gemini.js';
@@ -220,6 +229,62 @@ describe('GeminiAdapter thought parts', () => {
     expect(response.content.map(b => b.type)).toEqual(['thinking', 'tool_use']);
     expect(response.content[1]).toMatchObject({ type: 'tool_use', name: 'zz_tool', input: { q: 1 } });
   });
+
+  // From the house's review. Live, gemini-3.5-flash-lite returned a thought
+  // part whose text was empty; a thought part may also carry no text.
+  it('a thought part with empty or no text adds nothing, to the answer or the thinking', async () => {
+    const parts = [{ text: '', thought: true }, { thought: true, thoughtSignature: 'zz-sig' }, { text: ANSWER_1 }];
+    stubComplete(parts);
+    const response = await new GeminiAdapter({ apiKey: 'zz-key' }).complete(REQUEST);
+
+    expect(response.content).toEqual([{ type: 'text', text: ANSWER_1 }]);
+    expect(fromGeminiParts(parts as any)).toEqual([{ type: 'text', text: ANSWER_1 }]);
+
+    stubStream([[parts[0]], [parts[1]], [parts[2]]]);
+    const chunks: string[] = [];
+    const streamed = await new GeminiAdapter({ apiKey: 'zz-key' }).stream(REQUEST, { onChunk: c => chunks.push(c) });
+
+    expect(chunks).toEqual([ANSWER_1]);
+    expect(streamed.content).toEqual([{ type: 'text', text: ANSWER_1 }]);
+  });
+
+  it('complete(): a response of only thought parts has a thinking block and no text block', async () => {
+    stubComplete([{ text: THOUGHT_1, thought: true }]);
+    const response = await new GeminiAdapter({ apiKey: 'zz-key' }).complete(REQUEST);
+
+    expect(response.content).toEqual([{ type: 'thinking', thinking: THOUGHT_1 }]);
+  });
+
+  // An image model's interim "thought images" are flagged thought, as its
+  // thought text is (Google's image-generation guide).
+  const THOUGHT_IMAGE = { inlineData: { mimeType: 'image/png', data: 'zz-draft' }, thought: true };
+  const FINAL_IMAGE = { inlineData: { mimeType: 'image/png', data: 'zz-final' } };
+  const IMAGES = [{ type: 'generated_image', data: 'zz-final', mimeType: 'image/png' }];
+
+  it('complete(): a thought image is not one of the answer\'s images', async () => {
+    stubComplete([THOUGHT_IMAGE, FINAL_IMAGE]);
+    const response = await new GeminiAdapter({ apiKey: 'zz-key' }).complete(REQUEST);
+
+    expect(response.content.filter(b => b.type === 'generated_image')).toEqual(IMAGES);
+  });
+
+  it('stream(): a thought image is not one of the answer\'s images', async () => {
+    stubStream([[THOUGHT_IMAGE], [FINAL_IMAGE]]);
+    const response = await new GeminiAdapter({ apiKey: 'zz-key' }).stream(REQUEST, { onChunk: () => {} });
+
+    expect(response.content.filter(b => b.type === 'generated_image')).toEqual(IMAGES);
+  });
+
+  it('toGeminiParts sends only text and tool calls, not a redacted_thinking block or an image as answer text', () => {
+    const parts = toGeminiParts([
+      { type: 'redacted_thinking', data: 'zz-redacted' },
+      { type: 'generated_image', data: 'zz-final', mimeType: 'image/png' },
+      { type: 'text', text: ANSWER_1 },
+      { type: 'tool_use', id: 'zz-id', name: 'zz_tool', input: { q: 1 } },
+    ] as ContentBlock[]);
+
+    expect(parts).toEqual([{ text: ANSWER_1 }, { functionCall: { name: 'zz_tool', args: { q: 1 } } }]);
+  });
 });
 
 const MEMBRANE_REQUEST = {
@@ -247,6 +312,10 @@ describe('Gemini thought parts through Membrane', () => {
     expect(textOf(response.content)).toContain(ANSWER_1);
     expect(textOf(response.content)).toContain(ANSWER_2);
     expect(thinkingOf(response.content)).toBe(THOUGHT_1 + THOUGHT_2);
+    // The answer itself reaches both channels, so the checks above can't pass
+    // on a channel that carries nothing.
+    expect(response.rawAssistantText).toBe(ANSWER_1 + ANSWER_2);
+    expect(chunks.join('')).toBe(ANSWER_1 + ANSWER_2);
   });
 
   it('complete(): the answer text carries no thought text', async () => {

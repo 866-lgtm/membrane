@@ -44,8 +44,8 @@ interface GeminiPart {
    * `text` is a thought (a summary or the trace itself), so it is kept out of
    * the answer: Google's own samples read the answer as the text of parts
    * where `thought` is not set. Gemini returns such parts when the request
-   * sets `thinkingConfig.includeThoughts`; Gemini 4 Argon's thinking can't be
-   * turned off.
+   * sets `thinkingConfig.includeThoughts`. An image model's interim "thought
+   * images" are flagged too, and are kept out of the answer's images.
    */
   thought?: boolean;
   /** Opaque reasoning state; may ride any part. Not round-tripped yet. */
@@ -532,7 +532,8 @@ export class GeminiAdapter implements ProviderAdapter {
           streamState.text += part.text;
           callbacks.onChunk(part.text);
         }
-        if (part.inlineData) {
+        // A thought image is a draft the model reasoned with, not its answer.
+        if (part.inlineData && !part.thought) {
           streamState.images.push({
             data: part.inlineData.data,
             mimeType: part.inlineData.mimeType,
@@ -802,7 +803,8 @@ export class GeminiAdapter implements ProviderAdapter {
     for (const part of parts) {
       if (part.text && part.thought) thinking += part.text;
       else if (part.text) text += part.text;
-      if (part.inlineData) {
+      // A thought image is a draft the model reasoned with, not its answer.
+      if (part.inlineData && !part.thought) {
         images.push({
           data: part.inlineData.data,
           mimeType: part.inlineData.mimeType,
@@ -842,8 +844,8 @@ export class GeminiAdapter implements ProviderAdapter {
     const content: ContentBlock[] = [];
 
     // Reasoning first, as the other adapters order a thinking block. No
-    // signature: Gemini's thoughtSignature may ride any part, not the thought,
-    // so it doesn't belong to this block.
+    // signature: Gemini's thoughtSignature may ride any part, so it doesn't
+    // belong to this block.
     if (thinking) {
       content.push({ type: 'thinking', thinking });
     }
@@ -943,31 +945,32 @@ export class GeminiAdapter implements ProviderAdapter {
  * Convert normalized content blocks to Gemini parts
  */
 export function toGeminiParts(blocks: ContentBlock[]): GeminiPart[] {
-  // A zero-width carrier holds a block this wire has no form for, so it adds
-  // no part, as the builder's own text branch skips empty text. A thinking
-  // block adds none either, as convertMessages drops it: falling through to
-  // String(block) below would send the model "[object Object]" as its words.
-  return blocks.filter(block => !isRawItemCarrier(block) && block.type !== 'thinking').map(block => {
+  // Only text and tool calls have a form here, so every other block adds no
+  // part: a thinking or redacted_thinking block, as convertMessages drops
+  // them, and an image, which this helper doesn't convert. Each used to fall
+  // through to String(block), sending the model "[object Object]" as its
+  // words. A zero-width carrier holds a block this wire has no form for, so
+  // it adds none either, as the builder's own text branch skips empty text.
+  return blocks.filter(block => (block.type === 'text' && !isRawItemCarrier(block)) || block.type === 'tool_use').map(block => {
     if (block.type === 'text') {
       return { text: (block as any).text };
     }
-    if (block.type === 'tool_use') {
-      return {
-        functionCall: {
-          name: (block as any).name,
-          args: (block as any).input ?? {},
-        },
-      };
-    }
-    return { text: String(block) };
+    return {
+      functionCall: {
+        name: (block as any).name,
+        args: (block as any).input ?? {},
+      },
+    };
   });
 }
 
 /**
- * Convert Gemini parts to normalized content blocks, one block per part, in
- * part order. The adapter's response differs: it joins all thought text into
- * one leading thinking block and all answer text into one text block. Here a
- * thought part is its own thinking block, where it fell among the text parts.
+ * Convert Gemini parts to normalized content blocks, in part order: a part
+ * with text becomes a text block, or a thinking block where it fell if it is
+ * a thought, and a function call becomes a tool_use block. Other parts, and
+ * parts with empty text, add no block. The adapter's response differs: it
+ * joins all thought text into one leading thinking block and all answer text
+ * into one text block.
  */
 export function fromGeminiParts(parts: GeminiPart[]): ContentBlock[] {
   const result: ContentBlock[] = [];
