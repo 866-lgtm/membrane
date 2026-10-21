@@ -23,7 +23,6 @@ import {
   MembraneError,
   abortError,
   authError,
-  classifyError,
   errorFromProviderStatus,
   extractProviderErrorFields,
   isTypedAbortError,
@@ -33,7 +32,7 @@ import {
   withRawRequest,
   unsupportedError,
 } from '../types/index.js';
-import { markSystemChangeRefused, runCallerCode, statusForProviderCode } from '../types/errors.js';
+import { markSystemChangeRefused, runCallerCode, statusForProviderCode, deadlineExpired, isDeadlineExpiry, errorFromThrown } from '../types/errors.js';
 import { flattenRootSchemaUnion } from './anthropic-tool-schema.js';
 import { isPlainObject } from '../utils/tool-schema.js';
 import { assertTerminalEventObserved, toolUseInputFromText, toolUseInputFromValue, isDeadlineAbort, deadlineTimeoutError } from './utils.js';
@@ -452,10 +451,11 @@ export class AnthropicAdapter implements ProviderAdapter {
     request: Anthropic.MessageCreateParamsNonStreaming,
     headers?: Record<string, string>,
     signal?: AbortSignal,
+    retries?: { maxRetries: number },
   ): Promise<Anthropic.Message> {
     const session = this.credentialSession(signal);
     try {
-      return await session.client.messages.create(request, { headers, signal: session.signal });
+      return await session.client.messages.create(request, { headers, signal: session.signal, ...retries });
     } catch (error) {
       throw session.failure() ?? error;
     }
@@ -478,7 +478,11 @@ export class AnthropicAdapter implements ProviderAdapter {
     const live = this.liveHeaders(headers, 'complete');
 
     try {
-      const response = await this.createMessage(fullRequest, live, options?.signal);
+      // Membrane is the one retry layer (see Membrane's retryPlan): the SDK
+      // client makes one attempt at this request, a credential resolver's
+      // resend after a 401 inside it. The keepalive's replays, which also go
+      // through createMessage, keep the SDK's default.
+      const response = await this.createMessage(fullRequest, live, options?.signal, { maxRetries: 0 });
       // The SDK has the provider's answer, so the provider has the request's
       // prefix: only now can the keepalive hold it warm. It's recorded before
       // membrane parses the answer, which can fail on an answer that arrived.
@@ -570,6 +574,10 @@ export class AnthropicAdapter implements ProviderAdapter {
       const stream = await session.client.messages.stream(anthropicRequest, {
         signal: session.signal,
         headers: live,
+        // Membrane is the one retry layer: the SDK client makes one attempt
+        // at this request, a credential resolver's resend after a 401 inside
+        // it.
+        maxRetries: 0,
       });
 
       // Accumulate response metadata from SSE events directly, so we can
@@ -861,9 +869,10 @@ export class AnthropicAdapter implements ProviderAdapter {
       // Our own idle watchdog fired: whatever shape the SDK wrapped the
       // abort into (AbortError, APIUserAbortError "Request was aborted.",
       // a connection error), the CAUSE is the stalled stream — classify as
-      // the retryable timeout, never as a user abort / unknown error.
+      // the retryable timeout, never as a user abort / unknown error. It is
+      // this call's deadline, so membrane doesn't send the call again.
       if (idleTimedOut) {
-        throw new MembraneError({
+        throw deadlineExpired(new MembraneError({
           type: 'timeout',
           message: sawEvent
             ? `SSE stream idle timeout — no observed activity within ${idleMs}ms`
@@ -871,7 +880,7 @@ export class AnthropicAdapter implements ProviderAdapter {
           retryable: true,
           rawError: error,
           rawRequest: fullRequest,
-        });
+        }));
       }
       // A deadline on the caller's signal (Membrane's progressTimeoutMs) is a
       // timeout with its own message, whatever the SDK wrapped the abort in.
@@ -1138,6 +1147,22 @@ export class AnthropicAdapter implements ProviderAdapter {
   }
 
   private handleError(error: unknown, rawRequest?: unknown): MembraneError {
+    const typed = this.typeError(error, rawRequest);
+    // The API can say whether a failure is worth sending again, and the SDK
+    // obeyed that before its own rules. Membrane is the one retry layer for a
+    // call's requests now (the SDK client makes one attempt at each; only the
+    // keepalive's replays keep its retries), so the advice decides
+    // `retryable` here.
+    const advice = error instanceof Anthropic.APIError ? error.headers?.get?.('x-should-retry') : undefined;
+    if ((advice === 'true' || advice === 'false') && typed.retryable !== (advice === 'true')) {
+      const advised = new MembraneError({ ...typed.toErrorInfo(), retryable: advice === 'true' });
+      // A spent deadline stays one: the mark isn't part of the error's info.
+      return isDeadlineExpiry(typed) ? deadlineExpired(advised) : advised;
+    }
+    return typed;
+  }
+
+  private typeError(error: unknown, rawRequest?: unknown): MembraneError {
     if (error instanceof MembraneError) return withRawRequest(error, rawRequest);
 
     // A cancellation is a type, never a phrase — not even the SDK's own exact
@@ -1155,8 +1180,14 @@ export class AnthropicAdapter implements ProviderAdapter {
     // The SDK's transport failures carry no status ("Connection error.",
     // `cause: TypeError: fetch failed`), so the status path below can't type
     // them. They are the SDK's own types: the timeout subclass first.
+    //
+    // A timeout is a deadline membrane leaves to the caller. The SDK reports
+    // its own request timeout, undici's headers timeout and a connect timeout
+    // as this same error, with no cause (SDK 0.52 makeRequest), so a connect
+    // timeout, which membrane would otherwise send again, can't be told
+    // apart here and goes to the caller too.
     if (error instanceof Anthropic.APIConnectionTimeoutError) {
-      return timeoutError(error.message, error, rawRequest);
+      return deadlineExpired(timeoutError(error.message, error, rawRequest));
     }
     if (error instanceof Anthropic.APIConnectionError) {
       return networkError(error.message, error, rawRequest);
@@ -1226,9 +1257,7 @@ export class AnthropicAdapter implements ProviderAdapter {
       }
     }
 
-    const info = classifyError(error);
-    info.rawRequest = rawRequest;
-    return new MembraneError(info);
+    return errorFromThrown(error, rawRequest);
   }
 
   /**
@@ -1238,6 +1267,9 @@ export class AnthropicAdapter implements ProviderAdapter {
    * message through the guarded prose reader.
    */
   private parseRetryAfter(error: { headers?: Headers }): number | undefined {
+    // The SDK, which used to do the waiting, read `retry-after-ms` first.
+    const ms = Number(error.headers?.get?.('retry-after-ms')?.trim() || NaN);
+    if (Number.isFinite(ms)) return Math.max(0, Math.round(ms));
     const header = error.headers?.get?.('retry-after');
     if (header) {
       const seconds = Number(header.trim());

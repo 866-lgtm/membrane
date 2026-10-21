@@ -537,7 +537,7 @@ const MAX_TIMER_DELAY_MS = 2_147_483_647;
  * days) is armed in steps no longer than it, so it fires on time, and
  * Infinity never fires. Returns its cancel.
  */
-function setLongTimeout(fire: () => void, delayMs: number): () => void {
+export function setLongTimeout(fire: () => void, delayMs: number): () => void {
   let timer: ReturnType<typeof setTimeout>;
   const arm = (left: number): void => {
     timer = left > MAX_TIMER_DELAY_MS

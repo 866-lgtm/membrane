@@ -225,6 +225,20 @@ export interface StreamOptions {
    */
   progressTimeoutMs?: number;
 
+  /**
+   * Whether membrane retries the call's failed provider calls itself. Default
+   * true: a provider call that fails with a retryable error before it
+   * delivered anything is sent again, in any round, on the `retry` config's
+   * schedules. With `false`, membrane retries none of the call's failed
+   * requests, whatever the error and whatever the config says: the failure is
+   * thrown as it came, with the provider's advice on it (`retryable`, and a
+   * stated wait on `retryAfterMs`), and `hooks.onError`, which is asked
+   * before each retry, isn't asked. For a caller whose own layer retries. One
+   * other send stays: the one resend with refreshed credentials that an
+   * adapter with a credential resolver makes after an HTTP 401.
+   */
+  retry?: boolean;
+
   /** Request ID for correlation */
   requestId?: string;
   
@@ -248,7 +262,12 @@ export interface StreamOptions {
   /** Called for structured block events (thinking, tool_use, tool_result) */
   onBlock?: OnBlockCallback;
 
-  /** Called with raw provider request before sending (for logging) */
+  /**
+   * Called with raw provider request before each attempt (for logging). A
+   * request membrane retries after a failure calls it again, so it counts
+   * attempts, not rounds. A credential resolver's resend after an HTTP 401 is
+   * part of the attempt it follows, and doesn't call it again.
+   */
   onRequest?: OnRequestCallback;
 
   /** Called with raw provider response after each API call (for logging) */
@@ -292,7 +311,8 @@ export interface CompleteOptions {
 
   /**
    * Re-issue the request when it ends with `stop_reason: 'refusal'`, up to
-   * this many times. Default 0 (off).
+   * this many times. Default 0 (off); a value that isn't a finite number of
+   * at least 0 asks for none.
    *
    * Safe and invisible on this path: nothing has been emitted to the caller
    * yet, so a discarded attempt leaves no trace beyond its output tokens
@@ -304,6 +324,20 @@ export interface CompleteOptions {
    * — cheaper and far less invasive than rewriting the conversation.
    */
   refusalRetries?: number;
+
+  /**
+   * Whether membrane retries the call's failed request itself. Default true:
+   * a request that fails with a retryable error is sent again on the `retry`
+   * config's schedules. With `false`, membrane retries none of the call's
+   * failed requests, whatever the error and whatever the config says: the
+   * failure is thrown as it came, with the provider's advice on it
+   * (`retryable`, and a stated wait on `retryAfterMs`), and `hooks.onError`,
+   * which is asked before each retry, isn't asked. For a caller whose own
+   * layer retries. Two sends stay: a refusal re-issue, which the call asks
+   * for with `refusalRetries`, and the one resend with refreshed credentials
+   * that an adapter with a credential resolver makes after an HTTP 401.
+   */
+  retry?: boolean;
 
   /** Request timeout */
   timeoutMs?: number;
@@ -321,7 +355,11 @@ export interface CompleteOptions {
   /** Request ID for correlation */
   requestId?: string;
 
-  /** Called with raw provider request before sending (for logging) */
+  /**
+   * Called with raw provider request before each attempt (for logging). A
+   * request membrane retries after a failure calls it again; a credential
+   * resolver's resend after an HTTP 401 doesn't.
+   */
   onRequest?: OnRequestCallback;
 
   /** Called with raw provider response after API call (for logging) */
