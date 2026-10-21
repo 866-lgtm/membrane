@@ -265,7 +265,8 @@ export interface ResponseDetails {
 
 /**
  * A round the provider ended with `stop_reason: end_turn` (or with no stop
- * reason) while its content held client tool calls. The provider contract is
+ * reason, as from an OpenAI-family server that sends no `finish_reason`)
+ * while its content held client tool calls. The provider contract is
  * that a response carrying a tool call stops with `tool_use`; a caller that
  * gates on the stop reason runs nothing and the turn ends with the calls
  * unanswered, silently.
@@ -274,8 +275,11 @@ export interface ResponseDetails {
  * parsed to an object), membrane treats the round as `tool_use`: the calls
  * run (or are returned to the caller) exactly as for a `tool_use` stop, and
  * `treatedAsToolUse` is true. When any call is incomplete the round keeps its
- * reported stop, nothing runs, and `treatedAsToolUse` is false.
- * `details.stop.providerReason` keeps the provider's own token either way.
+ * reported stop, nothing runs, and `treatedAsToolUse` is false. Either way
+ * `providerStopReason` here keeps the round's own token. `details.stop`
+ * describes the response's final round: from `complete()` that is this one,
+ * while a loop that ran the calls goes on to a later round unless its tool
+ * depth limit ends it first.
  */
 export interface ToolUseWithEndTurnAnomaly {
   kind: 'tool_use_with_end_turn';

@@ -5,9 +5,14 @@
   kept neither, and `complete()`'s raw response lost the request id when
   serialized (the SDK attaches it non-enumerably). The stream path's `raw`
   also carries `provider_events`: `message_start` (the event, its message
-  without `content`), `message_delta` verbatim, and `unhandled`, the first
-  20 events or deltas the adapter doesn't read, each cut to 4,096 JSON
-  characters, with `unhandled_omitted` counting the rest. A field or event
-  the API adds is now visible where it used to be dropped. Block content is
-  not duplicated. `ProviderResponse` gains optional `responseId` and
-  `requestId` for any adapter to fill.
+  without `content`), `message_delta`, and `unhandled`, the first 20 events
+  or deltas the adapter doesn't read or doesn't apply, with
+  `unhandled_omitted` counting the rest; each kept event is cut to 4,096
+  JSON characters. A field the API adds to `message_start` or
+  `message_delta`, a delta type the adapter doesn't read, and a
+  `content_block_stop` carrying more than its type and index are now visible
+  where they used to be dropped. A new event type isn't: the SDK
+  (`@anthropic-ai/sdk` 0.52) yields only the event types it knows. Block
+  content stays in `content`, though an event kept in `unhandled`, such as a
+  `citations_delta`, keeps the payload it carried. `ProviderResponse` gains
+  optional `responseId` and `requestId` for any adapter to fill.
