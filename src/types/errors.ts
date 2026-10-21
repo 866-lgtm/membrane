@@ -83,6 +83,9 @@ export interface ErrorInfo {
 
   /** Raw request that caused the error (for logging) */
   rawRequest?: unknown;
+
+  /** See {@link MembraneError.systemChangeRefused}. */
+  systemChangeRefused?: boolean;
 }
 
 // ============================================================================
@@ -97,6 +100,23 @@ export class MembraneError extends Error {
   readonly providerErrorCode?: string;
   readonly rawError?: unknown;
   readonly rawRequest?: unknown;
+  /**
+   * True when the request was refused for the system change it carried (a
+   * `system_change` block, SystemChangeContent): by the API, on a model
+   * without mid-conversation system messages or tool changes, or by membrane
+   * before sending, when the formatter or adapter can't send one or no point
+   * in the conversation takes it. The same request with the change applied to
+   * `tools` and `system` instead would not meet this refusal. Through
+   * NativeFormatter and AnthropicAdapter, a change refused as malformed (mixed
+   * with other blocks in its message, or a definition whose wire name another
+   * tool holds) isn't marked: the caller's fix is to the change, not a
+   * fallback. Through anything else the formatter or adapter refusal comes
+   * first, and is marked, unless the formatter can't carry the request's tools
+   * at all (`tools` as the request's changes leave them): that refusal comes
+   * before it, unmarked, since the change made in
+   * `tools` would meet it too.
+   */
+  readonly systemChangeRefused?: boolean;
 
   constructor(info: ErrorInfo) {
     super(info.message);
@@ -109,6 +129,7 @@ export class MembraneError extends Error {
     // Serialize error objects so they don't become {} when JSON.stringify'd
     this.rawError = serializeError(info.rawError);
     this.rawRequest = info.rawRequest;
+    if (info.systemChangeRefused) this.systemChangeRefused = true;
   }
 
   toErrorInfo(): ErrorInfo {
@@ -121,6 +142,7 @@ export class MembraneError extends Error {
       providerErrorCode: this.providerErrorCode,
       rawError: this.rawError,
       rawRequest: this.rawRequest,
+      ...(this.systemChangeRefused ? { systemChangeRefused: true } : {}),
     };
   }
 }
@@ -290,6 +312,29 @@ export function unsupportedError(message: string, rawRequest?: unknown): Membran
     rawError: undefined,
     rawRequest,
   });
+}
+
+/** Membrane's own refusal, before sending, of a request for the system change it carries. */
+export function systemChangeRefusedError(message: string, rawRequest?: unknown): MembraneError {
+  return new MembraneError({
+    type: 'unsupported',
+    message,
+    retryable: false,
+    rawError: undefined,
+    rawRequest,
+    systemChangeRefused: true,
+  });
+}
+
+/**
+ * Mark an error an adapter already classified as the API refusing the
+ * request's system change, keeping its identity, as withRawRequest does.
+ */
+export function markSystemChangeRefused(error: MembraneError): MembraneError {
+  try {
+    Object.defineProperty(error, 'systemChangeRefused', { value: true, enumerable: true, configurable: true });
+  } catch { /* A frozen error still propagates unchanged. */ }
+  return error;
 }
 
 // ============================================================================

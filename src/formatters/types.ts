@@ -264,9 +264,13 @@ export interface BuildResult {
 }
 
 export interface ProviderMessage {
-  role: 'user' | 'assistant';
+  /** 'system' only for a mid-conversation system message (SystemChangeContent), which a formatter that `rendersSystemChanges` builds. */
+  role: 'user' | 'assistant' | 'system';
   content: unknown;
 }
+
+/** A user or assistant turn: what the tool-pair normalizer and the role merge take and give. */
+export type ProviderTurnMessage = ProviderMessage & { role: 'user' | 'assistant' };
 
 // ============================================================================
 // Stream Parser
@@ -386,6 +390,15 @@ export interface PrefillFormatter {
    * round's fidelity unknown.
    */
   readonly reportsAlterations?: boolean;
+
+  /**
+   * True when `buildMessages` sends a message holding `system_change` blocks
+   * (SystemChangeContent) as a mid-conversation `role: 'system'` message. Only
+   * NativeFormatter declares it; AnthropicXmlFormatter doesn't, even in its
+   * native tool mode. Membrane refuses, before sending, a request carrying one
+   * unless both this and the adapter's `sendsSystemChanges` hold.
+   */
+  readonly rendersSystemChanges?: boolean;
 
   /**
    * The tool mode this formatter instance was EXPLICITLY constructed with, if

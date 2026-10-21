@@ -60,7 +60,7 @@ import { NativeFormatter } from '@animalabs/membrane';
 const formatter = new NativeFormatter({ nameFormat: '{name}: ' });
 ```
 
-In simple mode, supply `humanParticipant` and `assistantParticipant`; other participants are rejected. Multiuser mode supports multiple names. Tool-pair normalization and media sanitation run in `buildMessages()`, including on native streaming and yielding paths. Native loop floating-cache placement is a separate post-build operation. Native names use the existing colon-to-double-underscore encoding. Returned calls are matched to declared names so literal double underscores survive. Colliding encoded definitions fail before dispatch.
+In simple mode, supply `humanParticipant` and `assistantParticipant`; other participants are rejected, except on a message holding only `system_change` blocks, which goes by its blocks' type. Multiuser mode supports multiple names. Tool-pair normalization and media sanitation run in `buildMessages()`, including on native streaming and yielding paths. Native loop floating-cache placement is a separate post-build operation. Native names use the existing colon-to-double-underscore encoding. Returned calls are matched to declared names so literal double underscores survive. Colliding encoded definitions fail before dispatch.
 
 ### CompletionsFormatter
 
@@ -123,6 +123,8 @@ const result = formatter.buildMessages(messages, {
 	hasCacheMarker: (_message, index) => index === someDynamicIndex,
 });
 ```
+
+A message of `system_change` blocks never takes such a boundary, since `NativeFormatter` can place it past later turns: a boundary goes where it would with the request's changes left out. A change's own `cacheBreakpoint` goes with it to where it lands.
 
 With prompt caching enabled, explicit message breakpoints are retained. Under the default `cacheMarkers: 'membrane-system'`, the formatters also mark the context prefix, and system/tool fallback markers depend on the selected representation and existing markers; they are not unconditional extra markers. Under `cacheMarkers: 'cm-owned'`, neither formatter places a system, context-prefix or fallback marker of its own, so the request carries only the markers the caller placed. A formatter's optional `cacheMarkersApplied` describes its build-time count. Membrane's reported request count is reconciled with its final marker policy.
 
