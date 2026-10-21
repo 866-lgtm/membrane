@@ -4,11 +4,15 @@
   (`thinkingConfig.includeThoughts`, e.g. through `providerParams`) had the
   model's reasoning joined onto the front of its reply
   with no separator, streamed through `onChunk` as visible text, and in
-  `rawAssistantText`. Thought parts now become one `thinking` block, placed
-  before the answer, on `complete()`, `stream()` and `fromGeminiParts()`, and
-  are not streamed through `onChunk`, as `OpenAICompatibleAdapter` already
-  treats its reasoning channel. A response of only thought parts has no text
-  block. Thinking blocks in prior assistant turns are still not sent back to
-  Gemini. A response without thought parts is unchanged.
+  `rawAssistantText`. On `complete()` and `stream()`, thought parts now
+  become one `thinking` block, placed before the answer, and are not streamed
+  through `onChunk`, as `OpenAICompatibleAdapter` treats its reasoning channel
+  (the Anthropic adapter, by contrast, streams thinking chunks). A response of
+  only thought parts has no text block. `fromGeminiParts()` keeps part order:
+  each thought part becomes its own `thinking` block where it fell, as each
+  text part is its own `text` block. `toGeminiParts()` drops `thinking`
+  blocks, as `convertMessages` does; one used to become a text part reading
+  "[object Object]". Thinking blocks in prior assistant turns are still not
+  sent back to Gemini. A response without thought parts is unchanged.
   - Not round-tripped: Gemini's `thoughtSignature`, which may ride any part,
     is not captured.

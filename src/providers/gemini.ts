@@ -522,9 +522,11 @@ export class GeminiAdapter implements ProviderAdapter {
     if (candidate?.content?.parts) {
       for (const part of candidate.content.parts) {
         if (part.text && part.thought) {
-          // A thought is not answer text: it goes to the thinking block and is
-          // not streamed through onChunk, which consumers read as the answer
-          // (the same convention as openai-compatible's reasoning channel).
+          // A thought is not answer text: it goes to the thinking block. It
+          // is not streamed through onChunk either, by choice: this follows
+          // openai-compatible's reasoning channel rather than the Anthropic
+          // adapter's thinking chunks, so a stream consumer sees the
+          // reasoning only in the final content.
           streamState.thinking += part.text;
         } else if (part.text) {
           streamState.text += part.text;
@@ -942,8 +944,10 @@ export class GeminiAdapter implements ProviderAdapter {
  */
 export function toGeminiParts(blocks: ContentBlock[]): GeminiPart[] {
   // A zero-width carrier holds a block this wire has no form for, so it adds
-  // no part, as the builder's own text branch skips empty text.
-  return blocks.filter(block => !isRawItemCarrier(block)).map(block => {
+  // no part, as the builder's own text branch skips empty text. A thinking
+  // block adds none either, as convertMessages drops it: falling through to
+  // String(block) below would send the model "[object Object]" as its words.
+  return blocks.filter(block => !isRawItemCarrier(block) && block.type !== 'thinking').map(block => {
     if (block.type === 'text') {
       return { text: (block as any).text };
     }
@@ -960,7 +964,10 @@ export function toGeminiParts(blocks: ContentBlock[]): GeminiPart[] {
 }
 
 /**
- * Convert Gemini parts to normalized content blocks
+ * Convert Gemini parts to normalized content blocks, one block per part, in
+ * part order. The adapter's response differs: it joins all thought text into
+ * one leading thinking block and all answer text into one text block. Here a
+ * thought part is its own thinking block, where it fell among the text parts.
  */
 export function fromGeminiParts(parts: GeminiPart[]): ContentBlock[] {
   const result: ContentBlock[] = [];

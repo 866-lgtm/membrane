@@ -7,15 +7,20 @@
  * its reply with no separator, streamed through onChunk as visible text, and
  * fed back to it as its own words on the next turn.
  *
- * Seven of the nine tests fail on the unfixed adapter: the thought text lands
+ * Seven of the first nine tests fail on the unfixed adapter: the thought text lands
  * in the text block, in onChunk, and in rawAssistantText. Two are guards that
  * pass on both: a response with no thought parts keeps its shape, and a prior
  * turn's thinking block is not sent back as answer text (convertMessages
  * drops thinking blocks today; with thoughts now landing in them, that
  * matters).
+ *
+ * Four more came from review. The toGeminiParts test fails without its fix.
+ * The other three pin behavior the first fix already had: fromGeminiParts
+ * keeps interleaved parts in order, and a thought before a function call is
+ * a thinking block on complete() and stream(), with the call still parsed.
  */
 import { describe, it, expect, afterEach, vi } from 'vitest';
-import { GeminiAdapter, fromGeminiParts } from '../../src/providers/gemini.js';
+import { GeminiAdapter, fromGeminiParts, toGeminiParts } from '../../src/providers/gemini.js';
 import { Membrane } from '../../src/membrane.js';
 import type { ContentBlock, NormalizedRequest, NormalizedResponse } from '../../src/types/index.js';
 
@@ -169,6 +174,51 @@ describe('GeminiAdapter thought parts', () => {
       { type: 'thinking', thinking: THOUGHT_1 },
       { type: 'text', text: ANSWER_1 },
     ]);
+  });
+
+  // The helper is per part, as it always was for text: unlike the adapter's
+  // response, it neither joins the thoughts nor moves them to the front.
+  it('fromGeminiParts keeps interleaved thought and answer parts in order', () => {
+    expect(fromGeminiParts([
+      { text: THOUGHT_1, thought: true },
+      { text: ANSWER_1 },
+      { text: THOUGHT_2, thought: true },
+      { text: ANSWER_2 },
+    ] as any)).toEqual([
+      { type: 'thinking', thinking: THOUGHT_1 },
+      { type: 'text', text: ANSWER_1 },
+      { type: 'thinking', thinking: THOUGHT_2 },
+      { type: 'text', text: ANSWER_2 },
+    ]);
+  });
+
+  // fromGeminiParts now makes thinking blocks; its inverse must not send one
+  // back as answer text (it fell through to String(block): "[object Object]").
+  it('toGeminiParts does not turn a thinking block into answer text', () => {
+    const parts = toGeminiParts(fromGeminiParts([{ text: THOUGHT_1, thought: true }, { text: ANSWER_1 }] as any));
+
+    expect(parts.filter(p => !p.thought && p.text !== ANSWER_1)).toEqual([]);
+    expect(parts).toContainEqual({ text: ANSWER_1 });
+  });
+
+  // Live, Argon's tool rounds start with a thought, then the call.
+  it('complete(): a thought before a function call is a thinking block, and the call still parses', async () => {
+    stubComplete([{ text: THOUGHT_1, thought: true }, { functionCall: { name: 'zz_tool', args: { q: 1 } } }]);
+    const response = await new GeminiAdapter({ apiKey: 'zz-key' }).complete(REQUEST);
+
+    expect(response.content.map(b => b.type)).toEqual(['thinking', 'tool_use']);
+    expect(response.content[0]).toEqual({ type: 'thinking', thinking: THOUGHT_1 });
+    expect(response.content[1]).toMatchObject({ type: 'tool_use', name: 'zz_tool', input: { q: 1 } });
+  });
+
+  it('stream(): a thought before a function call is a thinking block, and the call still parses', async () => {
+    stubStream([[{ text: THOUGHT_1, thought: true }], [{ functionCall: { name: 'zz_tool', args: { q: 1 } } }]]);
+    const chunks: string[] = [];
+    const response = await new GeminiAdapter({ apiKey: 'zz-key' }).stream(REQUEST, { onChunk: c => chunks.push(c) });
+
+    expect(chunks).toEqual([]);
+    expect(response.content.map(b => b.type)).toEqual(['thinking', 'tool_use']);
+    expect(response.content[1]).toMatchObject({ type: 'tool_use', name: 'zz_tool', input: { q: 1 } });
   });
 });
 
