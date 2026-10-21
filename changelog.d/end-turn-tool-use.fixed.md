@@ -1,6 +1,5 @@
-- A round the provider ends with `stop_reason: end_turn`, or with no stop
-  reason (as an OpenAI-family server that sends no `finish_reason` does),
-  while its content holds complete client tool calls now runs as a
+- A round the provider ends with a literal `stop_reason: end_turn` while its
+  content holds complete client tool calls now runs as a
   `tool_use` round on both native tool loops (`stream()` with `onToolCalls`,
   and `streamYielding()`), and `complete()` returns it as a `tool_use` stop.
   Before, every native loop gated execution on `tool_use` alone, so the
@@ -9,7 +8,10 @@
   complete when its block stopped and its input parsed to an object (no
   `unparseableInput`); a round holding an incomplete call runs nothing, as
   before. A length, refusal, stop-sequence or pause stop never qualifies,
-  nor does a provider token membrane doesn't map. Each occurrence warns
+  nor does a provider token membrane doesn't map, nor a round with no
+  provider stop token at all (an adapter that reports none, or an
+  OpenAI-family server that sends no `finish_reason`): those run nothing, as
+  before. Each occurrence warns
   once, through the configured `logger` when one is set, with the model, the
   tool names and the message and request ids, and is recorded in the new
   `details.anomalies` (`ToolUseWithEndTurnAnomaly`: `kind:

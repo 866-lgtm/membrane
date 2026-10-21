@@ -135,12 +135,7 @@ class SingleCallbackAdapter implements ProviderAdapter {
   async stream(_request: ProviderRequest, callbacks: StreamCallbacks): Promise<ProviderResponse> {
     for (const chunk of this.chunks) callbacks.onChunk(chunk);
     (this.content as unknown[]).forEach((block, index) => callbacks.onContentBlock?.(index, block));
-    // The provider's own token, as the Responses adapter reports it
-    // (response.status). Without one, an end_turn holding a complete tool
-    // call reads as the provider's end_turn and runs as a tool_use round
-    // (ToolUseWithEndTurnAnomaly), and the yielding test would wait for
-    // tool results it never sends; this test is about block lifecycle.
-    return { content: this.content, stopReason: 'end_turn', providerStopReason: 'completed', usage: { inputTokens: 10, outputTokens: 10 }, raw: {} };
+    return { content: this.content, stopReason: 'end_turn', usage: { inputTokens: 10, outputTokens: 10 }, raw: {} };
   }
 }
 

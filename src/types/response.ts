@@ -264,9 +264,11 @@ export interface ResponseDetails {
 // ============================================================================
 
 /**
- * A round the provider ended with `stop_reason: end_turn` (or with no stop
- * reason, as from an OpenAI-family server that sends no `finish_reason`)
- * while its content held client tool calls. The provider contract is
+ * A round the provider ended with a literal `stop_reason: end_turn` while its
+ * content held client tool calls. A round with no provider stop token (an
+ * adapter that reports none, or an OpenAI-family server that sends no
+ * `finish_reason`) is not this case: it runs nothing, as before. The provider
+ * contract is
  * that a response carrying a tool call stops with `tool_use`; a caller that
  * gates on the stop reason runs nothing and the turn ends with the calls
  * unanswered, silently.
@@ -287,8 +289,8 @@ export interface ToolUseWithEndTurnAnomaly {
   /** 0-based round index within this call (the index round reports use). */
   round: number;
 
-  /** The provider's stop token, verbatim. Absent when it reported none. */
-  providerStopReason?: string;
+  /** The provider's stop token: always `end_turn`, the only token that qualifies. */
+  providerStopReason: 'end_turn';
 
   /** The round's tool calls, in content order. */
   toolNames: string[];

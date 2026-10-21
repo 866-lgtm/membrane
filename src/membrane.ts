@@ -3287,8 +3287,8 @@ export class Membrane {
   }
 
   /**
-   * A native round whose provider stop was `end_turn`, or none at all, while
-   * its content holds client tool calls (see ToolUseWithEndTurnAnomaly). The
+   * A native round whose provider stop was literally `end_turn` while its
+   * content holds client tool calls (see ToolUseWithEndTurnAnomaly). The
    * provider contract is a `tool_use` stop for any response carrying a tool
    * call; production Anthropic responses broke it on 2026-10-19, and every
    * native loop, gating tool execution on `tool_use`, silently dropped the
@@ -3300,8 +3300,10 @@ export class Membrane {
    * the caller can run the round as a `tool_use` stop. A length, refusal,
    * stop-sequence or pause stop never qualifies, nor does a provider token
    * membrane doesn't map (it reads as end_turn but isn't the provider saying
-   * end_turn). Warns once per occurrence, with the ids a provider report
-   * needs.
+   * end_turn), nor a round with no provider token at all (an adapter that
+   * reports none, or an OpenAI-family server sending no `finish_reason`):
+   * those behave as before, and nothing runs. Warns once per occurrence, with
+   * the ids a provider report needs.
    */
   private toolUseWithEndTurn(
     responseBlocks: ContentBlock[],
@@ -3314,11 +3316,9 @@ export class Membrane {
     },
     round: number,
   ): ResponseAnomaly | undefined {
-    if (mappedStopReason !== 'end_turn') return undefined;
-    const reported = typeof provider.providerStopReason === 'string' && provider.providerStopReason !== ''
-      ? provider.providerStopReason
-      : undefined;
-    if (reported !== undefined && reported !== 'end_turn') return undefined;
+    // Only the provider's own, literal `end_turn`: a missing token is not the
+    // provider saying end_turn, and runs nothing, as before.
+    if (mappedStopReason !== 'end_turn' || provider.providerStopReason !== 'end_turn') return undefined;
     const calls = responseBlocks.filter(
       (b): b is ContentBlock & { type: 'tool_use' } => b.type === 'tool_use'
     );
@@ -3328,7 +3328,7 @@ export class Membrane {
     const anomaly: ResponseAnomaly = {
       kind: 'tool_use_with_end_turn',
       round,
-      ...(reported !== undefined ? { providerStopReason: reported } : {}),
+      providerStopReason: 'end_turn',
       toolNames: calls.map((c) => c.name),
       toolUseIds: calls.map((c) => c.id),
       treatedAsToolUse,
@@ -3338,7 +3338,7 @@ export class Membrane {
     };
     this.warnLogger().warn(
       `[membrane] ${provider.model || '(unknown model)'} ended round ${round} with ` +
-      `stop_reason ${reported ?? '(none)'} but returned ${calls.length} tool call(s) ` +
+      `stop_reason end_turn but returned ${calls.length} tool call(s) ` +
       `(${anomaly.toolNames.join(', ')}); ` +
       (treatedAsToolUse
         ? 'all complete, treating the round as tool_use'

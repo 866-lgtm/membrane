@@ -650,8 +650,8 @@ describe('tool calls the provider stopped with end_turn', () => {
     expect(response.details.anomalies).toBeUndefined();
   });
 
-  it('a round with no stop reason at all (an OpenAI-family server sending no finish_reason) runs its complete calls', async () => {
-    captureWarnings();
+  it('a round with no stop reason at all (an OpenAI-family server sending no finish_reason) runs nothing: only a literal end_turn qualifies', async () => {
+    const warnings = captureWarnings();
     const chunk = (delta: unknown, finishReason?: string) => JSON.stringify({
       id: 'zz-id', model: 'zz-model-1',
       choices: [{ index: 0, delta, ...(finishReason ? { finish_reason: finishReason } : {}) }],
@@ -670,10 +670,40 @@ describe('tool calls the provider stopped with end_turn', () => {
       { onToolCalls: async (toolCalls) => { ran.push(...toolCalls); return answer(toolCalls); } },
     );
 
-    expect(ran.map((c) => [c.id, c.input])).toEqual([['call_zz_1', { query: 'zz' }]]);
-    expect(fetchMock).toHaveBeenCalledTimes(2);
-    expect(response.details.anomalies).toEqual([expect.objectContaining({ treatedAsToolUse: true, toolUseIds: ['call_zz_1'] })]);
-    expect('providerStopReason' in response.details.anomalies![0]!).toBe(false);
+    expect(ran).toEqual([]);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(response.stopReason).toBe('end_turn');
+    expect(response.details.anomalies).toBeUndefined();
+    expect(warnings.filter((w) => w.includes('tool call(s)'))).toEqual([]);
+  });
+
+  it('an end_turn with no provider token runs nothing on stream() or complete(), and records nothing', async () => {
+    const warnings = captureWarnings();
+    const blocks = [{ type: 'tool_use', id: 'toolu_zz_tokenless', name: 'zz_lookup', input: { query: 'zz' } }];
+    const streamed = new TokenlessAdapter({ content: blocks as ProviderResponse['content'], stopReason: 'end_turn' });
+    const onToolCalls = onceToolCalls();
+    const response = await new Membrane(streamed, { formatter: new NativeFormatter() }).stream(request(), { onToolCalls });
+
+    expect(onToolCalls).not.toHaveBeenCalled();
+    expect(response.stopReason).toBe('end_turn');
+    expect(response.details.anomalies).toBeUndefined();
+
+    // The same round through complete(): an adapter whose complete() reports
+    // no provider token. Re-adding a "missing token" clause to the gate makes
+    // both halves fail.
+    class TokenlessCompleteAdapter extends TokenlessAdapter {
+      override async complete(): Promise<ProviderResponse> {
+        return { content: blocks as ProviderResponse['content'], stopReason: 'end_turn', usage: { inputTokens: 10, outputTokens: 10 }, raw: {} };
+      }
+    }
+    const completed = await new Membrane(
+      new TokenlessCompleteAdapter({ content: [], stopReason: 'end_turn' }),
+      { formatter: new NativeFormatter() },
+    ).complete(request());
+
+    expect(completed.stopReason).toBe('end_turn');
+    expect(completed.details.anomalies).toBeUndefined();
+    expect(warnings.filter((w) => w.includes('tool call(s)'))).toEqual([]);
   });
 
   it('anomalies in later rounds keep their round index and accumulate in order, one warning each', async () => {
