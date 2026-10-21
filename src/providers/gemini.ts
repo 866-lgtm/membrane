@@ -66,7 +66,13 @@ interface GeminiRequest {
 interface GeminiFunctionDeclaration {
   name: string;
   description: string;
-  parameters?: Record<string, unknown>;
+  /**
+   * The tool's `inputSchema`, as JSON Schema. Gemini's other field,
+   * `parameters`, takes only its OpenAPI-subset `Schema`, where a `type` is a
+   * single value and `$schema`, `$defs`, `$ref` and `const` are unknown
+   * fields, so a schema using any of them fails the whole request (#185).
+   */
+  parametersJsonSchema?: Record<string, unknown>;
 }
 
 interface GeminiResponse {
@@ -750,7 +756,7 @@ export class GeminiAdapter implements ProviderAdapter {
       return {
         name: tool.name,
         description: tool.description ?? '',
-        parameters: schema,
+        parametersJsonSchema: schema,
       };
     });
   }
