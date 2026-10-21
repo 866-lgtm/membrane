@@ -189,11 +189,14 @@ async function completeAcrossOneWait(membrane: Membrane, adapter: FailingAdapter
     await vi.advanceTimersByTimeAsync(waitMs - 1);
     expect(adapter.completeCalls).toBe(1);
     await vi.advanceTimersByTimeAsync(1);
+    // The second send goes out at the wait, with no more time passing.
+    for (let hop = 0; hop < 50 && adapter.completeCalls < 2; hop++) {
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+    expect(adapter.completeCalls).toBe(2);
     // The mock adapter's own simulated latency is a timer too.
     await vi.runAllTimersAsync();
-    const response = await done;
-    expect(adapter.completeCalls).toBe(2);
-    return response;
+    return await done;
   } finally {
     vi.useRealTimers();
   }
@@ -233,6 +236,33 @@ describe('a stated wait of up to a minute is waited out, whatever the schedule\'
     expect(longer.completeCalls).toBe(1);
   });
 
+  it('a wait past the platform timer\'s limit that is cancelled after its first step leaves no timer armed', async () => {
+    const day = 24 * 60 * 60 * 1000;
+    const adapter = new FailingAdapter(1, () => rateLimit(25 * day));
+    adapter.queueResponse('zz-never');
+    const membrane = new Membrane(adapter, { retry: { maxRetryDelayMs: 30 * day } });
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      const controller = new AbortController();
+      const settled = membrane.complete(zzRequest, { signal: controller.signal }).then(() => 'resolved', () => 'rejected');
+      for (let hop = 0; hop < 50 && vi.getTimerCount() === 0; hop++) {
+        await new Promise((resolve) => setImmediate(resolve));
+      }
+      expect(vi.getTimerCount()).toBe(1);
+      // An hour past the first step of 2^31 - 1 ms (about 24.86 days), inside
+      // the 25 days: the wait's second step is armed.
+      await vi.advanceTimersByTimeAsync(2_147_483_647 + 60 * 60 * 1000);
+      expect(adapter.completeCalls).toBe(1);
+      expect(vi.getTimerCount()).toBe(1);
+      controller.abort();
+      expect(await settled).toBe('rejected');
+      expect(vi.getTimerCount()).toBe(0);
+      expect(adapter.completeCalls).toBe(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('a stated wait past the platform timer\'s limit is waited out in full, not after 1 ms', async () => {
     // A timer longer than 2^31 - 1 ms (about 24.8 days) fires after 1 ms on
     // Node and in browsers, and vitest's fake timers do the same.
@@ -249,7 +279,7 @@ describe('the retry config: a field left out takes its default, and a value that
   const FAST = { retryDelayMs: 1, maxRetryDelayMs: 2, backoffMultiplier: 1 };
 
   it('a field given as undefined takes its default', async () => {
-    // A 5xx gets retry.maxRetries attempts, three by default. Before, the
+    // A 5xx gets retry.maxRetries attempts, three by default. On main, the
     // undefined replaced the default and the call wasn't retried at all.
     const adapter = new FailingAdapter(10, () => serverError('zz internal', 503));
     adapter.queueResponse('zz-never');
@@ -288,6 +318,12 @@ describe('the retry config: a field left out takes its default, and a value that
   it.each(fields)('retry.%s = NaN is refused at construction, naming the field', (field) => {
     expect(() => new Membrane(new MockAdapter(), { retry: retryWith(field, NaN) }))
       .toThrow(new RangeError(`[membrane] retry.${field} must be a finite number of at least 0, got NaN`));
+  });
+
+  // Each field must be finite, so Infinity is refused as NaN is.
+  it.each(fields)('retry.%s = Infinity is refused at construction, naming the field', (field) => {
+    expect(() => new Membrane(new MockAdapter(), { retry: retryWith(field, Infinity) }))
+      .toThrow(new RangeError(`[membrane] retry.${field} must be a finite number of at least 0, got Infinity`));
   });
 
   it.each([[Infinity], [-1]])('retry.maxRetries = %s is refused at construction', (value) => {

@@ -782,8 +782,16 @@ describe('a refusal re-issue in a later round re-issues that round only', () => 
     expect(adapter.sends).toBe(3);
     const order = events.map((e) => e.type);
     // The retrying event belongs to the second round: the first had already
-    // ended with its tool calls.
-    expect(order.indexOf('retrying')).toBeGreaterThan(order.indexOf('tool-calls'));
+    // ended with its tool calls. It comes after the refused attempt's tokens
+    // and before the re-issue's, so a consumer discarding that round's events
+    // up to it discards the refused attempt and nothing else.
+    const tokensAt = (text: string): number => events.findIndex((e) => e.type === 'tokens' && e.content.includes(text));
+    const retrying = order.indexOf('retrying');
+    expect(retrying).toBeGreaterThan(order.indexOf('tool-calls'));
+    expect(tokensAt('zz refused')).toBeGreaterThan(order.indexOf('tool-calls'));
+    expect(retrying).toBeGreaterThan(tokensAt('zz refused'));
+    expect(tokensAt('zz round two')).toBeGreaterThan(retrying);
+    expect(tokensAt('zz round one')).toBeLessThan(order.indexOf('tool-calls'));
     const [complete] = ofType(events, 'complete');
     expect(complete!.response.rawAssistantText).toContain('zz round one');
     expect(complete!.response.rawAssistantText).toContain('zz round two');

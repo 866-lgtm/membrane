@@ -14,6 +14,10 @@
   response's `details.timing.attempts` counts every attempt, retries included,
   and `streamYielding()`'s and `complete()`'s now carry
   `details.timing.retryDelaysMs` too, listing the waits, as `stream()`'s does.
+- A retry wait longer than about 24.8 days (2^31 − 1 ms), which a stated wait
+  or a backoff can be under a very large `retry.maxRetryDelayMs`, is waited in
+  full. It fired after 1 ms, so the call was sent again at once, for a stated
+  wait inside the window the provider had named.
 - On `complete()`, a refusal re-issue (`refusalRetries`) no longer spends the
   retry budget for transport errors: after a re-issue, a 529 or 429 gets the
   whole schedule again, as it does on the streaming paths.
