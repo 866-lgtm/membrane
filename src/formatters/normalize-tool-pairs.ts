@@ -59,7 +59,7 @@
  * answered apart, and the API refuses those.
  */
 
-import type { ProviderMessage as LooseProviderMessage } from './types.js';
+import type { ProviderTurnMessage as LooseProviderMessage } from './types.js';
 import type { NormalizeEvent } from './types.js';
 import { MembraneError } from '../types/errors.js';
 
@@ -1486,8 +1486,10 @@ function noop(): void {
 
 /**
  * Merge consecutive same-role envelopes by concatenating their content
- * arrays. Anthropic's API requires strictly alternating user/assistant
- * roles, and `normalizeToolPairs` can leave adjacent same-role envelopes
+ * arrays. Anthropic's API accepts adjacent same-role envelopes, but counts
+ * one token more at each boundary than for the same blocks in one envelope,
+ * so the merge gives a turn one rendering however its blocks arrived; and
+ * `normalizeToolPairs` can leave adjacent same-role envelopes
  * (e.g. an assistant turn re-roled out of a user message, or two
  * assistant turns stranded by an upstream chunker that dropped the
  * tool_result message between them).

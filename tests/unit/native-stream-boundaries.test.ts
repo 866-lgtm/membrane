@@ -816,6 +816,13 @@ describe('partialContent after a native stream aborts', () => {
     expect(s.toolCalls).toEqual([]);
   });
 
+  it.each(['stream', 'yielding'])('keeps a finished call to a tool only a system change defines under the name the change gave it (%s)', async path => {
+    script(() => anthropicResponse([messageStart, ...textBlock(0, 'pre '), ...toolBlock(1, 'toolu_1', 'srv__echo', '{"x":1}')], true));
+    const define = { participant: 'Harness', content: [{ type: 'system_change', defineTools: [{ name: 'srv:echo', description: 'echo', inputSchema: { type: 'object', properties: {} } }] }] };
+    const response = await run(path, claude({ formatter: new NativeFormatter() }), ask({ messages: [{ participant: 'User', content: [text('Question')] }, define] }), sink());
+    expect(response.partialContent).toEqual([text('pre '), { type: 'tool_use', id: 'toolu_1', name: 'srv:echo', input: { x: 1 } }]);
+  });
+
   it.each(['stream', 'yielding'])('keeps a finished thinking block and its signature when the transport aborts, with stops configured (%s)', async path => {
     script(() => anthropicResponse([messageStart, ...thinkingBlock(0, 'mull')], true));
     const response = await run(path, claude(), ask({ stopSequences: ['END'] }), sink());
