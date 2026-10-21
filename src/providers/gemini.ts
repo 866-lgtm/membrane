@@ -39,6 +39,17 @@ import { createCombinedSignal, textOnlyToolResultContent, toolUseInputFromValue,
 
 interface GeminiPart {
   text?: string;
+  /**
+   * Set on a part that is the model's reasoning rather than its answer. Its
+   * `text` is a thought (a summary or the trace itself), so it is kept out of
+   * the answer: Google's own samples read the answer as the text of parts
+   * where `thought` is not set. Gemini returns such parts when the request
+   * sets `thinkingConfig.includeThoughts`; Gemini 4 Argon's thinking can't be
+   * turned off.
+   */
+  thought?: boolean;
+  /** Opaque reasoning state; may ride any part. Not round-tripped yet. */
+  thoughtSignature?: string;
   inlineData?: { mimeType: string; data: string };
   functionCall?: { name: string; args: Record<string, unknown> };
   functionResponse?: { name: string; response: Record<string, unknown> };
@@ -109,6 +120,8 @@ interface GeminiResponse {
 
 interface GeminiStreamState {
   text: string;
+  /** Text of the parts flagged `thought`, kept apart from the answer. */
+  thinking: string;
   toolCalls: { name: string; args: Record<string, unknown> }[];
   images: { data: string; mimeType: string }[];
   candidateFinishReason: string | undefined;
@@ -397,6 +410,7 @@ export class GeminiAdapter implements ProviderAdapter {
       const decoder = new TextDecoder();
       const streamState: GeminiStreamState = {
         text: '',
+        thinking: '',
         sawTerminalEvent: false,
         lastModelVersion: undefined,
         toolCalls: [],
@@ -449,7 +463,7 @@ export class GeminiAdapter implements ProviderAdapter {
       );
 
       return {
-        content: this.buildContentBlocks(streamState.text, streamState.toolCalls, streamState.images),
+        content: this.buildContentBlocks(streamState.text, streamState.toolCalls, streamState.images, streamState.thinking),
         stopReason: this.resolveStopReason(
           streamState.sawCandidateData,
           streamState.candidateFinishReason,
@@ -507,7 +521,12 @@ export class GeminiAdapter implements ProviderAdapter {
 
     if (candidate?.content?.parts) {
       for (const part of candidate.content.parts) {
-        if (part.text) {
+        if (part.text && part.thought) {
+          // A thought is not answer text: it goes to the thinking block and is
+          // not streamed through onChunk, which consumers read as the answer
+          // (the same convention as openai-compatible's reasoning channel).
+          streamState.thinking += part.text;
+        } else if (part.text) {
           streamState.text += part.text;
           callbacks.onChunk(part.text);
         }
@@ -774,11 +793,13 @@ export class GeminiAdapter implements ProviderAdapter {
     const parts = candidate?.content?.parts ?? [];
 
     let text = '';
+    let thinking = '';
     const toolCalls: { name: string; args: Record<string, unknown> }[] = [];
     const images: { data: string; mimeType: string }[] = [];
 
     for (const part of parts) {
-      if (part.text) text += part.text;
+      if (part.text && part.thought) thinking += part.text;
+      else if (part.text) text += part.text;
       if (part.inlineData) {
         images.push({
           data: part.inlineData.data,
@@ -794,7 +815,7 @@ export class GeminiAdapter implements ProviderAdapter {
     }
 
     return {
-      content: this.buildContentBlocks(text, toolCalls, images),
+      content: this.buildContentBlocks(text, toolCalls, images, thinking),
       stopReason: this.resolveStopReason(
         hasCandidateData(candidate),
         candidate?.finishReason,
@@ -813,9 +834,17 @@ export class GeminiAdapter implements ProviderAdapter {
   private buildContentBlocks(
     text: string,
     toolCalls: { name: string; args: Record<string, unknown> }[],
-    images: { data: string; mimeType: string }[] = []
+    images: { data: string; mimeType: string }[] = [],
+    thinking = ''
   ): ContentBlock[] {
     const content: ContentBlock[] = [];
+
+    // Reasoning first, as the other adapters order a thinking block. No
+    // signature: Gemini's thoughtSignature may ride any part, not the thought,
+    // so it doesn't belong to this block.
+    if (thinking) {
+      content.push({ type: 'thinking', thinking });
+    }
 
     if (text) {
       content.push({ type: 'text', text });
@@ -937,7 +966,9 @@ export function fromGeminiParts(parts: GeminiPart[]): ContentBlock[] {
   const result: ContentBlock[] = [];
 
   for (const part of parts) {
-    if (part.text) {
+    if (part.text && part.thought) {
+      result.push({ type: 'thinking', thinking: part.text });
+    } else if (part.text) {
       result.push({ type: 'text', text: part.text });
     }
     if (part.functionCall) {
