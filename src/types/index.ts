@@ -19,6 +19,7 @@ export type {
   ToolResultContent,
   ThinkingContent,
   RedactedThinkingContent,
+  SystemChangeContent,
 } from './content.js';
 
 export {
@@ -32,6 +33,7 @@ export {
   isToolResultContent,
   isThinkingContent,
   isRedactedThinkingContent,
+  isSystemChangeContent,
   isMediaContent,
 } from './content.js';
 

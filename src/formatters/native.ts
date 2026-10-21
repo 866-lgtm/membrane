@@ -11,11 +11,14 @@
 
 import { followNormalizedBlocks, isRawItemCarrier, ownBlocks, type FidelityNotes } from '../utils/fidelity.js';
 import { sanitizeToolName } from '../utils/tool-names.js';
-import { unsupportedError } from '../types/errors.js';
+import { systemChangeRefusedError, unsupportedError } from '../types/errors.js';
+import { isSystemChangeContent } from '../types/content.js';
+import { hasNonEmptyText } from '../utils/empty-text.js';
 
 import type {
   NormalizedMessage,
   ContentBlock,
+  SystemChangeContent,
   ToolDefinition,
   ToolCall,
   ToolResult,
@@ -28,6 +31,7 @@ import type {
   BuildResult,
   FormatterConfig,
   ProviderMessage,
+  ProviderTurnMessage,
   ParseResult,
   BlockType,
   BlockEvent,
@@ -62,6 +66,18 @@ export function lastCacheableBlockIndex(blocks: Array<Record<string, unknown>>):
     if (t !== 'thinking' && t !== 'redacted_thinking') return k;
   }
   return -1;
+}
+
+/** Put a cache marker on a message's last block that can hold one. */
+function markLastCacheable(blocks: Array<Record<string, unknown>>, cacheControl: Record<string, unknown>): void {
+  const at = lastCacheableBlockIndex(blocks);
+  if (at >= 0) blocks[at]!.cache_control = cacheControl;
+}
+
+/** A message of system changes, built, and the input index it came from. */
+interface BuiltSystemChange {
+  content: Array<Record<string, unknown>>;
+  at: number;
 }
 
 // ============================================================================
@@ -186,6 +202,8 @@ export class NativeFormatter implements PrefillFormatter {
   readonly usesPrefill = false;
   readonly supportsNativeTools = true;
   readonly supportsXmlTools = false;
+  /** A message of `system_change` blocks goes as a mid-conversation `role: 'system'` message (SystemChangeContent). */
+  readonly rendersSystemChanges = true;
 
   readonly nameFormat: string;
   private config: Required<FormatterConfig>;
@@ -226,7 +244,19 @@ export class NativeFormatter implements PrefillFormatter {
       ? { type: 'ephemeral', ...(cacheTtl ? { ttl: cacheTtl } : {}) }
       : undefined;
 
-    const providerMessages: ProviderMessage[] = [];
+    const providerMessages: ProviderTurnMessage[] = [];
+    // Messages of system changes stay out of the turn passes below and are
+    // placed after them; `origin` gives each turn block's input index, which
+    // the placement reads (placeSystemChanges).
+    const systemChanges: BuiltSystemChange[] = [];
+    const origin = new WeakMap<object, number>();
+    // The content of the message before the current one, in input order and
+    // system changes included: where a hasCacheMarker boundary goes.
+    let previousContent: Array<Record<string, unknown>> | undefined;
+    // Each tool's wire name, with the caller name that holds it, so a
+    // definition in a system change can't take another tool's wire name.
+    const wireNames = new Map<string, string>();
+    for (const tool of tools ?? []) wireNames.set(sanitizeToolName(tool.name), tool.name);
 
     // Add context prefix as first assistant message (for simulacrum seeding)
     if (contextPrefix) {
@@ -238,6 +268,7 @@ export class NativeFormatter implements PrefillFormatter {
         role: 'assistant',
         content: [prefixBlock],
       });
+      previousContent = [prefixBlock];
     }
 
     // Validate simple mode participants
@@ -248,6 +279,27 @@ export class NativeFormatter implements PrefillFormatter {
     for (let i = 0; i < messages.length; i++) {
       const message = messages[i];
       if (!message) continue;
+
+      // A message of system changes goes by its blocks' type, whatever its
+      // participant, and holds nothing else.
+      const changes = message.content.filter(isSystemChangeContent);
+      if (changes.length > 0) {
+        if (changes.length !== message.content.length) {
+          throw unsupportedError(
+            `NativeFormatter: message ${i} holds a system_change block beside other blocks. A message holding one holds nothing else.`
+          );
+        }
+        const content = this.convertSystemChanges(changes, wireNames, () => options.fidelity?.alter(i));
+        if (content.length === 0) continue; // Nothing to change: skipped as an empty message is
+        ownBlocks(options.fidelity, content, i);
+        if (hasCacheMarker && hasCacheMarker(message, i) && cacheControl && previousContent) {
+          markLastCacheable(previousContent, cacheControl);
+        }
+        if (message.cacheBreakpoint && cacheControl) markLastCacheable(content, cacheControl);
+        systemChanges.push({ content, at: i });
+        previousContent = content;
+        continue;
+      }
 
       // Determine role
       const isAssistant = message.participant === assistantParticipant;
@@ -284,18 +336,15 @@ export class NativeFormatter implements PrefillFormatter {
       }
       // An adapter's report about one of these blocks names this message.
       ownBlocks(options.fidelity, content, i);
+      for (const block of content) origin.set(block as object, i);
 
       // hasCacheMarker: cache boundary is BEFORE this message — tag previous message's last block
-      if (hasCacheMarker && hasCacheMarker(message, i) && cacheControl && providerMessages.length > 0) {
-        const prevMsg = providerMessages[providerMessages.length - 1]!;
-        const prevContent = Array.isArray(prevMsg.content) ? prevMsg.content as Record<string, unknown>[] : [];
-        const prevIdx = lastCacheableBlockIndex(prevContent);
-        if (prevIdx >= 0) {
-          prevContent[prevIdx]!.cache_control = cacheControl;
-        }
+      if (hasCacheMarker && hasCacheMarker(message, i) && cacheControl && previousContent) {
+        markLastCacheable(previousContent, cacheControl);
       }
 
       providerMessages.push({ role, content });
+      previousContent = content as Array<Record<string, unknown>>;
 
       // cacheBreakpoint: cache up to and INCLUDING this message — tag last block
       if (message.cacheBreakpoint && cacheControl && content.length > 0) {
@@ -322,7 +371,10 @@ export class NativeFormatter implements PrefillFormatter {
       leadingUserText: options.prefillUserMessage,
     });
 
-    // Merge consecutive same-role messages (API requires alternating)
+    // Merge consecutive same-role messages into one envelope per turn. The
+    // API accepts consecutive same-role messages too, but counts one token
+    // more at each boundary than for the same blocks in one message, so the
+    // merge gives a turn one rendering however its blocks were stored.
     let mergedMessages = mergeConsecutiveRoles(normalized.messages);
     // A server call goes out only with its result in its turn, and a result
     // only with its call: the API refuses either alone. The request's final
@@ -331,6 +383,9 @@ export class NativeFormatter implements PrefillFormatter {
     // call and its result stored as two consecutive assistant messages stay
     // together. With server blocks off, none reached this far.
     mergedMessages = NativeFormatter.pairServerBlocks(mergedMessages, options.fidelity);
+    const builtMessages: ProviderMessage[] = systemChanges.length > 0
+      ? NativeFormatter.placeSystemChanges(mergedMessages, systemChanges, origin)
+      : mergedMessages;
 
     // Build system content. The system block is cached only as a FALLBACK: a
     // message breakpoint already caches a prefix that begins at the front of
@@ -349,7 +404,7 @@ export class NativeFormatter implements PrefillFormatter {
     // cache; a caller's empty text blocks are dropped the same way, before the
     // marker count and before the fallback picks the last block.
     const system = withoutEmptySystemText(systemPrompt);
-    const markedBreakpoints = countWireCacheMarkers({ messages: mergedMessages, system });
+    const markedBreakpoints = countWireCacheMarkers({ messages: builtMessages, system });
     const cacheSystem =
       cacheMarkers === 'membrane-system' && cacheControl && markedBreakpoints === 0
         ? cacheControl
@@ -380,13 +435,13 @@ export class NativeFormatter implements PrefillFormatter {
     const nativeTools = tools?.length ? this.convertToNativeTools(tools) : undefined;
     if (cacheMarkers === 'cm-owned' || !options.deferCacheBudgetCheck) {
       assertCacheMarkersWithinLimit(
-        { messages: mergedMessages, system: systemContent, tools: nativeTools },
+        { messages: builtMessages, system: systemContent, tools: nativeTools },
         'native'
       );
     }
 
     return {
-      messages: mergedMessages,
+      messages: builtMessages,
       systemContent,
       stopSequences: additionalStopSequences ?? [],
       nativeTools,
@@ -447,7 +502,7 @@ export class NativeFormatter implements PrefillFormatter {
    * block that can hold one, it goes. A turn left with nothing is dropped,
    * its marker with it, and its neighbours merge again.
    */
-  private static pairServerBlocks(messages: ProviderMessage[], fidelity?: FidelityNotes): ProviderMessage[] {
+  private static pairServerBlocks(messages: ProviderTurnMessage[], fidelity?: FidelityNotes): ProviderTurnMessage[] {
     const emptied = new Set<number>();
     const paired = messages.map((message, index) => {
       if (message.role !== 'assistant' || !Array.isArray(message.content)) return message;
@@ -470,6 +525,134 @@ export class NativeFormatter implements PrefillFormatter {
     });
     if (emptied.size === 0) return paired;
     return mergeConsecutiveRoles(paired.filter((_, index) => !emptied.has(index)));
+  }
+
+  /**
+   * Each message of system changes, as a `role: 'system'` message, at the
+   * first point at or after its place where the API takes one: before an
+   * assistant turn that follows a user turn (a tool-result turn included), or
+   * at the end after a user turn. Never after an assistant turn, so never
+   * after a paused one, which takes no tool change. The turns are read as the
+   * adapter's empty-text cleanup (utils/empty-text.ts) leaves them: a message
+   * of only empty or whitespace text is dropped there, and the surviving
+   * messages of one role between two of the other are one turn. The API
+   * accepts consecutive messages of one role, and judges a system message, or
+   * a run of them, by the message right before it, so a change goes right
+   * after a user turn's
+   * last surviving message and right before an assistant turn's first. Its
+   * place is its input index: it
+   * goes before the first surviving message of the first such assistant turn
+   * whose earliest surviving block, across all its messages, came from a
+   * later message, or at the end when the last surviving turn is a user turn.
+   * A block keeps its input index through the turn passes when they move it;
+   * one they rebuild, or a contextPrefix, has none. An assistant turn of such
+   * blocks alone is no point, and one that holds them with later blocks is
+   * dated by those, so a change can go ahead of a contextPrefix that shares
+   * its turn. With no point at or after its
+   * place, as after a final assistant turn, the request is refused before
+   * sending. Adjacent ones keep their order, and the API judges consecutive
+   * system messages together. The message's own breakpoint goes with it to
+   * where it lands; a `hasCacheMarker` boundary on it goes on the message
+   * before it in input order, as for any message.
+   */
+  private static placeSystemChanges(
+    messages: ProviderTurnMessage[],
+    changes: BuiltSystemChange[],
+    origin: WeakMap<object, number>,
+  ): ProviderMessage[] {
+    // A block the adapter's empty-text cleanup keeps, and a turn holding one.
+    const survives = (block: { type?: string; text?: unknown }): boolean => block.type !== 'text' || hasNonEmptyText(block.text);
+    const kept = (message: ProviderTurnMessage): boolean =>
+      Array.isArray(message.content) && (message.content as Array<{ type?: string; text?: unknown }>).some(survives);
+    // The turns as the cleanup leaves them: it drops a message with no
+    // surviving block, and the surviving messages of one role between two of
+    // the other are one turn, dated by the earliest input index among all its
+    // surviving blocks.
+    type Turn = { role: ProviderTurnMessage['role']; first: number; earliest: number; after?: ProviderTurnMessage['role'] };
+    const turns: Turn[] = [];
+    messages.forEach((message, index) => {
+      if (!kept(message)) return;
+      let turn = turns[turns.length - 1];
+      if (turn?.role !== message.role) {
+        turn = { role: message.role, first: index, earliest: Infinity, after: turn?.role };
+        turns.push(turn);
+      }
+      for (const block of message.content as Array<{ type?: string; text?: unknown }>) {
+        const at = survives(block) ? origin.get(block) : undefined;
+        if (at !== undefined && at < turn.earliest) turn.earliest = at;
+      }
+    });
+    // A point: the first surviving message of an assistant turn after a user turn.
+    const points = new Map<number, number>();
+    for (const turn of turns) if (turn.role === 'assistant' && turn.after === 'user') points.set(turn.first, turn.earliest);
+    const placed: ProviderMessage[] = [];
+    let next = 0;
+    messages.forEach((message, index) => {
+      const earliest = points.get(index);
+      while (earliest !== undefined && earliest !== Infinity && next < changes.length && changes[next]!.at < earliest) {
+        placed.push({ role: 'system', content: changes[next]!.content });
+        next++;
+      }
+      placed.push(message);
+    });
+    if (next < changes.length) {
+      if (turns[turns.length - 1]?.role !== 'user') {
+        throw systemChangeRefusedError(
+          `NativeFormatter: message ${changes[next]!.at}, a system change, has no place the API takes one at or after it: ` +
+          'a system message goes after a user turn, and before an assistant turn or at the end. ' +
+          'End the request with a user turn that has content after it, or make the change in the request\'s tools and system.'
+        );
+      }
+      for (; next < changes.length; next++) placed.push({ role: 'system', content: changes[next]!.content });
+    }
+    return placed;
+  }
+
+  /**
+   * A message's system changes as the blocks of a `role: 'system'` message:
+   * for each change in order, a `tool_removal` for each tool it withdraws, a
+   * `tool_addition` for each tool it defines, then a text block for each
+   * system text that isn't only whitespace, which the API refuses. A
+   * definition's wire name can't be another caller name's, as in `tools`; a
+   * removal frees the wire name of the tool it removes.
+   */
+  private convertSystemChanges(
+    changes: SystemChangeContent[],
+    wireNames: Map<string, string>,
+    /** Called when a system text is left out, as an alteration of the message. */
+    onAltered: () => void,
+  ): Array<Record<string, unknown>> {
+    const blocks: Array<Record<string, unknown>> = [];
+    const claim = (name: string): string => {
+      const wire = sanitizeToolName(name);
+      const holder = wireNames.get(wire);
+      if (holder !== undefined && holder !== name) {
+        throw unsupportedError('Native tool names collide after colon escaping: "' + wire + '". Choose distinct wire names.');
+      }
+      return wire;
+    };
+    for (const change of changes) {
+      for (const name of change.removeTools ?? []) {
+        const wire = claim(name);
+        if (wireNames.get(wire) === name) wireNames.delete(wire);
+        blocks.push({ type: 'tool_removal', tool: { type: 'tool_reference', name: wire } });
+      }
+      for (const tool of change.defineTools ?? []) {
+        const name = claim(tool.name);
+        wireNames.set(name, tool.name);
+        blocks.push({
+          type: 'tool_addition',
+          tool: { type: 'tool_definition', definition: { name, description: tool.description, input_schema: tool.inputSchema } },
+        });
+      }
+      for (const text of change.addSystem ?? []) {
+        // The API refuses empty or whitespace text. An empty one says nothing,
+        // as an empty text block elsewhere; whitespace left out is reported.
+        if (hasNonEmptyText(text)) blocks.push({ type: 'text', text });
+        else if (text !== '') onAltered();
+      }
+    }
+    return blocks;
   }
 
   private convertContent(

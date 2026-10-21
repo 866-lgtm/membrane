@@ -60,7 +60,7 @@ import { NativeFormatter } from '@animalabs/membrane';
 const formatter = new NativeFormatter({ nameFormat: '{name}: ' });
 ```
 
-In simple mode, supply `humanParticipant` and `assistantParticipant`; other participants are rejected. Multiuser mode supports multiple names. Tool-pair normalization and media sanitation run in `buildMessages()`, including on native streaming and yielding paths. Native loop floating-cache placement is a separate post-build operation. Native names use the existing colon-to-double-underscore encoding. Returned calls are matched to declared names so literal double underscores survive. Colliding encoded definitions fail before dispatch.
+In simple mode, supply `humanParticipant` and `assistantParticipant`; other participants are rejected, except on a message holding only `system_change` blocks, which goes by its blocks' type. Multiuser mode supports multiple names. Tool-pair normalization and media sanitation run in `buildMessages()`, including on native streaming and yielding paths. Native loop floating-cache placement is a separate post-build operation. Native names use the existing colon-to-double-underscore encoding. Returned calls are matched to declared names so literal double underscores survive. Colliding encoded definitions fail before dispatch.
 
 ### CompletionsFormatter
 

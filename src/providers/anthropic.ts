@@ -25,6 +25,7 @@ import {
   authError,
   classifyError,
   errorFromProviderStatus,
+  extractProviderErrorFields,
   isTypedAbortError,
   networkError,
   serverError,
@@ -32,7 +33,7 @@ import {
   withRawRequest,
   unsupportedError,
 } from '../types/index.js';
-import { runCallerCode, statusForProviderCode } from '../types/errors.js';
+import { markSystemChangeRefused, runCallerCode, statusForProviderCode } from '../types/errors.js';
 import { flattenRootSchemaUnion } from './anthropic-tool-schema.js';
 import { isPlainObject } from '../utils/tool-schema.js';
 import { assertTerminalEventObserved, toolUseInputFromText, toolUseInputFromValue, isDeadlineAbort, deadlineTimeoutError } from './utils.js';
@@ -147,6 +148,32 @@ export const THINKING_BINDING_BETA = 'thinking-binding-controls-2026-08-01';
 export function sendsBlockBinding(params: { thinking?: unknown }): boolean {
   const binding = (params.thinking as { block_binding?: unknown } | null | undefined)?.block_binding;
   return binding !== undefined && binding !== null;
+}
+
+/** Beta flag for mid-conversation tool changes (`tool_addition` and
+ *  `tool_removal` in a `role: 'system'` message), definitions by value
+ *  included. System text there needs none. */
+export const INLINE_TOOLS_BETA = 'inline-tools-2026-09-15';
+
+/** Whether a built request carries a tool change, which needs its beta. */
+export function sendsToolChanges(params: { messages?: unknown }): boolean {
+  return Array.isArray(params.messages) && params.messages.some((message: { role?: unknown; content?: unknown }) =>
+    message?.role === 'system' && Array.isArray(message.content) &&
+    message.content.some((block: { type?: unknown }) => block?.type === 'tool_addition' || block?.type === 'tool_removal'));
+}
+
+/** The API's wordings, in a 400, for a model that takes no mid-conversation
+ *  system message or no tool change in one (live runs, Oct 19 2026). */
+const SYSTEM_CHANGE_REFUSALS = [
+  "role 'system' is not supported on this model",
+  'tool_addition/tool_removal requires a model that supports mid-conversation system content',
+  'tool_addition/tool_removal is not supported on this model',
+];
+
+/** Whether a 400's own message is the API refusing the request's system change. */
+export function isSystemChangeRefusal(body: unknown): boolean {
+  const message = extractProviderErrorFields(body).message;
+  return typeof message === 'string' && SYSTEM_CHANGE_REFUSALS.some((wording) => message.includes(wording));
 }
 
 /**
@@ -305,6 +332,8 @@ export class AnthropicAdapter implements ProviderAdapter {
   readonly cacheReceiptBasis = 'wire-request' as const;
   /** Membrane sends server-tool blocks back through this adapter, in the turn that produced them. Live checks had the API accept each type, with or without a cache marker, but `container_upload`, which it refuses in an assistant turn and so is left out (see utils/anthropic-server-blocks.ts). */
   readonly replaysAnthropicServerBlocks = true;
+  /** Sends a mid-conversation `role: 'system'` message, with the inline-tools beta when it changes tools. Live checks had the API take tool removals and definitions by value there (Opus 5.5, Haiku 5.5), system text (Haiku 5.5, Sonnet 5), and a cache marker on each block type (Haiku 5.5). Where the model takes none, its 400 is marked `systemChangeRefused`. */
+  readonly sendsSystemChanges = true;
 
   /**
    * Verified live 2026-08-25 (claude-haiku-4-5, 4,650-token cached system
@@ -864,10 +893,11 @@ export class AnthropicAdapter implements ProviderAdapter {
    *  header — the SDK replaces same-key defaults instead of merging, and the
    *  API accepts comma-separated betas. Undefined when nothing to add, so
    *  the defaults apply untouched. */
-  private betaHeaders(request: ProviderRequest, built: { thinking?: unknown }): Record<string, string> | undefined {
+  private betaHeaders(request: ProviderRequest, built: { thinking?: unknown; messages?: unknown }): Record<string, string> | undefined {
     const needed: string[] = [];
     if (thinkingEnabled(request) && needsInterleavedThinkingBeta(request.model)) needed.push(INTERLEAVED_THINKING_BETA);
     if (sendsBlockBinding(built)) needed.push(THINKING_BINDING_BETA);
+    if (sendsToolChanges(built)) needed.push(INLINE_TOOLS_BETA);
     if (needed.length === 0) return undefined;
     // Set-join so a default that already carries a beta doesn't emit it
     // twice (the API tolerates duplicates; this is hygiene).
@@ -949,6 +979,17 @@ export class AnthropicAdapter implements ProviderAdapter {
               .filter((b) => !(b?.type === 'text' && (typeof b.text !== 'string' || b.text === ''))).length;
             if (content.length !== carried || substituted) onContentAltered?.(original);
             return { ...block, content };
+          }
+          if (block.type === 'tool_addition' && block.tool?.type === 'tool_definition' && block.tool.definition) {
+            // A definition by value meets the same rule as `tools`: its root
+            // union is flattened, as below. That changes what the model is
+            // told about the tool, so its message is reported altered.
+            const definition = block.tool.definition;
+            const flattened = flattenRootSchemaUnion(definition.input_schema);
+            if (flattened !== definition.input_schema) {
+              onContentAltered?.(original);
+              return { ...block, tool: { ...block.tool, definition: { ...definition, input_schema: flattened } } };
+            }
           }
           return block;
         }).filter((block: unknown) => block !== undefined),
@@ -1164,6 +1205,10 @@ export class AnthropicAdapter implements ProviderAdapter {
           rawRequest,
         });
       }
+      // A model without mid-conversation system messages or tool changes
+      // refuses the request for its system change: said on the error, so the
+      // caller can apply the change to `tools` and `system` instead.
+      if (classified.httpStatus === 400 && isSystemChangeRefusal(error.error)) markSystemChangeRefused(classified);
       if (classified.type !== 'unknown') return classified;
 
       // Safety net: if the SSE error body wasn't parseable JSON, neither

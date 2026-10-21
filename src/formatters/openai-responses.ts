@@ -140,7 +140,7 @@ export class OpenAIResponsesFormatter implements PrefillFormatter {
           onAltered?.();
           continue;
         }
-        const rawItem = block.rawItem as NativeItem | undefined;
+        const rawItem = ('rawItem' in block ? block.rawItem : undefined) as NativeItem | undefined;
         if (!rawItem || typeof rawItem !== 'object') {
           pendingParts.push(block);
           continue;

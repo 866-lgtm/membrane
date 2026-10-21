@@ -227,6 +227,17 @@ export interface ProviderAdapter {
    * capability. */
   readonly replaysAnthropicServerBlocks?: boolean;
 
+  /** Whether this adapter sends a mid-conversation `role: 'system'` message,
+   * which a formatter that `rendersSystemChanges` builds from a message's
+   * `system_change` blocks (SystemChangeContent), with what the API needs for
+   * it. Only AnthropicAdapter declares it: live checks had the Anthropic API
+   * accept such messages, and whether another provider accepts them is
+   * unknown. For any other adapter Membrane refuses a request carrying one
+   * before sending. A decorator must forward this capability, or a request
+   * through it is refused; connectome-host's LoggingProviderAdapter doesn't
+   * forward it yet. */
+  readonly sendsSystemChanges?: boolean;
+
   /**
    * True when this adapter carries the content of every message in the
    * ProviderRequest it receives into its API call (format conversion
@@ -323,6 +334,12 @@ export interface ProviderRequest {
 export interface ProviderRequestContext {
   formatterName: string;
   toolMode: 'native' | 'xml';
+  /** Whether the request's `tools` holds any. Only the prompt transports'
+   *  check (assertPromptToolSupport) reads it, and a request carrying a
+   *  system change never reaches it: membrane refuses that request unless
+   *  its formatter and adapter send system changes, which no prompt
+   *  transport does. So it reads `tools` alone, not the tools as the
+   *  request's changes leave them. */
   toolsDeclared: boolean;
   /** An XML streaming runner may manufacture prefill on a later continuation. */
   requiresAssistantPrefill: boolean;

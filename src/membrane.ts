@@ -4,7 +4,7 @@
  * A selective boundary that transforms what passes through.
  */
 
-import { restoreToolName } from './utils/tool-names.js';
+import { restoreToolName, toolsOffered } from './utils/tool-names.js';
 import { toolUseInputFromValue } from './providers/utils.js';
 import { StreamedThinking } from './utils/streamed-thinking.js';
 import { LocalStopSequences, firstStop, membraneBlockType } from './utils/local-stop-sequences.js';
@@ -68,7 +68,7 @@ import {
 } from './types/index.js';
 import type { BuildResult } from './formatters/types.js';
 import { computeCacheWireReceipt } from './cache-wire-receipt.js';
-import { awaitCallerCode, runCallerCode } from './types/errors.js';
+import { awaitCallerCode, runCallerCode, systemChangeRefusedError } from './types/errors.js';
 import { createProgressDeadline } from './providers/utils.js';
 import {
   parseToolCalls,
@@ -174,7 +174,11 @@ class NativeBlockTracker {
   private received: ReceivedBlock[] = [];
   private readonly receivedByIndex = new Map<number, ReceivedBlock>();
 
-  constructor(private readonly emit: ((event: BlockEvent) => void) | undefined) {}
+  constructor(
+    private readonly emit: ((event: BlockEvent) => void) | undefined,
+    /** A tool call's name as the caller knows it (restoreToolName), for native rounds. */
+    private readonly restoreName?: (name: string) => string,
+  ) {}
 
   /** Provider block callback: first sighting of an index starts it, a second completes it. */
   onProviderBlock(index: number, block: unknown): void {
@@ -296,7 +300,7 @@ class NativeBlockTracker {
     else if (mbType === 'thinking') mb.content = apiBlock?.thinking;
     else if (mbType === 'tool_call') {
       mb.toolId = apiBlock?.id;
-      mb.toolName = apiBlock?.name;
+      mb.toolName = apiBlock?.name !== undefined && this.restoreName ? this.restoreName(apiBlock.name) : apiBlock?.name;
       mb.input = apiBlock?.input as Record<string, unknown> | undefined;
     }
     this.emit?.({ event: 'block_complete', index, block: mb });
@@ -326,6 +330,11 @@ function toolCallOf(block: ToolUseContent): ToolCall {
  */
 function isBuildRefusal(error: unknown): error is MembraneError {
   return error instanceof MembraneNotReadyError || error instanceof MembraneNormalizerError;
+}
+
+/** Whether a wire message's content holds a tool call. */
+function holdsToolUse(content: unknown): boolean {
+  return Array.isArray(content) && content.some((block) => (block as { type?: unknown } | null)?.type === 'tool_use');
 }
 
 /**
@@ -892,8 +901,8 @@ export class Membrane {
     }
     const mode = request.toolMode && request.toolMode !== 'auto' ? request.toolMode
       : formatter.configuredToolMode ?? (formatter.supportsNativeTools ? 'native' : 'xml');
-    if (request.tools?.length && !(mode === 'native' ? formatter.supportsNativeTools : formatter.supportsXmlTools)) {
-      throw unsupportedError(`Formatter "${formatter.name}" cannot carry ${mode} tool definitions. Choose a formatter supporting that carrier or omit tools.`);
+    if (toolsOffered(request).length && !(mode === 'native' ? formatter.supportsNativeTools : formatter.supportsXmlTools)) {
+      throw unsupportedError(`Formatter "${formatter.name}" cannot carry ${mode} tool definitions. Choose a formatter supporting that carrier, or leave out the tools (those in tools and those a system change's defineTools offers).`);
     }
     return mode;
   }
@@ -1664,8 +1673,11 @@ export class Membrane {
         // runNativeToolsYielding uses (#19). Before this, meta.type was
         // hardcoded to 'text' on every chunk and onBlock was never invoked
         // from this path (#20).
-        const tracker = new NativeBlockTracker(onBlock ? (event) => onBlock(event) : undefined);
-        roundReceived = () => this.parseProviderContent(tracker.partialContent(), request.tools);
+        // A reply calls from the tools this round's messages offer, a change
+        // in them included.
+        const offered = toolsOffered({ tools: request.tools, messages });
+        const tracker = new NativeBlockTracker(onBlock ? (event) => onBlock(event) : undefined, (name) => restoreToolName(name, offered));
+        roundReceived = () => this.parseProviderContent(tracker.partialContent(), offered);
         const streamResult = await this.streamOnce(
           providerRequest,
           {
@@ -1718,7 +1730,7 @@ export class Membrane {
 
         // The provider has finished the round: from here, what it received is
         // the content it returned.
-        const responseBlocks = this.parseProviderContent(streamResult.content, request.tools);
+        const responseBlocks = this.parseProviderContent(streamResult.content, offered);
         roundReceived = () => responseBlocks;
 
         // Single-callback adapters (OpenAI Responses) report each finalised
@@ -1965,10 +1977,12 @@ export class Membrane {
     // budget (Anthropic allows 4 cache_control including tools/system).
     // Upstream markers are never displaced or stripped — if they fill all
     // 4 slots the float is withheld (with a warning) and behavior is
-    // exactly pre-float. With 2+ slots free, the previous round's
-    // endpoint is marked too: a wide parallel-tool round can append more
-    // blocks than the provider's ~20-block backward search covers, which
-    // would orphan the previous round's cache entry behind an unmarked
+    // exactly pre-float. With 2+ slots free, the message before the
+    // assistant turn that made the round's calls is marked too, which is
+    // usually the previous request's last message (the exception is named
+    // where the targets are chosen): a wide parallel-tool round can append
+    // more blocks than the provider's ~20-block backward search covers,
+    // which would orphan the previous round's cache entry behind an unmarked
     // boundary.
     //
     // Skipped after any repair that rewrites prefix bytes (the kinds in
@@ -1989,9 +2003,23 @@ export class Membrane {
       if (residuum <= 0) {
         this.warnFloatBudgetExhausted(wireMarkers);
       } else {
-        // Newest message first; then the previous round's endpoint (two
-        // wire messages back: [..., prevResults, assistant, results]).
-        const targets = [mergedMessages.length - 1, mergedMessages.length - 3];
+        // Newest message first; then the message before the assistant turn
+        // that made this round's tool calls (the newest assistant message
+        // holding a tool_use, with any assistant messages just before it),
+        // [..., prevEnd, assistant, results]. That is the previous request's
+        // last message wherever a system message of changes went and
+        // whatever was injected with the results, an assistant-role message
+        // included, except when the previous request ended with an assistant
+        // message, such as one injected with the results: it joins the new
+        // assistant turn, and the second marker lands on the message before
+        // that turn, which the previous request didn't mark. Only the newest
+        // marker's ~20-block backward search then reaches the previous
+        // request's cache entry, so a round wider than that writes again what
+        // it could have read.
+        let callingTurn = mergedMessages.length - 1;
+        while (callingTurn >= 0 && !(mergedMessages[callingTurn]?.role === 'assistant' && holdsToolUse(mergedMessages[callingTurn]?.content))) callingTurn--;
+        while (callingTurn > 0 && mergedMessages[callingTurn - 1]?.role === 'assistant') callingTurn--;
+        const targets = [mergedMessages.length - 1, callingTurn - 1];
         for (const mi of targets) {
           if (residuum <= 0 || mi < 0) continue;
           const content = mergedMessages[mi]?.content;
@@ -2410,6 +2438,20 @@ export class Membrane {
     // the caller's messages stay as they were, and the indices the build
     // records alterations by are theirs.
     const messages = convertMcpMedia(nativeLoopMessages ?? request.messages);
+    // A system change goes only where both ends can send it; anywhere else it
+    // would be left out (another formatter reports it only as an alteration),
+    // so the request is refused before sending, as one the API refuses for its
+    // change is (SystemChangeContent).
+    if (
+      !(activeFormatter.rendersSystemChanges && this.adapter.sendsSystemChanges) &&
+      messages.some((message) => message.content.some((block) => block.type === 'system_change'))
+    ) {
+      throw systemChangeRefusedError(
+        `A system_change block goes only through a formatter that renders it (NativeFormatter) and an adapter that sends it (AnthropicAdapter); ` +
+        `this request has formatter "${activeFormatter.name}" and adapter "${this.adapter.name}". ` +
+        'Send it through those two, or make the change in the request\'s tools and system instead.'
+      );
+    }
     // Extract user-provided stop sequences
     const additionalStopSequences = Array.isArray(request.stopSequences)
       ? request.stopSequences
@@ -2995,7 +3037,7 @@ export class Membrane {
           content.push({ type: 'text', text: block.text });
           rawAssistantText += block.text;
         } else if (block.type === 'tool_use') {
-          const name = restoreToolName(block.name, request.tools);
+          const name = restoreToolName(block.name, toolsOffered(request));
           // As in parseProviderContent: `input` is an object, and the
           // adapter's marker comes through.
           const toolUse: ToolUseContent = {
@@ -4476,10 +4518,14 @@ export class Membrane {
         // every token chunk is tagged with the membrane block it belongs to.
         // Without this, thinking_delta chunks get mislabelled as 'text' and
         // downstream consumers (TUIs, WebUIs) can't render them distinctly.
+        // A reply calls from the tools this round's messages offer, a change
+        // injected mid-turn included.
+        const offered = toolsOffered({ tools: request.tools, messages });
         const tracker = new NativeBlockTracker(
           emitBlocks ? (event) => stream.emit({ type: 'block', event }) : undefined,
+          (name) => restoreToolName(name, offered),
         );
-        roundReceived = () => this.parseProviderContent(tracker.partialContent(), request.tools);
+        roundReceived = () => this.parseProviderContent(tracker.partialContent(), offered);
         const streamResult = await this.streamOnce(
           providerRequest,
           {
@@ -4554,7 +4600,7 @@ export class Membrane {
 
         // The provider has finished the round: from here, what it received is
         // the content it returned.
-        const responseBlocks = this.parseProviderContent(streamResult.content, request.tools);
+        const responseBlocks = this.parseProviderContent(streamResult.content, offered);
         roundReceived = () => responseBlocks;
 
         // Single-callback adapters (OpenAI Responses) report each finalised
