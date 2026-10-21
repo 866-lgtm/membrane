@@ -232,6 +232,17 @@ describe('a stated wait of up to a minute is waited out, whatever the schedule\'
       .rejects.toMatchObject({ type: 'rate_limit', retryAfterMs: 120_001 });
     expect(longer.completeCalls).toBe(1);
   });
+
+  it('a stated wait past the platform timer\'s limit is waited out in full, not after 1 ms', async () => {
+    // A timer longer than 2^31 - 1 ms (about 24.8 days) fires after 1 ms on
+    // Node and in browsers, and vitest's fake timers do the same.
+    const day = 24 * 60 * 60 * 1000;
+    const adapter = new FailingAdapter(1, () => rateLimit(25 * day));
+    adapter.queueResponse('zz-recovered');
+    const membrane = new Membrane(adapter, { retry: { maxRetryDelayMs: 30 * day } });
+    const response = await completeAcrossOneWait(membrane, adapter, 25 * day);
+    expect(response.details.timing.retryDelaysMs).toEqual([25 * day]);
+  });
 });
 
 describe('the retry config: a field left out takes its default, and a value that can\'t bound a retry is refused', () => {

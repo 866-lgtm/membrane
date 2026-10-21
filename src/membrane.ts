@@ -69,7 +69,7 @@ import {
 import type { BuildResult } from './formatters/types.js';
 import { computeCacheWireReceipt } from './cache-wire-receipt.js';
 import { awaitCallerCode, runCallerCode, isDeadlineExpiry, errorFromThrown, systemChangeRefusedError } from './types/errors.js';
-import { createProgressDeadline } from './providers/utils.js';
+import { createProgressDeadline, setLongTimeout } from './providers/utils.js';
 import {
   parseToolCalls,
   formatToolResults,
@@ -3680,12 +3680,15 @@ export class Membrane {
         return;
       }
       const onAbort = () => {
-        clearTimeout(timer);
+        cancel();
         reject(signal?.reason ?? new DOMException('The operation was aborted.', 'AbortError'));
       };
       // The listener goes when the timer fires: a long-lived caller signal
-      // would otherwise keep one per retry sleep until it aborts.
-      const timer = setTimeout(() => {
+      // would otherwise keep one per retry sleep until it aborts. A wait past
+      // the platform timer's limit (about 24.8 days), which a stated wait
+      // under a large maxRetryDelayMs can be, is waited in full rather than
+      // after 1 ms.
+      const cancel = setLongTimeout(() => {
         signal?.removeEventListener('abort', onAbort);
         resolve();
       }, ms);
