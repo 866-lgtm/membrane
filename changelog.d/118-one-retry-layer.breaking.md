@@ -9,10 +9,10 @@
     keeps one attempt for these errors, and `retry: false` on a call turns off
     every retry the `retry` config schedules for it.
   - **Siblings:** connectome-host builds the `Membrane` its agents use, and
-    0.10.2 depends on `^0.5.87`, which admits no 0.6.x. agent-framework and
-    context-manager build none: their calls run on the `Membrane` their host
-    passes in, so the host's range decides, whatever their own (agent-framework
-    0.23.1's `^0.5.87`, context-manager 0.17.1's `^0.6.0`).
+    its `main` depends on `^0.5.87`, which admits no 0.6.x. agent-framework
+    and context-manager build none: their calls run on the `Membrane` their
+    host passes in, so the host's range decides, whatever their own
+    (`^0.5.87` and `^0.6.0` on their `main`s).
   - **Unchanged:** what a call whose first attempt succeeds sends and returns.
     A call that has delivered anything isn't retried after a failure.
 - **Callers with a retry layer of their own,** such as a framework that
@@ -32,8 +32,14 @@
     seconds apart end the call inside it.
   - **Siblings:** agent-framework retries its turns so, and context-manager's
     compression lane has a backoff of its own that also paces on a stated
-    wait. Neither passes `retry` today. Both call through the `Membrane` their
-    host passes in, and connectome-host's `^0.5.87` admits no 0.6.x.
+    wait. connectome-host's subagent module restarts a failed subagent run,
+    twice by default, 5 and then 10 seconds apart (after a 30-second cooldown
+    first, for a rate limit), when its failure reads as a timeout, a network or
+    server error, an overload, or a rate limit; that restart sits above
+    agent-framework's attempts. None of the three passes `retry: false` on a
+    call today. agent-framework and context-manager call through the
+    `Membrane` their host passes in, and connectome-host, which builds it,
+    depends on `^0.5.87` on its `main`, which admits no 0.6.x.
   - **Unchanged:** the error your layer receives, and how it is classified.
 - **`hooks.onError` users:** it is now asked before each retry on
   `streamYielding()` too, and on every entry point its `attempt` counts the
