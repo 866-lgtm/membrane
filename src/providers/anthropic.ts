@@ -116,24 +116,31 @@ export function needsInterleavedThinkingBeta(model: string): boolean {
   return parseInt(minor, 10) < 6;
 }
 
-/** Pull any anthropic-beta value out of a ClientOptions defaultHeaders bag,
- *  which the SDK types as record | entries-array | Headers. Case-insensitive
- *  on the key; non-string values (explicit null override, arrays) are treated
- *  as absent. */
+/** Pull the anthropic-beta value out of a ClientOptions defaultHeaders bag,
+ *  which the SDK types as record | entries-array | Headers, as the SDK's
+ *  buildHeaders reads it: case-insensitive on the key, each value of an array
+ *  appended, undefined skipped, and null clearing what came before; an
+ *  object's key replaces what an earlier key gave, where entries rows append.
+ *  Nothing left is absent. */
 function extractBetaHeader(headers: ClientOptions['defaultHeaders']): string | undefined {
   if (!headers) return undefined;
   if (typeof (headers as Headers).get === 'function') {
     return (headers as Headers).get('anthropic-beta') ?? undefined;
   }
-  const entries = Array.isArray(headers)
-    ? headers
-    : Object.entries(headers as Record<string, unknown>);
+  const rows = Array.isArray(headers);
+  const entries = rows ? headers : Object.entries(headers as Record<string, unknown>);
+  let values: string[] = [];
   for (const [key, value] of entries) {
-    if (String(key).toLowerCase() === 'anthropic-beta' && typeof value === 'string') {
-      return value;
+    if (String(key).toLowerCase() !== 'anthropic-beta') continue;
+    let replaced = rows;
+    for (const v of Array.isArray(value) ? value : [value]) {
+      if (v === undefined) continue;
+      if (!replaced) { values = []; replaced = true; }
+      if (v === null) values = [];
+      else values.push(String(v));
     }
   }
-  return undefined;
+  return values.length > 0 ? values.join(',') : undefined;
 }
 
 /** Beta flag for thinking-binding controls (`thinking.block_binding`) and
