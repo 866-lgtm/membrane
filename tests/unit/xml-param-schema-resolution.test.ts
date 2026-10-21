@@ -800,7 +800,7 @@ describe('values behind a $ref, in branches and across root alternatives', () =>
     expect(fromB).toContain('<parameter name="fld18">');
   });
 
-  it("lists nothing where a keyword or a value can't be read", () => {
+  it("lists nothing where a $ref doesn't resolve, an enum isn't a list, or a listed or const value isn't a scalar", () => {
     const doc = renderedTools(tool);
     expect(doc).toContain('<parameter name="fld19">');
     expect(doc).toContain('<parameter name="fld20">');
