@@ -234,8 +234,7 @@ export interface ProviderAdapter {
    * accept such messages, and whether another provider accepts them is
    * unknown. For any other adapter Membrane refuses a request carrying one
    * before sending. A decorator must forward this capability, or a request
-   * through it is refused; connectome-host's LoggingProviderAdapter doesn't
-   * forward it yet. */
+   * through it is refused. */
   readonly sendsSystemChanges?: boolean;
 
   /**

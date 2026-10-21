@@ -124,6 +124,8 @@ const result = formatter.buildMessages(messages, {
 });
 ```
 
+A message of `system_change` blocks never takes such a boundary, since `NativeFormatter` can place it past later turns: a boundary goes where it would with the request's changes left out. A change's own `cacheBreakpoint` goes with it to where it lands.
+
 With prompt caching enabled, explicit message breakpoints are retained. Under the default `cacheMarkers: 'membrane-system'`, the formatters also mark the context prefix, and system/tool fallback markers depend on the selected representation and existing markers; they are not unconditional extra markers. Under `cacheMarkers: 'cm-owned'`, neither formatter places a system, context-prefix or fallback marker of its own, so the request carries only the markers the caller placed. A formatter's optional `cacheMarkersApplied` describes its build-time count. Membrane's reported request count is reconciled with its final marker policy.
 
 For `cacheMarkers: 'membrane-system'`, Membrane applies the complete-request clamp after hooks, retaining the deepest permitted markers, and native streaming spends only the remaining budget on floating tool-loop markers, withholding them across prefix-rewriting normalization repairs. For `cacheMarkers: 'cm-owned'`, it rejects an excess budget instead of displacing caller-owned markers, and places no floating marker.

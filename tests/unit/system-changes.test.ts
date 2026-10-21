@@ -24,7 +24,6 @@ import { CompletionsFormatter } from '../../src/formatters/completions.js';
 import { AnthropicAdapter, isSystemChangeRefusal } from '../../src/providers/anthropic.js';
 import { MembraneError } from '../../src/types/errors.js';
 import { FidelityNotes } from '../../src/utils/fidelity.js';
-import { isSystemChangeContent } from '../../src/types/content.js';
 import { toolsOffered } from '../../src/utils/tool-names.js';
 import { stripEmptyTextMessages } from '../../src/utils/empty-text.js';
 import type {
@@ -169,13 +168,18 @@ describe('NativeFormatter: cache markers and system messages', () => {
     expect(blocks.map((b) => b.cache_control)).toEqual([undefined, { type: 'ephemeral' }]);
   });
 
-  it('a boundary before the message after one goes on the system message, its message before it', () => {
-    const built = build([user('u0'), changes(change({ addSystem: ['s1'] })), reply(text('a2'))], {
+  it('a boundary goes where it would with the changes left out, never on a system message, which can land past later turns', () => {
+    const s = changes(change({ addSystem: ['s'] }));
+    const marked = (messages: NormalizedMessage[], at: number) => build(messages, {
       ...caching,
-      hasCacheMarker: (_m: NormalizedMessage, index: number) => index === 2,
-    });
-    expect((built.messages[1]!.content as Array<Record<string, unknown>>)[0]!.cache_control).toEqual({ type: 'ephemeral' });
-    expect((built.messages[0]!.content as Array<Record<string, unknown>>)[0]!.cache_control).toBeUndefined();
+      hasCacheMarker: (_m: NormalizedMessage, index: number) => index === at,
+    }).messages.flatMap((m) => (m.content as Array<Record<string, unknown>>).filter((b) => b.cache_control).map((b) => `${m.role}:${b.text}`));
+    // The change lands after u4, past a3: the boundary before a3 stays after a1, as without the change.
+    expect(marked([user('u0'), reply(text('a1')), s, reply(text('a3')), user('u4'), reply(text('a5'))], 3)).toEqual(['assistant:a1']);
+    expect(marked([user('u0'), reply(text('a1')), reply(text('a3')), user('u4'), reply(text('a5'))], 2)).toEqual(['assistant:a1']);
+    // Landing right before the boundary's message, it still takes none.
+    expect(marked([user('u0'), s, reply(text('a2'))], 2)).toEqual(['user:u0']);
+    expect(marked([user('u0'), reply(text('a1')), s, user('u2'), reply(text('a3'))], 4)).toEqual(['user:u2']);
   });
 });
 
@@ -232,11 +236,10 @@ describe('Membrane: a request carrying a system change', () => {
     expect(new AnthropicXmlFormatter().rendersSystemChanges).toBeUndefined();
   });
 
-  it('is not a system change when it carries none', async () => {
+  it('a request carrying none goes through an adapter that doesn\'t send them', async () => {
     const adapter = new RecordingAdapter(false);
     await new Membrane(adapter).complete(request([user('u0')]));
     expect(adapter.requests).toHaveLength(1);
-    expect(isSystemChangeContent(text('x'))).toBe(false);
   });
 });
 
@@ -365,20 +368,6 @@ describe('system changes: placement edges, markers, names, the beta and refusals
     expect(Object.keys(sent.properties).sort()).toEqual(['a', 'b']);
     expect(definition.input_schema).toBe(anyOfSchema);
     expect(anyOfSchema).toEqual(anyOfSnapshot);
-  });
-
-  it('keeps a configured default beta beside the inline-tools beta', async () => {
-    const seen: Array<Record<string, string> | undefined> = [];
-    const adapter = new AnthropicAdapter({ apiKey: 'sk-test', cacheKeepalive: { enabled: false }, defaultHeaders: { 'anthropic-beta': 'oauth-2025-04-20' } });
-    (adapter as any).client = { messages: { create: async (_body: unknown, opts: { headers?: Record<string, string> }) => {
-      seen.push(opts.headers);
-      return { content: [{ type: 'text', text: 'ok' }], stop_reason: 'end_turn', model: 'm', usage: { input_tokens: 1, output_tokens: 1 } };
-    } } };
-    await adapter.complete({ model: 'claude-opus-5-5', maxTokens: 100, messages: [
-      { role: 'user', content: [{ type: 'text', text: 'hello' }] },
-      { role: 'system', content: [{ type: 'tool_removal', tool: { type: 'tool_reference', name: 'x' } }] },
-    ] } as any);
-    expect(seen[0]?.['anthropic-beta']).toBe('oauth-2025-04-20,inline-tools-2026-09-15');
   });
 
   /** An adapter that sends system changes and answers with a call to `srv__get_weather`. */

@@ -3030,6 +3030,8 @@ export class Membrane {
 
     // Build raw text for rawAssistantText
     let rawAssistantText = '';
+    // The tools the request offers, read once at the first call.
+    let offered: readonly { name: string }[] | undefined;
 
     if (Array.isArray(providerResponse.content)) {
       for (const block of providerResponse.content) {
@@ -3037,7 +3039,8 @@ export class Membrane {
           content.push({ type: 'text', text: block.text });
           rawAssistantText += block.text;
         } else if (block.type === 'tool_use') {
-          const name = restoreToolName(block.name, toolsOffered(request));
+          offered ??= toolsOffered(request);
+          const name = restoreToolName(block.name, offered);
           // As in parseProviderContent: `input` is an object, and the
           // adapter's marker comes through.
           const toolUse: ToolUseContent = {

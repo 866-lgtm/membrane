@@ -250,8 +250,10 @@ export class NativeFormatter implements PrefillFormatter {
     // the placement reads (placeSystemChanges).
     const systemChanges: BuiltSystemChange[] = [];
     const origin = new WeakMap<object, number>();
-    // The content of the message before the current one, in input order and
-    // system changes included: where a hasCacheMarker boundary goes.
+    // The content of the turn message before the current one in input order,
+    // or the contextPrefix: where a hasCacheMarker boundary goes. A message of
+    // system changes never takes one, since it can land past later turns, so
+    // a boundary goes where it would with the request's changes left out.
     let previousContent: Array<Record<string, unknown>> | undefined;
     // Each tool's wire name, with the caller name that holds it, so a
     // definition in a system change can't take another tool's wire name.
@@ -297,7 +299,6 @@ export class NativeFormatter implements PrefillFormatter {
         }
         if (message.cacheBreakpoint && cacheControl) markLastCacheable(content, cacheControl);
         systemChanges.push({ content, at: i });
-        previousContent = content;
         continue;
       }
 
@@ -552,8 +553,10 @@ export class NativeFormatter implements PrefillFormatter {
    * place, as after a final assistant turn, the request is refused before
    * sending. Adjacent ones keep their order, and the API judges consecutive
    * system messages together. The message's own breakpoint goes with it to
-   * where it lands; a `hasCacheMarker` boundary on it goes on the message
-   * before it in input order, as for any message.
+   * where it lands. A `hasCacheMarker` boundary never goes on it, since it can
+   * land past later turns: a boundary, on it or on any other message, goes on
+   * the turn message before that message in input order, where it would go
+   * with the request's changes left out.
    */
   private static placeSystemChanges(
     messages: ProviderTurnMessage[],
