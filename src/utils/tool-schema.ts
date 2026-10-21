@@ -382,12 +382,15 @@ function isScalar(value: unknown): value is Scalar {
 }
 
 /**
- * The values a schema node admits, when the schema names them (shelf-963): a
- * list; `undefined` when it names none, so the node takes values no list
- * holds (a `type` alone, a branch with no list of its own); or UNREADABLE
- * when something that would narrow them can't be read (a `$ref` that cycles
- * or does not resolve, a keyword of the wrong shape, a listed value that isn't
- * a string, number, boolean or null). UNREADABLE wins every combination, so a
+ * The values a schema node admits, when the schema names them: a list;
+ * `undefined` when it names none (as for any `type` but one that admits only
+ * null, or a branch with no list of its own); or UNREADABLE when something
+ * that would narrow them can't be read (a `$ref` that cycles, does not
+ * resolve or takes a form this reading doesn't follow, an `enum`, combinator
+ * or `$ref` of the wrong shape, a listed or `const` value that isn't a
+ * string, number, boolean or null).
+ * A `type` that can't be read narrows nothing, so it leaves the list as the
+ * other keywords give it. UNREADABLE wins every combination, so a
  * cycle reads the same from any entry point. Read only for the tool
  * instructions' `enum`; the parser never reads it.
  */
@@ -459,7 +462,7 @@ function valuesByRef(ref: unknown, context: ValuesContext): Values {
 }
 
 /**
- * The values one schema node admits, for the tool instructions (shelf-963).
+ * The values one schema node admits, for the tool instructions.
  *
  * `enum` lists its values, `const` one value, and a `type` that admits only
  * null the value null. A node's keywords all apply at once, so their lists
