@@ -31,9 +31,11 @@ import { createCombinedSignal, isDeadlineAbort, deadlineTimeoutError, assertTerm
 import {
   INTERLEAVED_THINKING_BETA,
   THINKING_BINDING_BETA,
+  THINKING_DISPLAY_UPDATES_BETA,
   needsInterleavedThinkingBeta,
   readInputTransformations,
   sendsBlockBinding,
+  sendsDisplayUpdates,
   thinkingEnabled,
 } from './anthropic.js';
 import { imageForRequest, urlImageForRequest } from '../utils/image-media.js';
@@ -93,8 +95,8 @@ interface BedrockMessageRequest {
   /** As membrane builds it: enabled with a budget, or adaptive, either with
    *  `display` and binding controls when they're set. */
   thinking?:
-    | { type: 'enabled'; budget_tokens: number; display?: 'summarized' | 'omitted'; block_binding?: { prefix_mismatch_behavior: 'error' | 'drop_block' } }
-    | { type: 'adaptive'; display?: 'summarized' | 'omitted'; block_binding?: { prefix_mismatch_behavior: 'error' | 'drop_block' } };
+    | { type: 'enabled'; budget_tokens: number; display?: 'summarized' | 'omitted' | 'updates'; block_binding?: { prefix_mismatch_behavior: 'error' | 'drop_block' } }
+    | { type: 'adaptive'; display?: 'summarized' | 'omitted' | 'updates'; block_binding?: { prefix_mismatch_behavior: 'error' | 'drop_block' } };
   /** Beta flags. On bedrock-runtime these ride in the body, not a header. */
   anthropic_beta?: string[];
 }
@@ -619,6 +621,11 @@ export class BedrockAdapter implements ProviderAdapter {
     if (sendsBlockBinding(params)) {
       const existing = params.anthropic_beta ?? [];
       params.anthropic_beta = [...new Set([...existing, THINKING_BINDING_BETA])];
+    }
+    // So does `display: 'updates'` (progress notes between tool calls).
+    if (sendsDisplayUpdates(params)) {
+      const existing = params.anthropic_beta ?? [];
+      params.anthropic_beta = [...new Set([...existing, THINKING_DISPLAY_UPDATES_BETA])];
     }
 
     stripEmptyTextRequest(params, onContentAltered

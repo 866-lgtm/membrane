@@ -156,6 +156,19 @@ export function sendsBlockBinding(params: { thinking?: unknown }): boolean {
   return binding !== undefined && binding !== null;
 }
 
+/** Beta flag for `thinking.display: 'updates'`, which returns the progress
+ *  notes the model writes between tool calls as text while reasoning stays
+ *  hidden. Without the beta the API rejects 'updates' as an unknown display
+ *  value. Shared with the Bedrock adapter, where it rides in `anthropic_beta`. */
+export const THINKING_DISPLAY_UPDATES_BETA = 'thinking-display-updates-2026-08-18';
+
+/** Whether a built request asks for `display: 'updates'`, which needs its
+ *  beta. Read from the final body, so a thinking config passed through
+ *  `extra` counts too. */
+export function sendsDisplayUpdates(params: { thinking?: unknown }): boolean {
+  return (params.thinking as { display?: unknown } | null | undefined)?.display === 'updates';
+}
+
 /** Beta flag for mid-conversation tool changes (`tool_addition` and
  *  `tool_removal` in a `role: 'system'` message), definitions by value
  *  included. System text there needs none. */
@@ -903,9 +916,10 @@ export class AnthropicAdapter implements ProviderAdapter {
   }
 
   /** Per-request headers for both create() and stream(): the interleaved-
-   *  thinking beta when thinking is enabled on a pre-4.6 Claude 4 model, and
-   *  the thinking-binding beta when the built request asks for binding
-   *  controls. Any default anthropic-beta (oauth) is re-carried in the same
+   *  thinking beta when thinking is enabled on a pre-4.6 Claude 4 model, the
+   *  thinking-binding beta when the built request asks for binding controls,
+   *  and the display-updates beta when it asks for `display: 'updates'`.
+   *  Any default anthropic-beta (oauth) is re-carried in the same
    *  header — the SDK replaces same-key defaults instead of merging, and the
    *  API accepts comma-separated betas. Undefined when nothing to add, so
    *  the defaults apply untouched. */
@@ -913,6 +927,7 @@ export class AnthropicAdapter implements ProviderAdapter {
     const needed: string[] = [];
     if (thinkingEnabled(request) && needsInterleavedThinkingBeta(request.model)) needed.push(INTERLEAVED_THINKING_BETA);
     if (sendsBlockBinding(built)) needed.push(THINKING_BINDING_BETA);
+    if (sendsDisplayUpdates(built)) needed.push(THINKING_DISPLAY_UPDATES_BETA);
     if (sendsToolChanges(built)) needed.push(INLINE_TOOLS_BETA);
     if (needed.length === 0) return undefined;
     // Set-join so a default that already carries a beta doesn't emit it
