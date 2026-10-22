@@ -119,6 +119,7 @@ import { FidelityNotes, isRawItemCarrier, requestFingerprint, type MessageOrigin
 
 /** Anthropic's thinking-binding controls, as a thinking config carries them. */
 type BlockBindingParam = { prefix_mismatch_behavior: 'error' | 'drop_block' };
+type ThinkingDisplay = 'summarized' | 'omitted' | 'updates';
 
 // ============================================================================
 // Membrane Class
@@ -2377,7 +2378,9 @@ export class Membrane {
    * accepted on 2026-10-10 (Fable 5.1 also accepted a budgeted config then),
    * and with `display` beside it when set, which they accepted on 2026-10-12.
    * They think whatever `thinking.enabled` says, so the binding goes whenever
-   * it's asked for.
+   * it's asked for. `display: 'updates'` is the other exception: it is sent
+   * as `{ type: 'adaptive', display: 'updates' }`, because without it these
+   * models return their progress notes between tool calls empty.
    */
   private static isAlwaysThinkingModel(model: string | undefined): boolean {
     return /\b(fable|mythos)\b/i.test(model ?? '');
@@ -2393,8 +2396,8 @@ export class Membrane {
    * the API will reject.
    */
   private buildThinkingParam(config: NormalizedRequest['config']):
-    | { type: 'adaptive'; display?: 'summarized' | 'omitted'; block_binding?: BlockBindingParam }
-    | { type: 'enabled'; budget_tokens: number; display?: 'summarized' | 'omitted'; block_binding?: BlockBindingParam }
+    | { type: 'adaptive'; display?: ThinkingDisplay; block_binding?: BlockBindingParam }
+    | { type: 'enabled'; budget_tokens: number; display?: ThinkingDisplay; block_binding?: BlockBindingParam }
     | undefined {
     const blockBinding = config.thinking?.blockBinding;
     const binding = blockBinding
@@ -2402,9 +2405,12 @@ export class Membrane {
       : {};
     const display = config.thinking?.display;
     // Thinking is always on for these: a thinking config is sent only to carry
-    // binding controls, with display as the other configs carry it.
+    // binding controls or progress updates, with display as the other configs
+    // carry it.
     if (Membrane.isAlwaysThinkingModel(config.model)) {
-      return blockBinding ? { type: 'adaptive', ...(display ? { display } : {}), ...binding } : undefined;
+      return blockBinding || display === 'updates'
+        ? { type: 'adaptive', ...(display ? { display } : {}), ...binding }
+        : undefined;
     }
     if (!config.thinking?.enabled) return undefined;
 
