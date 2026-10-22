@@ -576,14 +576,19 @@ export class AnthropicAdapter implements ProviderAdapter {
       // client makes one attempt at this request, a credential resolver's
       // resend after a 401 inside it. The keepalive's replays, which also go
       // through createMessage, keep the SDK's default.
+      // The cache's clock starts with this request, so the keepalive's touch
+      // is stamped here, not when the answer arrives. Each of Membrane's
+      // attempts is its own call here, so a retry's backoff isn't counted.
+      const sentAt = Date.now();
       const response = await this.createMessage(fullRequest, live, options?.signal, { maxRetries: 0 });
-      // The SDK has the provider's answer, so the provider has the request's
-      // prefix: only now can the keepalive hold it warm. It's recorded before
+      // The SDK has the provider's answer, so the provider has processed the
+      // request's prefix: only now can the keepalive take it up (whether it was
+      // cached, a refresh's self-check finds out). It's recorded before
       // membrane parses the answer, which can fail on an answer that arrived.
       // A call that failed before the SDK had an answer, a body cut off in
       // transit included, leaves the lineage's earlier snapshot as it was.
       this.cacheKeepalive?.record(
-        fullRequest as unknown as Record<string, unknown>, headers, 'complete',
+        fullRequest as unknown as Record<string, unknown>, headers, 'complete', sentAt,
       );
 
       return this.parseResponse(response, fullRequest);
@@ -665,6 +670,9 @@ export class AnthropicAdapter implements ProviderAdapter {
 
     try {
       session = this.credentialSession(idleAbort.signal, onTransportActivity);
+      // The cache's clock starts with this request: the keepalive's touch is
+      // stamped here, not at message_start (see complete()).
+      const sentAt = Date.now();
       const stream = await session.client.messages.stream(anthropicRequest, {
         signal: session.signal,
         headers: live,
@@ -819,14 +827,15 @@ export class AnthropicAdapter implements ProviderAdapter {
       for await (const event of stream) {
         sawEvent = true;
         resetIdleTimer();
-        // The provider has the request's prefix from its message_start on, so
-        // the keepalive can hold it warm across idle gaps (`stream: true` is
-        // dropped at replay time: transport, not cache key). A call that
+        // The provider has processed the request's prefix from its
+        // message_start on, so the keepalive can take it up across idle gaps
+        // (whether it was cached, a refresh's self-check finds out; `stream:
+        // true` is dropped at replay time: transport, not cache key). A call that
         // failed before this leaves the lineage's earlier snapshot as it was.
         // It's recorded before the caller's onProgress runs, so a callback
         // that throws can't lose a prefix the provider has.
         if (event.type === 'message_start') {
-          this.cacheKeepalive?.record(fullRequest as unknown as Record<string, unknown>, headers, 'stream');
+          this.cacheKeepalive?.record(fullRequest as unknown as Record<string, unknown>, headers, 'stream', sentAt);
         }
         // Every SDK event is progress; pings never reach this loop.
         options?.onProgress?.();

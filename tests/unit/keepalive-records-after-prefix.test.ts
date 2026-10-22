@@ -13,13 +13,19 @@
  * made where the real SDK makes it: a refused or undelivered stream fails at
  * its iterator's first event, after messages.stream() has returned.
  *
+ * A lineage's touch counts from the send of the call that's recorded, where
+ * the cache's clock starts, and a refresh's from its own send.
+ *
  * The SDK client is a stub, so nothing leaves the process, and the clock is
  * faked.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import Anthropic from '@anthropic-ai/sdk';
 import { AnthropicAdapter, INTERLEAVED_THINKING_BETA } from '../../src/providers/anthropic.js';
 import type { CacheKeepaliveConfig, KeepaliveEvent } from '../../src/cache-keepalive.js';
 import { MembraneError } from '../../src/types/index.js';
+import { Membrane } from '../../src/membrane.js';
+import { NativeFormatter } from '../../src/formatters/native.js';
 
 const START = Date.parse('2026-10-19T00:00:00Z');
 const timing = { refreshAfterMs: 100, checkIntervalMs: 100, maxIdleMs: 10_000 };
@@ -205,11 +211,12 @@ describe('the stream lane records a request at message_start', () => {
     const call = a.stream(request('Resident system G', 2), noCallbacks);
     await vi.advanceTimersByTimeAsync(200);
     expect(replays().map(wire => wire.messages.length)).toEqual([1, 1]);
-    // Once it has its first event, the call's request is the one held, and
-    // the next refresh due replays it.
+    // Once it has its first event, the call's request is the one held. Its
+    // touch counts from its send at 50 ms, where the cache's clock started,
+    // so its refresh is due already and the next tick replays it.
     first.release(undefined);
     await call;
-    await vi.advanceTimersByTimeAsync(200);
+    await vi.advanceTimersByTimeAsync(50);
     expect(replays().map(wire => wire.messages.length)).toEqual([1, 1, 2]);
   });
 
@@ -237,6 +244,145 @@ describe('the stream lane records a request at message_start', () => {
     expect(record).toHaveBeenCalledTimes(1);
     expect(record.mock.calls[0]![1]).toEqual({ 'anthropic-beta': INTERLEAVED_THINKING_BETA });
     expect(record.mock.calls[0]![2]).toBe('stream');
+  });
+});
+
+/**
+ * #164's follow-up R1-2: the cache's clock starts at a request's send, so a
+ * lineage's touch counts from the send of the call that's recorded, and from
+ * a refresh's send, not from when its answer arrives. Stamped at the answer,
+ * a slow call's first refresh came that much later, toward the TTL's edge.
+ */
+describe('the touch counts from the send', () => {
+  // A tick every 10 ms, so a refresh is found within 10 ms of falling due.
+  const fine = { checkIntervalMs: 10 };
+  const replayAnswer = () => ({ ...answer, content: [], stop_reason: 'max_tokens', usage: readUsage });
+
+  it('stream lane: a call whose first event comes 50 ms after its send', async () => {
+    const first = held();
+    const { a, replays } = adapter(fine, replayAnswer, () => heldStream(first.promise, [messageStart, ...rest]));
+    const call = a.stream(request('Resident system S'), noCallbacks);
+    await vi.advanceTimersByTimeAsync(50);
+    first.release(undefined);
+    await call;
+    const [lineage] = a.cacheKeepalive!.getStatus();
+    expect(lineage!.idleMs).toBe(50);
+    expect(lineage!.realIdleMs).toBe(50);
+    // Due refreshAfterMs (100 ms) after the send, so by 110 ms, not 150.
+    await vi.advanceTimersByTimeAsync(60);
+    expect(replays()).toHaveLength(1);
+  });
+
+  it('complete lane: a call whose answer comes 50 ms after its send', async () => {
+    const first = held();
+    let waited = false;
+    const { a, replays } = adapter({ ...fine, lanes: ['complete'] }, async wire => {
+      if (wire.max_tokens === 0) return replayAnswer();
+      if (!waited) { waited = true; await first.promise; }
+      return answer;
+    });
+    const call = a.complete(request('Resident system T'));
+    await vi.advanceTimersByTimeAsync(50);
+    first.release(undefined);
+    await call;
+    const [lineage] = a.cacheKeepalive!.getStatus();
+    expect(lineage!.idleMs).toBe(50);
+    expect(lineage!.realIdleMs).toBe(50);
+    await vi.advanceTimersByTimeAsync(60);
+    expect(replays()).toHaveLength(1);
+  });
+
+  it('through Membrane, a retried call counts from the send of the attempt that got its answer, not the first', async () => {
+    const sends: number[] = [];
+    const second = held();
+    const overloaded = new Anthropic.APIError(529, { error: { type: 'overloaded_error', message: 'zz overloaded' } }, undefined, new Headers({}));
+    const { a } = adapter(fine, replayAnswer, () => {
+      sends.push(Date.now());
+      // The first attempt is refused before its first event; the second's
+      // first event comes at least 30 ms after its send (the wait below steps
+      // a second at a time through Membrane's jittered backoff).
+      return sends.length === 1 ? sdkStream([], overloaded) : heldStream(second.promise, [messageStart, ...rest]);
+    });
+    const membrane = new Membrane(a, { formatter: new NativeFormatter() });
+    const call = membrane.stream({
+      messages: [{ participant: 'User', content: [{ type: 'text', text: 'hello' }] }],
+      system: 'Resident system U',
+      config: { model: 'claude-opus-4-1', maxTokens: 1024 },
+      promptCaching: true, cacheTtl: '1h', toolMode: 'native',
+    } as any, { onChunk: () => {} } as any);
+    // Through Membrane's backoff to the second attempt's send.
+    for (let i = 0; i < 600 && sends.length < 2; i++) await vi.advanceTimersByTimeAsync(1_000);
+    expect(sends).toHaveLength(2);
+    expect(sends[1]! - sends[0]!).toBeGreaterThan(0);
+    await vi.advanceTimersByTimeAsync(30);
+    second.release(undefined);
+    await call;
+    const [lineage] = a.cacheKeepalive!.getStatus();
+    expect(lineage!.idleMs).toBe(Date.now() - sends[1]!);
+    expect(lineage!.idleMs).toBeLessThan(Date.now() - sends[0]!);
+    expect(lineage!.idleMs).toBeGreaterThanOrEqual(30);
+  });
+
+  it('a refresh whose answer comes 40 ms after its send counts from its send', async () => {
+    let hold: ReturnType<typeof held> | undefined;
+    const { a, replays } = adapter(fine, async wire => {
+      if (wire.max_tokens === 0 && hold) await hold.promise;
+      return wire.max_tokens === 0 ? replayAnswer() : answer;
+    }, () => sdkStream([messageStart, ...rest]));
+    await a.stream(request('Resident system V'), noCallbacks);
+    hold = held();
+    // The refresh falls due at 100 ms and is found by the tick at 100 ms.
+    await vi.advanceTimersByTimeAsync(100);
+    expect(replays()).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(40);
+    hold.release(undefined);
+    await vi.advanceTimersByTimeAsync(0);
+    const [lineage] = a.cacheKeepalive!.getStatus();
+    expect(lineage!.idleMs).toBe(40);
+    // So the next is due 100 ms after the poke's send, by 210 ms, not 240.
+    hold = undefined;
+    await vi.advanceTimersByTimeAsync(70);
+    expect(replays()).toHaveLength(2);
+  });
+
+  it('an ineffective refresh whose answer comes 40 ms after its send counts from its send too', async () => {
+    let hold: ReturnType<typeof held> | undefined;
+    const { a, events, replays } = adapter(fine, async wire => {
+      if (wire.max_tokens === 0 && hold) await hold.promise;
+      // A write, not a read: the entry's clock started again at the poke's send.
+      return wire.max_tokens === 0 ? { ...replayAnswer(), usage: { ...readUsage, cache_read_input_tokens: 0, cache_creation_input_tokens: 1000 } } : answer;
+    }, () => sdkStream([messageStart, ...rest]));
+    await a.stream(request('Resident system W'), noCallbacks);
+    hold = held();
+    await vi.advanceTimersByTimeAsync(140);
+    hold.release(undefined);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(events.filter(e => e.type === 'ineffective')).toHaveLength(1);
+    const [lineage] = a.cacheKeepalive!.getStatus();
+    expect(lineage!.idleMs).toBe(40);
+    // The next poke is due 100 ms after this one's send, by 210 ms, not 240.
+    hold = undefined;
+    await vi.advanceTimersByTimeAsync(70);
+    expect(replays()).toHaveLength(2);
+  });
+
+  it('a call sent before another on its lineage but recorded after it: its touch is its own send, its window the later call\'s', async () => {
+    const first = held();
+    let calls = 0;
+    const { a } = adapter(fine, replayAnswer,
+      () => ++calls === 1 ? heldStream(first.promise, [messageStart, ...rest]) : sdkStream([messageStart, ...rest]));
+    const older = a.stream(request('Resident system X', 2), noCallbacks);
+    await vi.advanceTimersByTimeAsync(80);
+    await a.stream(request('Resident system X'), noCallbacks);
+    await vi.advanceTimersByTimeAsync(10);
+    first.release(undefined);
+    await older;
+    const [lineage, ...others] = a.cacheKeepalive!.getStatus();
+    expect(others).toEqual([]);
+    // The snapshot is the older request, whose entries' clock started at 0 ms.
+    expect(lineage!.idleMs).toBe(90);
+    // The window still counts from the later real call, sent at 80 ms.
+    expect(lineage!.realIdleMs).toBe(10);
   });
 });
 
