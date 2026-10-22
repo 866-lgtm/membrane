@@ -26,11 +26,14 @@
 // apart from what it takes to end where a user turn ends (below). A request
 // with no user message at or after that marker is replayed whole, as it was
 // sent.
-// A call is snapshotted only once the provider is known to have its prefix
-// (the adapter records at `message_start`, or once the SDK has a non-streamed
-// response): a request that failed before then isn't known to be cached, and
-// one the provider refused for what its prefix holds would have its replays
-// refused too.
+// A call is snapshotted only once the provider is known to have processed its
+// prefix (the adapter records at `message_start`, or once the SDK has a
+// non-streamed response): a request that failed before then isn't known to
+// have reached the cache at all, and one the provider refused for what its
+// prefix holds would have its replays refused too. Processed isn't cached: a
+// prefix under the model's minimum cacheable length is processed and not
+// cached, and `refresh()`'s self-check then drops its lineage. The touch is
+// stamped at the call's send, where the cache's clock starts.
 //
 // ⚠️ THE REPLAY MUST BE BYTE-IDENTICAL ABOVE THE LAST BREAKPOINT.
 // Prompt caching is a prefix match, and the API's invalidation hierarchy means
@@ -155,9 +158,14 @@ interface Lineage {
   wire: Record<string, unknown>;
   headers: Record<string, string> | undefined;
   lane: KeepaliveLane;
-  /** Last real (non-keepalive) request. Bounds the keepalive window. */
+  /** Send time of the latest real (non-keepalive) request recorded on this
+   *  lineage, whichever order they were recorded in. Bounds the keepalive
+   *  window. */
   lastRealAt: number;
-  /** Last time the entry was touched by anything, real or keepalive. */
+  /** When the held snapshot's cache entries were last known touched: the
+   *  recorded request's send, or a later refresh's send. After a failed
+   *  refresh it's the failure's arrival instead, a back-off rather than a
+   *  touch. The next refresh falls due `refreshAfterMs` after it. */
   lastTouchAt: number;
   ineffective: number;
 }
@@ -290,11 +298,17 @@ export class CacheKeepalive {
   }
 
   /** Record a real request the provider is known to have begun answering, so
-   *  its prefix is cached. Cheap; called once per call that gets that far. */
+   *  it has processed the request's prefix (whether it cached it is the
+   *  reply's to say; see the file header). `sentAt` is when the request was
+   *  sent, where the cache entry's clock starts: the lineage's touch counts
+   *  from it, and its window from it or a later real call the lineage already
+   *  has. Left out, both count from now. Cheap; called once per call that gets
+   *  that far. */
   record(
     wire: Record<string, unknown>,
     headers: Record<string, string> | undefined,
     lane: KeepaliveLane,
+    sentAt: number = Date.now(),
   ): void {
     if (this.stopped) return;
     if (!this.cfg.lanes.includes(lane)) return;
@@ -307,7 +321,6 @@ export class CacheKeepalive {
       return;
     }
 
-    const now = Date.now();
     const existing = this.lineages.get(key);
     // Re-insert to refresh LRU position.
     this.lineages.delete(key);
@@ -315,8 +328,13 @@ export class CacheKeepalive {
       wire,
       headers,
       lane,
-      lastRealAt: now,
-      lastTouchAt: now,
+      // A call sent before another on this lineage can be recorded after it.
+      // Its window still counts from the later real call, but its touch is its
+      // own send: the snapshot is now this request, whose newest cache entries
+      // started their clocks then. That's the only touch known to have reached
+      // them; a later one that did would only make this early, never late.
+      lastRealAt: Math.max(sentAt, existing?.lastRealAt ?? sentAt),
+      lastTouchAt: sentAt,
       ineffective: existing?.ineffective ?? 0,
     });
 
@@ -412,13 +430,15 @@ export class CacheKeepalive {
           // fresh one under the same key, which keeps its keepalive.
           if (this.lineages.get(key) === lin) this.lineages.delete(key);
         } else {
-          lin.lastTouchAt = Date.now();
+          // As a real call's: the entry's clock started with the poke's send.
+          lin.lastTouchAt = startedAt;
         }
         return;
       }
 
       lin.ineffective = 0;
-      lin.lastTouchAt = Date.now();
+      // The read restarted the entry's clock at the poke's send, not its return.
+      lin.lastTouchAt = startedAt;
       this.emit({ type: 'refreshed', key, lane: lin.lane, readTokens: read, idleMs });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
