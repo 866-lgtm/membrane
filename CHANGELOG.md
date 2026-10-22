@@ -12,6 +12,134 @@ Releases up to and including 0.5.75 predate this file; for their contents see
 
 ## Unreleased
 
+## 0.7.1 — 2026-10-22
+
+### Added
+
+- `AnthropicAdapter` keeps what it needs to report a response to Anthropic,
+  on `ProviderResponse` and on its `raw` response: `responseId` / `raw.id`,
+  the message id, and `requestId` / `raw.request_id`, the `request-id`
+  response header, on `stream()` and `complete()`. Before, the stream path
+  kept neither, and `complete()`'s raw response lost the request id when
+  serialized (the SDK attaches it non-enumerably). The stream path's `raw`
+  also carries `provider_events`: `message_start` (the event, its message
+  without `content`), `message_delta`, and `unhandled`, the first 20 events
+  or deltas the adapter doesn't read or doesn't apply, with
+  `unhandled_omitted` counting the rest; each kept event is cut to 4,096
+  JSON characters. A field the API adds to `message_start` or
+  `message_delta`, a delta type the adapter doesn't read, and a
+  `content_block_stop` carrying more than its type and index are now visible
+  where they used to be dropped. A new event type isn't: the SDK
+  (`@anthropic-ai/sdk` 0.52) yields only the event types it knows. Block
+  content stays in `content`, though an event kept in `unhandled`, such as a
+  `citations_delta`, keeps the payload it carried. `ProviderResponse` gains
+  optional `responseId` and `requestId` for any adapter to fill.
+
+- Membrane's retry decision is its own entry, `@animalabs/membrane/retry`,
+  for a layer that retries provider calls itself after passing
+  `retry: false`. `classifyFailure` names a failure's class (overloaded, rate
+  limited, other retryable, a deadline that ran out on a sent request, or
+  final). `retryDecision` says whether to retry after a number of tries and
+  how long to wait, or hands back a stated wait past its schedule's ceiling.
+  `delayFor` gives one wait and its un-jittered step, for a caller that holds
+  rather than gives up. Each takes a path's own settings, a schedule per
+  class. `membraneRetrySettings(config)` gives membrane's for a retry config,
+  and `MEMBRANE_RETRY_SETTINGS` its default. A retry after attempt n (the
+  tries made so far) waits `firstDelayMs × multiplier^(n − 1)`, up to
+  `maxDelayMs`, and only an overloaded failure's wait is jittered. It fails
+  closed: an attempt must be a whole number from 1, and a wait that isn't a
+  finite number ends the retries (`delayFor` throws a `RangeError` for
+  either). A wait can be longer than one `setTimeout`
+  holds, so sleep it in chunks, as membrane does. The entry loads no
+  provider SDK. Membrane's own retries now go through it, and for
+  every error membrane's adapters build they decide as before.
+
+### Fixed
+
+- **Anthropic and Bedrock: a thinking block with no signature is left out of the request, and reported (#191).** Another provider's reasoning, such as Gemini's thought parts (#190) or an OpenAI-compatible reasoning channel, comes back from history as a `thinking` block with no signature. Anthropic's Messages API refuses that block, and refuses an empty or made-up signature too, so a conversation that moved to an Anthropic model after such a turn failed with a 400 until the turn left its history. `AnthropicAdapter` and `BedrockAdapter` now leave the block out and call `onContentAltered` for it, and `toAnthropicContent()` leaves it out too. An assistant turn whose only block it was is dropped, as a turn of whitespace text is, and a system change goes where it would with that turn gone. So a final assistant turn whose only block it was is refused before sending, as an emptied final turn is. When a system change comes after the last user turn, it ends the request instead, and the turn is dropped. Signed and signature-only thinking blocks are sent as before.
+
+- A round the provider ends with a literal `stop_reason: end_turn` while its
+  content holds complete client tool calls now runs as a
+  `tool_use` round on both native tool loops (`stream()` with `onToolCalls`,
+  and `streamYielding()`), and `complete()` returns it as a `tool_use` stop.
+  Before, every native loop gated execution on `tool_use` alone, so the
+  calls never ran and the turn ended as if finished, with nothing logged;
+  production Anthropic responses had this shape on 2026-10-19. A call is
+  complete when its block stopped and its input parsed to an object (no
+  `unparseableInput`); a round holding an incomplete call runs nothing, as
+  before. A length, refusal, stop-sequence or pause stop never qualifies,
+  nor does a provider token membrane doesn't map, nor a round with no
+  provider stop token at all (an adapter that reports none, or an
+  OpenAI-family server that sends no `finish_reason`): those run nothing, as
+  before. Each occurrence warns
+  once, through the configured `logger` when one is set, with the model, the
+  tool names and the message and request ids, and is recorded in the new
+  `details.anomalies` (`ToolUseWithEndTurnAnomaly`: `kind:
+  'tool_use_with_end_turn'`, `round`, `providerStopReason`, `toolNames`,
+  `toolUseIds`, `treatedAsToolUse`, `model`, `messageId`, `requestId`),
+  which keeps the round's own stop token. `details.stop` describes the
+  response's final round. The Anthropic and Bedrock stream adapters now hold
+  block events to the API's order: a start while no block is open, at the
+  next index (in Bedrock a start above it leaves the slot it skips empty,
+  which fails the call as a lost block, as before, and a later start in that
+  slot now breaks order instead of filling it), then that block's deltas, a
+  tool call's being only its arguments, and its stop. The first event out of
+  that order (such as a block left open when the next one starts, a late
+  stop or delta, a second start for an index, or a text delta in a tool
+  call) means the stream can't vouch for which call any arguments belong to:
+  no later block event is applied, a block still open is finalized as cut
+  off, and every `tool_use` block in the response is marked
+  (`unparseableInput`; one not already marked also gets `input` `{}`), so
+  the gate runs none of them on an `end_turn` round, and on a `tool_use`
+  round the caller gets them marked. Each adapter warns once, and the
+  Anthropic adapter keeps those events in `raw.provider_events.unhandled`.
+  Bedrock now stops reading at `message_delta`, as the Anthropic adapter
+  does, so a call still open there is marked as cut off in both, and nothing
+  after it is read: before, a later block event was applied, a second
+  `message_delta` set the stop reason again, and an error event failed the
+  call. In the Anthropic adapter the marking leaves server tool calls as
+  they streamed, since they ran on the API's side: one that stopped keeps
+  its input. Bedrock's response carries no server tool blocks, as before.
+  Citations are the exception to "not applied": the SDK appends each one to
+  the `citations` array a text block's start carried, which the adapter's
+  block shares, so one still lands there when the start carried an array. A
+  stream that ends with a block open, as a `max_tokens` cut does, is in
+  order, as before.
+
+- `GeminiAdapter` keeps the model's reasoning out of its answer. Gemini
+  returns reasoning as text parts flagged `thought: true`, and the adapter read
+  every part's text as answer text, so a request that asked for them
+  (`thinkingConfig.includeThoughts`, e.g. through `providerParams`) had the
+  model's reasoning joined onto the front of its reply
+  with no separator, streamed through `onChunk` as visible text, and in
+  `rawAssistantText`. On `complete()` and `stream()`, thought parts now
+  become one `thinking` block, placed before the answer, and are not streamed
+  through `onChunk`, as `OpenAICompatibleAdapter` treats its reasoning channel
+  (the Anthropic adapter, by contrast, streams thinking chunks). A response of
+  only thought parts has no text block. An image model's interim thought
+  images, flagged the same way, are no longer among the answer's images.
+  `fromGeminiParts()` keeps part order:
+  each thought part with text becomes its own `thinking` block where it fell,
+  as each text part is its own `text` block. `toGeminiParts()` sends only text
+  and tool calls: a `thinking` or `redacted_thinking` block, as
+  `convertMessages` drops them, or an image, which it doesn't convert, used to
+  become a text part reading "[object Object]". Thinking blocks in prior
+  assistant turns are still not sent back to Gemini. A response without
+  thought parts is unchanged.
+  - Not round-tripped: Gemini's `thoughtSignature`, which may ride any part,
+    is not captured.
+
+- `hooks.onError` is asked after a retry's wait is decided, so a change it
+  makes to `error.retryAfterMs` no longer changes the wait. Its documented
+  contract, `'retry'` or `'abort'`, is unchanged.
+- A failure typed `rate_limit` that is also overloaded (a 529, or no status
+  and `529` or `overloaded_error` in its message), which only another
+  adapter's error can be, gets the overloaded attempt count, seven by
+  default, or with `overloaded.maxRetries: 0` the base count, where it got
+  the rate limit's five.
+- A provider's stated wait is read as a number: one that isn't a number
+  counts as none, where it gave a wait that ran at once.
+
 ## 0.7.0 — 2026-10-22
 
 ### Breaking
