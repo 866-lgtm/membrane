@@ -12,6 +12,720 @@ Releases up to and including 0.5.75 predate this file; for their contents see
 
 ## Unreleased
 
+## 0.7.0 — 2026-10-22
+
+### Breaking
+
+- **Callers without a retry layer of their own:** `retry.maxRetries` now
+  defaults to 3 (it was 0). A 5xx, a provider's 408 or a connection failure
+  before anything was delivered gets three attempts on the base schedule, with
+  waits of 1 and 2 seconds, on every adapter. On `AnthropicAdapter` those three
+  attempts were already made, inside its SDK client, and are now membrane's,
+  counted in `details.timing.attempts` and cancellable; on the other adapters
+  it was one attempt.
+  - **Migration:** none, to keep a call working. `retry: { maxRetries: 1 }`
+    keeps one attempt for these errors, and `retry: false` on a call turns off
+    every retry the `retry` config schedules for it.
+  - **Siblings:** connectome-host builds the `Membrane` its agents use, and
+    its `main` depends on `^0.5.87`, which admits no 0.6.x. agent-framework
+    and context-manager build none: their calls run on the `Membrane` their
+    host passes in, so the host's range decides, whatever their own
+    (`^0.5.87` and `^0.6.0` on their `main`s).
+  - **Unchanged:** what a call whose first attempt succeeds sends and returns.
+    A call that has delivered anything isn't retried after a failure.
+- **Callers with a retry layer of their own,** such as a framework that
+  retries its turns under a policy of its own: pass `retry: false` on each
+  call. Otherwise membrane's schedules run inside each of your attempts, up to
+  seven attempts at a 529 over five to ten minutes, and a stated wait of up to
+  a minute is spent inside membrane, out of your layer's sight. That includes
+  `streamYielding()`, which didn't retry before, and a 529 after a refusal
+  re-issue, which gets a whole schedule again.
+  - **Migration:** `retry: false` on `complete()`, `stream()` or
+    `streamYielding()`. A failure then reaches you after one attempt, as it
+    came, with `retryable` and any stated wait on `retryAfterMs`. Two sends
+    stay: a refusal re-issue you ask for with `refusalRetries`, and a
+    credential resolver's one resend after a 401. If your layer takes over
+    capacity errors, give a 529 a schedule of its own: membrane's overloaded
+    schedule waits a capacity storm out for minutes, and a few retries
+    seconds apart end the call inside it.
+  - **Siblings:** agent-framework retries its turns so, and context-manager's
+    compression lane has a backoff of its own that also paces on a stated
+    wait. connectome-host's subagent module restarts a failed subagent run,
+    twice by default, 5 and then 10 seconds apart (after a 30-second cooldown
+    first, for a rate limit), when its failure reads as a timeout, a network or
+    server error, an overload, or a rate limit; that restart sits above
+    agent-framework's attempts. None of the three passes `retry: false` on a
+    call today. agent-framework and context-manager call through the
+    `Membrane` their host passes in, and connectome-host, which builds it,
+    depends on `^0.5.87` on its `main`, which admits no 0.6.x.
+  - **Unchanged:** the error your layer receives, and how it is classified.
+- **`hooks.onError` users:** it is now asked before each retry on
+  `streamYielding()` too, and on every entry point its `attempt` counts the
+  attempts at the failing request since its last refusal re-issue, the count
+  the retry budget reads. It used to count every pass of the whole call,
+  refusal re-issues included, so after a re-issue it now starts again from 1.
+  - **Migration:** a hook that told the call's passes apart by `attempt`
+    counts them itself.
+  - **Siblings:** none of the three sets `hooks.onError`.
+  - **Unchanged:** returning `'abort'` ends the call with the error.
+- **`AnthropicAdapter` callers who relied on its SDK client's retries of a
+  connect timeout:** a connect timeout now reaches you after one attempt, as
+  a retryable `timeout`, where the SDK made three. The SDK reports a
+  connect timeout the same way as a timeout on a request already sent, which
+  membrane doesn't spend another deadline on.
+  - **Migration:** retry a `timeout` yourself where a stalled connect is likely.
+  - **Siblings:** connectome-host, which builds the `Membrane` the other two
+    call through, depends on `^0.5.87`, which admits no 0.6.x.
+  - **Unchanged:** on the other adapters, on Node, a connect timeout is
+    retried like any connection failure.
+- **Callers who relied on the 429 floor's five attempts:** an error whose
+  stated wait (`retry-after`) is longer than a minute, or than its schedule's
+  `maxRetryDelayMs` where that's longer, now reaches you at once, with the
+  stated wait on `retryAfterMs`. Before, membrane waited only its own cap and
+  sent the call again inside the window the provider had named, and
+  `AnthropicAdapter`'s SDK client sent it again after its own short backoff. A
+  stated wait of up to a minute is waited out, as the SDK waited out one under
+  a minute, though the base schedule's own backoff stops at 30 seconds.
+  - **Migration:** pace on `retryAfterMs`, or raise `retry.maxRetryDelayMs`
+    to have longer stated waits waited out.
+  - **Siblings:** connectome-host, which builds the `Membrane` the other two
+    call through, depends on `^0.5.87`, which admits no 0.6.x.
+  - **Unchanged:** a 429 that states no wait still gets five attempts.
+- **Callers who build the `retry` config:** a field that isn't a finite number
+  of at least 0 is now refused when the `Membrane` is constructed, with a
+  `RangeError` naming the field (a `TypeError` for a value that isn't a
+  number). A field given as `undefined` takes its default. Before, an explicit
+  `undefined` replaced the default. As `maxRetries`, `undefined` and `NaN`
+  meant no retries at all, a 429's and a 529's included. −1 and `null` meant
+  none for other errors, as 0 does, while a 429 and a 529 kept their own
+  schedules. `Infinity` meant retrying without end while the error lasted,
+  and a numeric string was read as its number.
+  - **Migration:** pass a finite number of at least 0, or leave the field out.
+    A caller that passed `Infinity` to keep retrying chooses a bound, and one
+    that passed `undefined` or `NaN` to turn every retry off passes
+    `retry: false` on its calls.
+  - **Siblings:** connectome-host, which builds the `Membrane` its agents use,
+    already refuses a recipe's `agent.retry` by the same rule, so no recipe it
+    loads today is refused here.
+  - **Unchanged:** a config whose fields are finite numbers of at least 0, or
+    absent.
+
+- **TypeScript consumers:** `ContentBlock` gains `SystemChangeContent` (`type: 'system_change'`), and
+  `ProviderMessage.role` gains `'system'`. Code that reads a property only some members declare, or that
+  checks a switch over either for exhaustiveness, fails to type-check until it handles the new member.
+  The type change itself changes nothing at run time.
+
+### Added
+
+- A per-call `retry` option on `complete()`, `stream()` and
+  `streamYielding()`. With `false`, membrane retries none of the call's failed
+  requests, whatever the error and whatever the `retry` config says: the 429
+  floor and the `overloaded` schedule are off too. The failure reaches the
+  caller as it came, with the provider's advice on it (`retryable`, and a
+  stated wait on `retryAfterMs`), and `hooks.onError`, which is asked before
+  each retry, isn't asked. It's for a caller whose own layer retries, such as
+  an agent framework that retries its turns under a policy of its own and
+  keeps a provider's stated waits. Two sends stay: a refusal re-issue, which
+  a `complete()` call, or a `streamYielding()` call in native tool mode, asks
+  for with `refusalRetries`, and the one resend with refreshed credentials
+  that an adapter with a credential resolver makes after an HTTP 401. The
+  default keeps membrane's retries.
+
+- System changes: a message holding only `system_change` blocks (`SystemChangeContent`, with
+  `removeTools`, `defineTools` and `addSystem`) changes the tools the model is offered and its system
+  text from that point on, without editing `tools` or `system`, so the prompt cache before it holds.
+  `NativeFormatter` and `AnthropicAdapter` send it as a mid-conversation `role: 'system'` message at the
+  first point the API accepts, with the inline-tools beta when it changes tools. A request carrying one
+  fails with `MembraneError.systemChangeRefused` set when no point after its place accepts it or the
+  formatter or adapter is another, before anything is sent, and when the model takes no mid-conversation
+  system message; a formatter that can't carry the request's tools at all refuses first, unflagged. A tool a change defines comes back under its own name when the model calls it. New
+  optional members: `ProviderAdapter.sendsSystemChanges` (a decorator must forward it, or requests
+  through it are refused) and `PrefillFormatter.rendersSystemChanges`.
+
+- `thinking.display` takes `'updates'` (Anthropic beta `thinking-display-updates-2026-08-18`). On
+  Fable 5 / 5.1, Mythos 5.1, Opus 5.5 and Sonnet 5.5 the notes the model writes between tool calls
+  come back as signed `thinking` blocks before the `tool_use` they introduce, and under the default
+  `'omitted'` their text is empty. With `'updates'` their text comes back, as a summary of each note,
+  while reasoning stays hidden; any thinking block with non-empty text is such a note. `AnthropicAdapter`
+  (header) and `BedrockAdapter` (`anthropic_beta`) add the beta whenever the body they send asks for
+  `'updates'`, a thinking config passed through `extra` included. Fable and Mythos models, which get
+  no thinking config for a display alone, get `{ type: 'adaptive', display: 'updates' }` for this
+  one. New exports from `providers/anthropic`: `THINKING_DISPLAY_UPDATES_BETA` and
+  `sendsDisplayUpdates`.
+  - **Unchanged:** requests that don't set `'updates'`, including `'summarized'` or `'omitted'` alone
+    on a Fable or Mythos model, which still send no thinking config.
+
+### Changed
+
+- Membrane is now the one layer that retries. `AnthropicAdapter`'s SDK client
+  makes one attempt at each request membrane makes. Its own retries are off:
+  two by default, inside each of membrane's attempts, on a 408, 409, 429 or
+  5xx response and on a connection failure. So with `retry: false` membrane
+  retries none of a call's failed requests: a failure reaches the caller
+  after one attempt at the request that failed, inside which a credential
+  resolver may resend once after a 401. A completed response's
+  `details.timing.attempts` and `retryDelaysMs` count every attempt and every
+  wait, none of them hidden inside the SDK. The keepalive's replays keep the
+  SDK's default.
+- What the SDK retried before delivery, membrane now retries on every adapter
+  and entry point (see Breaking for the new default of `retry.maxRetries`). A
+  409, which the SDK also retried, stays non-retryable unless the API's
+  `x-should-retry` says otherwise: Anthropic's Messages API doesn't document
+  it. With `overloaded.maxRetries: 0`, a 529 follows the base policy on every
+  path; before, it wasn't retried on the streaming paths.
+- A deadline that runs out on a request already sent isn't retried. The call
+  still ends with a retryable `timeout`, which the caller may retry, but
+  membrane doesn't spend another full deadline on it. That covers
+  `AnthropicAdapter`'s idle and first-event watchdogs, the runtime's own
+  fetch deadlines on the other adapters (undici's headers and body timeouts,
+  300 s each by default; Bun's fetch timeout), and every timeout
+  `AnthropicAdapter`'s SDK client reports, a connect timeout included (see
+  Breaking). On the other adapters, on Node, a connect timeout
+  (`UND_ERR_CONNECT_TIMEOUT`, `ETIMEDOUT`) is retried like any connection
+  failure. Bun's fetch timeout doesn't say which stage ran out, so on Bun a
+  stalled connect is left to the caller too.
+- `AnthropicAdapter` reads the API's `x-should-retry` (it decides whether the
+  error is retryable) and `retry-after-ms` (before `retry-after`), as the SDK
+  did.
+
+- The stripped-image note, which membrane writes in place of an image it
+  can't send, now says so when the image came without its data, with no
+  base64 data in its source or on the block (#139). Before, it gave the
+  reason it gives for data that isn't an accepted image: "[system: an image
+  that belongs here was NOT shown to you — its data is not a JPEG, PNG, GIF
+  or WebP image, the formats this request can carry. You are not seeing this
+  image. If it matters, ask for it in one of those formats.]", with the label
+  the image came with after the formats where it had one, and the warning
+  `[membrane] image block stripped: its data is not a JPEG, PNG, GIF or WebP
+  image`. After: "[system: an image that belongs here was NOT shown to you —
+  it came without its data. You are not seeing this image.]", with the
+  warning `[membrane] image block stripped: no data`. Data that isn't an
+  accepted image keeps the formats note. An image in MCP's form with empty
+  data, or none, gets the new note wherever the same image in membrane's form
+  does, at the top of a message as inside a `tool_result` (see Fixed). The
+  Responses formatter's own note for a `tool_result` image it can't carry is
+  unchanged. The first request after upgrading carries the new text where a
+  history holds such an image under the formats note and membrane writes the
+  note again, so a provider's prompt cache misses from that note on, once. An
+  xml tool loop's result stored with its raw text replays the note its turn
+  wrote.
+- In an xml tool loop's results, an image at a URL a provider would fetch
+  gets a note that says so and gives the link, where it got the formats note
+  above (#139). After: "[system: an image that belongs here was NOT shown to
+  you — it came as a link (https://…), which tool results here can't carry.
+  You are not seeing this image.]", with the warning
+  `[membrane] image block stripped: a URL source, which the XML tool path can't carry`.
+  Only an http or https link is repeated, cut at 2,048 characters between
+  code points; for any other URL, or one holding half a surrogate pair, which
+  the API refuses in a request's JSON, the note leaves out the parenthesis. A
+  URL source that also carries data is such an image too: the split that
+  sends a result's images sent that data as an image, where the native path
+  reads the image at its URL. A split round stored before this change, whose
+  result held one, replays without that image; when it was the only image
+  the split sent, the round's report says the message was altered, and
+  otherwise nothing says so.
+- In an xml tool loop's results, an image in a `data:` URL is decided by its
+  bytes, as the native path decides it, where it got the formats note above
+  (#139): the split sends an accepted one, the results without a split give
+  its `[Image: …]` note, and any other gets the note its bytes call for. A
+  split round stored before this change, whose result held one beside an
+  image the split sent, replays with it sent too, beside the formats note
+  that turn wrote, and nothing reports it.
+- A stored tool result that xml tool mode re-renders without its raw text
+  keeps an image with a URL source, and gives it the note the live results
+  give: the link note, or for a `data:` URL, what its bytes call for (#139).
+  Before, it left the image out with no note. The first request after
+  upgrading carries that note where a history holds such a result, so a
+  provider's prompt cache misses from there on, once.
+
+### Fixed
+
+- `streamYielding()` now retries a provider call that fails with a retryable
+  error before it has delivered anything, on the native and XML paths: the
+  `overloaded` schedule for a 529, the base schedule for the rest, with a
+  five-attempt floor for a 429. Before, it had no retry at all, and the first
+  529 ended the turn (#118). A call that has delivered anything is still not
+  retried, since that would replay what the caller already has.
+- `stream()` and `streamYielding()` retry such a call in any round of a tool
+  loop. `stream()` used to retry only until anything had been emitted, so a
+  529 on the call after a tool round ended the turn. The retry now happens
+  inside each provider call, so the `beforeRequest` hook and the cache wire
+  receipt run once for the round, as they do for `streamYielding()`'s refusal
+  re-issue, and a cancellation during a later round's wait returns an
+  `AbortedResponse` with what the earlier rounds delivered. A completed
+  response's `details.timing.attempts` counts every attempt, retries included,
+  and `streamYielding()`'s and `complete()`'s now carry
+  `details.timing.retryDelaysMs` too, listing the waits, as `stream()`'s does.
+- A retry wait longer than about 24.8 days (2^31 − 1 ms), which a stated wait
+  or a backoff can be under a very large `retry.maxRetryDelayMs`, is waited in
+  full. It fired after 1 ms, so the call was sent again at once, for a stated
+  wait inside the window the provider had named.
+- On `complete()`, a refusal re-issue (`refusalRetries`) no longer spends the
+  retry budget for transport errors: after a re-issue, a 529 or 429 gets the
+  whole schedule again, as it does on the streaming paths.
+
+- Media in MCP's form, `{ type: 'image', data, mimeType }` with no `source`,
+  is now carried as the same media in membrane's form is,
+  `{ type, source: { type: 'base64', data, mediaType } }`, for an image,
+  document, audio clip or video (#139). An image converts whatever its data
+  and label, and is then read as any image is: a request that sends an image
+  decides it by its data's header, and one with data that is missing or empty
+  gets the note that it came without its data wherever the same image in
+  membrane's form gets it (see Changed). A document, audio clip or video
+  converts only with data that isn't empty and a `mimeType` that
+  isn't empty. A media block with neither `data` nor `mimeType` isn't MCP's
+  form and stays as it came; `toAnthropicContent` and `transformToChat` leave
+  out such an image, where they threw a TypeError. Membrane converts MCP's
+  form wherever it takes content: the messages of `complete()`, `stream()`
+  and `streamYielding()`, rebuilt each round of a native tool loop; the
+  messages a caller hands `AnthropicXmlFormatter`, `NativeFormatter` or
+  `OpenAIResponsesFormatter` directly; the request built directly by each
+  adapter that reads membrane's content blocks, `AnthropicAdapter`,
+  `BedrockAdapter`, `OpenAIAdapter`, `OpenAICompatibleAdapter`,
+  `OpenRouterAdapter`, `GeminiAdapter`, the image adapter
+  `OpenAIResponsesAdapter`, and `OpenAIResponsesAPIAdapter` in subscription
+  mode; and the exported `toAnthropicContent` and `transformToChat`. An xml
+  tool loop's results, which `formatToolResults` and the split that sends a
+  result's images render each round, already read an image in MCP's form by
+  its data.
+  The block keeps its other fields, apart from MCP's `annotations` and
+  `_meta`, which no request carries. The caller's messages and the executor's
+  results stay as they were, and a round's report names what it would for the
+  same media in membrane's form. Inside a `tool_result`, the anthropic-xml and
+  native formatters already read such an image by its data, and send it as
+  before, and the Responses formatter now sends it, where it gave its note
+  that the request couldn't carry it. Before:
+  - at the top of a message, the anthropic-xml formatter in either tool mode,
+    the native formatter and the Responses formatter threw a TypeError on
+    such an image, and the anthropic-xml formatter in native tool mode and
+    the native formatter on such audio;
+  - `AnthropicAdapter`'s request built directly threw on one in a
+    `tool_result`, and sent one at the top of a message as it was, with no
+    source, which the API refuses;
+  - `BedrockAdapter`'s request built directly sent one as it was, at the top
+    of a message and in a `tool_result`, which the API refuses;
+  - the requests built directly by `OpenAIAdapter`, `OpenAICompatibleAdapter`,
+    `OpenRouterAdapter` and `GeminiAdapter` left such an image at the top of
+    a message out, with no note and no report, `OpenAIResponsesAdapter`
+    attached none to an image edit, and the one `OpenAIResponsesAPIAdapter`
+    built in subscription mode left it out and reported its message altered,
+    and gave one in a `tool_result` the note for an image it can't carry;
+  - `toAnthropicContent` threw a TypeError on such an image, at the top of
+    the turn and in a `tool_result`, and on such a document at the top, and
+    `transformToChat` threw one on such an image at the top of a message.
+- A document, audio clip or video in MCP's form that doesn't convert, with
+  no `data`, empty `data` or no `mimeType`, is a source membrane's request
+  builds can't represent, as a URL image is where they have no branch for
+  one: at the top of a message they leave it out with no note and report its
+  message altered (#139). Before, the native formatter, and the anthropic-xml
+  formatter in native tool mode, threw a TypeError on such audio there, and
+  the requests `AnthropicAdapter` and `BedrockAdapter` built directly sent it
+  as it was, with no source, which the API refuses. A document, or audio in
+  xml tool mode, still meets `unsupportedMedia` at the top of a message, as
+  in membrane's form. `toAnthropicContent` leaves out such a document, where
+  it threw a TypeError, and gives such audio or video the error it gives
+  audio or video in membrane's form. Inside a `tool_result` the xml renderers
+  leave it out, and the native formatter passes it on, which the Anthropic
+  adapter leaves out as it does any block it has no tool-result form for, as
+  before; `BedrockAdapter`'s request built directly now leaves it out there
+  too and reports the result, where it sent it as it was. A message the
+  Anthropic or Bedrock adapter's direct build leaves with no block is
+  dropped, as the build drops any message it leaves empty, and where dropping
+  it would change the request's final role, the build refuses.
+- An image in a base64 `data:` URL whose payload escapes characters, such as
+  its padding as `%3D`, is percent-decoded before its bytes are read, as the
+  fetch spec's `data:` URL processor decodes it, wherever membrane reads a
+  `data:` URL image (#153). Before, `AnthropicAdapter`'s request sent the
+  escaped text as the image's base64 data, which isn't base64, and the OpenAI,
+  OpenAI-compatible and OpenRouter requests sent the URL with its escapes.
+
+- XML tool instructions no longer mark a parameter `nullable="true"` when
+  its type admits null but an `enum` or `const` beside that type leaves null
+  out (#150). Before, a type list naming null, or OpenAPI's `nullable: true`,
+  marked the parameter whatever else the schema said, so
+  `{type: ["string", "null"], enum: ["a", "b"]}` told the model it could send
+  a null the schema doesn't accept. This also applies where such a type sits
+  behind a `$ref`, in an `anyOf`, `oneOf` or `allOf` branch, or in a root
+  alternative, and where the keyword beside the type that leaves null out is
+  a combinator or a `$ref`. A parameter stays marked where null survives the
+  combination: in at least one branch of an `anyOf` or `oneOf`, or in every
+  branch of an `allOf`. The parse is unchanged, so a written `null` for such
+  a parameter still follows the type. In the same instructions a null enum
+  member now prints as `null` (`enum="a,b,null"`); before, it printed as an
+  empty item (`enum="a,b,"`).
+
+- Streamed tool calls whose `tool_calls` entries carry no `index` (absent or
+  `null`), as some OpenAI-compatible servers are reported to send them, are
+  no longer merged into one call (#159). The OpenAI, OpenAI-compatible and
+  OpenRouter adapters put every such entry in the call at index 0, so a
+  second call's id and name replaced the first's and their arguments ran
+  together. Now an entry with no `index` never takes an index's slot. It
+  joins the call that already has its id, or failing that the call the last
+  entry went to, unless it carries a name and a new id while that call has an
+  id; then it starts a new call. Calls without an index come after those with
+  one, in the order they started. Entries with an `index` go to their slots
+  as before. In a slot, a piece continues the latest call there that has its
+  id, or else the last call there. One that carries the id of a call that
+  began without an index, when no call in the slot has it, moves that call
+  into its slot, unless it names another tool.
+- On the same three adapters, with or without an `index`, a piece that names
+  a tool other than its call's starts a call of its own, and a call keeps the
+  first id a piece gives it. A later piece's name and id replaced the call's,
+  so two calls of different tools that a server put in one slot, or gave one
+  id, came back as one call under the later name and id, with their arguments
+  run together. They now come back as two calls, each with its own arguments.
+  An entry that carries no id, name or arguments is dropped, with or without
+  an `index`; one with an `index` opened an empty call. A stream that gives
+  each call its own `index` and sends each call's id and name once, with no
+  two calls under one id, comes back as before.
+- Every streamed tool call in a response comes back under an id of its own,
+  on the same three adapters. A call with no id comes back as `call_<n>`,
+  from `call_1`, and one whose id an earlier call in the response already has
+  as `<id>_<n>`, from `<id>_2`, and a `[membrane]` warning names each. A call
+  with no id came back with `''`, which no tool result can answer: the
+  adapters send it back as `""` or as no `tool_call_id` at all. Two calls
+  under one id, as these adapters returned for two calls in their own slots
+  that a server gave one id or none, made the native formatter's tool-pair
+  check refuse the turn that held them.
+- Four kinds of stream that came back as one call now come back as several:
+  one call whose every piece repeats its name and changes its id, as one call
+  per such piece; one whose first piece has no `index` and whose later pieces
+  carry index 0 without its id, as two; one call that a later piece renames
+  midway through its arguments, as two whose halves don't parse; and a piece
+  that carries one call's id and names another call's tool, as a call of its
+  own, so that tool comes back twice. In the first kind, a first piece with
+  no arguments becomes an extra call with `{}`, and in the last, the other
+  call comes back with `{}` when it has no arguments of its own. As before,
+  these adapters merge two calls of the same tool sent with no ids or with
+  their names before their ids, distinct calls of one tool given the same id
+  or put in one slot, and a call whose first piece has its id but no name
+  into the call before it. When the earlier call's arguments are empty, the
+  merged call parses, and in the last case it runs the earlier call's tool
+  with the later call's arguments.
+
+- **Gemini adapter: a tool's schema is sent as JSON Schema (#185).** `GeminiAdapter` sent each tool's `inputSchema` as the function declaration's `parameters`, which Google's API reference describes as a `Schema` reflecting OpenAPI 3.0.3. The adapter now sends the schema unchanged as `parametersJsonSchema`, which the reference describes as JSON Schema, on `complete()` and `stream()` alike. Through Google's Code Assist endpoint, a `parameters` schema with a type array such as `["string", "null"]`, or with `$schema`, `$defs`, `$ref` or `const`, was refused, failing the whole `generateContent` call. The public API wasn't run. A tool with no schema still gets `{ type: "object", properties: {} }`.
+  - Every tool declaration's bytes change, so the first request after upgrading doesn't read a prompt cache written before it.
+  - A schema that uses OpenAPI's `nullable: true` is sent as written. Through Code Assist, Gemini accepted it under `parametersJsonSchema`, but whether it still lets such a field take null there hasn't been shown. JSON Schema's own spelling, a type array with `"null"`, is the one this field defines.
+
+- **`AnthropicAdapter` keeps a default `anthropic-beta` header as the SDK sends it** when it adds a
+  beta of its own for one request, reading `defaultHeaders` as the SDK's `buildHeaders` does. It used
+  to read only a string: a default given as an array was dropped, so the request went out with the
+  adapter's beta alone; of entries rows, only the first string row was kept; and of keys differing
+  only in case, the first with a string was kept, where for the SDK a later key that carries a value
+  replaces it, and a later `null` clears it.
+
+- `blockBinding`'s doc no longer implies that a request that sends no
+  thinking config holds no thinking that binds. On 2026-10-19 Claude Opus 5.5
+  and 5, Sonnet 5.5 and 5, and Haiku 5.5 each returned a signed thinking block
+  to a request with no thinking config, and the thinking of Opus 5.5, Sonnet
+  5.5 and Haiku 5.5 binds: on an account that enforces the binding, a reply
+  from them replayed after its tool list changed was refused with a 400 when
+  the request carried no thinking config. The doc now says so, and that a
+  caller who wants the controls on such a model, in a request that doesn't
+  end in an assistant prefill, sets `blockBinding` and asks for adaptive
+  thinking (`enabled: true`, `type: 'adaptive'`, and `display: 'omitted'`, so
+  the block comes back signature only, as it did with no config), which those
+  three accepted with the binding in place of no config. As with any thinking
+  config other than `disabled`, the Anthropic adapter then sends none of the
+  caller's `temperature` or `topK`, and no `topP` below 0.95; the Bedrock
+  adapter sends `temperature` 1 and the caller's `topK`. The doc also says
+  that Fable and Mythos carry the binding when an enabled budget can't fit, as
+  they do with thinking disabled, and `RoundReport.thinking`'s doc now says
+  the provider's report comes back when the request carries the binding. What
+  membrane sends is unchanged.
+
+- An error from the caller's own code that membrane runs beside a call is no
+  longer resent (#160). That code is the `beforeRequest`, `afterResponse`,
+  `onError` and `onNormalize` hooks, `onRequest`, `onResponse` and
+  `stream()`'s callbacks, a request's `onCacheWireReceipt`, the Anthropic
+  adapter's `dynamicHeaders`, the configured logger's `warn()` and a
+  registry's `getPricing()`, and a resend of the request can't mend it. The
+  call now ends at once with a `MembraneError` whose `retryable` is `false`:
+  the caller's own if it already said so, or else a new one classified from
+  its error as before, with that error as its `cause` and no `httpStatus`,
+  `providerErrorCode` or `retryAfterMs`, since no response to this call
+  stands behind them, nor a wrapped `MembraneError`'s `rawError` or
+  `rawRequest`, which would be another call's. What builds, sends or reads
+  the call keeps its classification: an adapter and the transport, a
+  credential resolver, a formatter and its parser. Before:
+  - An error that read like a rate limit made `complete()` send the request
+    up to five times when it came from `onResponse`, `afterResponse`, the
+    logger or the registry, paying again for a response that had already
+    arrived.
+  - Thrown before the send, it made `complete()` and `stream()` run the hook
+    or callback again on each attempt.
+  - Thrown after `stream()` had emitted, it ended the call but still said
+    `retryable: true`, unless the adapter's stream handler caught it (see
+    the entry on stream callbacks), and what the `onError` hook threw left
+    as it was. Either way, a caller's policy could resend the request.
+- **`AbortError`:** an error the caller's code throws named `AbortError`
+  keeps the type `abort`, so membrane treats it as any other abort thrown at
+  the same point, as it did before.
+- **`streamYielding()` consumers:** an error the caller's code throws, such
+  as a `beforeRequest` hook's or an `onCacheWireReceipt` consumer's, now
+  reaches the `error` event as that `MembraneError`, where it used to be the
+  caller's own error. The caller's error is its `cause`, unless it was a
+  `MembraneError` that already said `retryable: false` and arrives as itself.
+- **Responses adapter, subscription mode:** an `onFastModeFallback` that
+  throws is now logged with `console.warn`, and the response stands. Its
+  error used to trigger a second request, which didn't call it again, so the
+  error was lost.
+
+- Claude Haiku 5.5 (`claude-haiku-5-5`) is listed as refusing an assistant
+  prefill, so a build that ends in one for it fails in membrane, with the
+  typed error that names native tool mode, rather than at the API. The
+  Messages API answered such a request with a 400, with no thinking config
+  and with an adaptive or an enabled one: "This model does not support
+  assistant message prefill. The conversation must end with a user message."
+- The default pricing table gives Claude Opus 5.5, Sonnet 5.5, Fable 5.1,
+  Mythos 5.1, Mythos 5 and Haiku 5.5 the rates Anthropic's price page lists
+  on 2026-10-19. Opus 5.5, Sonnet 5.5 and Fable 5.1 had matched their
+  family's shorter prefix and taken its rate: Opus 5.5 $5/$25, $6.25 for a
+  5-minute write and $0.50 for a cache hit, where the page gives $4/$20, $5
+  and $0.20; Sonnet 5.5's hits $0.20 for $0.10; Fable 5.1's $1 for $0.25.
+  Mythos 5 and 5.1 and Haiku 5.5 had no rate. So where no `ModelRegistry`
+  supplies pricing, a response's `usage.estimatedCost` falls for Opus 5.5
+  and for those cache hits, and Haiku 5.5, Mythos 5 and Mythos 5.1 responses
+  carry a cost instead of the unpriced warning. Haiku 5.5 takes its rate for
+  prompts up to 100,000 tokens, since the table has no field for the higher
+  rate above that, so a longer prompt is priced low. Every Anthropic row the
+  page lists is dated 2026-10-19, which callers see as `pricingAsOf`.
+
+- The Anthropic adapter leaves `temperature`, `top_p` and `top_k` out of a
+  request to Claude Haiku 5.5 (`claude-haiku-5-5`), as it already does for
+  the other models that refuse them. With no thinking config, the Messages
+  API refused `temperature` 0.2, `top_k` 40, and `top_p` 0.9 and 0.95 with
+  a 400 ("`temperature` is deprecated for this model", and likewise for the
+  others). A `top_p` of 0.99, which Haiku 5.5 accepted, is left out too, as
+  for the other listed models.
+
+- **Responses API function tools now always state `strict`.** Every function
+  tool the `openai-responses-api` adapter converts, in API-key and
+  subscription modes, carries a boolean `strict`: an omitted or `null` value
+  is sent as `false`, and an explicit `true` or `false` is kept. Previously
+  `strict` was left out unless the caller set it, which handed validation to
+  the provider's default; strict validation treats every property as one the
+  model must send, so optional parameters of plain JSON Schema tools could
+  reach the model as required. With `strict: false`, the model's arguments
+  are no longer constrained to the schema as it generates them (`required`,
+  `enum` and `type` included), so a tool's handler validates them as plain
+  JSON Schema, as Chat Completions tools already were. This applies to flat
+  Responses functions, nested Chat-style `{ type: 'function', function }`
+  tools (whose `strict` is read from the function, or from the wrapper when
+  the function's is omitted or `null`) and tools built from
+  `inputSchema`/`input_schema`/`parameters`, whether they came as
+  `request.tools` or as a `providerParams.tools` override of them. A
+  `strict` that is not a boolean, `null` or absent (such as the string
+  `'true'`, `1` or an object) used to be forwarded to the provider as given,
+  or dropped where a Chat-style tool wrote it beside `function`; it is now
+  refused with an `invalid_request` error naming the tool, before any request
+  is sent.
+  - **What changes on the wire:** a function tool that lacked a boolean
+    `strict` now carries `strict: false`, or, for a Chat-style tool whose
+    wrapper carries a boolean `strict`, which used to be dropped, that
+    boolean. So the serialized tools change, and a prompt prefix cached
+    before the upgrade that includes them no longer matches. A
+    `providerParams.tools` entry in a membrane or Chat shape is now
+    converted to a flat Responses tool, so its bytes change too; it wasn't a
+    valid Responses tool before.
+  - **Unchanged:** non-function tools, and container tools such as a
+    Responses namespace tool, pass through as the caller wrote them, member
+    functions included. Flat Responses functions that already carried a
+    boolean `strict` serialize as before. The Chat Completions and
+    openai-compatible adapters are unchanged.
+  - Thanks to `@HO-git`, whose #105 found the same bug and verified it live.
+
+- XML tool instructions no longer print an `enum` list the model can't split
+  exactly (#176). Where any of a parameter's values holds `"`, `,`, a control
+  character (a line break or a tab among them), a line or paragraph
+  separator or a lone surrogate, or is empty, or has whitespace at either
+  end, the parameter's line shows no `enum` at all, and keeps its type and
+  description. Every other list prints as before, unescaped, since the
+  parser doesn't decode entities in a value the model writes.
+  `toolDefinitionForPrompt` still returns every value.
+
+- XML tool instructions now list a parameter's values from more of its
+  schema, where before they listed only an `enum` on the first node that
+  declares the parameter. An enum behind a `$ref`, as pydantic writes an
+  `Enum` field, an `anyOf` of an enum and `{type: "null"}`, as pydantic and
+  zod write a nullable enum, enums in `anyOf`, `oneOf` or `allOf` branches,
+  enums across root alternatives, and a `const` now render as
+  `enum="..."`. Values are listed in schema order, each once, and null only
+  where the parameter is marked `nullable="true"`. A nested `oneOf` lists
+  only the values exactly one of its branches admits. No list comes from a
+  union where a branch, or a root alternative that declares the parameter,
+  also takes values outside it, and none is shown where a `$ref` cycles or
+  doesn't resolve, or where a listed value is an object or an array. Where
+  these rules differ from the first declaring node's own `enum`, the list
+  shown before changes: another declaring node can narrow it, values of
+  kinds the schema's types exclude are left out, and an empty list renders
+  no `enum` attribute. `toolDefinitionForPrompt` returns this list in
+  `enum`, each value as a string, as its type says.
+
+- **In the native tool loop, the floating cache marker's second mark goes on the message before the assistant turn that made the round's calls.** With an assistant-role message injected with a round's results, it used to go on the round's assistant turn, the third message from the end, so the provider's ~20-block backward search had to cross that turn's blocks to reach the previous request's cache entry. It now goes on the previous request's last message.
+  - **When the previous request itself ended with an assistant message,** that message joins the new assistant turn, and the mark goes on the message before the turn. The previous request didn't mark that message, so only the newest mark's search reaches its cache entry. When another assistant-role message is injected with the results, the mark used to go on the turn the previous request's last message joined.
+  - **Otherwise,** through `NativeFormatter`, the mark is where it was: with nothing injected, or a user-role message.
+
+- `gemini` reads a `null` `blockReason` as no block, and a candidate whose
+  content and finish reason are `null` or absent as no candidate, on both
+  paths. Gemini's API speaks proto3's JSON mapping, where a `null` field is
+  unset.
+  - A non-streamed response with no candidates and a `null` `blockReason` was
+    a `refusal`. It's now an empty `end_turn`.
+  - A stream whose frames give only a `null` `blockReason` was a `refusal`. It
+    now fails as a stream with nothing in it does, with membrane's retryable
+    error for a stream that ended before a terminal event, so membrane can
+    send the request again.
+  - A later stream frame with a `null` `blockReason` replaced the reason an
+    earlier frame gave, so the stop carried no provider reason. The earlier
+    reason now stands, and the stop's provider reason carries it.
+  - Beside a blocked prompt, a candidate with no data failed a stream as one
+    cut short where its content or finish reason was `null`, and read as an
+    empty `end_turn` in a non-streamed response. It's now a `refusal` on both
+    paths, with the block's reason as the provider reason, as a block with no
+    candidates is. A candidate with content or a finish reason still wins over
+    a block, as before.
+
+- The Anthropic adapter's cache keepalive now holds a request only once the
+  provider is known to have started its message: at `message_start` in a
+  stream, and once the SDK has the response in `complete()`. It recorded
+  each request before sending it, so a request the provider refused for what
+  its prefix holds, such as a prompt longer than the model's context, was
+  the one replayed, and its replays were refused too. Three refresh failures
+  in a row turn the keepalive off for every lineage for the rest of the
+  adapter's life, so one refused request could leave every lineage's next
+  call after an idle hour writing its prefix again. A call that failed
+  before its message started, such as one never delivered, also took the
+  place of the request the provider had cached, and the day ran from it: its
+  first replay paid to write whatever of it, up to its one-hour marker, the
+  provider hadn't cached, which the next real call would otherwise have
+  written. Now a call that fails before its message starts leaves its
+  lineage's earlier snapshot, and the day measured from it, as they were.
+  One cost: a call no longer marks its lineage touched until its message
+  starts, so a refresh can fall due while the call waits for its first event
+  and replay the earlier snapshot, once per 45 minutes of that wait. In
+  `complete()`, where the keepalive is opt-in, the wait is the whole call. A
+  refresh's effect on a lineage now stays with the snapshot it replayed.
+  While a replay was out, a real call could record a newer request for its
+  lineage, which a second ineffective refresh in a row then dropped, and a
+  tick could go on to replay a snapshot that a real call had replaced, or
+  that had been dropped, since the tick began. A failed refresh still counts
+  toward the breaker, which stops the keepalive for every lineage.
+
+- The Anthropic adapter's cache keepalive now replays a request only through
+  its last one-hour cache marker and the end of the user turn at or after it,
+  so that a refresh doesn't split a tool call's results or end on an assistant
+  message unless the request did. A request with no user message at or after
+  that marker is replayed whole. It replayed the whole request every time, and
+  whatever followed the last one-hour marker was billed as input on every
+  refresh, or written again where a five-minute marker covered it, though no
+  cache entry the refresh kept warm held it. Under `cacheMarkers: 'cm-owned'`,
+  membrane places no marker on a tool loop's rounds, so a tool-using turn's
+  last request carries its rounds after the last marker, and after such a
+  turn each refresh paid for them again, every 45 minutes by default for up to
+  a day. A refresh now reads the same cache entries without that cost. A
+  five-minute marker in what's left out goes with it: each refresh wrote its
+  expired entry again, and after two such refreshes the lineage was dropped.
+
+- **A native tool call's `block_complete` event carries the tool's name as the caller gave it.** For
+  a tool whose name has a colon, the event carried the escaped wire name (`srv__get_weather` for
+  `srv:get_weather`), unlike the returned content and tool calls.
+
+- `openai-completions` and `gemini` read a `null` finish reason as no reason,
+  a plain `end_turn`, as `openai`, `openai-compatible` and `openrouter`
+  already did. They returned the `null` as their stop reason, and membrane's
+  log line for an unmapped stop reason read its `length`, so the first
+  non-streamed `complete()` in a process that met one failed with a
+  `MembraneError`, "Cannot read properties of null (reading 'length')".
+  Each stream reads a finish reason only when it's truthy, so a `null` or
+  empty one is none there and never reached the mapper. A non-streamed
+  response's empty finish reason is still passed on as an unmapped stop
+  reason, as in the other three.
+- Membrane's log line for an unmapped stop reason can't fail the call. An
+  adapter can return a stop reason outside its type, passing on a server's
+  value or written in JavaScript, and one the line couldn't print, such as
+  `null`, `undefined` or a bigint, failed the first call that met it. The
+  line now prints a number, `null` or `undefined` by its value and anything
+  else but a string by its kind, such as `object (not a string)`. Such a
+  stop reason still normalizes to `end_turn`. It's logged once by what the
+  line prints, so an object an adapter returns fresh on every response is
+  logged once.
+- The line, and the one printed once 64 reasons are logged, say that
+  `details.stop.providerReason` carries the adapter's `providerStopReason`
+  if that's a non-empty string, else the stop reason if it's one. They said
+  it carried any stop reason the adapter gave without a
+  `providerStopReason`. `ProviderResponse.providerStopReason`'s doc says
+  the same now.
+
+- A stream callback's error is no longer swallowed (#117). The OpenAI,
+  OpenAI-compatible, OpenAI completions and OpenRouter adapters ignored an
+  error thrown by `onChunk` (or, on OpenRouter, `onContentBlock`), and the
+  Bedrock adapter logged it as a malformed event and skipped it, so the stream
+  finished as if nothing had happened. Now the error fails the stream through
+  the adapter's error boundary, as it already did on the Anthropic, Gemini and
+  Responses API adapters. The provider's response body is cancelled rather
+  than left unread, on Gemini too. The error is typed by `classifyError` like
+  any other, a plain `Error` by its message: most are `unknown`, while one
+  whose code reads as a network failure, such as `EPIPE` from a callback
+  writing to a closed pipe, is typed `network`. Called on an adapter directly,
+  such an error is retryable; through `Membrane` it isn't, as no error from
+  the caller's code is (see the entry on the caller's code). With stop
+  sequences, text held back for a possible stop isn't handed to a callback
+  that has thrown.
+- What these adapters can't read is still dropped. A data line that isn't
+  JSON, or whose JSON isn't an object (`null`, a number, a string, an array),
+  drops its frame, on Gemini and the Responses API too, where `data: null`
+  failed the stream. A frame whose JSON isn't an object no longer renews the
+  progress deadline (`progressTimeoutMs`), and a Bedrock event that decodes to
+  such JSON doesn't either. In 0.6.0 every SSE data frame that parsed renewed
+  it, and so did every Bedrock event that decoded, other than a `ping` and one
+  that decoded to `null`. On the OpenAI, OpenAI-compatible and OpenRouter
+  adapters, a `tool_calls` that isn't an array drops its tool calls, and an
+  entry that isn't an object, or whose `index` isn't an array index (an
+  integer from 0 to 2^32 - 2, or its decimal string with no leading zero)
+  and isn't absent or `null`, drops that entry; the rest of the frame is
+  read. The calls placed are gathered in index order, so a first call at index
+  1, or one after a dropped entry, no longer fails the response. A number
+  entry used to become an empty tool call. On Bedrock, an event that doesn't
+  decode, or decodes to `null`, is skipped with a warning, as before, and so
+  is a block start or stop whose index or block can't be placed. When a
+  skipped block start leaves the message without a block before later ones,
+  the call fails as a retryable `network` error naming that block. Where the
+  start's index named no slot, or its block was `null`, the call failed with a
+  `TypeError`; where its block was another value that isn't an object, it
+  returned the message without that block. An event that carries no `bytes`
+  (the field missing or empty), which was skipped silently, and one that
+  decodes to other JSON that isn't an object, which was read as nothing, are
+  now skipped with the warning too.
+- **Provider adapters:** `onProgress`'s doc now says a streaming adapter calls
+  it for an SSE data frame only when the frame parses to a JSON object, and
+  for an event-stream message only when it decodes to one. A custom adapter
+  that follows 0.6.0's wording, each SSE data frame that parses and each
+  decoded event-stream message, still renews the progress deadline on a frame
+  or message whose JSON is `null`, a number, a string or an array. To match
+  the built-in adapters, drop such a frame or message before calling
+  `onProgress`.
+
+- A cancelled `streamYielding()` stream now ends at its `aborted` event, as
+  `cancel()`'s documentation says: no event of any kind follows it. A loop
+  that resumed because a wait had already resolved, from results passed to
+  `provideToolResults()` just before the cancel or a provider response that
+  crossed the abort, could deliver `block`, `tokens`, `usage`, `tool-calls`
+  or a late `complete` after it. Its next tool wait is now refused at once, so
+  the loop finishes instead of waiting for results that will never come. A
+  round whose response arrives after the cancel isn't reported, its usage
+  included. A `cancel()` that comes after the stream has queued its own
+  `complete`, `error` or `aborted` adds no event, and that event stays the
+  stream's last.
+
+- A cancelled `streamYielding()` turn keeps what it had (#142). Its `aborted`
+  event, from `cancel()` or from the caller's `AbortSignal`, now carries
+  `partialContent`, `rawAssistantText`, `toolCalls` and `toolResults`, built
+  the way a provider or deadline abort's event builds them. Before, it carried
+  none of them. A round whose tools were still running shows its calls with no
+  results. So does a round whose results were passed to `provideToolResults()`
+  just before the cancel, since the turn hadn't recorded them yet.
+
 ## 0.6.0 — 2026-10-18
 
 ### Breaking
