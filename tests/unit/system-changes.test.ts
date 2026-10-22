@@ -639,6 +639,20 @@ describe('system changes: turns as the API reads them, the float, and withdrawn 
     expect(sent[0]!.messages.map((m) => m.role)).toEqual(['user', 'user', 'system', 'assistant', 'user']);
   });
 
+  it('through the real AnthropicAdapter, a trailing turn of unsigned thinking alone with a change after the last user turn is dropped, not refused (#191)', async () => {
+    // The change ends the request after the trailing turn, so leaving the turn out doesn't change
+    // the final role, as for a trailing turn of whitespace.
+    const sent: Array<{ messages: Array<{ role: string }> }> = [];
+    const adapter = new AnthropicAdapter({ apiKey: 'sk-test', cacheKeepalive: { enabled: false } });
+    (adapter as any).client = { messages: { create: async (body: { messages: Array<{ role: string }> }) => {
+      sent.push(body);
+      return { content: [{ type: 'text', text: 'ok' }], stop_reason: 'end_turn', model: 'm', usage: { input_tokens: 1, output_tokens: 1 } };
+    } } };
+    const unsigned: ContentBlock = { type: 'thinking', thinking: 'reasoning from another provider' };
+    await new Membrane(adapter, { formatter: new NativeFormatter() }).complete(request([user('u0'), s, reply(unsigned)]));
+    expect(sent[0]!.messages.map((m) => m.role)).toEqual(['user', 'system']);
+  });
+
   it('the previous round\'s endpoint the float marks is the message before the assistant turn that made the round\'s calls, a change injected at the end included', async () => {
     class ToolOnce extends RecordingAdapter {
       override async stream(req: ProviderRequest): Promise<ProviderResponse> {

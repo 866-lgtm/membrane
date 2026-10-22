@@ -202,6 +202,10 @@ describe('toAnthropicContent: thinking signature', () => {
     expect(out).toEqual([{ type: 'text', text: 'answer' }]);
   });
 
+  it('leaves a turn of only a thinking block with no signature empty, for the caller to drop', () => {
+    expect(toAnthropicContent([{ type: 'thinking', thinking: 'no sig' }])).toEqual([]);
+  });
+
   it('keeps a signature-only block, Anthropic\'s own with its thinking omitted', () => {
     const out = toAnthropicContent([{ type: 'thinking', thinking: '', signature: 'sig-only' }]);
     expect(out).toEqual([{ type: 'thinking', thinking: '', signature: 'sig-only' }]);

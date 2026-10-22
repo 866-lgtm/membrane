@@ -1388,8 +1388,9 @@ function anthropicUrlImage(url: string): Anthropic.ImageBlockParam | Anthropic.T
  * source object that isn't MCP's form, with neither `data` nor `mimeType`.
  * A thinking block with no signature is left out too (isUnsignedThinking).
  * Nothing reports what it leaves out: it has no alteration callback. It sees
- * one turn, so a turn whose only blocks pairing leaves out comes back empty,
- * for the caller to drop as NativeFormatter drops it.
+ * one turn, so a turn whose only blocks it or pairing leaves out comes back
+ * empty, for the caller to drop as the adapters' cleanup drops it, and to
+ * refuse when it's the final turn, as that cleanup does.
  */
 export function toAnthropicContent(
   blocks: ContentBlock[],
