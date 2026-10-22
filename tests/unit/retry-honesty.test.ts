@@ -2,9 +2,10 @@
  * Retry honesty: what the server said, and what membrane waits.
  *
  * `ErrorInfo.retryAfterMs` existed, was surfaced on MembraneError, and was
- * populated by five adapters — but calculateRetryDelay never received the
- * error, so a 429 saying "wait 60s" was answered with five attempts inside
- * ~15s, burning the whole budget inside the server's stated window.
+ * populated by five adapters — but the retry wait (then calculateRetryDelay,
+ * since folded into membrane's retry decision) never received the error, so
+ * a 429 saying "wait 60s" was answered with five attempts inside ~15s,
+ * burning the whole budget inside the server's stated window.
  *
  * The companion asymmetry: complete() forced five attempts on any 429 while
  * stream() retried none of them, though a 429 arriving INSTEAD of a stream is
@@ -67,7 +68,7 @@ function rateLimit(retryAfterMs?: number, providerErrorCode?: string, retryable 
   });
 }
 
-describe('calculateRetryDelay honors retry-after (MAJOR-2)', () => {
+describe("membrane's retry wait honors retry-after (MAJOR-2)", () => {
   it('waits at least the server-stated window instead of the backoff', async () => {
     const adapter = new FailingAdapter(1, () => rateLimit(180));
     adapter.queueResponse('zz-recovered');

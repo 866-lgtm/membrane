@@ -174,7 +174,10 @@ export interface MembraneHooks {
   /**
    * Called before each retry the `retry` config schedules: return 'retry' to
    * let it, or 'abort' to end the call with that error. Not called for an
-   * error membrane won't retry, or when the call passes `retry: false`.
+   * error membrane won't retry, or when the call passes `retry: false`. The
+   * retry's wait, a stated wait on `error.retryAfterMs` included, is decided
+   * before it's asked, so a change it makes to `error` doesn't change the
+   * wait.
    * `attempt` counts membrane's attempts at the failing request since its
    * last refusal re-issue, as the retry budget does: 1 after its first
    * failure. A credential resolver's resend after a 401 is part of the
