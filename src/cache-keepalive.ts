@@ -158,9 +158,14 @@ interface Lineage {
   wire: Record<string, unknown>;
   headers: Record<string, string> | undefined;
   lane: KeepaliveLane;
-  /** Last real (non-keepalive) request. Bounds the keepalive window. */
+  /** Send time of the latest real (non-keepalive) request recorded on this
+   *  lineage, whichever order they were recorded in. Bounds the keepalive
+   *  window. */
   lastRealAt: number;
-  /** Last time the entry was touched by anything, real or keepalive. */
+  /** When the held snapshot's cache entries were last known touched: the
+   *  recorded request's send, or a later refresh's send. After a failed
+   *  refresh it's the failure's arrival instead, a back-off rather than a
+   *  touch. The next refresh falls due `refreshAfterMs` after it. */
   lastTouchAt: number;
   ineffective: number;
 }

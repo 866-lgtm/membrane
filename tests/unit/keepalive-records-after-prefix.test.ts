@@ -366,6 +366,26 @@ describe('the touch counts from the send', () => {
     expect(replays()).toHaveLength(2);
   });
 
+  it('a refresh that fails 40 ms after its send backs off from the failure, not its send', async () => {
+    let hold: ReturnType<typeof held> | undefined;
+    const { a, events } = adapter(fine, async wire => {
+      if (wire.max_tokens === 0 && hold) {
+        await hold.promise;
+        throw Object.assign(new Error('zz poke failed'), { status: 500 });
+      }
+      return wire.max_tokens === 0 ? replayAnswer() : answer;
+    }, () => sdkStream([messageStart, ...rest]));
+    await a.stream(request('Resident system Y'), noCallbacks);
+    hold = held();
+    await vi.advanceTimersByTimeAsync(140);
+    hold.release(undefined);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(events.filter(e => e.type === 'error')).toHaveLength(1);
+    const [lineage] = a.cacheKeepalive!.getStatus();
+    // A back-off, not a touch: it counts from the failure's arrival.
+    expect(lineage!.idleMs).toBe(0);
+  });
+
   it('a call sent before another on its lineage but recorded after it: its touch is its own send, its window the later call\'s', async () => {
     const first = held();
     let calls = 0;
@@ -387,8 +407,9 @@ describe('the touch counts from the send', () => {
 });
 
 describe('a refresh acts only on the snapshot it replayed', () => {
-  // Recording at message_start, a real call no longer touches its lineage at
-  // the send, so a refresh can be out while the call records a newer request.
+  // A real call is recorded only at its message_start (its touch counting
+  // from its send), so a refresh can be out while the call records a newer
+  // request.
   const noRead = { input_tokens: 5, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 };
   const replyWith = (usage: object) => ({ ...answer, content: [], stop_reason: 'max_tokens', usage });
 
@@ -414,7 +435,8 @@ describe('a refresh acts only on the snapshot it replayed', () => {
     replay.release(replyWith(noRead));
     await vi.advanceTimersByTimeAsync(0);
     expect(events.filter(e => e.type === 'ineffective')).toHaveLength(2);
-    // The newer request is still held, touched when it was recorded…
+    // The newer request is still held, touched at its send (the stub answers
+    // at once, so its send and its record are the same instant)…
     const [lineage, ...others] = a.cacheKeepalive!.getStatus();
     expect(others).toEqual([]);
     expect(lineage!.idleMs).toBe(0);
