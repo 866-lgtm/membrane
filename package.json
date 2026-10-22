@@ -14,6 +14,11 @@
       "bun": "./src/index.ts",
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
+    },
+    "./retry": {
+      "bun": "./src/retry.ts",
+      "types": "./dist/retry.d.ts",
+      "import": "./dist/retry.js"
     }
   },
   "scripts": {

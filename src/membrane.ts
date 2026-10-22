@@ -58,7 +58,6 @@ import {
   MembraneError,
   MembraneNotReadyError,
   classifyError,
-  isOverloadedError,
   isTypedAbortError,
   withRawRequest,
   isTimeoutAbortError,
@@ -101,6 +100,7 @@ import {
   PREFIX_REWRITING_NORMALIZE_EVENT_KINDS,
 } from './formatters/normalize-tool-pairs.js';
 import { YieldingStreamImpl } from './yielding-stream.js';
+import { classifyFailure, membraneRetrySettings, retryDecision, type RetrySettings } from './retry.js';
 import { calculateCost, warnUnpricedModel } from './utils/cost.js';
 import { isAnthropicServerBlock } from './utils/anthropic-server-blocks.js';
 import {
@@ -464,20 +464,12 @@ function refusalBudget(asked: number | undefined): number {
   return typeof asked === 'number' && Number.isFinite(asked) ? Math.max(0, asked) : 0;
 }
 
-/**
- * The longest stated wait (`retry-after`) membrane waits out on a schedule
- * whose own ceiling is shorter: a minute. AnthropicAdapter's SDK client, whose
- * retries membrane took over, waited out a stated wait under a minute (SDK
- * 0.52's `retryRequest`). A schedule's `maxRetryDelayMs` caps membrane's own
- * backoff, a different question; where it is longer than a minute, stated
- * waits are waited out up to it, as on the overloaded schedule.
- */
-const STATED_WAIT_CEILING_MS = 60_000;
-
 export class Membrane {
   private adapter: ProviderAdapter;
   private registry?: ModelRegistry;
-  private retryConfig: RetryConfig;
+  /** The retry decision's settings for this membrane's resolved retry config
+   *  (membraneRetrySettings), made once: the config doesn't change. */
+  private retrySettings: RetrySettings;
   private config: MembraneConfig;
   private formatter: PrefillFormatter;
 
@@ -487,7 +479,7 @@ export class Membrane {
   ) {
     this.adapter = adapter;
     this.registry = config.registry;
-    this.retryConfig = resolveRetryConfig(config.retry);
+    this.retrySettings = membraneRetrySettings(resolveRetryConfig(config.retry));
     this.config = config;
     // Use provided formatter or default to AnthropicXmlFormatter
     this.formatter = config.formatter ?? new AnthropicXmlFormatter();
@@ -670,16 +662,15 @@ export class Membrane {
         const classifiedError = this.attachRawRequest(error, rawRequest);
         const errorInfo = classifyError(classifiedError);
 
-        // The one retry policy (retryPlan): a 529 on the overloaded schedule,
-        // a 429 with its floor of five, any other retryable error within
-        // maxRetries. Terminal billing/quota codes are excluded by
-        // classification (on AnthropicAdapter the API's x-should-retry has
-        // the last word), and a deadline on a sent request is the caller's.
-        const plan = isDeadlineExpiry(classifiedError)
-          ? undefined
-          : this.retryPlan(errorInfo, tries, { retry: options.retry });
+        // The one retry policy (retryPlan): a 529 on the overloaded schedule
+        // (the base one when overloaded.maxRetries is 0), a 429 with its floor
+        // of five, any other retryable error within maxRetries. Terminal
+        // billing/quota codes are excluded by classification (on
+        // AnthropicAdapter the API's x-should-retry has the last word), and a
+        // deadline on a sent request is the caller's.
+        const plan = this.retryPlan(errorInfo, tries, isDeadlineExpiry(classifiedError), options.retry);
 
-        if (plan) {
+        if (plan.retry) {
           // Check hook for retry decision
           const hooks = this.config.hooks;
           if (hooks?.onError) {
@@ -693,7 +684,7 @@ export class Membrane {
           // sleep must fail like every other failure of this method — a
           // MembraneError — rather than escaping the loop as a raw
           // DOMException whose shape no caller of complete() expects.
-          const delay = this.calculateRetryDelay(tries, plan.overloaded, errorInfo);
+          const delay = plan.delayMs;
           // Reported only with a response: a cancellation ends the wait by
           // throwing, so a wait that didn't happen is never reported.
           retryDelaysMs.push(delay);
@@ -2882,8 +2873,8 @@ export class Membrane {
         // reports it as the cancellation it is.
         if (adapterOptions.signal?.aborted) throw typed;
         const errorInfo = classifyError(typed);
-        const plan = isDeadlineExpiry(typed) ? undefined : this.retryPlan(errorInfo, tries, { retry });
-        if (!plan) throw typed;
+        const plan = this.retryPlan(errorInfo, tries, isDeadlineExpiry(typed), retry);
+        if (!plan.retry) throw typed;
         // The same pre-retry hook contract as complete(): hosts use onError
         // for circuit-breaking, and its 'abort' decision ends the call here.
         const hooks = this.config.hooks;
@@ -2891,7 +2882,7 @@ export class Membrane {
           const decision = await awaitCallerCode(() => hooks.onError!(errorInfo, tries));
           if (decision === 'abort') throw typed;
         }
-        const delayMs = this.calculateRetryDelay(tries, plan.overloaded, errorInfo);
+        const delayMs = plan.delayMs;
         // Reported only with a response this helper returns: a cancellation,
         // even one that landed while onError decided, ends the wait below by
         // throwing, so a wait that didn't happen is never reported.
@@ -3578,95 +3569,42 @@ export class Membrane {
   }
 
   /**
-   * The server's own `retry-after` outranks our backoff when it is longer:
-   * retrying inside a window the provider has already told us to wait out
-   * burns the whole attempt budget on guaranteed failures. A stated wait
-   * longer than the schedule's stated-wait ceiling (statedWaitCeiling) isn't
-   * retried at all (see retryPlan), so a hostile or absurd retry-after cannot
-   * park the call; the min() below keeps that bound here too. The error a
-   * caller receives carries the provider's stated wait as stated
-   * (retryAfterMs): pacing across calls is the caller's.
-   */
-  private calculateRetryDelay(attempt: number, overloaded = false, errorInfo?: ErrorInfo): number {
-    const { retryDelayMs, backoffMultiplier, maxRetryDelayMs } = overloaded
-      ? this.retryConfig.overloaded
-      : this.retryConfig;
-    // A zero base delay stays zero: times a power that overflowed to
-    // Infinity it would be NaN, which would discard a stated wait below.
-    const delay = retryDelayMs === 0
-      ? 0
-      : Math.min(retryDelayMs * Math.pow(backoffMultiplier, attempt - 1), maxRetryDelayMs);
-    // Equal jitter on the overloaded schedule only: a capacity storm is
-    // exactly the case where a fleet retrying in sync re-creates the
-    // stampede it's backing off from. [delay/2, delay) keeps the wait long.
-    const backoffMs = overloaded ? Math.floor(delay / 2 + Math.random() * (delay / 2)) : delay;
-
-    // A stated wait can only lengthen the backoff, and the stated-wait ceiling
-    // still caps it. So a zero or negative wait (a 429 with retry_after_ms:
-    // -1000) loses to the backoff and can't make the loop spin. Keep the
-    // max(): never trust a stated wait alone to pace retries.
-    // A NaN stated wait counts as none. Membrane's own parsers never give
-    // one; another adapter's error might.
-    const retryAfterMs = errorInfo?.retryAfterMs;
-    if (retryAfterMs === undefined || Number.isNaN(retryAfterMs)) return backoffMs;
-    return Math.min(this.statedWaitCeiling(overloaded), Math.max(backoffMs, retryAfterMs));
-  }
-
-  /**
-   * The longest stated wait a schedule waits out: a minute, or the schedule's
-   * maxRetryDelayMs where that's longer (see STATED_WAIT_CEILING_MS).
-   */
-  private statedWaitCeiling(overloaded: boolean): number {
-    const { maxRetryDelayMs } = overloaded ? this.retryConfig.overloaded : this.retryConfig;
-    return Math.max(STATED_WAIT_CEILING_MS, maxRetryDelayMs);
-  }
-
-  /**
-   * One retry policy, read the same way by complete() and streamOnce() for
+   * The one retry policy, read the same way by complete() and streamOnce() for
    * every adapter: membrane is the one layer that retries a call's requests
    * (AnthropicAdapter turns its SDK client's own retries off for them).
    * Whether a request that failed with this error, after `attempt` tries, is
-   * sent again: undefined when it isn't; otherwise the schedule it waits on
-   * (overloaded) and the most tries it gets in all (maxAttempts). The callers
-   * send again only what failed before delivering anything, and leave a
-   * deadline that ran out on a sent request (isDeadlineExpiry) to the caller.
+   * sent again, and after how long: membrane's retry decision (retry.ts) on
+   * its settings for this membrane's retry config (membraneRetrySettings).
+   * The callers send again only what failed before delivering anything.
    *
-   * A 529 takes the overloaded schedule, a 429 at least five attempts, and
-   * any other retryable error (a 5xx, a 408, a connection failure) the base
-   * schedule within maxRetries. The 429 floor exists so a transient rate
-   * limit doesn't end a turn whatever maxRetries says. A 429 whose provider
-   * code says the account is out of quota is not a rate limit in that sense:
-   * it is classified non-retryable at the boundary, and gets no floor.
+   * A 529 takes the overloaded schedule, with jitter, or with
+   * overloaded.maxRetries 0 the base schedule and count; a 429 gets at least
+   * five attempts; any other retryable error (a 5xx, a 408, a connection
+   * failure) the base schedule within maxRetries. A 429 whose provider code
+   * says the account is out of quota is not a rate limit in that sense: it is
+   * classified non-retryable at the boundary, and gets no floor. A deadline
+   * that ran out on a sent request (`deadline`) is the caller's, and so is a
+   * stated wait longer than its schedule's ceiling, a minute or the
+   * schedule's maxRetryDelayMs where that's longer, which the caller gets on
+   * the error's retryAfterMs.
    *
-   * With the call's `retry: false` it returns undefined for every error,
-   * these floors included: the error goes to the caller. It does the same
-   * for an error whose stated wait is longer than its schedule's stated-wait
-   * ceiling: a minute, or the schedule's maxRetryDelayMs where that's longer.
+   * With the call's `retry: false` nothing is retried, these floors included:
+   * the error goes to the caller.
    */
   private retryPlan(
     errorInfo: ErrorInfo,
     attempt: number,
-    options: { retry?: boolean },
-  ): { overloaded: boolean; maxAttempts: number } | undefined {
-    if (options.retry === false) return undefined;
-    if (!errorInfo.retryable) return undefined;
-    const isRateLimit = errorInfo.type === 'rate_limit';
-    const overloaded =
-      isOverloadedError(errorInfo) && this.retryConfig.overloaded.maxRetries > 0;
-    const maxAttempts = isRateLimit
-      ? Math.max(this.retryConfig.maxRetries, 5)
-      : overloaded
-        ? Math.max(this.retryConfig.maxRetries, this.retryConfig.overloaded.maxRetries)
-        : this.retryConfig.maxRetries;
-    // Written to fail closed: a bound that compares false with every count
-    // ends the retries rather than letting them run on.
-    if (!(attempt < maxAttempts)) return undefined;
-    // A stated wait longer than the schedule's stated-wait ceiling isn't
-    // waited out here, and retrying at the ceiling would send the call back
-    // inside the window the provider named. The caller gets the error, with
-    // the stated wait on retryAfterMs.
-    if (errorInfo.retryAfterMs !== undefined && errorInfo.retryAfterMs > this.statedWaitCeiling(overloaded)) return undefined;
-    return { overloaded, maxAttempts };
+    deadline: boolean,
+    retry: boolean | undefined,
+  ): { retry: true; delayMs: number } | { retry: false } {
+    if (retry === false) return { retry: false };
+    const decision = retryDecision(
+      classifyFailure({ ...errorInfo, deadline }),
+      attempt,
+      errorInfo.retryAfterMs,
+      this.retrySettings,
+    );
+    return decision.retry ? decision : { retry: false };
   }
 
   private attachRawRequest(error: unknown, rawRequest: unknown): MembraneError {

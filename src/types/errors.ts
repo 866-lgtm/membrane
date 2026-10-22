@@ -2,6 +2,8 @@
  * Error types for membrane
  */
 
+import { classifyFailure } from '../retry.js';
+
 // ============================================================================
 // Error Serialization Helper
 // ============================================================================
@@ -435,8 +437,6 @@ const CONTEXT_LENGTH_PATTERN =
 const RATE_LIMIT_PATTERN = /\b429\b|(?<![a-z])rate[ _-]?limit|too many requests/i;
 
 const SERVER_STATUS_PATTERN = /\b(500|502|503|504|529)\b/;
-
-const OVERLOADED_PATTERN = /\b529\b|overloaded_error/i;
 
 /**
  * Structured evidence that a 400 is a credential failure, not a malformed
@@ -963,9 +963,7 @@ function renderBody(body: unknown): string {
  * must not put an unrelated error onto the ~10-minute schedule.
  */
 export function isOverloadedError(info: ErrorInfo): boolean {
-  if (!info.retryable) return false;
-  if (info.httpStatus !== undefined) return info.httpStatus === 529;
-  return OVERLOADED_PATTERN.test(info.message);
+  return classifyFailure(info) === 'overloaded';
 }
 
 /**
