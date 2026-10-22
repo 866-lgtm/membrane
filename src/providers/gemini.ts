@@ -39,6 +39,17 @@ import { createCombinedSignal, textOnlyToolResultContent, toolUseInputFromValue,
 
 interface GeminiPart {
   text?: string;
+  /**
+   * Set on a part that is the model's reasoning rather than its answer. Its
+   * `text` is a thought (a summary or the trace itself), so it is kept out of
+   * the answer: Google's own samples read the answer as the text of parts
+   * where `thought` is not set. Gemini returns such parts when the request
+   * sets `thinkingConfig.includeThoughts`. An image model's interim "thought
+   * images" are flagged too, and are kept out of the answer's images.
+   */
+  thought?: boolean;
+  /** Opaque reasoning state; may ride any part. Not round-tripped yet. */
+  thoughtSignature?: string;
   inlineData?: { mimeType: string; data: string };
   functionCall?: { name: string; args: Record<string, unknown> };
   functionResponse?: { name: string; response: Record<string, unknown> };
@@ -109,6 +120,8 @@ interface GeminiResponse {
 
 interface GeminiStreamState {
   text: string;
+  /** Text of the parts flagged `thought`, kept apart from the answer. */
+  thinking: string;
   toolCalls: { name: string; args: Record<string, unknown> }[];
   images: { data: string; mimeType: string }[];
   candidateFinishReason: string | undefined;
@@ -397,6 +410,7 @@ export class GeminiAdapter implements ProviderAdapter {
       const decoder = new TextDecoder();
       const streamState: GeminiStreamState = {
         text: '',
+        thinking: '',
         sawTerminalEvent: false,
         lastModelVersion: undefined,
         toolCalls: [],
@@ -449,7 +463,7 @@ export class GeminiAdapter implements ProviderAdapter {
       );
 
       return {
-        content: this.buildContentBlocks(streamState.text, streamState.toolCalls, streamState.images),
+        content: this.buildContentBlocks(streamState.text, streamState.toolCalls, streamState.images, streamState.thinking),
         stopReason: this.resolveStopReason(
           streamState.sawCandidateData,
           streamState.candidateFinishReason,
@@ -507,11 +521,19 @@ export class GeminiAdapter implements ProviderAdapter {
 
     if (candidate?.content?.parts) {
       for (const part of candidate.content.parts) {
-        if (part.text) {
+        if (part.text && part.thought) {
+          // A thought is not answer text: it goes to the thinking block. It
+          // is not streamed through onChunk either, by choice: this follows
+          // openai-compatible's reasoning channel rather than the Anthropic
+          // adapter's thinking chunks, so a stream consumer sees the
+          // reasoning only in the final content.
+          streamState.thinking += part.text;
+        } else if (part.text) {
           streamState.text += part.text;
           callbacks.onChunk(part.text);
         }
-        if (part.inlineData) {
+        // A thought image is a draft the model reasoned with, not its answer.
+        if (part.inlineData && !part.thought) {
           streamState.images.push({
             data: part.inlineData.data,
             mimeType: part.inlineData.mimeType,
@@ -774,12 +796,15 @@ export class GeminiAdapter implements ProviderAdapter {
     const parts = candidate?.content?.parts ?? [];
 
     let text = '';
+    let thinking = '';
     const toolCalls: { name: string; args: Record<string, unknown> }[] = [];
     const images: { data: string; mimeType: string }[] = [];
 
     for (const part of parts) {
-      if (part.text) text += part.text;
-      if (part.inlineData) {
+      if (part.text && part.thought) thinking += part.text;
+      else if (part.text) text += part.text;
+      // A thought image is a draft the model reasoned with, not its answer.
+      if (part.inlineData && !part.thought) {
         images.push({
           data: part.inlineData.data,
           mimeType: part.inlineData.mimeType,
@@ -794,7 +819,7 @@ export class GeminiAdapter implements ProviderAdapter {
     }
 
     return {
-      content: this.buildContentBlocks(text, toolCalls, images),
+      content: this.buildContentBlocks(text, toolCalls, images, thinking),
       stopReason: this.resolveStopReason(
         hasCandidateData(candidate),
         candidate?.finishReason,
@@ -813,9 +838,17 @@ export class GeminiAdapter implements ProviderAdapter {
   private buildContentBlocks(
     text: string,
     toolCalls: { name: string; args: Record<string, unknown> }[],
-    images: { data: string; mimeType: string }[] = []
+    images: { data: string; mimeType: string }[] = [],
+    thinking = ''
   ): ContentBlock[] {
     const content: ContentBlock[] = [];
+
+    // Reasoning first, as the other adapters order a thinking block. No
+    // signature: Gemini's thoughtSignature may ride any part, so it doesn't
+    // belong to this block.
+    if (thinking) {
+      content.push({ type: 'thinking', thinking });
+    }
 
     if (text) {
       content.push({ type: 'text', text });
@@ -912,32 +945,40 @@ export class GeminiAdapter implements ProviderAdapter {
  * Convert normalized content blocks to Gemini parts
  */
 export function toGeminiParts(blocks: ContentBlock[]): GeminiPart[] {
-  // A zero-width carrier holds a block this wire has no form for, so it adds
-  // no part, as the builder's own text branch skips empty text.
-  return blocks.filter(block => !isRawItemCarrier(block)).map(block => {
+  // Only text and tool calls have a form here, so every other block adds no
+  // part: a thinking or redacted_thinking block, as convertMessages drops
+  // them, and an image, which this helper doesn't convert. Each used to fall
+  // through to String(block), sending the model "[object Object]" as its
+  // words. A zero-width carrier holds a block this wire has no form for, so
+  // it adds none either, as the builder's own text branch skips empty text.
+  return blocks.filter(block => (block.type === 'text' && !isRawItemCarrier(block)) || block.type === 'tool_use').map(block => {
     if (block.type === 'text') {
       return { text: (block as any).text };
     }
-    if (block.type === 'tool_use') {
-      return {
-        functionCall: {
-          name: (block as any).name,
-          args: (block as any).input ?? {},
-        },
-      };
-    }
-    return { text: String(block) };
+    return {
+      functionCall: {
+        name: (block as any).name,
+        args: (block as any).input ?? {},
+      },
+    };
   });
 }
 
 /**
- * Convert Gemini parts to normalized content blocks
+ * Convert Gemini parts to normalized content blocks, in part order: a part
+ * with text becomes a text block, or a thinking block where it fell if it is
+ * a thought, and a function call becomes a tool_use block. Other parts, and
+ * parts with empty text, add no block. The adapter's response differs: it
+ * joins all thought text into one leading thinking block and all answer text
+ * into one text block.
  */
 export function fromGeminiParts(parts: GeminiPart[]): ContentBlock[] {
   const result: ContentBlock[] = [];
 
   for (const part of parts) {
-    if (part.text) {
+    if (part.text && part.thought) {
+      result.push({ type: 'thinking', thinking: part.text });
+    } else if (part.text) {
       result.push({ type: 'text', text: part.text });
     }
     if (part.functionCall) {
