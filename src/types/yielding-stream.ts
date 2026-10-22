@@ -149,9 +149,10 @@ export interface RoundReport {
   /**
    * The signed thinking this round's request sent back that failed the
    * provider's binding check, as the provider reported it: Anthropic's
-   * `input_transformations`, which come back when `thinking.blockBinding` is
-   * set. Absent when the response carried no report; both lists empty when
-   * it reported that nothing failed. This is the provider's account, beside
+   * `input_transformations`, which come back when the request carries the
+   * binding (`thinking.blockBinding`'s doc names the requests that don't).
+   * Absent when the response carried no report; both lists empty when it
+   * reported that nothing failed. This is the provider's account, beside
    * `altered`, which is membrane's: a dropped block was carried on the
    * request verbatim and removed before the model saw it. Entries of a type
    * membrane doesn't know are left out.
@@ -208,7 +209,8 @@ export interface CompleteEvent {
 }
 
 /**
- * Error event - something went wrong.
+ * Error event - something went wrong. When a provider call failed, the error
+ * is a MembraneError.
  */
 export interface ErrorEvent {
   type: 'error';
@@ -220,11 +222,14 @@ export interface ErrorEvent {
  * `stop_reason: 'refusal'` and membrane is re-issuing it (opt-in via
  * `refusalRetries`).
  *
- * **The consumer MUST discard everything this call has emitted so far**:
- * `tokens`, `block`, and any partially built assistant content belong to an
- * attempt that no longer exists. A fresh sequence follows. Consumers that
- * have already shown those tokens to a human (a TUI, a chat surface) must
- * retract or overwrite them.
+ * **The consumer MUST discard what the refused attempt emitted**: the
+ * `tokens` and `block` events of the round it belongs to, since the stream
+ * began or since the `tool-calls` event whose results began that round, and
+ * any partially built assistant content from them. They belong to an attempt
+ * that no longer exists, and a fresh sequence follows. Earlier rounds stand:
+ * the call's text (`rawAssistantText`) keeps what they produced. Consumers
+ * that have already shown the refused attempt's tokens to a human (a TUI, a
+ * chat surface) must retract or overwrite them.
  *
  * Why this exists: near the classifier threshold a refusal is probabilistic
  * rather than a property of the payload — the same bytes pass and refuse
@@ -440,11 +445,14 @@ export interface YieldingStreamOptions {
 
   /**
    * Re-issue an attempt that ends with `stop_reason: 'refusal'`, up to this
-   * many times. Default 0 (off).
+   * many times. Default 0 (off); a value that isn't a finite number of at
+   * least 0 asks for none. Native tool mode only: in XML tool mode it's
+   * ignored, with a warning, and the refusal stands.
    *
    * Enabling it means the stream can emit `RetryingEvent` — **consumers MUST
-   * handle it and discard what they have received for the call**, or two
-   * attempts will be concatenated. That is why it is off by default and why
+   * handle it and discard what the refused attempt emitted** (its round's
+   * tokens and blocks; see RetryingEvent), or two attempts will be
+   * concatenated. That is why it is off by default and why
    * turning it on is a per-call decision by a consumer that has been updated.
    *
    * Rationale: near the content-policy threshold a refusal is probabilistic,
@@ -454,6 +462,22 @@ export interface YieldingStreamOptions {
    * tokens are real spend.
    */
   refusalRetries?: number;
+
+  /**
+   * Whether membrane retries the stream's failed provider calls itself.
+   * Default true: a call that fails with a retryable error before it
+   * delivered anything is sent again, in any round, on the `retry` config's
+   * schedules. With `false`, membrane retries none of the call's failed
+   * requests, whatever the error and whatever the config says: the failure
+   * ends the stream with an `error` event, carrying the provider's advice
+   * (`retryable`, and a stated wait on `retryAfterMs`), and `hooks.onError`,
+   * which is asked before each retry, isn't asked. For a caller whose own
+   * layer retries. Two sends stay: a refusal re-issue, which a call in native
+   * tool mode asks for with `refusalRetries`, and the one resend with
+   * refreshed credentials that an adapter with a credential resolver makes
+   * after an HTTP 401.
+   */
+  retry?: boolean;
 
   /**
    * Maximum tool execution depth. Default: unlimited.

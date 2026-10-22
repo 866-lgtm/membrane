@@ -22,12 +22,12 @@ import type {
 import {
   MembraneError,
   abortError,
-  classifyError,
   errorFromHttpResponse,
   errorFromProviderStatus,
   isTypedAbortError,
   withRawRequest,
 } from '../types/index.js';
+import { errorFromThrown } from '../types/errors.js';
 import { isRawItemCarrier } from '../utils/fidelity.js';
 import { imageForRequest, GEMINI_IMAGE_TYPES } from '../utils/image-media.js';
 import { convertMcpMedia } from '../utils/mcp-media.js';
@@ -66,7 +66,13 @@ interface GeminiRequest {
 interface GeminiFunctionDeclaration {
   name: string;
   description: string;
-  parameters?: Record<string, unknown>;
+  /**
+   * The tool's `inputSchema`, as JSON Schema. Gemini's other field,
+   * `parameters`, takes only its OpenAPI-subset `Schema`, where a `type` is a
+   * single value and `$schema`, `$defs`, `$ref` and `const` are unknown
+   * fields, so a schema using any of them fails the whole request (#185).
+   */
+  parametersJsonSchema?: Record<string, unknown>;
 }
 
 interface GeminiResponse {
@@ -750,7 +756,7 @@ export class GeminiAdapter implements ProviderAdapter {
       return {
         name: tool.name,
         description: tool.description ?? '',
-        parameters: schema,
+        parametersJsonSchema: schema,
       };
     });
   }
@@ -894,9 +900,7 @@ export class GeminiAdapter implements ProviderAdapter {
     if (error instanceof MembraneError) return withRawRequest(error, rawRequest);
     if (isTypedAbortError(error)) return abortError(undefined, rawRequest);
 
-    const info = classifyError(error);
-    info.rawRequest = rawRequest;
-    return new MembraneError(info);
+    return errorFromThrown(error, rawRequest);
   }
 }
 

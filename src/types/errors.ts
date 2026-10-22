@@ -83,6 +83,9 @@ export interface ErrorInfo {
 
   /** Raw request that caused the error (for logging) */
   rawRequest?: unknown;
+
+  /** See {@link MembraneError.systemChangeRefused}. */
+  systemChangeRefused?: boolean;
 }
 
 // ============================================================================
@@ -97,6 +100,23 @@ export class MembraneError extends Error {
   readonly providerErrorCode?: string;
   readonly rawError?: unknown;
   readonly rawRequest?: unknown;
+  /**
+   * True when the request was refused for the system change it carried (a
+   * `system_change` block, SystemChangeContent): by the API, on a model
+   * without mid-conversation system messages or tool changes, or by membrane
+   * before sending, when the formatter or adapter can't send one or no point
+   * in the conversation takes it. The same request with the change applied to
+   * `tools` and `system` instead would not meet this refusal. Through
+   * NativeFormatter and AnthropicAdapter, a change refused as malformed (mixed
+   * with other blocks in its message, or a definition whose wire name another
+   * tool holds) isn't marked: the caller's fix is to the change, not a
+   * fallback. Through anything else the formatter or adapter refusal comes
+   * first, and is marked, unless the formatter can't carry the request's tools
+   * at all (`tools` as the request's changes leave them): that refusal comes
+   * before it, unmarked, since the change made in
+   * `tools` would meet it too.
+   */
+  readonly systemChangeRefused?: boolean;
 
   constructor(info: ErrorInfo) {
     super(info.message);
@@ -109,6 +129,7 @@ export class MembraneError extends Error {
     // Serialize error objects so they don't become {} when JSON.stringify'd
     this.rawError = serializeError(info.rawError);
     this.rawRequest = info.rawRequest;
+    if (info.systemChangeRefused) this.systemChangeRefused = true;
   }
 
   toErrorInfo(): ErrorInfo {
@@ -121,6 +142,7 @@ export class MembraneError extends Error {
       providerErrorCode: this.providerErrorCode,
       rawError: this.rawError,
       rawRequest: this.rawRequest,
+      ...(this.systemChangeRefused ? { systemChangeRefused: true } : {}),
     };
   }
 }
@@ -292,6 +314,29 @@ export function unsupportedError(message: string, rawRequest?: unknown): Membran
   });
 }
 
+/** Membrane's own refusal, before sending, of a request for the system change it carries. */
+export function systemChangeRefusedError(message: string, rawRequest?: unknown): MembraneError {
+  return new MembraneError({
+    type: 'unsupported',
+    message,
+    retryable: false,
+    rawError: undefined,
+    rawRequest,
+    systemChangeRefused: true,
+  });
+}
+
+/**
+ * Mark an error an adapter already classified as the API refusing the
+ * request's system change, keeping its identity, as withRawRequest does.
+ */
+export function markSystemChangeRefused(error: MembraneError): MembraneError {
+  try {
+    Object.defineProperty(error, 'systemChangeRefused', { value: true, enumerable: true, configurable: true });
+  } catch { /* A frozen error still propagates unchanged. */ }
+  return error;
+}
+
 // ============================================================================
 // HTTP Boundary Classification
 // ============================================================================
@@ -441,6 +486,30 @@ const NETWORK_ERROR_CODES = new Set([
   'und_err_socket', 'connectionrefused', 'connectionclosed', 'connectionreset',
 ]);
 const TIMEOUT_ERROR_CODES = new Set(['etimedout', 'und_err_connect_timeout', 'und_err_headers_timeout', 'und_err_body_timeout']);
+/**
+ * Undici's own deadlines on a request it already sent: no response headers
+ * within headersTimeout, or no body data within bodyTimeout (300 s each by
+ * default). Each is a call's budget spent, so errorFromThrown marks it
+ * deadlineExpired. Its connect timeout and the system's ETIMEDOUT aren't
+ * here: they're sent again like any connection failure.
+ */
+const SENT_REQUEST_DEADLINE_CODES = new Set(['und_err_headers_timeout', 'und_err_body_timeout']);
+
+/**
+ * Whether a failure is a runtime's own deadline on a request it sent: one of
+ * undici's above, or Bun's fetch timeout, a DOMException named TimeoutError
+ * (Bun 1.4.3 threw it after 360 s at a server that never answered). It
+ * doesn't say which stage ran out, so a stalled connect is marked too. Its
+ * code, 23, is a number, which the code check doesn't read, so the name decides,
+ * anywhere down the cause chain: the Anthropic SDK's MessageStream wraps a
+ * failed read once more. A caller's AbortSignal.timeout() rejects the same
+ * way, but membrane reads the caller's signal before the error, so that one
+ * stays a cancellation.
+ */
+function isSentRequestDeadline(error: unknown): boolean {
+  if (socketCodes(error).some((code) => SENT_REQUEST_DEADLINE_CODES.has(code))) return true;
+  return causeChain(error).some((link) => (link as { name?: unknown }).name === 'TimeoutError');
+}
 
 function firstString(...candidates: unknown[]): string | undefined {
   for (const candidate of candidates) {
@@ -754,6 +823,32 @@ export function withRawRequest(error: MembraneError, rawRequest: unknown): Membr
   return error;
 }
 
+// Symbol.for, like the adapters' deadline-abort mark, so a second loaded copy
+// of membrane reads the same mark.
+const DEADLINE_EXPIRY = Symbol.for('membrane.deadlineExpiry');
+
+/**
+ * Mark an error as a deadline running out on a call that was under way:
+ * AnthropicAdapter's idle and first-event watchdogs, every timeout its SDK
+ * client reports, and a runtime's own fetch deadlines (errorFromThrown). It
+ * stays the retryable timeout a caller sees, but membrane doesn't send the
+ * call again: the deadline was the call's budget, and another full one is the
+ * caller's to give. (An adapter's `timeoutMs` deadline is a TimeoutAbortError,
+ * which isn't retryable at all.) Keeps the error's identity.
+ */
+export function deadlineExpired<E extends MembraneError>(error: E): E {
+  try {
+    Object.defineProperty(error, DEADLINE_EXPIRY, { value: true });
+  } catch { /* A frozen error is retried like any other timeout. */ }
+  return error;
+}
+
+/** Whether an error was marked with deadlineExpired. */
+export function isDeadlineExpiry(error: unknown): boolean {
+  return typeof error === 'object' && error !== null
+    && (error as Record<symbol, unknown>)[DEADLINE_EXPIRY] === true;
+}
+
 /**
  * What the caller's own code threw while membrane ran it beside a call: a
  * hook, a request or stream callback, a receipt consumer, a header stamp,
@@ -929,24 +1024,61 @@ function classifyMessage(rawMessage: string, ownText: string = rawMessage): {
 }
 
 /**
- * A transport failure named by its code, on the error or its `cause`: Node's
- * `fetch failed` hides `ECONNREFUSED` in `cause.code`, and Bun's "Unable to
+ * A transport failure named by its code, on the error or down its causes:
+ * Node's `fetch failed` hides `ECONNREFUSED` in `cause.code`, and Bun's "Unable to
  * connect. Is the computer able to access the url?" carries
  * `code: 'ConnectionRefused'` (the same text for a DNS failure). The message
  * names neither.
  */
 function classifySocketCode(error: Error): { type: MembraneErrorType; retryable: boolean; httpStatus?: number } | undefined {
-  const codes = [
-    (error as { code?: unknown }).code,
-    ((error as { cause?: unknown }).cause as { code?: unknown } | undefined)?.code,
-  ];
-  for (const code of codes) {
-    if (typeof code !== 'string') continue;
-    const key = code.toLowerCase();
+  for (const key of socketCodes(error)) {
     if (NETWORK_ERROR_CODES.has(key)) return { type: 'network', retryable: true };
     if (TIMEOUT_ERROR_CODES.has(key)) return { type: 'timeout', retryable: true };
   }
   return undefined;
+}
+
+/**
+ * The lowercased string codes on an error and down its chain of causes,
+ * outermost first. Node's fetch hides undici's error in `cause`, and the
+ * Anthropic SDK's MessageStream wraps a failed read once more (an
+ * AnthropicError whose cause is the `terminated` TypeError), so the code can
+ * sit two causes down.
+ */
+function socketCodes(error: unknown): string[] {
+  return causeChain(error)
+    .map((link) => (link as { code?: unknown }).code)
+    .filter((code): code is string => typeof code === 'string')
+    .map((code) => code.toLowerCase());
+}
+
+/** An error and its causes, outermost first, at most four deep. */
+function causeChain(error: unknown): object[] {
+  const chain: object[] = [];
+  let current = error;
+  while (typeof current === 'object' && current !== null && !chain.includes(current) && chain.length < 4) {
+    chain.push(current);
+    current = (current as { cause?: unknown }).cause;
+  }
+  return chain;
+}
+
+/**
+ * The MembraneError for a failure an adapter caught that isn't one yet, such
+ * as what `fetch` throws: typed by classifyError, with the request attached.
+ * A runtime's deadline on a request it already sent (undici's headers and
+ * body timeouts, Bun's fetch timeout) is marked deadlineExpired, as an
+ * adapter's own watchdog is, so membrane leaves it to the caller.
+ */
+export function errorFromThrown(error: unknown, rawRequest?: unknown): MembraneError {
+  // Already typed: keep it, and its marks, as it is.
+  if (error instanceof MembraneError) return withRawRequest(error, rawRequest);
+  const info = classifyError(error);
+  info.rawRequest = rawRequest;
+  const typed = new MembraneError(info);
+  // A mark the error already carries, as a second loaded copy of membrane
+  // sets one on its own MembraneError, stays on the new one.
+  return isSentRequestDeadline(error) || isDeadlineExpiry(error) ? deadlineExpired(typed) : typed;
 }
 
 export function classifyError(error: unknown): ErrorInfo {
@@ -967,6 +1099,12 @@ export function classifyError(error: unknown): ErrorInfo {
         retryable: false,
         rawError: serializedError,
       };
+    }
+    // A runtime's own timeout (Bun's fetch deadline) is named, whatever its
+    // message says. A caller's AbortSignal.timeout() rejects the same way, and
+    // membrane still ends that call as a cancellation, from the caller's signal.
+    if (causeChain(error).some((link) => (link as { name?: unknown }).name === 'TimeoutError')) {
+      return { type: 'timeout', message: error.message, retryable: true, rawError: serializedError };
     }
 
     const classification = classifySocketCode(error) ?? classifyMessage(error.message);

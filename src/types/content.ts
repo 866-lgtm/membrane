@@ -2,6 +2,8 @@
  * Content block types for normalized messages
  */
 
+import type { ToolDefinition } from './tools.js';
+
 // ============================================================================
 // Cache Control (Anthropic prompt caching)
 // ============================================================================
@@ -257,6 +259,54 @@ export interface RedactedThinkingContent {
 }
 
 // ============================================================================
+// System Changes
+// ============================================================================
+
+/**
+ * A change, from this point in the conversation on, to the tools the model is
+ * offered and to its system text, made without editing the request's `tools`
+ * or `system`, so the prompt cache before it still holds.
+ *
+ * A message holding one holds nothing else; NativeFormatter refuses a message
+ * that mixes it with other blocks. Its participant isn't read: the block's
+ * type decides how it goes out.
+ *
+ * NativeFormatter sends each such message, through AnthropicAdapter, as a
+ * mid-conversation `role: 'system'` message: each of `removeTools` as a
+ * `tool_removal` naming the tool, then each of `defineTools` as a
+ * `tool_addition` carrying its full definition, then each of `addSystem` that
+ * isn't only whitespace as a text block (one that is is left out and the
+ * message reported altered): that order within each block, and the blocks in the message's
+ * order, so a removal in a later block withdraws a tool an earlier one
+ * defined. A tool a change defines can be called like one in `tools`, and a
+ * call to it comes back under its name. It goes at the first
+ * point at or after its place where the API accepts one: after a user turn,
+ * a tool-result turn included, and before an assistant turn or at the end,
+ * reading the turns as the adapter's empty-text cleanup leaves them.
+ * With no such point, as after a final assistant message, the request is
+ * refused before sending. Through any other formatter or adapter, Membrane
+ * refuses a request that carries one before sending. Both refusals, and the
+ * API's own refusal on a model without mid-conversation system messages, are
+ * MembraneErrors with `systemChangeRefused: true`. Through NativeFormatter and
+ * AnthropicAdapter, a malformed change, mixed with other blocks or defining a
+ * tool whose wire name another holds, is refused as unsupported, without the
+ * flag. Through anything else the refusal for the formatter or adapter comes
+ * first, with it, unless the formatter can't carry the request's tools at all
+ * (`tools` as the request's changes leave them, definitions added and
+ * removals taken away): that refusal comes before
+ * it, without the flag, since making the change in `tools` would meet it too.
+ */
+export interface SystemChangeContent {
+  type: 'system_change';
+  /** Tools withdrawn from here on, by name. */
+  removeTools?: string[];
+  /** Tools offered from here on, each by its full definition: a new tool, or a redefinition of one by its name. */
+  defineTools?: ToolDefinition[];
+  /** System text added from here on, one text block each; only whitespace is left out. */
+  addSystem?: string[];
+}
+
+// ============================================================================
 // Union Type
 // ============================================================================
 
@@ -275,7 +325,9 @@ export type ContentBlock =
   | ToolResultContent
   // Thinking
   | ThinkingContent
-  | RedactedThinkingContent;
+  | RedactedThinkingContent
+  // System changes
+  | SystemChangeContent;
 
 // ============================================================================
 // Type Guards
@@ -319,6 +371,10 @@ export function isThinkingContent(block: ContentBlock): block is ThinkingContent
 
 export function isRedactedThinkingContent(block: ContentBlock): block is RedactedThinkingContent {
   return block.type === 'redacted_thinking';
+}
+
+export function isSystemChangeContent(block: ContentBlock): block is SystemChangeContent {
+  return block.type === 'system_change';
 }
 
 export function isMediaContent(

@@ -259,7 +259,7 @@ describe('YieldingStream', () => {
       expect(wire).toBeDefined();
       const wireMessages = (wire as any).messages as Array<{ role: string; content: any[] }>;
 
-      // No two consecutive same-role envelopes — Anthropic's hard rule.
+      // No two consecutive same-role envelopes: each turn goes as one.
       for (let i = 1; i < wireMessages.length; i++) {
         expect(wireMessages[i]!.role).not.toBe(wireMessages[i - 1]!.role);
       }

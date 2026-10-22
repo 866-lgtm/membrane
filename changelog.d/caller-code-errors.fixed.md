@@ -30,8 +30,6 @@
   reaches the `error` event as that `MembraneError`, where it used to be the
   caller's own error. The caller's error is its `cause`, unless it was a
   `MembraneError` that already said `retryable: false` and arrives as itself.
-- **Anthropic adapter:** `dynamicHeaders` now runs before the keepalive
-  records the request, so a request it fails isn't replayed later.
 - **Responses adapter, subscription mode:** an `onFastModeFallback` that
   throws is now logged with `console.warn`, and the response stands. Its
   error used to trigger a second request, which didn't call it again, so the

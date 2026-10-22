@@ -217,7 +217,7 @@ describe('the caller\'s code before the send runs once', () => {
       expect(error.retryable).toBe(false);
     });
 
-    it(`${path}: the Anthropic adapter's dynamicHeaders, before the keepalive records the request`, async () => {
+    it(`${path}: the Anthropic adapter's dynamicHeaders, before the send`, async () => {
       let runs = 0;
       const { adapter, create } = anthropic({ dynamicHeaders: () => { runs++; throw callerError(); } });
       const record = vi.fn();
@@ -301,6 +301,14 @@ describe('the onError hook is the caller\'s code too', () => {
       expect(runs).toBe(2);
     });
   }
+
+  it('streamYielding: what it throws, or rejects with, leaves as a MembraneError that isn\'t retryable', async () => {
+    const original = callerError();
+    const membrane = new Membrane(new RateLimitedOnce(), { ...noDelay, hooks: { onError: async () => { throw original; } } });
+    const error = await yieldingError(membrane, request());
+    expect(error.retryable).toBe(false);
+    expect(error.cause).toBe(original);
+  });
 });
 
 describe('the configured logger and a model registry run beside the call, so complete() sends once when they throw', () => {

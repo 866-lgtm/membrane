@@ -307,7 +307,7 @@ describe('a frame the handler cannot read is still dropped', () => {
     }
 
     for (const [what, rest] of [['null', { index: null }], ['absent', {}]] as Array<[string, Record<string, unknown>]>) {
-      it(`${name}: a continuation whose index is ${what} joins the call at index 0`, async () => {
+      it(`${name}: a continuation whose index is ${what} joins the call before it, here the one at index 0`, async () => {
         const start = { choices: [{ delta: { tool_calls: [{ index: 0, id: 'call_zz', type: 'function', function: { name: 'zz_tool', arguments: '{"a":' } }] } }] };
         const more = { choices: [{ delta: { tool_calls: [{ ...rest, function: { arguments: '1}' } }] } }] };
         vi.stubGlobal('fetch', vi.fn(async () => sseResponse([start, more, { choices: [{ delta: {}, finish_reason: 'tool_calls' }] }, '[DONE]']).response));

@@ -215,7 +215,8 @@ function withoutFraming(value: string): string {
  *
  * What happens next depends on the parameter's declaration, as
  * {@link readToolSchema} reads it — the same reading the XML tool
- * instructions are rendered from:
+ * instructions are rendered from, except that they withhold a null the
+ * schema's other keywords leave out (#150):
  *   - typed `string` → the text as written, less one layout newline on each
  *                 side ({@link withoutFraming}). No JSON.parse, no trim: an
  *                 exact-match edit tool must be able to send leading and
@@ -745,10 +746,15 @@ export interface ToolDefinitionForPrompt {
      * `type="undefined"` or a type the parser will not apply.
      */
     type?: string;
-    /** The declaration also admits null: renders `nullable="true"`. */
+    /** The reading's `instructedNullable` (#150): renders `nullable="true"`. */
     nullable?: boolean;
     description?: string;
     required?: boolean;
+    /**
+     * The reading's `enum`, each value as `String()` prints it.
+     * {@link formatToolDefinitions} prints the list where it can show each
+     * value exactly.
+     */
     enum?: string[];
   }>;
 }
@@ -758,7 +764,10 @@ export interface ToolDefinitionForPrompt {
  * input schema by the same reading the XML parameter parser applies
  * ({@link readToolSchema}): the type the model is told a parameter has is the
  * type its value is parsed by, and a parameter the parser cannot type states
- * none.
+ * none. Its null mark is the reading's `instructedNullable`, which keywords
+ * that leave null out withhold though the parse admits null (#150), and its
+ * `enum` lists the values the reading finds behind `$ref`s, in branches and
+ * across root alternatives as well as on the declaring node.
  */
 export function toolDefinitionForPrompt(tool: ToolDefinition): ToolDefinitionForPrompt {
   const { parameters } = readToolSchema(tool.inputSchema);
@@ -770,10 +779,10 @@ export function toolDefinitionForPrompt(tool: ToolDefinition): ToolDefinitionFor
         name,
         {
           type: declaration.type,
-          nullable: declaration.nullable || undefined,
+          nullable: declaration.instructedNullable || undefined,
           description: declaration.description,
           required: declaration.required,
-          enum: declaration.enum,
+          enum: declaration.enum?.map(String),
         },
       ])
     ),
@@ -781,7 +790,32 @@ export function toolDefinitionForPrompt(tool: ToolDefinition): ToolDefinitionFor
 }
 
 /**
- * Format tool definitions as XML for system prompt
+ * Whether `enum="…"`, which joins the values with commas, shows each value
+ * exactly, so the model can split the list and write a value as it is (#176).
+ * A value holding `"` would end the attribute, and one holding `,` would read
+ * as two values. A control character (a line break or a tab among them), a
+ * line or paragraph separator, or a lone surrogate can't be shown as it is.
+ * An empty value, or whitespace at either end, leaves the value's bounds
+ * unclear, and an empty list has no value to show.
+ */
+function listsExactly(values: readonly string[]): boolean {
+  return (
+    values.length > 0 &&
+    values.every(
+      value => value !== '' && value === value.trim() && !/[",\p{Cc}\p{Cs}\p{Zl}\p{Zp}]/u.test(value)
+    )
+  );
+}
+
+/**
+ * Format tool definitions as XML for system prompt.
+ *
+ * A parameter's `enum` values print raw, unlike its name and type, since the
+ * parser doesn't decode entities in a value the model writes: an entity shown
+ * here, such as `&quot;`, would be copied into the call and kept. Where the
+ * attribute can't show every value exactly ({@link listsExactly}), the
+ * parameter's line has no `enum` at all, rather than a list the model would
+ * split wrongly.
  */
 export function formatToolDefinitions(tools: ToolDefinitionForPrompt[]): string {
   const parts: string[] = ['<tools>'];
@@ -796,7 +830,9 @@ export function formatToolDefinitions(tools: ToolDefinitionForPrompt[]): string 
       if (param.type) attrs.push(`type="${escapeXml(param.type)}"`);
       if (param.nullable) attrs.push('nullable="true"');
       if (param.required) attrs.push('required="true"');
-      if (param.enum) attrs.push(`enum="${param.enum.join(',')}"`);
+      // `String` prints a null member as `null`; `join` alone printed it as an empty item (#150).
+      const values = param.enum?.map(String);
+      if (values && listsExactly(values)) attrs.push(`enum="${values.join(',')}"`);
       
       parts.push(`<parameter ${attrs.join(' ')}>`);
       if (param.description) {

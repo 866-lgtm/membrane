@@ -23,8 +23,8 @@ import {
   MembraneError,
   abortError,
   authError,
-  classifyError,
   errorFromProviderStatus,
+  extractProviderErrorFields,
   isTypedAbortError,
   networkError,
   serverError,
@@ -32,7 +32,7 @@ import {
   withRawRequest,
   unsupportedError,
 } from '../types/index.js';
-import { runCallerCode, statusForProviderCode } from '../types/errors.js';
+import { markSystemChangeRefused, runCallerCode, statusForProviderCode, deadlineExpired, isDeadlineExpiry, errorFromThrown } from '../types/errors.js';
 import { flattenRootSchemaUnion } from './anthropic-tool-schema.js';
 import { isPlainObject } from '../utils/tool-schema.js';
 import { assertTerminalEventObserved, toolUseInputFromText, toolUseInputFromValue, isDeadlineAbort, deadlineTimeoutError, isToolCallBlock, isToolCallArgumentsDelta } from './utils.js';
@@ -49,13 +49,20 @@ import { CacheKeepalive, type CacheKeepaliveConfig } from '../cache-keepalive.js
  * non-retryable, so a single stray `temperature` kills the whole turn.
  * Mirrors the `noTemperatureSupport` gate in the OpenAI provider.
  *
- * This is the always-on-thinking / reasoning-forward tier, which removes the
- * sampling parameters from the API surface entirely (Sonnet 5 rejects only
- * non-default values). Everything else — Haiku 4.5, Sonnet 4.6, Opus 4.6 and
- * older — ACCEPTS `temperature`, so it must NOT be listed here.
+ * Most of these are the always-on-thinking / reasoning-forward tier, which
+ * removes the sampling parameters from the API surface entirely (Sonnet 5
+ * rejects only non-default values). Haiku 5.5 is listed on a measurement,
+ * below. Everything else — Haiku 4.5, Sonnet 4.6, Opus 4.6 and older —
+ * ACCEPTS `temperature`, so it must NOT be listed here.
  *
  *   - Opus 4.7 / Opus 4.8 / Sonnet 5 / Fable 5 / Mythos 5 / Mythos preview:
  *     documented 400 on any sampling parameter.
+ *   - Haiku 5.5: measured against the Messages API on 2026-10-19, with no
+ *     thinking config. `temperature` 0.2, `top_k` 40, and `top_p` 0.9 and 0.95
+ *     were each refused with a 400 ("`temperature` is deprecated for this
+ *     model", and likewise for the other two); `top_p` 0.99 was accepted.
+ *     Sonnet 5.5, which `claude-sonnet-5` matches, answered `top_p` 0.9 and
+ *     0.99 the same way. A listed model loses every `top_p`, 0.99 included.
  *
  * NB: claude-haiku-4-5 was previously listed here on the strength of a single
  * "observed 400 in production when temperature is sent" anecdote. Haiku 4.5
@@ -72,6 +79,7 @@ const NO_TEMPERATURE_MODELS = [
   'claude-opus-4-7',
   'claude-opus-4-8',
   'claude-sonnet-5',
+  'claude-haiku-5-5',
   'claude-fable-5',
   'claude-mythos-5',
   'claude-mythos-preview',
@@ -108,24 +116,31 @@ export function needsInterleavedThinkingBeta(model: string): boolean {
   return parseInt(minor, 10) < 6;
 }
 
-/** Pull any anthropic-beta value out of a ClientOptions defaultHeaders bag,
- *  which the SDK types as record | entries-array | Headers. Case-insensitive
- *  on the key; non-string values (explicit null override, arrays) are treated
- *  as absent. */
+/** Pull the anthropic-beta value out of a ClientOptions defaultHeaders bag,
+ *  which the SDK types as record | entries-array | Headers, as the SDK's
+ *  buildHeaders reads it: case-insensitive on the key, each value of an array
+ *  appended, undefined skipped, and null clearing what came before; an
+ *  object's key replaces what an earlier key gave, where entries rows append.
+ *  Nothing left is absent. */
 function extractBetaHeader(headers: ClientOptions['defaultHeaders']): string | undefined {
   if (!headers) return undefined;
   if (typeof (headers as Headers).get === 'function') {
     return (headers as Headers).get('anthropic-beta') ?? undefined;
   }
-  const entries = Array.isArray(headers)
-    ? headers
-    : Object.entries(headers as Record<string, unknown>);
+  const rows = Array.isArray(headers);
+  const entries = rows ? headers : Object.entries(headers as Record<string, unknown>);
+  let values: string[] = [];
   for (const [key, value] of entries) {
-    if (String(key).toLowerCase() === 'anthropic-beta' && typeof value === 'string') {
-      return value;
+    if (String(key).toLowerCase() !== 'anthropic-beta') continue;
+    let replaced = rows;
+    for (const v of Array.isArray(value) ? value : [value]) {
+      if (v === undefined) continue;
+      if (!replaced) { values = []; replaced = true; }
+      if (v === null) values = [];
+      else values.push(String(v));
     }
   }
-  return undefined;
+  return values.length > 0 ? values.join(',') : undefined;
 }
 
 /** Beta flag for thinking-binding controls (`thinking.block_binding`) and
@@ -139,6 +154,32 @@ export const THINKING_BINDING_BETA = 'thinking-binding-controls-2026-08-01';
 export function sendsBlockBinding(params: { thinking?: unknown }): boolean {
   const binding = (params.thinking as { block_binding?: unknown } | null | undefined)?.block_binding;
   return binding !== undefined && binding !== null;
+}
+
+/** Beta flag for mid-conversation tool changes (`tool_addition` and
+ *  `tool_removal` in a `role: 'system'` message), definitions by value
+ *  included. System text there needs none. */
+export const INLINE_TOOLS_BETA = 'inline-tools-2026-09-15';
+
+/** Whether a built request carries a tool change, which needs its beta. */
+export function sendsToolChanges(params: { messages?: unknown }): boolean {
+  return Array.isArray(params.messages) && params.messages.some((message: { role?: unknown; content?: unknown }) =>
+    message?.role === 'system' && Array.isArray(message.content) &&
+    message.content.some((block: { type?: unknown }) => block?.type === 'tool_addition' || block?.type === 'tool_removal'));
+}
+
+/** The API's wordings, in a 400, for a model that takes no mid-conversation
+ *  system message or no tool change in one (live runs, Oct 19 2026). */
+const SYSTEM_CHANGE_REFUSALS = [
+  "role 'system' is not supported on this model",
+  'tool_addition/tool_removal requires a model that supports mid-conversation system content',
+  'tool_addition/tool_removal is not supported on this model',
+];
+
+/** Whether a 400's own message is the API refusing the request's system change. */
+export function isSystemChangeRefusal(body: unknown): boolean {
+  const message = extractProviderErrorFields(body).message;
+  return typeof message === 'string' && SYSTEM_CHANGE_REFUSALS.some((wording) => message.includes(wording));
 }
 
 /**
@@ -318,9 +359,11 @@ export interface AnthropicAdapterConfig {
 
   /**
    * Prompt-cache keepalive: hold this agent's cached prefix warm across idle
-   * gaps by replaying the last request with `max_tokens: 0`, which refreshes
-   * the entry's TTL at cache-READ price instead of letting it expire into a
-   * 2x cache write on the next wake. See `../cache-keepalive.ts`.
+   * gaps by replaying the last request with `max_tokens: 0`, through its last
+   * one-hour cache marker and the end of the user turn at or after it (whole,
+   * when no user turn comes there), which refreshes the entry's TTL at
+   * cache-READ price instead of letting it expire into a 2x cache write on the
+   * next wake. See `../cache-keepalive.ts`.
    * Pass `{ enabled: false }` to turn off.
    */
   cacheKeepalive?: CacheKeepaliveConfig;
@@ -375,6 +418,8 @@ export class AnthropicAdapter implements ProviderAdapter {
   readonly cacheReceiptBasis = 'wire-request' as const;
   /** Membrane sends server-tool blocks back through this adapter, in the turn that produced them. Live checks had the API accept each type, with or without a cache marker, but `container_upload`, which it refuses in an assistant turn and so is left out (see utils/anthropic-server-blocks.ts). */
   readonly replaysAnthropicServerBlocks = true;
+  /** Sends a mid-conversation `role: 'system'` message, with the inline-tools beta when it changes tools. Live checks had the API take tool removals and definitions by value there (Opus 5.5, Haiku 5.5), system text (Haiku 5.5, Sonnet 5), and a cache marker on each block type (Haiku 5.5). Where the model takes none, its 400 is marked `systemChangeRefused`. */
+  readonly sendsSystemChanges = true;
 
   /**
    * Verified live 2026-08-25 (claude-haiku-4-5, 4,650-token cached system
@@ -486,10 +531,11 @@ export class AnthropicAdapter implements ProviderAdapter {
     request: Anthropic.MessageCreateParamsNonStreaming,
     headers?: Record<string, string>,
     signal?: AbortSignal,
+    retries?: { maxRetries: number },
   ): Promise<Anthropic.Message> {
     const session = this.credentialSession(signal);
     try {
-      return await session.client.messages.create(request, { headers, signal: session.signal });
+      return await session.client.messages.create(request, { headers, signal: session.signal, ...retries });
     } catch (error) {
       throw session.failure() ?? error;
     }
@@ -509,15 +555,22 @@ export class AnthropicAdapter implements ProviderAdapter {
     options?.onRequest?.(fullRequest);
 
     const headers = this.betaHeaders(request, anthropicRequest);
-    // Before the keepalive records the request: a dynamicHeaders that throws
-    // ends the call before the send, leaving nothing to replay.
     const live = this.liveHeaders(headers, 'complete');
-    this.cacheKeepalive?.record(
-      fullRequest as unknown as Record<string, unknown>, headers, 'complete',
-    );
 
     try {
-      const response = await this.createMessage(fullRequest, live, options?.signal);
+      // Membrane is the one retry layer (see Membrane's retryPlan): the SDK
+      // client makes one attempt at this request, a credential resolver's
+      // resend after a 401 inside it. The keepalive's replays, which also go
+      // through createMessage, keep the SDK's default.
+      const response = await this.createMessage(fullRequest, live, options?.signal, { maxRetries: 0 });
+      // The SDK has the provider's answer, so the provider has the request's
+      // prefix: only now can the keepalive hold it warm. It's recorded before
+      // membrane parses the answer, which can fail on an answer that arrived.
+      // A call that failed before the SDK had an answer, a body cut off in
+      // transit included, leaves the lineage's earlier snapshot as it was.
+      this.cacheKeepalive?.record(
+        fullRequest as unknown as Record<string, unknown>, headers, 'complete',
+      );
 
       return this.parseResponse(response, fullRequest);
     } catch (error) {
@@ -539,17 +592,8 @@ export class AnthropicAdapter implements ProviderAdapter {
     assertMessagePrefillSupported(fullRequest.model, fullRequest.messages, options, this.name, fullRequest);
     options?.onRequest?.(fullRequest);
 
-    // Before the keepalive records the request: a dynamicHeaders that throws
-    // ends the call before the send, leaving nothing to replay.
-    const live = this.liveHeaders(this.betaHeaders(request, anthropicRequest), 'stream');
-
-    // Snapshot the primary lane's prefix so it can be held warm across idle
-    // gaps. `stream: true` is dropped at replay time (transport, not cache key).
-    this.cacheKeepalive?.record(
-      fullRequest as unknown as Record<string, unknown>,
-      this.betaHeaders(request, anthropicRequest),
-      'stream',
-    );
+    const headers = this.betaHeaders(request, anthropicRequest);
+    const live = this.liveHeaders(headers, 'stream');
 
     // Idle timeout: abort on transport silence after the first SDK event.
     // The SDK's timeout only covers the initial HTTP response headers;
@@ -610,6 +654,10 @@ export class AnthropicAdapter implements ProviderAdapter {
       const stream = await session.client.messages.stream(anthropicRequest, {
         signal: session.signal,
         headers: live,
+        // Membrane is the one retry layer: the SDK client makes one attempt
+        // at this request, a credential resolver's resend after a 401 inside
+        // it.
+        maxRetries: 0,
       });
 
       // Accumulate response metadata from SSE events directly, so we can
@@ -757,6 +805,15 @@ export class AnthropicAdapter implements ProviderAdapter {
       for await (const event of stream) {
         sawEvent = true;
         resetIdleTimer();
+        // The provider has the request's prefix from its message_start on, so
+        // the keepalive can hold it warm across idle gaps (`stream: true` is
+        // dropped at replay time: transport, not cache key). A call that
+        // failed before this leaves the lineage's earlier snapshot as it was.
+        // It's recorded before the caller's onProgress runs, so a callback
+        // that throws can't lose a prefix the provider has.
+        if (event.type === 'message_start') {
+          this.cacheKeepalive?.record(fullRequest as unknown as Record<string, unknown>, headers, 'stream');
+        }
         // Every SDK event is progress; pings never reach this loop.
         options?.onProgress?.();
         if (event.type === 'message_start') {
@@ -989,9 +1046,10 @@ export class AnthropicAdapter implements ProviderAdapter {
       // Our own idle watchdog fired: whatever shape the SDK wrapped the
       // abort into (AbortError, APIUserAbortError "Request was aborted.",
       // a connection error), the CAUSE is the stalled stream — classify as
-      // the retryable timeout, never as a user abort / unknown error.
+      // the retryable timeout, never as a user abort / unknown error. It is
+      // this call's deadline, so membrane doesn't send the call again.
       if (idleTimedOut) {
-        throw new MembraneError({
+        throw deadlineExpired(new MembraneError({
           type: 'timeout',
           message: sawEvent
             ? `SSE stream idle timeout — no observed activity within ${idleMs}ms`
@@ -999,7 +1057,7 @@ export class AnthropicAdapter implements ProviderAdapter {
           retryable: true,
           rawError: error,
           rawRequest: fullRequest,
-        });
+        }));
       }
       // A deadline on the caller's signal (Membrane's progressTimeoutMs) is a
       // timeout with its own message, whatever the SDK wrapped the abort in.
@@ -1028,10 +1086,11 @@ export class AnthropicAdapter implements ProviderAdapter {
    *  header — the SDK replaces same-key defaults instead of merging, and the
    *  API accepts comma-separated betas. Undefined when nothing to add, so
    *  the defaults apply untouched. */
-  private betaHeaders(request: ProviderRequest, built: { thinking?: unknown }): Record<string, string> | undefined {
+  private betaHeaders(request: ProviderRequest, built: { thinking?: unknown; messages?: unknown }): Record<string, string> | undefined {
     const needed: string[] = [];
     if (thinkingEnabled(request) && needsInterleavedThinkingBeta(request.model)) needed.push(INTERLEAVED_THINKING_BETA);
     if (sendsBlockBinding(built)) needed.push(THINKING_BINDING_BETA);
+    if (sendsToolChanges(built)) needed.push(INLINE_TOOLS_BETA);
     if (needed.length === 0) return undefined;
     // Set-join so a default that already carries a beta doesn't emit it
     // twice (the API tolerates duplicates; this is hygiene).
@@ -1113,6 +1172,17 @@ export class AnthropicAdapter implements ProviderAdapter {
               .filter((b) => !(b?.type === 'text' && (typeof b.text !== 'string' || b.text === ''))).length;
             if (content.length !== carried || substituted) onContentAltered?.(original);
             return { ...block, content };
+          }
+          if (block.type === 'tool_addition' && block.tool?.type === 'tool_definition' && block.tool.definition) {
+            // A definition by value meets the same rule as `tools`: its root
+            // union is flattened, as below. That changes what the model is
+            // told about the tool, so its message is reported altered.
+            const definition = block.tool.definition;
+            const flattened = flattenRootSchemaUnion(definition.input_schema);
+            if (flattened !== definition.input_schema) {
+              onContentAltered?.(original);
+              return { ...block, tool: { ...block.tool, definition: { ...definition, input_schema: flattened } } };
+            }
           }
           return block;
         }).filter((block: unknown) => block !== undefined),
@@ -1260,6 +1330,22 @@ export class AnthropicAdapter implements ProviderAdapter {
   }
 
   private handleError(error: unknown, rawRequest?: unknown): MembraneError {
+    const typed = this.typeError(error, rawRequest);
+    // The API can say whether a failure is worth sending again, and the SDK
+    // obeyed that before its own rules. Membrane is the one retry layer for a
+    // call's requests now (the SDK client makes one attempt at each; only the
+    // keepalive's replays keep its retries), so the advice decides
+    // `retryable` here.
+    const advice = error instanceof Anthropic.APIError ? error.headers?.get?.('x-should-retry') : undefined;
+    if ((advice === 'true' || advice === 'false') && typed.retryable !== (advice === 'true')) {
+      const advised = new MembraneError({ ...typed.toErrorInfo(), retryable: advice === 'true' });
+      // A spent deadline stays one: the mark isn't part of the error's info.
+      return isDeadlineExpiry(typed) ? deadlineExpired(advised) : advised;
+    }
+    return typed;
+  }
+
+  private typeError(error: unknown, rawRequest?: unknown): MembraneError {
     if (error instanceof MembraneError) return withRawRequest(error, rawRequest);
 
     // A cancellation is a type, never a phrase — not even the SDK's own exact
@@ -1277,8 +1363,14 @@ export class AnthropicAdapter implements ProviderAdapter {
     // The SDK's transport failures carry no status ("Connection error.",
     // `cause: TypeError: fetch failed`), so the status path below can't type
     // them. They are the SDK's own types: the timeout subclass first.
+    //
+    // A timeout is a deadline membrane leaves to the caller. The SDK reports
+    // its own request timeout, undici's headers timeout and a connect timeout
+    // as this same error, with no cause (SDK 0.52 makeRequest), so a connect
+    // timeout, which membrane would otherwise send again, can't be told
+    // apart here and goes to the caller too.
     if (error instanceof Anthropic.APIConnectionTimeoutError) {
-      return timeoutError(error.message, error, rawRequest);
+      return deadlineExpired(timeoutError(error.message, error, rawRequest));
     }
     if (error instanceof Anthropic.APIConnectionError) {
       return networkError(error.message, error, rawRequest);
@@ -1334,6 +1426,10 @@ export class AnthropicAdapter implements ProviderAdapter {
           rawRequest,
         });
       }
+      // A model without mid-conversation system messages or tool changes
+      // refuses the request for its system change: said on the error, so the
+      // caller can apply the change to `tools` and `system` instead.
+      if (classified.httpStatus === 400 && isSystemChangeRefusal(error.error)) markSystemChangeRefused(classified);
       if (classified.type !== 'unknown') return classified;
 
       // Safety net: if the SSE error body wasn't parseable JSON, neither
@@ -1344,9 +1440,7 @@ export class AnthropicAdapter implements ProviderAdapter {
       }
     }
 
-    const info = classifyError(error);
-    info.rawRequest = rawRequest;
-    return new MembraneError(info);
+    return errorFromThrown(error, rawRequest);
   }
 
   /**
@@ -1356,6 +1450,9 @@ export class AnthropicAdapter implements ProviderAdapter {
    * message through the guarded prose reader.
    */
   private parseRetryAfter(error: { headers?: Headers }): number | undefined {
+    // The SDK, which used to do the waiting, read `retry-after-ms` first.
+    const ms = Number(error.headers?.get?.('retry-after-ms')?.trim() || NaN);
+    if (Number.isFinite(ms)) return Math.max(0, Math.round(ms));
     const header = error.headers?.get?.('retry-after');
     if (header) {
       const seconds = Number(header.trim());

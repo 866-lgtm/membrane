@@ -83,9 +83,10 @@ export interface WireCacheSurfaces {
  * ONE walk serves both the count and the clamp's strip, so a marker the
  * counter can see is always a marker the clamp can strip. A collector that
  * stopped at the top level would count four while five rode to the wire, and
- * the provider would reject the request the belt just declared legal.
+ * the provider would reject the request the belt just declared legal. The
+ * Anthropic adapter's keepalive reads a request's breakpoints through it too.
  */
-function collectMarkedBlocks(surfaces: WireCacheSurfaces): Array<Record<string, unknown>> {
+export function collectMarkedBlocks(surfaces: WireCacheSurfaces): Array<Record<string, unknown>> {
   const marked: Array<Record<string, unknown>> = [];
   const collectIfMarked = (candidate: unknown) =>
     walkBlockTree(candidate, 0, (block) => {

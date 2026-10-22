@@ -127,6 +127,14 @@ describe('the request asks for the controls', () => {
     ]);
   });
 
+  it('sends the config the doc advises for a model that thinks with no config: adaptive, display omitted, and the controls', async () => {
+    const adapter = new BindingAdapter([finalTurn()]);
+    const membrane = new Membrane(adapter);
+    await rounds(membrane, request([user('hi')], { thinking: { enabled: true, type: 'adaptive', display: 'omitted', blockBinding: DROP } }));
+    expect(adapter.requests[0]!.model).toBe('claude-opus-5-5');
+    expect(adapter.requests[0]!.thinking).toEqual({ type: 'adaptive', display: 'omitted', block_binding: { prefix_mismatch_behavior: 'drop_block' } });
+  });
+
   it('sends a model whose thinking is always on only the controls, with display when set, and still no sampling params', async () => {
     const adapter = new BindingAdapter([finalTurn(), finalTurn(), finalTurn(), finalTurn(), finalTurn()]);
     const membrane = new Membrane(adapter);

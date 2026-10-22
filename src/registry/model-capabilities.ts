@@ -30,6 +30,12 @@
  * cases. Mythos entries remain family-analogy entries, not measurements here;
  * an incorrect refusal entry would reject a working request.
  *
+ * claude-haiku-5-5 was measured on 2026-10-19 (the same two-message shape;
+ * max_tokens 16 with no thinking config, 2048 with an adaptive or an enabled
+ * one): REFUSED (400) each time, with the message above. With no thinking
+ * config, claude-sonnet-5-5 was refused too and claude-haiku-4-5-20251001
+ * accepted.
+ *
  * Older Claude (4.5 and earlier, including 3.x) accepts prefill and must NOT
  * be listed. Nothing outside Anthropic belongs here: the OpenAI, Gemini and
  * text-completion surfaces have their own prefill stories, and an unlisted model is
@@ -42,6 +48,7 @@ const NO_ASSISTANT_PREFILL_MODELS = [
   'claude-opus-4-8',
   'claude-opus-5',
   'claude-sonnet-5',
+  'claude-haiku-5-5',
   'claude-fable-5',
   'claude-mythos-5',
   'claude-mythos-preview',
