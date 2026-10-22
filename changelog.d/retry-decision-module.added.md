@@ -9,10 +9,10 @@
   class. `membraneRetrySettings(config)` gives membrane's for a retry config,
   and `MEMBRANE_RETRY_SETTINGS` its default. A retry after attempt n (the
   tries made so far) waits `firstDelayMs × multiplier^(n − 1)`, up to
-  `maxDelayMs`, and only an overloaded failure's wait is jittered. The entry
-  loads no provider SDK. Membrane's own retries now go through it, and for
-  every error membrane's adapters build they decide as before. A failure
-  another adapter types `rate_limit` that is also overloaded now takes the
-  overloaded class's attempts, and a stated wait is read as a number.
-  `hooks.onError` is asked after the retry's wait is decided, so a change it
-  makes to `error.retryAfterMs` no longer changes the wait.
+  `maxDelayMs`, and only an overloaded failure's wait is jittered. It fails
+  closed: an attempt must be a whole number from 1, and a wait that isn't a
+  finite number ends the retries (`delayFor` throws a `RangeError` for
+  either). A wait can be longer than one `setTimeout`
+  holds, so sleep it in chunks, as membrane does. The entry loads no
+  provider SDK. Membrane's own retries now go through it, and for
+  every error membrane's adapters build they decide as before.

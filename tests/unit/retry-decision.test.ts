@@ -25,6 +25,13 @@ const config = (change: Partial<Omit<RetryConfig, 'overloaded'>> & { overloaded?
   overloaded: { ...DEFAULT_RETRY_CONFIG.overloaded, ...change.overloaded },
 });
 const settings = MEMBRANE_RETRY_SETTINGS;
+/** Schedule changes whose step at attempt 2 isn't a finite number (and
+ *  attempt 2 is inside the default bound of 3): NaN, and
+ *  Infinity (given, or a product that overflows under no cap). */
+const NON_FINITE_STEPS = [
+  { firstDelayMs: Number.NaN }, { multiplier: Number.NaN }, { maxDelayMs: Number.NaN },
+  { firstDelayMs: Infinity, maxDelayMs: Infinity }, { multiplier: 1e308, maxDelayMs: Infinity },
+];
 const at = (value: number) => () => value;
 
 afterEach(() => {
@@ -162,9 +169,18 @@ describe('delayFor', () => {
     expect(delayFor('overloaded', 2, noOverloaded, at(0))).toEqual({ delayMs: 2000, nominalMs: 2000 });
   });
 
-  it('throws for an attempt that is not a finite count', () => {
-    expect(() => delayFor('retryable', Number.NaN, settings)).toThrow(RangeError);
-    expect(() => delayFor('overloaded', Infinity, settings)).toThrow(RangeError);
+  it('throws for an attempt that is not a whole count from 1', () => {
+    for (const attempt of [Number.NaN, Infinity, 0, -1, 1.5]) {
+      expect(() => delayFor('retryable', attempt, settings)).toThrow(RangeError);
+      expect(() => delayFor('overloaded', attempt, settings)).toThrow(RangeError);
+    }
+  });
+
+  it("throws for a schedule whose numbers give no finite step", () => {
+    for (const change of NON_FINITE_STEPS) {
+      const broken: RetrySettings = { retryable: { ...settings.retryable!, ...change } };
+      expect(() => delayFor('retryable', 2, broken)).toThrow(RangeError);
+    }
   });
 
   it('throws for a class with no schedule', () => {
@@ -183,12 +199,27 @@ describe('retryDecision', () => {
     expect(retryDecision('overloaded', 7, undefined, settings, at(0))).toEqual({ retry: false });
   });
 
-  it('ends the retries on an attempt that is not a finite count, bound or none', () => {
+  it('ends the retries on an attempt that is not a whole count from 1, bound or none', () => {
     const unbounded: RetrySettings = { retryable: { ...settings.retryable!, maxAttempts: null } };
-    for (const attempt of [Number.NaN, Infinity]) {
+    for (const attempt of [Number.NaN, Infinity, 0, -1, 1.5]) {
       expect(retryDecision('retryable', attempt, undefined, unbounded)).toEqual({ retry: false });
       expect(retryDecision('retryable', attempt, undefined, settings)).toEqual({ retry: false });
     }
+  });
+
+  it("ends the retries on a wait that isn't a finite number, with a stated wait or none", () => {
+    for (const change of NON_FINITE_STEPS) {
+      const broken: RetrySettings = { retryable: { ...settings.retryable!, ...change } };
+      expect(retryDecision('retryable', 2, undefined, broken)).toEqual({ retry: false });
+      expect(retryDecision('retryable', 2, 500, broken)).toEqual({ retry: false });
+    }
+  });
+
+  it('gives an Infinity stated wait back to the caller, whatever the ceiling, and lets -Infinity lose to the backoff', () => {
+    const holds: RetrySettings = { retryable: { ...settings.retryable!, statedWaitCeilingMs: null } };
+    expect(retryDecision('retryable', 1, Infinity, holds)).toEqual({ retry: false, statedWaitMs: Infinity });
+    expect(retryDecision('retryable', 1, Infinity, settings)).toEqual({ retry: false, statedWaitMs: Infinity });
+    expect(retryDecision('retryable', 1, -Infinity, holds)).toEqual({ retry: true, delayMs: 1000 });
   });
 
   it('ends the retries when maxAttempts is NaN', () => {
@@ -244,7 +275,7 @@ describe('retryDecision', () => {
     expect(retryDecision('overloaded', 1, 300_000, settings, at(0))).toEqual({ retry: true, delayMs: 300_000 });
   });
 
-  it('waits out any stated wait when the ceiling is null', () => {
+  it('waits out any finite stated wait when the ceiling is null', () => {
     const holds: RetrySettings = { rate_limited: { ...settings.rate_limited!, statedWaitCeilingMs: null } };
     expect(retryDecision('rate_limited', 1, 3_600_000, holds)).toEqual({ retry: true, delayMs: 3_600_000 });
   });
@@ -332,23 +363,58 @@ describe("membrane's core asks onError after the retry's wait is decided", () =>
     messages: [{ participant: 'User', content: [{ type: 'text', text: 'zz-prompt' }] }],
     config: { model: 'zz-model-1', maxTokens: 64 },
   };
-  /** A membrane whose onError lengthens the stated wait it's handed. */
-  const lengthening = (adapter: FailsOnce) => new Membrane(adapter, {
-    retry: { maxRetries: 2, retryDelayMs: 1 },
-    hooks: { onError: (error) => { error.retryAfterMs = 40; return 'retry'; } },
-  });
+  /** A membrane whose onError lengthens the stated wait it's handed, and the
+   *  stated waits its onError saw. */
+  const lengthening = (adapter: FailsOnce) => {
+    const seen: Array<number | undefined> = [];
+    const membrane = new Membrane(adapter, {
+      retry: { maxRetries: 2, retryDelayMs: 1 },
+      hooks: { onError: (error) => { seen.push(error.retryAfterMs); error.retryAfterMs = 40; return 'retry'; } },
+    });
+    return { membrane, seen };
+  };
 
   it('complete(): a change onError makes to the stated wait leaves the wait as decided', async () => {
     const adapter = new FailsOnce();
     adapter.queueResponse('zz-recovered');
-    const response = await lengthening(adapter).complete(request);
+    const { membrane, seen } = lengthening(adapter);
+    const response = await membrane.complete(request);
+    expect(seen).toEqual([5]);
     expect(response.details.timing.retryDelaysMs).toEqual([5]);
   });
 
   it('stream(): a change onError makes to the stated wait leaves the wait as decided', async () => {
     const adapter = new FailsOnce();
     adapter.queueResponse('zz-recovered');
-    const response = await lengthening(adapter).stream(request, { onChunk: () => {} });
+    const { membrane, seen } = lengthening(adapter);
+    const response = await membrane.stream(request, { onChunk: () => {} });
+    expect(seen).toEqual([5]);
     expect(response.details.timing.retryDelaysMs).toEqual([5]);
+  });
+});
+
+describe("membrane's core counts a rate_limit failure that is also overloaded by the overloaded class", () => {
+  class AlwaysOverloadedRateLimit extends MockAdapter {
+    sends = 0;
+    override async complete(): Promise<ProviderResponse> {
+      this.sends++;
+      throw new MembraneError({ type: 'rate_limit', message: 'zz rate limit', retryable: true, httpStatus: 529, rawError: undefined });
+    }
+  }
+  const request: NormalizedRequest = {
+    messages: [{ participant: 'User', content: [{ type: 'text', text: 'zz-prompt' }] }],
+    config: { model: 'zz-model-1', maxTokens: 64 },
+  };
+
+  it("makes the overloaded count of tries, 7 by default, where 0.7.0 made the rate limit's 5", async () => {
+    const adapter = new AlwaysOverloadedRateLimit();
+    await expect(new Membrane(adapter, { retry: { retryDelayMs: 1, overloaded: { retryDelayMs: 1 } } }).complete(request)).rejects.toThrow();
+    expect(adapter.sends).toBe(7);
+  });
+
+  it('makes the retryable count, maxRetries, when overloaded.maxRetries is 0', async () => {
+    const adapter = new AlwaysOverloadedRateLimit();
+    await expect(new Membrane(adapter, { retry: { retryDelayMs: 1, overloaded: { maxRetries: 0 } } }).complete(request)).rejects.toThrow();
+    expect(adapter.sends).toBe(3);
   });
 });

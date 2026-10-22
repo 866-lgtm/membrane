@@ -16,8 +16,9 @@
  * - the stated-wait rule: a provider's stated wait (`retry-after`) only ever
  *   lengthens the backoff, and one past its schedule's ceiling isn't waited
  *   out but goes back to the caller (retryDecision);
- * - the jitter: equal jitter, a point in `[d/2, d)`, on the overloaded class
- *   only, since a capacity storm is where a fleet retrying in sync re-creates
+ * - the jitter: equal jitter, a whole number of milliseconds in
+ *   `[floor(d/2), d)` (a zero step waits 0), on the overloaded class only,
+ *   since a capacity storm is where a fleet retrying in sync re-creates
  *   the stampede it's backing off from (delayFor).
  *
  * Attempts are counted as tries made so far: after a call's first send fails,
@@ -65,7 +66,8 @@ export interface RetrySchedule {
   firstDelayMs: number;
   multiplier: number;
   maxDelayMs: number;
-  /** The longest stated wait waited out; `null` to wait out any, however long. */
+  /** The longest stated wait waited out; `null` to wait out any finite one,
+   *  however long. */
   statedWaitCeilingMs: number | null;
 }
 
@@ -75,7 +77,8 @@ export type RetrySettings = Partial<Record<RetryClass, RetrySchedule>>;
 
 export type RetryDecision =
   | { retry: true; delayMs: number }
-  /** `statedWaitMs`, when the stated wait was past its schedule's ceiling. */
+  /** `statedWaitMs`, when the stated wait was past its schedule's ceiling, or
+   *  was Infinity, which nobody can wait out. */
   | { retry: false; statedWaitMs?: number };
 
 /** A status-shaped 529, or Anthropic's overloaded error type, in a message. */
@@ -126,14 +129,41 @@ function scheduleFor(cls: RetryClass, settings: RetrySettings): { schedule?: Ret
   return { schedule: settings[cls], jitter: false };
 }
 
+/** Whether `attempt` is a count of tries: a whole number of at least 1. */
+function isAttempt(attempt: number): boolean {
+  return Number.isInteger(attempt) && attempt >= 1;
+}
+
+/** A schedule's un-jittered step after `attempt` tries. A zero first delay
+ *  stays zero: times a power that overflowed to Infinity it would be NaN. */
+function stepOf(schedule: RetrySchedule, attempt: number): number {
+  return schedule.firstDelayMs === 0
+    ? 0
+    : Math.min(schedule.firstDelayMs * Math.pow(schedule.multiplier, attempt - 1), schedule.maxDelayMs);
+}
+
+/** A step's wait: on the overloaded class a whole number of milliseconds in
+ *  `[floor(step/2), step)` (a zero step waits 0), drawn with `random`; on any
+ *  other, the step itself. */
+function waitOf(stepMs: number, jitter: boolean, random: () => number): number {
+  return jitter ? Math.floor(stepMs / 2 + random() * (stepMs / 2)) : stepMs;
+}
+
 /**
  * How long to wait before a retry after `attempt` tries, with no stated wait:
  * `nominalMs` is the schedule's un-jittered step, and `delayMs` the wait, the
- * same as `nominalMs` but on the overloaded class, where it's a point in
- * `[nominalMs/2, nominalMs)` drawn with `random` (Math.random by default).
+ * same as `nominalMs` but on the overloaded class, where it's a whole number
+ * of milliseconds in `[floor(nominalMs/2), nominalMs)` drawn with `random`
+ * (Math.random by default), or 0 for a zero step.
  * It answers "how long" alone, not "whether": a caller that holds rather than
  * gives up, such as a storm, asks it for each held call's own draw. It throws
- * for a class with no schedule, or an attempt that isn't a finite number.
+ * for a class with no schedule, an attempt that isn't a whole number of at
+ * least 1, or a schedule whose numbers give no finite step.
+ *
+ * A wait can be longer than one setTimeout holds (2^31 − 1 ms, about 24.8
+ * days), wherever a schedule's maxDelayMs is: Node and Bun run such a timer
+ * at once, so a caller that sleeps `delayMs` with a single setTimeout retries
+ * at once. Sleep it in chunks, as membrane's own sleep does.
  */
 export function delayFor(
   cls: RetryClass,
@@ -143,27 +173,34 @@ export function delayFor(
 ): { delayMs: number; nominalMs: number } {
   const { schedule, jitter } = scheduleFor(cls, settings);
   if (!schedule) throw new RangeError(`[membrane] no retry schedule for the ${cls} class`);
-  if (!Number.isFinite(attempt)) throw new RangeError(`[membrane] a retry's attempt is a count of tries, not ${attempt}`);
-  // A zero first delay stays zero: times a power that overflowed to Infinity
-  // it would be NaN, which would discard a stated wait.
-  const nominalMs = schedule.firstDelayMs === 0
-    ? 0
-    : Math.min(schedule.firstDelayMs * Math.pow(schedule.multiplier, attempt - 1), schedule.maxDelayMs);
-  const delayMs = jitter ? Math.floor(nominalMs / 2 + random() * (nominalMs / 2)) : nominalMs;
-  return { delayMs, nominalMs };
+  if (!isAttempt(attempt)) throw new RangeError(`[membrane] a retry's attempt is a count of tries from 1, not ${attempt}`);
+  const nominalMs = stepOf(schedule, attempt);
+  if (!Number.isFinite(nominalMs)) throw new RangeError(`[membrane] the ${cls} schedule's numbers give no finite wait at attempt ${attempt}`);
+  return { delayMs: waitOf(nominalMs, jitter, random), nominalMs };
 }
 
 /**
  * Whether a call that failed in class `cls`, after `attempt` tries, is sent
  * again, and after how long. Not when its class has no schedule, when its
  * attempts are spent, or when the provider's stated wait is past its
- * schedule's ceiling: then the stated wait goes back as `statedWaitMs`, for
- * the caller to wait out or to end on. Otherwise the wait is the backoff, or the
- * stated wait where that's longer: a stated wait never shortens the backoff,
- * even where a schedule's maxDelayMs is past its ceiling. A stated wait is
- * read as a number, so a numeric string, which another adapter's error might
- * carry, counts as its number; one that reads as NaN counts as none. A zero or
- * negative one loses to the backoff, so it can't make the retries spin.
+ * schedule's ceiling or is Infinity: then the stated wait goes back as
+ * `statedWaitMs`, for the caller to wait out or to end on. Otherwise the wait
+ * is the backoff, or the stated wait where that's longer: a stated wait never
+ * shortens the backoff, even where a schedule's maxDelayMs is past its
+ * ceiling. A stated wait is read as a number, so a numeric string, which
+ * another adapter's error might carry, counts as its number; one that reads as
+ * NaN counts as none. A zero or negative one loses to the backoff, so it can't
+ * make the retries spin.
+ *
+ * It fails closed: an attempt that isn't a whole number of at least 1, and a
+ * wait that isn't a finite number (from a schedule's numbers), end the
+ * retries, since a NaN wait would run at once.
+ *
+ * Under a `null` ceiling a stated wait can be longer than one setTimeout
+ * holds (2^31 − 1 ms, about 24.8 days), and so can a schedule's maxDelayMs:
+ * Node and Bun run such a timer at once, so a caller that sleeps `delayMs`
+ * with a single setTimeout retries at once. Sleep it in chunks, as membrane's
+ * own sleep does.
  */
 export function retryDecision(
   cls: RetryClass,
@@ -172,21 +209,23 @@ export function retryDecision(
   settings: RetrySettings,
   random: () => number = Math.random,
 ): RetryDecision {
-  const { schedule } = scheduleFor(cls, settings);
+  const { schedule, jitter } = scheduleFor(cls, settings);
   if (!schedule) return { retry: false };
-  // Written to fail closed: an attempt that isn't a finite count, or a bound
-  // that compares false with every count, ends the retries rather than
-  // letting them run on, bound or none (a NaN wait would run at once).
-  if (!Number.isFinite(attempt)) return { retry: false };
+  if (!isAttempt(attempt)) return { retry: false };
+  // A bound that compares false with every count ends the retries rather than
+  // letting them run on.
   if (schedule.maxAttempts !== null && !(attempt < schedule.maxAttempts)) return { retry: false };
   // Number(undefined) is NaN, so no stated wait reads as none.
   const read = Number(statedWaitMs);
   const stated = Number.isNaN(read) ? undefined : read;
   const ceiling = schedule.statedWaitCeilingMs;
-  if (stated !== undefined && ceiling !== null && stated > ceiling) return { retry: false, statedWaitMs: stated };
-  const { delayMs: backoffMs } = delayFor(cls, attempt, settings, random);
-  if (stated === undefined) return { retry: true, delayMs: backoffMs };
-  return { retry: true, delayMs: Math.max(backoffMs, stated) };
+  if (stated !== undefined && (stated === Infinity || (ceiling !== null && stated > ceiling))) {
+    return { retry: false, statedWaitMs: stated };
+  }
+  const backoffMs = waitOf(stepOf(schedule, attempt), jitter, random);
+  const delayMs = stated === undefined ? backoffMs : Math.max(backoffMs, stated);
+  if (!Number.isFinite(delayMs)) return { retry: false };
+  return { retry: true, delayMs };
 }
 
 /**

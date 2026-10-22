@@ -423,8 +423,8 @@ function parseUpToStop(
  * out, as the optional fields of `MembraneConfig.retry` invite
  * (`{ maxRetries: opts.maxRetries }` with the option unset). Any other value
  * must be a finite number of at least 0, or the constructor throws, naming
- * the field: a `NaN` attempt bound compares false with every count, so it
- * would retry without end, and a `NaN` delay waits about a millisecond.
+ * the field, rather than let a bad value quietly change how calls are
+ * retried.
  */
 function resolveRetryConfig(given: MembraneConfig['retry']): RetryConfig {
   const { overloaded, ...base } = given ?? {};
