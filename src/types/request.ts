@@ -44,8 +44,32 @@ export interface GenerationConfig {
      * Controls how thinking content is returned: 'summarized' (readable summary)
      * or 'omitted' (empty thinking field, signature only). Models like Fable 5 /
      * Opus 4.7+ default to 'omitted' — set 'summarized' to receive thinking text.
+     *
+     * 'updates' (Anthropic's `thinking-display-updates-2026-08-18` beta, which
+     * the Anthropic and Bedrock adapters add when the body they send carries
+     * it) hides reasoning as 'omitted' does, but returns the progress notes
+     * the model writes between tool calls ("found X, checking Y next") as
+     * text. On Fable 5 and 5.1 and Mythos 5.1 those notes come back as
+     * `thinking` blocks, and on Opus 5.5 and Sonnet 5.5 those longer than a
+     * sentence or two do, each signed and placed just before the `tool_use`
+     * it introduces, where earlier models returned them as `text`. Under
+     * 'omitted' their text is empty, so a long tool
+     * loop looks silent. Under 'updates' every thinking block with non-empty
+     * text is such a note; there may be none in a response. The text is a
+     * summary of the note: `output_tokens` bills the full note, and the
+     * model reads the full note when the block is sent back unchanged.
+     * 'summarized' returns these notes too, mixed with the reasoning
+     * summaries. A response cut off soon after a tool call can end in one
+     * whose text is exactly
+     * `This part of the response was interrupted before it finished.`
+     *
+     * Fable and Mythos models get no thinking config for 'summarized' or
+     * 'omitted' alone (see `blockBinding`), but they get
+     * `{ type: 'adaptive', display: 'updates' }` for 'updates'. Anthropic
+     * documents the value for the models above, on every platform; what
+     * other models do with it is untested.
      */
-    display?: 'summarized' | 'omitted';
+    display?: 'summarized' | 'omitted' | 'updates';
     /**
      * What the API does with a signed thinking block this request sends back
      * when the conversation before it differs from the one it was minted in
