@@ -85,6 +85,8 @@ export type {
   TimingInfo,
   CacheInfo,
   ResponseDetails,
+  ResponseAnomaly,
+  ToolUseWithEndTurnAnomaly,
   RawAccess,
   NormalizedResponse,
   AbortedResponse,

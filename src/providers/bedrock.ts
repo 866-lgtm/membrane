@@ -28,7 +28,7 @@ import {
 import { errorFromThrown } from '../types/errors.js';
 import { stripEmptyTextRequest } from '../utils/empty-text.js';
 import { isUnsignedThinking } from '../utils/thinking-carriers.js';
-import { createCombinedSignal, isDeadlineAbort, deadlineTimeoutError, assertTerminalEventObserved, toolUseInputFromText, toolUseInputFromValue, streamIndex, isEventObject } from './utils.js';
+import { createCombinedSignal, isDeadlineAbort, deadlineTimeoutError, assertTerminalEventObserved, toolUseInputFromText, toolUseInputFromValue, streamIndex, isEventObject, isToolCallBlock, isToolCallArgumentsDelta } from './utils.js';
 import {
   INTERLEAVED_THINKING_BETA,
   THINKING_BINDING_BETA,
@@ -731,6 +731,34 @@ export class BedrockAdapter implements ProviderAdapter {
     // max_tokens never gets one, as in the Anthropic adapter.
     const stoppedBlocks = new Set<number>();
     let currentBlockIndex = -1;
+    // Block events come in the API's order: a start while no block is open,
+    // at the next index, then that block's deltas (a tool call's carry only
+    // its arguments: isToolCallBlock, isToolCallArgumentsDelta) and its stop.
+    // A start above the next index is placed, as it always was, and the slots
+    // it skips fail the call below as lost blocks; the Anthropic adapter takes
+    // that start as out of order instead. A stream that ends with a block
+    // open, as a max_tokens cut does, is in order. Reading stops at
+    // message_delta, as in the Anthropic adapter, so a block still open there
+    // is cut off in both. The first event that isn't in order
+    // means the stream can't vouch for which call any arguments belong to:
+    // no later block event is applied, a block still open stays unstopped
+    // (marked below), and every tool_use block in the response is marked,
+    // with one warning.
+    let blockOrderBroken = false;
+    // A start that names no block, while none is open, is skipped as it
+    // always was: until the next start, the deltas and stop after it join no
+    // block rather than breaking block order, and a later block still fails
+    // the call over the block the message lost. A start while a block is
+    // open, or at an index below the next, breaks block order whatever it
+    // names.
+    let skippedStart = false;
+    const blockOpen = (): boolean =>
+      currentBlockIndex >= 0 && contentBlocks[currentBlockIndex] !== undefined && !stoppedBlocks.has(currentBlockIndex);
+    const breakBlockOrder = (what: string): void => {
+      if (blockOrderBroken) return;
+      blockOrderBroken = true;
+      console.warn('[membrane:bedrock] Skipping malformed stream event:', `${what}; no later block event is applied, and every tool_use block in the response is marked`);
+    };
     let finalMessage: BedrockMessageResponse | undefined;
     let inputTokens = 0;
     let outputTokens = 0;
@@ -754,7 +782,7 @@ export class BedrockAdapter implements ProviderAdapter {
     let buffer = new Uint8Array(0);
 
     try {
-      while (true) {
+      read: while (true) {
         const { done, value } = await reader.read();
         if (done) break;
 
@@ -897,22 +925,37 @@ export class BedrockAdapter implements ProviderAdapter {
                   cacheReadTokens = startUsage.cache_read_input_tokens;
                 }
               } else if (eventData.type === 'content_block_start') {
-                // A block whose index names no slot (streamIndex: 0 when
-                // absent), or that isn't an object, an array included, can't
-                // be placed: it's skipped, with the warning, and its deltas
-                // join no block.
+                // Order first: a start while a block is open, or at an index
+                // below the next (one already used, or a slot a start above
+                // the next skipped), breaks block order whatever it names.
+                // Then a block whose index names no slot (an absent index is
+                // slot 0, as streamIndex reads it), or that isn't an object,
+                // an array included, can't be placed: it's skipped, with the
+                // warning, and its deltas and stop join no block, though a
+                // text delta's text still streams.
                 const startIndex = streamIndex(eventData.index);
                 const startBlock: unknown = eventData.content_block;
-                if (startIndex === undefined || startBlock === null || typeof startBlock !== 'object' || Array.isArray(startBlock)) {
+                if (blockOrderBroken || blockOpen() || (startIndex !== undefined && startIndex < contentBlocks.length)) {
+                  breakBlockOrder('a content_block_start while a block is open or at an index below the next');
+                } else if (startIndex === undefined || startBlock === null || typeof startBlock !== 'object' || Array.isArray(startBlock)) {
                   console.warn('[membrane:bedrock] Skipping malformed stream event:', 'a content_block_start that names no block');
                   currentBlockIndex = -1;
+                  skippedStart = true;
                 } else {
+                  skippedStart = false;
                   currentBlockIndex = startIndex;
                   contentBlocks[currentBlockIndex] = startBlock as { type: string };
                   callbacks.onContentBlock?.(currentBlockIndex, startBlock);
                 }
               } else if (eventData.type === 'content_block_delta') {
-                if (eventData.delta?.type === 'text_delta' && eventData.delta.text) {
+                const deltaIndex = streamIndex((eventData as { index?: unknown }).index, currentBlockIndex);
+                if (blockOrderBroken || (!skippedStart && (!blockOpen() || deltaIndex !== currentBlockIndex))) {
+                  breakBlockOrder('a content_block_delta for a block other than the open one');
+                } else if (isToolCallBlock(contentBlocks[currentBlockIndex]) && !isToolCallArgumentsDelta(eventData.delta)) {
+                  // A tool call's deltas carry only its arguments. (After a
+                  // skipped start currentBlockIndex is -1, which holds no block.)
+                  breakBlockOrder('a content_block_delta that a tool call can\'t take');
+                } else if (eventData.delta?.type === 'text_delta' && eventData.delta.text) {
                   fullText += eventData.delta.text;
                   callbacks.onChunk(eventData.delta.text);
                   if (contentBlocks[currentBlockIndex]) {
@@ -947,8 +990,16 @@ export class BedrockAdapter implements ProviderAdapter {
                 // on the dual-fire convention (e.g. membrane's native
                 // yielding path) silently drops block_complete on Bedrock.
                 const blockIdx = streamIndex((eventData as { index?: unknown }).index, currentBlockIndex);
-                if (blockIdx === undefined || blockIdx < 0 || contentBlocks[blockIdx] === undefined) {
-                  console.warn('[membrane:bedrock] Skipping malformed stream event:', 'a content_block_stop that names no block');
+                if (skippedStart) {
+                  // After a skipped start no block is open. A stop joins no
+                  // block, as the skipped block's deltas do, whatever index it
+                  // names, the skipped start's own slot included: nothing is
+                  // applied or reported, and a slot no block filled still
+                  // fails the call below.
+                } else if (blockOrderBroken || !blockOpen() || blockIdx !== currentBlockIndex) {
+                  // A stop for no block, or for a block never started,
+                  // included.
+                  breakBlockOrder('a content_block_stop for a block other than the open one');
                 } else {
                   stoppedBlocks.add(blockIdx);
                   // Finalize tool_use blocks: parse accumulated argument JSON
@@ -1000,6 +1051,9 @@ export class BedrockAdapter implements ProviderAdapter {
 
           // Remove processed message from buffer
           buffer = buffer.slice(totalLength);
+          // message_delta ends the message: as in the Anthropic adapter,
+          // nothing after it is read, and the finally lets the body go.
+          if (sawTerminalEvent) break read;
         }
       }
     } finally {
@@ -1062,9 +1116,18 @@ export class BedrockAdapter implements ProviderAdapter {
           // and whatever argument text arrived marks it, none included, as in
           // the Anthropic adapter: the call never finished, so nothing says
           // its arguments were complete, even text that parses.
-          const unparseableInput = stoppedBlocks.has(blockIdx) ? tb.unparseableInput : (tb.partialJson ?? '');
+          let unparseableInput = stoppedBlocks.has(blockIdx) ? tb.unparseableInput : (tb.partialJson ?? '');
+          let input = tb.input ?? {};
+          // After a break in block order no call counts as complete, those
+          // finished before it included: one not already marked keeps its
+          // arguments, as JSON, in the marker, and an empty input. One already
+          // marked keeps its marker and the input its start carried.
+          if (blockOrderBroken && unparseableInput === undefined) {
+            unparseableInput = JSON.stringify(input);
+            input = {};
+          }
           return {
-            type: 'tool_use', id: tb.id, name: tb.name, input: tb.input ?? {},
+            type: 'tool_use', id: tb.id, name: tb.name, input,
             ...(unparseableInput !== undefined ? { unparseableInput } : {}),
           } as unknown as { type: 'text'; text?: string };
         }
@@ -1098,8 +1161,9 @@ export class BedrockAdapter implements ProviderAdapter {
       if (block.type === 'text' && block.text) {
         content.push({ type: 'text', text: block.text });
       } else if (block.type === 'tool_use' && block.id && block.name) {
-        // The stream assembly's marker, which keeps the text as it came, wins
-        // over the value's JSON.
+        // The stream assembly's marker wins over the value's JSON: it holds
+        // the arguments as they came, or after a break in block order as JSON
+        // when they had parsed (ToolUseContent.unparseableInput).
         content.push({
           type: 'tool_use',
           id: block.id,
