@@ -209,7 +209,11 @@ export interface NormalizedRequest {
   /** Conversation messages */
   messages: NormalizedMessage[];
   
-  /** System prompt */
+  /**
+   * System prompt, as text. Under `cacheMarkers: 'cm-owned'`, a caller that
+   * wants it marked for Anthropic's prompt cache marks the provider request's
+   * `system` in a `beforeRequest` hook, as docs/formatters.md describes.
+   */
   system?: string;
   
   /** Generation configuration */
@@ -239,7 +243,9 @@ export interface NormalizedRequest {
   promptCaching?: boolean;
 
   /** Marker ownership policy. `cm-owned` disables every formatter-generated
-   * system/context-prefix marker; only normalized message breakpoints survive. */
+   * system/context-prefix marker, so a request carries only the markers its
+   * caller placed, such as its message breakpoints and a marker a
+   * `beforeRequest` hook adds. */
   cacheMarkers?: 'membrane-system' | 'cm-owned';
 
   /**

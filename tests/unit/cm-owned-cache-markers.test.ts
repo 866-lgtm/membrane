@@ -149,6 +149,53 @@ describe('cm-owned cache marker contract', () => {
     expect(() => build(formatter, messages)).toThrow(/imported block-level/);
   });
 
+  // docs/formatters.md gives a beforeRequest hook as the way a Membrane caller
+  // marks its system prompt under cm-owned, since NormalizedRequest.system is
+  // a string. The hook's marker is sent beside the caller's breakpoints, on
+  // complete() and on stream(), which applies the hook at its own site.
+  for (const [name, makeFormatter, toolMode, method] of [
+    ['native', () => new NativeFormatter(), undefined, 'complete'],
+    ['anthropic-xml', () => new AnthropicXmlFormatter(), 'xml', 'complete'],
+    ['native', () => new NativeFormatter(), undefined, 'stream'],
+  ] as const) {
+    it(`${name} through Membrane.${method}(): a hook that marks the system sends it beside three breakpoints`, async () => {
+      const adapter = new MockAdapter();
+      const membrane = new Membrane(adapter, {
+        formatter: makeFormatter(),
+        hooks: {
+          beforeRequest: (_normalized, raw) => {
+            const request = raw as Record<string, unknown>;
+            const blocks = typeof request.system === 'string'
+              ? [{ type: 'text', text: request.system }]
+              : (request.system as Array<Record<string, unknown>>);
+            return {
+              ...request,
+              system: blocks.map((block, index) =>
+                index === blocks.length - 1 ? { ...block, cache_control: { type: 'ephemeral' } } : block),
+            };
+          },
+        },
+      });
+      const normalized = {
+        messages: markedMessages(3),
+        system: 'system one',
+        config: { model: 'test-model', maxTokens: 10 },
+        promptCaching: true,
+        cacheMarkers: 'cm-owned' as const,
+        assistantParticipant: 'Claude',
+        ...(toolMode ? { toolMode } : {}),
+      };
+      if (method === 'stream') await membrane.stream(normalized, { onChunk: () => {} });
+      else await membrane.complete(normalized);
+      const sent = adapter.getLastRequest() as unknown as { system?: unknown; messages?: unknown[] };
+      // The XML transcript was built: without toolMode 'xml' the XML formatter
+      // hands the build to the native formatter, and this case would test that.
+      if (toolMode === 'xml') expect(sent.messages?.at(-1)).toEqual({ role: 'assistant', content: 'Claude:' });
+      expect(sentSystem(sent.system)).toEqual([{ text: 'system one', marked: true }]);
+      expect(countCacheControls({ system: sent.system, messages: sent.messages })).toBe(4);
+    });
+  }
+
   it('fails closed when a final hook adds a fifth caller-owned marker', async () => {
     let receiptCalls = 0;
     const membrane = new Membrane(new MockAdapter(), {

@@ -295,8 +295,11 @@ export class AnthropicXmlFormatter implements PrefillFormatter {
     const toolsText = hasToolsForConversation ? this.formatToolsForInjection(tools!) : '';
 
     // Build system content. A caller-supplied system ARRAY keeps its block
-    // structure and its per-block cache_control: `request.system` explicitly
-    // accepts caller-marked blocks, and flattening them into one text block
+    // structure and its per-block cache_control: `systemPrompt` accepts
+    // caller-marked blocks from a caller of the formatter itself (a Membrane
+    // request's `system` is a string, so a `cm-owned` Membrane caller marks
+    // its system prompt in a `beforeRequest` hook instead, as
+    // docs/formatters.md describes), and flattening them into one text block
     // discarded every marker the caller placed (three in, one out) — the
     // caller's stable prefixes then re-paid full input price forever.
     const callerSystemBlocks = Array.isArray(systemPrompt)
