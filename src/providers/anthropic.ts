@@ -48,27 +48,37 @@ import { CacheKeepalive, type CacheKeepaliveConfig } from '../cache-keepalive.js
  * Models that reject the sampling parameters (`temperature`, `top_p`,
  * `top_k`) with a 400 invalid_request_error — which Membrane classifies as
  * non-retryable, so a single stray `temperature` kills the whole turn.
- * Mirrors the `noTemperatureSupport` gate in the OpenAI provider.
+ * The OpenAI provider keeps a `noTemperatureSupport` list of its own, matched
+ * by prefix.
  *
- * Most of these are the always-on-thinking / reasoning-forward tier, which
- * removes the sampling parameters from the API surface entirely (Sonnet 5
- * rejects only non-default values). Haiku 5.5, Opus 5 and Opus 5.5 are
- * listed on measurements, below. Everything else — Haiku 4.5, Sonnet 4.6,
- * Opus 4.6 and older — ACCEPTS `temperature`, so it must NOT be listed here.
+ * Each entry is a model documented or measured to refuse them, and nothing
+ * else is listed: this gate doesn't strip them for a model the list doesn't
+ * name, so one that refuses them fails with the API's 400 until it's listed
+ * here. The other gates in `buildRequest` still apply to every model (no
+ * `top_p` beside a `temperature`, and under thinking no `temperature` or
+ * `top_k` and no `top_p` below 0.95), and
+ * `Membrane` drops them from a request's config for every Fable and Mythos
+ * id by family name (`isAlwaysThinkingModel`), before this adapter sees the
+ * request. Through `Membrane`, then, this list decides for those ids only
+ * what a caller sends in `providerParams`. Haiku 4.5, Sonnet 4.6, Opus 4.6 and older ACCEPT
+ * `temperature`, so they must NOT be listed.
  *
  *   - Opus 4.7 / Opus 4.8 / Sonnet 5 / Fable 5 / Mythos 5 / Mythos preview:
- *     documented 400 on any sampling parameter.
+ *     documented 400 on any sampling parameter (Sonnet 5 rejects only
+ *     non-default values).
  *   - Haiku 5.5: measured against the Messages API on 2026-10-19, with no
  *     thinking config. `temperature` 0.2, `top_k` 40, and `top_p` 0.9 and 0.95
  *     were each refused with a 400 ("`temperature` is deprecated for this
  *     model", and likewise for the other two); `top_p` 0.99 was accepted.
- *     Sonnet 5.5, which `claude-sonnet-5` matches, answered `top_p` 0.9 and
- *     0.99 the same way. A listed model loses every `top_p`, 0.99 included.
- *   - Opus 5 and Opus 5.5, which `claude-opus-5` matches: measured the same
- *     way on 2026-10-23, unstreamed. Each refused `temperature` 0.2, `top_k`
- *     40 and `top_p` 0.9 with the same 400s, and took a `top_p` of 0.99.
- *     The prefix also reaches later `claude-opus-5-*` ids, which aren't
- *     measured here, so check each as it launches.
+ *   - Opus 5 and Opus 5.5: measured the same way on 2026-10-23, unstreamed.
+ *     Each refused `temperature` 0.2, `top_k` 40 and `top_p` 0.9 with the same
+ *     400s, and took a `top_p` of 0.99.
+ *   - Fable 5.1: measured the same way on 2026-10-23, with the same answers.
+ *   - Sonnet 5.5: `top_p` 0.9 refused and 0.99 accepted on 2026-10-19, and
+ *     `temperature` 0.2 and `top_k` 40 refused on 2026-10-23, the same way.
+ *
+ * A listed model loses every `top_p`, 0.99 included, with a thinking config
+ * or without one.
  *
  * NB: claude-haiku-4-5 was previously listed here on the strength of a single
  * "observed 400 in production when temperature is sent" anecdote. Haiku 4.5
@@ -77,26 +87,30 @@ import { CacheKeepalive, type CacheKeepaliveConfig } from '../cache-keepalive.js
  * through `extra` and re-inserted after the gate — 400s on any model), not a
  * capability of Haiku. Listing it silently discarded a valid parameter on the
  * most common cheap model, so it has been removed.
- *
- * Prefix-matched, so dated snapshots (e.g. claude-opus-4-8-20251001) are
- * covered. Keep this list updated as models launch.
  */
 const NO_TEMPERATURE_MODELS = [
   'claude-opus-4-7',
   'claude-opus-4-8',
   'claude-opus-5',
+  'claude-opus-5-5',
   'claude-sonnet-5',
+  'claude-sonnet-5-5',
   'claude-haiku-5-5',
   'claude-fable-5',
+  'claude-fable-5-1',
   'claude-mythos-5',
   'claude-mythos-preview',
 ];
 
 /**
- * Check if a model doesn't support custom sampling parameters
+ * Whether `model` is a listed model: its id, or its id followed by anything
+ * that isn't a later version, such as a dated snapshot
+ * (claude-opus-4-8-20251001). A digit, or a hyphen and one or two digits,
+ * continues the version, so `claude-opus-5` doesn't name `claude-opus-5-5`
+ * or `claude-opus-5-6`, and each is listed on its own or not at all.
  */
 function noTemperatureSupport(model: string): boolean {
-  return NO_TEMPERATURE_MODELS.some(prefix => model.startsWith(prefix));
+  return NO_TEMPERATURE_MODELS.some((id) => model.startsWith(id) && !/^(\d|-\d{1,2}(?!\d))/.test(model.slice(id.length)));
 }
 
 /** Beta flag for thinking blocks between tool calls on pre-4.6 Claude 4.
