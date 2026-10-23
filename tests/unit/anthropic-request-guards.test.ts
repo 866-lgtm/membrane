@@ -6,7 +6,7 @@
  *
  * 1. Temperature stripping for the models listed as rejecting sampling
  *    parameters, each by its own id (Opus 4.7, 4.8, 5 and 5.5, Sonnet 5 and
- *    5.5, Haiku 5.5, Fable 5 and 5.1, Mythos 5 and preview, some of which take
+ *    5.5, Haiku 5.5, Fable 5 and 5.1, Mythos 5, 5.1 and preview, some of which take
  *    only a top_p near 1). Haiku 4.5 ACCEPTS temperature and must be
  *    forwarded, and so is an unlisted later version. Through Membrane, a
  *    request's config already loses them for every Fable and Mythos id.
@@ -206,14 +206,15 @@ describe('AnthropicAdapter: sampling-parameter model gate', () => {
 
   it('strips sampling for each listed id and its dated snapshots, and sends it as given to an unlisted later version', async () => {
     // The list names models, not families: each entry was documented or
-    // measured to refuse, and a later version is a model of its own, sent
-    // what the caller asked until it's listed.
+    // measured to refuse, or (Mythos 5.1) is of the always-thinking family,
+    // and a later version is a model of its own, sent what the caller asked
+    // until it's listed.
     const listed = [
       'claude-opus-4-7', 'claude-opus-4-8', 'claude-opus-5', 'claude-opus-5-5', 'claude-sonnet-5',
       'claude-sonnet-5-5', 'claude-haiku-5-5', 'claude-fable-5', 'claude-fable-5-1', 'claude-mythos-5',
-      'claude-mythos-preview',
+      'claude-mythos-5-1', 'claude-mythos-preview',
     ];
-    const unlisted = ['claude-opus-5-6', 'claude-opus-5-50', 'claude-sonnet-5-6', 'claude-fable-5-2', 'claude-fable-5-10', 'claude-mythos-5-1', 'claude-haiku-5-6'];
+    const unlisted = ['claude-opus-5-6', 'claude-opus-5-50', 'claude-sonnet-5-6', 'claude-fable-5-2', 'claude-fable-5-10', 'claude-mythos-5-2', 'claude-haiku-5-6'];
     const { adapter, captured } = captureAdapter();
 
     for (const model of [...listed, ...listed.map((id) => `${id}-20260301`), ...unlisted]) {
@@ -230,9 +231,10 @@ describe('AnthropicAdapter: sampling-parameter model gate', () => {
 
   it('through Membrane: Fable and Mythos ids lose config sampling by family, the list decides providerParams', async () => {
     // Membrane drops a request config's sampling for every Fable and Mythos id
-    // by name (isAlwaysThinkingModel) before the adapter sees it. So for
-    // Mythos 5.1, which the list no longer names, only sampling sent in
-    // providerParams reaches the wire; a later Opus version gets either.
+    // by name (isAlwaysThinkingModel) before the adapter sees it. So for a
+    // later Mythos the list doesn't name, only sampling sent in providerParams
+    // reaches the wire, while Mythos 5.1, listed, loses it there too; a later
+    // Opus version gets either.
     const { adapter, captured } = captureAdapter();
     const membrane = new Membrane(adapter, { formatter: new NativeFormatter() });
     const send = (model: string, sampling: { temperature?: number; providerParams?: Record<string, unknown> }) =>
@@ -242,6 +244,8 @@ describe('AnthropicAdapter: sampling-parameter model gate', () => {
         ...(sampling.providerParams ? { providerParams: sampling.providerParams } : {}),
       } as any);
 
+    await send('claude-mythos-5-2', { temperature: 0.2 });
+    await send('claude-mythos-5-2', { providerParams: { temperature: 0.2 } });
     await send('claude-mythos-5-1', { temperature: 0.2 });
     await send('claude-mythos-5-1', { providerParams: { temperature: 0.2 } });
     await send('claude-fable-5-1', { providerParams: { temperature: 0.2 } });
@@ -249,8 +253,10 @@ describe('AnthropicAdapter: sampling-parameter model gate', () => {
     await send('claude-opus-5-5', { temperature: 0.2 });
 
     expect(captured.map((request: any) => [request.model, request.temperature])).toEqual([
+      ['claude-mythos-5-2', undefined],
+      ['claude-mythos-5-2', 0.2],
       ['claude-mythos-5-1', undefined],
-      ['claude-mythos-5-1', 0.2],
+      ['claude-mythos-5-1', undefined],
       ['claude-fable-5-1', undefined],
       ['claude-opus-5-6', 0.2],
       ['claude-opus-5-5', undefined],

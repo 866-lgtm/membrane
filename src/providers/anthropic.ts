@@ -51,7 +51,8 @@ import { CacheKeepalive, type CacheKeepaliveConfig } from '../cache-keepalive.js
  * The OpenAI provider keeps a `noTemperatureSupport` list of its own, matched
  * by prefix.
  *
- * Each entry is a model documented or measured to refuse them, and nothing
+ * Each entry names one model that refuses them: documented, measured, or,
+ * for Mythos 5.1, a member of the always-thinking family (below). Nothing
  * else is listed: this gate doesn't strip them for a model the list doesn't
  * name, so one that refuses them fails with the API's 400 until it's listed
  * here. The other gates in `buildRequest` still apply to every model (no
@@ -76,6 +77,10 @@ import { CacheKeepalive, type CacheKeepaliveConfig } from '../cache-keepalive.js
  *   - Fable 5.1: measured the same way on 2026-10-23, with the same answers.
  *   - Sonnet 5.5: `top_p` 0.9 refused and 0.99 accepted on 2026-10-19, and
  *     `temperature` 0.2 and `top_k` 40 refused on 2026-10-23, the same way.
+ *   - Mythos 5.1: not measured, since our accounts aren't served it. Listed
+ *     because membrane treats the Fable and Mythos family as always thinking
+ *     (`Membrane.isAlwaysThinkingModel`), and with thinking on the API takes
+ *     no custom `temperature` or `top_k`.
  *
  * A listed model loses every `top_p`, 0.99 included, with a thinking config
  * or without one.
@@ -99,6 +104,7 @@ const NO_TEMPERATURE_MODELS = [
   'claude-fable-5',
   'claude-fable-5-1',
   'claude-mythos-5',
+  'claude-mythos-5-1',
   'claude-mythos-preview',
 ];
 
