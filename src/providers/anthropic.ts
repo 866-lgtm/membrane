@@ -52,9 +52,9 @@ import { CacheKeepalive, type CacheKeepaliveConfig } from '../cache-keepalive.js
  *
  * Most of these are the always-on-thinking / reasoning-forward tier, which
  * removes the sampling parameters from the API surface entirely (Sonnet 5
- * rejects only non-default values). Haiku 5.5 and Opus 5.x are listed on
- * measurements, below. Everything else — Haiku 4.5, Sonnet 4.6, Opus 4.6
- * and older — ACCEPTS `temperature`, so it must NOT be listed here.
+ * rejects only non-default values). Haiku 5.5, Opus 5 and Opus 5.5 are
+ * listed on measurements, below. Everything else — Haiku 4.5, Sonnet 4.6,
+ * Opus 4.6 and older — ACCEPTS `temperature`, so it must NOT be listed here.
  *
  *   - Opus 4.7 / Opus 4.8 / Sonnet 5 / Fable 5 / Mythos 5 / Mythos preview:
  *     documented 400 on any sampling parameter.
@@ -67,6 +67,8 @@ import { CacheKeepalive, type CacheKeepaliveConfig } from '../cache-keepalive.js
  *   - Opus 5 and Opus 5.5, which `claude-opus-5` matches: measured the same
  *     way on 2026-10-23, unstreamed. Each refused `temperature` 0.2, `top_k`
  *     40 and `top_p` 0.9 with the same 400s, and took a `top_p` of 0.99.
+ *     The prefix also reaches later `claude-opus-5-*` ids, which aren't
+ *     measured here, so check each as it launches.
  *
  * NB: claude-haiku-4-5 was previously listed here on the strength of a single
  * "observed 400 in production when temperature is sent" anecdote. Haiku 4.5
