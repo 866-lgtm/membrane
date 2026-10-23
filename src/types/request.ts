@@ -115,7 +115,9 @@ export interface GenerationConfig {
      * accepted that config with the binding in place of no config, and read
      * the same cached prefix, in one run each at the 5-minute TTL. As with any
      * thinking config other than `disabled`, the Anthropic adapter then sends
-     * none of the caller's `temperature` or `topK`, and no `topP` below 0.95.
+     * none of the caller's `temperature` or `topK`, and no `topP` below 0.95;
+     * to these three it sends no `topP` at all, since it strips sampling
+     * parameters for them whatever the config (NO_TEMPERATURE_MODELS).
      * The Bedrock adapter sends `temperature` 1 and the caller's `topK` beside
      * it; whether Bedrock takes that hasn't been tried. A `thinking` object
      * passed through `providerParams` replaces the one membrane builds,

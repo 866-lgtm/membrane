@@ -5,8 +5,9 @@
  * previously produced a non-retryable 400 that killed the whole turn:
  *
  * 1. Temperature stripping for models that reject sampling parameters
- *    (Opus 4.7+/Sonnet 5/Fable 5/Mythos 5 have the parameters removed from
- *    the API surface). Haiku 4.5 ACCEPTS temperature and must be forwarded.
+ *    (Opus 4.7, 4.8 and 5.x, Sonnet 5, Haiku 5.5, Fable 5 and Mythos 5,
+ *    some of which take only a top_p near 1). Haiku 4.5 ACCEPTS temperature
+ *    and must be forwarded.
  *    Mirrors the OpenAI provider's `noTemperatureSupport` gate.
  *
  * 2. Root-level oneOf/anyOf/allOf in a tool's input schema (legal MCP,
@@ -167,6 +168,37 @@ describe('AnthropicAdapter: sampling-parameter model gate', () => {
     expect(captured[2]).not.toHaveProperty('top_k');
     expect(captured[3]).not.toHaveProperty('top_p');
     expect(captured[4]).not.toHaveProperty('top_p');
+  });
+
+  it('strips temperature, top_p and top_k for claude-opus-5 and claude-opus-5-5, each on its own', async () => {
+    // With no thinking config, the API refused temperature 0.2, top_k 40 and
+    // top_p 0.9 for both with a 400 ("`temperature` is deprecated for this
+    // model", and likewise for the other two), and took a top_p of 0.99, as
+    // for Haiku 5.5. The one prefix covers both and their dated snapshots.
+    // As for every listed model, every top_p goes, 0.99 included, at the top
+    // level and through `extra`, with a thinking config or without one.
+    const { adapter, captured } = captureAdapter();
+    const thinking = { type: 'adaptive', display: 'omitted' };
+
+    for (const model of ['claude-opus-5', 'claude-opus-5-5', 'claude-opus-5-5-20260301']) {
+      await adapter.complete({ ...baseRequest, model, temperature: 0.2 } as any);
+      await adapter.complete({ ...baseRequest, model, topP: 0.9 } as any);
+      await adapter.complete({ ...baseRequest, model, topK: 40 } as any);
+      await adapter.complete({ ...baseRequest, model, topP: 0.99 } as any);
+      await adapter.complete({ ...baseRequest, model, extra: { top_p: 0.99 } } as any);
+      await adapter.complete({ ...baseRequest, model, topP: 0.97, thinking } as any);
+    }
+
+    expect(captured).toHaveLength(18);
+    for (let i = 0; i < 18; i += 6) {
+      expect(captured[i]).not.toHaveProperty('temperature');
+      expect(captured[i + 1]).not.toHaveProperty('top_p');
+      expect(captured[i + 2]).not.toHaveProperty('top_k');
+      expect(captured[i + 3]).not.toHaveProperty('top_p');
+      expect(captured[i + 4]).not.toHaveProperty('top_p');
+      expect(captured[i + 5]).not.toHaveProperty('top_p');
+      expect(captured[i + 5].thinking).toEqual(thinking);
+    }
   });
 
   it('strips temperature/top_k when extended thinking is enabled (any model)', async () => {
