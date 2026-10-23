@@ -1,10 +1,11 @@
 /**
  * Model capability heuristics that no provider SDK exposes.
  *
- * Same shape as the sampling-parameter lists in the provider adapters
- * (`NO_TEMPERATURE_MODELS` in `providers/anthropic.ts` and
- * `providers/openai.ts`): a prefix table plus a predicate, prefix-matched so
- * dated snapshots are covered, and kept current by hand as models launch.
+ * Same shape as the OpenAI adapter's sampling-parameter list
+ * (`NO_TEMPERATURE_MODELS` in `providers/openai.ts`): a prefix table plus a
+ * predicate, prefix-matched so dated snapshots are covered, and kept current
+ * by hand as models launch. The Anthropic adapter's list of that name instead
+ * names each model by its id, and an entry doesn't cover later versions.
  * Message adapters consult this shared table against their final built model
  * and body. Formatter/parser prefill on a text-prompt transport is separate.
  */
