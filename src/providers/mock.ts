@@ -13,6 +13,7 @@ import type {
   StreamCallbacks,
 } from '../types/provider.js';
 import { abortError } from '../types/errors.js';
+import { isDeadlineAbort, deadlineTimeoutError } from './utils.js';
 
 export interface MockAdapterConfig {
   /** Default response text when no specific response is configured */
@@ -51,6 +52,9 @@ const DEFAULT_CONFIG: Required<Omit<MockAdapterConfig, 'responseGenerator'>> = {
  */
 export class MockAdapter implements ProviderAdapter {
   readonly name = 'mock';
+
+  /** Test double: it carries the request it receives as is. */
+  readonly reportsContentAlterations = true;
 
   /** Test double; it reports no cache tokens, so the convention never bites. */
   readonly usageCacheConvention = 'cache-excluded' as const;
@@ -208,6 +212,8 @@ export class MockAdapter implements ProviderAdapter {
       this.checkAbort(options?.signal);
 
       const chunk = responseText.slice(offset, offset + this.config.streamChunkSize);
+      // Each streamed chunk is a provider event, as a real adapter reports.
+      options?.onProgress?.();
       callbacks.onChunk(chunk);
       streamedText += chunk;
       offset += this.config.streamChunkSize;
@@ -235,8 +241,13 @@ export class MockAdapter implements ProviderAdapter {
    */
   private checkAbort(signal?: AbortSignal): void {
     if (signal?.aborted) {
-      throw abortError('Request aborted');
+      throw this.abortFor(signal);
     }
+  }
+
+  /** A deadline abort (the caller's progress deadline) is a timeout, as on every adapter. */
+  private abortFor(signal?: AbortSignal): Error {
+    return isDeadlineAbort(signal?.reason) ? deadlineTimeoutError(signal!.reason) : abortError('Request aborted');
   }
 
   /**
@@ -245,13 +256,13 @@ export class MockAdapter implements ProviderAdapter {
   private abortableSleep(ms: number, signal?: AbortSignal): Promise<void> {
     return new Promise((resolve, reject) => {
       if (signal?.aborted) {
-        reject(abortError('Request aborted'));
+        reject(this.abortFor(signal));
         return;
       }
 
       const onAbort = () => {
         clearTimeout(timeout);
-        reject(abortError('Request aborted'));
+        reject(this.abortFor(signal));
       };
 
       const timeout = setTimeout(() => {

@@ -1,6 +1,31 @@
 /**
  * OpenAI Images API provider adapter
  *
+ * ⚠ DO NOT CONFUSE WITH THE RESPONSES API. Despite the filename and the class
+ * name `OpenAIResponsesAdapter`, nothing in this file talks to OpenAI's
+ * Responses API. The real Responses-API surfaces are:
+ *
+ *   - `src/formatters/openai-responses.ts` — the Responses input-item
+ *     formatter (`function_call` / `function_call_output` items, item ids,
+ *     encrypted reasoning), and
+ *   - `src/providers/openai-responses-api.ts` — the Responses transport
+ *     adapter (`readonly name = 'openai-responses-api'`).
+ *
+ * This file is the IMAGES adapter, and reviews or edits aimed at Responses
+ * behaviour belong in those two. The names collide by history, not design.
+ *
+ * The rename is deferred, not forgotten. The cost lands outside this repo:
+ * the original note here records consumer vendor configs matching an
+ * `openairesponses-*` prefix — a consumer-side fact this repo cannot check,
+ * carried forward as the reason of record. In-repo, `'openai-responses'` as
+ * an adapter name is only telemetry (`details.model.provider`); the sole
+ * behavioural read of an adapter name is `membrane.ts` matching
+ * `'openai-responses-api'`, i.e. the OTHER adapter. Note also that
+ * `'openai-responses'` is simultaneously the FORMATTER name, which
+ * `Membrane.buildNativeToolRequest` and `Membrane.transformRequest` do
+ * branch on — so check which of the two a name refers to before touching
+ * either.
+ *
  * Adapter for OpenAI's Images API endpoints, used for image generation
  * models like `gpt-image-1`:
  *
@@ -17,13 +42,13 @@
  * - Return base64-encoded images in `data[].b64_json`
  * - No streaming support (returns complete image)
  * - Support `size`, `quality`, `n`, `background`, `output_format`
- *
- * Note: File retains the name openai-responses.ts and class name
- * OpenAIResponsesAdapter for compatibility with existing factory
- * routing and vendor configs (`openairesponses-*` prefix).
  */
 
-import { resolveImageMediaType } from '../utils/image-media.js';
+import { unreportedUsage } from '../utils/usage.js';
+import { assertPromptToolSupport } from './request-capabilities.js';
+
+import { imageForRequest, OPENAI_IMAGE_EDIT_TYPES } from '../utils/image-media.js';
+import { convertMcpMedia } from '../utils/mcp-media.js';
 import type {
   ProviderAdapter,
   ProviderRequest,
@@ -34,15 +59,12 @@ import type {
 } from '../types/index.js';
 import {
   MembraneError,
-  rateLimitError,
-  creditExhaustionError,
-  isCreditExhaustion,
-  contextLengthError,
-  authError,
-  serverError,
   abortError,
-  networkError,
+  errorFromHttpResponse,
+  isTypedAbortError,
+  withRawRequest,
 } from '../types/index.js';
+import { errorFromThrown } from '../types/errors.js';
 import { createCombinedSignal, isDeadlineAbort, deadlineTimeoutError } from './utils.js';
 
 // ============================================================================
@@ -211,6 +233,15 @@ export class OpenAIResponsesAdapter implements ProviderAdapter {
     request: ProviderRequest,
     options?: ProviderRequestOptions
   ): Promise<ProviderResponse> {
+    assertPromptToolSupport(request, options, this.name, { kind: 'none', extraTools: request.extra?.tools });
+    // Media in MCP's form becomes membrane's first, for a caller that builds
+    // a request directly (Membrane's own builds have converted it already,
+    // utils/mcp-media.ts), so the images it attaches and the transcript's
+    // image numbers read one form.
+    if (Array.isArray(request.messages)) {
+      const messages = convertMcpMedia(request.messages as unknown[]) as ProviderRequest['messages'];
+      if (messages !== request.messages) request = { ...request, messages };
+    }
     const allImages = this.allowImageEditing ? this.collectImages(request) : [];
     const selected = this.selectImages(allImages);
     const inputImages = selected.map(ref => ref.dataUrl);
@@ -258,8 +289,7 @@ export class OpenAIResponsesAdapter implements ProviderAdapter {
       const response = await fetch(`${this.baseURL}/${endpoint}`, fetchOptions);
 
       if (!response.ok) {
-        const errorText = await response.text();
-        throw new Error(`OpenAI Images API error: ${response.status} ${errorText}`);
+        throw errorFromHttpResponse(this.name, response, await response.text(), imagesRequest);
       }
 
       const data = (await response.json()) as ImagesAPIResponse;
@@ -323,15 +353,17 @@ export class OpenAIResponsesAdapter implements ProviderAdapter {
         if (block?.type === 'image') {
           const source = block.source;
           if (source?.type === 'base64' && source.data) {
-            const mimeType = resolveImageMediaType(source.data, source.media_type ?? source.mediaType) ?? 'image/png';
-            refs.push({ dataUrl: `data:${mimeType};base64,${source.data}`, msgIndex, blockIndex });
+            // Data that is no image the edits endpoint takes stays
+            // unattached, and the transcript shows it as an omitted image.
+            const { mediaType } = imageForRequest(source.data, source.media_type ?? source.mediaType, OPENAI_IMAGE_EDIT_TYPES);
+            if (mediaType) refs.push({ dataUrl: `data:${mediaType};base64,${source.data}`, msgIndex, blockIndex });
           }
         } else if (block?.type === 'generated_image' && typeof block.data === 'string' && block.data) {
           // A previous output of this adapter carried forward verbatim in
           // history (consumers that keep ProviderResponse content rather
           // than rebuilding from a channel). It is an image like any other.
-          const mimeType = resolveImageMediaType(block.data, block.mimeType) ?? 'image/png';
-          refs.push({ dataUrl: `data:${mimeType};base64,${block.data}`, msgIndex, blockIndex });
+          const { mediaType } = imageForRequest(block.data, block.mimeType, OPENAI_IMAGE_EDIT_TYPES);
+          if (mediaType) refs.push({ dataUrl: `data:${mediaType};base64,${block.data}`, msgIndex, blockIndex });
         }
       });
     });
@@ -458,7 +490,8 @@ export class OpenAIResponsesAdapter implements ProviderAdapter {
    * consecutive same-role messages share one header. Text blocks are kept
    * verbatim. Image blocks become `[Image N]` (N = 1-based position in the
    * attached `image[]` list) when the image is attached, or
-   * `[Image omitted]` when it fell outside the input-image cap. An
+   * `[Image omitted]` when it fell outside the input-image cap or its data
+   * is no image the edits endpoint takes. An
    * assistant message that only carried an image therefore still appears
    * as an assistant turn — that is what lets a previous generation read as
    * the assistant's own prior output. The prompt ends with an open
@@ -546,6 +579,7 @@ export class OpenAIResponsesAdapter implements ProviderAdapter {
         inputTokens: response.usage?.input_tokens ?? 0,
         outputTokens: response.usage?.output_tokens ?? 0,
       },
+      ...unreportedUsage(response.usage?.input_tokens, response.usage?.output_tokens),
       model: requestedModel,
       rawRequest,
       raw: response,
@@ -578,85 +612,10 @@ export class OpenAIResponsesAdapter implements ProviderAdapter {
   // --------------------------------------------------------------------------
 
   private handleError(error: unknown, rawRequest?: unknown): MembraneError {
-    // A deadline abort is a timeout and stays one. Collapsing it into a bare
-    // abortError() here is what erased the identity before Membrane's
-    // caller-signal > timeout > error ladder could read it.
     if (isDeadlineAbort(error)) return deadlineTimeoutError(error, rawRequest);
-    if (error instanceof MembraneError) return error;
+    if (error instanceof MembraneError) return withRawRequest(error, rawRequest);
+    if (isTypedAbortError(error)) return abortError(undefined, rawRequest);
 
-    if (error instanceof Error) {
-      const message = error.message;
-
-      // 402 / insufficient credits: transient at account scale, never a
-      // property of the request (see isCreditExhaustion).
-      if (isCreditExhaustion(message)) {
-        return creditExhaustionError(message, error, rawRequest);
-      }
-
-      if (message.includes('429') || message.includes('rate_limit')) {
-        const retryMatch = message.match(/retry after (\d+)/i);
-        const retryAfter = retryMatch?.[1] ? parseInt(retryMatch[1], 10) * 1000 : undefined;
-        return rateLimitError(message, retryAfter, error, rawRequest);
-      }
-
-      if (
-        message.includes('401') ||
-        message.includes('invalid_api_key') ||
-        message.includes('Incorrect API key')
-      ) {
-        return authError(message, error, rawRequest);
-      }
-
-      if (
-        message.includes('context_length') ||
-        message.includes('maximum context') ||
-        message.includes('too long')
-      ) {
-        return contextLengthError(message, error, rawRequest);
-      }
-
-      if (
-        message.includes('content_policy') ||
-        message.includes('safety_system') ||
-        message.includes('moderation')
-      ) {
-        return new MembraneError({
-          type: 'unknown',
-          message: `Content policy violation: ${message}`,
-          retryable: false,
-          rawError: error,
-          rawRequest,
-        });
-      }
-
-      if (
-        message.includes('500') ||
-        message.includes('502') ||
-        message.includes('503') ||
-        message.includes('server_error')
-      ) {
-        return serverError(message, undefined, error, rawRequest);
-      }
-
-      if (error.name === 'AbortError') {
-        return abortError(undefined, rawRequest);
-      }
-
-      if (
-        message.includes('network') ||
-        message.includes('fetch') ||
-        message.includes('ECONNREFUSED')
-      ) {
-        return networkError(message, error, rawRequest);
-      }
-    }
-
-    return new MembraneError({
-      type: 'unknown',
-      message: error instanceof Error ? error.message : String(error),
-      retryable: false,
-      rawError: error,
-      rawRequest,
-    });
+    return errorFromThrown(error, rawRequest);
   }
 }

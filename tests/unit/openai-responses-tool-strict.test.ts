@@ -63,15 +63,15 @@ describe('OpenAIResponsesAPIAdapter tool strictness', () => {
     expect(tools.map((t) => t.strict)).toEqual([true, true]);
   });
 
-  it('passes native Responses function tools through unchanged', async () => {
+  it('passes native Responses function tools through, stating strict: false when they leave it out', async () => {
     const native = { type: 'function', name: 'native', parameters: schema };
     const [tool] = await wireTools([native]);
-    expect(tool).toEqual(native);
+    expect(tool).toEqual({ ...native, strict: false });
   });
 
   it('sends strict: false through the full Membrane + Responses formatter path', async () => {
-    // The formatter turns membrane tools into native Responses tools before the
-    // adapter sees them, so the adapter's own defaulting never applies there.
+    // The formatter turns membrane tools into native Responses tools; the
+    // adapter states strict on them.
     const fetchMock = vi.fn().mockResolvedValue(
       new Response(JSON.stringify({
         id: 'resp_1', model: 'gpt-5.6', status: 'completed',

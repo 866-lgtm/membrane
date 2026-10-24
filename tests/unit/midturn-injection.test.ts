@@ -291,6 +291,9 @@ describe('XML yielding: injectedMessages are ignored with a warning', () => {
         messages: [{ participant: 'User', content: [{ type: 'text', text: 'go' }] }],
         config: { model: 'test-model', maxTokens: 1000 },
         tools: [noopTool],
+        // This case is about the XML yielding path; native is the default
+        // tool mode now, so the XML path is an explicit opt-in.
+        toolMode: 'xml',
       };
 
       const events = await drive(membrane, request, (stream, event) => {
@@ -415,7 +418,7 @@ describe('ChatCompletions-shaped convertMessages: images inside tool_results', (
       expect(parts.some((p: any) => p.type === 'text')).toBe(true);
     });
 
-    it(`${name}: accepts snake_case media_type`, () => {
+    it(`${name}: accepts snake_case media_type, labelled by the image's bytes`, () => {
       const out = convert([
         {
           role: 'user',
@@ -431,7 +434,9 @@ describe('ChatCompletions-shaped convertMessages: images inside tool_results', (
         },
       ]);
       const imagePart = out[1].content.find((p: any) => p.type === 'image_url');
-      expect(imagePart.image_url.url.startsWith('data:image/jpeg;base64,')).toBe(true);
+      // PNG bytes under a JPEG label go out as what they are, as a
+      // user-message image does (openAIImagePart).
+      expect(imagePart.image_url.url.startsWith('data:image/png;base64,')).toBe(true);
     });
 
     it(`${name}: hoisted image and envelope interloper text share one user message`, () => {
@@ -442,6 +447,29 @@ describe('ChatCompletions-shaped convertMessages: images inside tool_results', (
       const parts = out[1].content;
       expect(parts.some((p: any) => p.type === 'image_url')).toBe(true);
       expect(JSON.stringify(parts)).toContain('look left!');
+    });
+
+    it(`${name}: data that is not an accepted image stays in the tool text as its placeholder`, () => {
+      const out = convert([
+        {
+          role: 'user',
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'tu_1',
+              content: [
+                { type: 'text', text: 'snapshot taken' },
+                { type: 'image', source: { type: 'base64', data: 'emVybyBpbWFnZSBieXRlcw==', mediaType: 'image/png' } },
+              ],
+            },
+          ],
+        },
+      ]);
+      expect(out.length).toBe(1);
+      expect(out[0].role).toBe('tool');
+      expect(out[0].content).toContain('snapshot taken');
+      expect(out[0].content).toContain('NOT shown to you');
+      expect(out[0].content).not.toContain('emVybyBpbWFnZSBieXRlcw');
     });
 
     it(`${name}: string and image-free array contents keep old serialization`, () => {

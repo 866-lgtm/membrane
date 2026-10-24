@@ -6,6 +6,7 @@
  */
 
 import type {
+  AbortedEvent,
   StreamEvent,
   YieldingStream,
   YieldingStreamOptions,
@@ -13,7 +14,11 @@ import type {
   InjectedMessage,
   ProvideToolResultsOptions,
 } from './types/yielding-stream.js';
+import { isTerminalEvent } from './types/yielding-stream.js';
 import type { ToolResult } from './types/tools.js';
+
+/** What an aborted event carries besides its type and reason. */
+type AbortedSnapshot = Omit<AbortedEvent, 'type' | 'reason'>;
 
 /**
  * Payload handed from provideToolResults() to the inference loop awaiting
@@ -22,7 +27,49 @@ import type { ToolResult } from './types/tools.js';
  */
 export interface ToolResultsPayload {
   results: ToolResult[];
-  injectedMessages?: InjectedMessage[];
+  /** Present when the consumer supplied a non-empty `injectedMessages` array (one batch). */
+  injected?: InjectedBatch;
+}
+
+/**
+ * One supplied `injectedMessages` array, cleaned to user-side content but
+ * kept in the consumer's coordinates, which round reports use
+ * (`RoundReport.altered.injected`, `injectedBatch.applied`): positions index
+ * the array as supplied, whatever the cleaning removed.
+ */
+export interface InjectedBatch {
+  /** How many messages the consumer supplied. */
+  size: number;
+  /** The messages left holding content, each with its supplied position. */
+  messages: Array<{ index: number; message: InjectedMessage }>;
+  /**
+   * Supplied positions that lost tool blocks to the cleaning, including a
+   * message left empty by it and dropped. A message supplied empty carried
+   * nothing: dropped, not altered.
+   */
+  altered: number[];
+}
+
+/**
+ * Clean a supplied batch to user-side content, keeping the consumer's
+ * positions and noting which ones lost tool blocks (see provideToolResults).
+ */
+function cleanInjectedBatch(supplied: InjectedMessage[]): InjectedBatch {
+  const batch: InjectedBatch = { size: supplied.length, messages: [], altered: [] };
+  supplied.forEach((m, index) => {
+    const clean = m.content.filter(
+      (block) => block.type !== 'tool_use' && block.type !== 'tool_result'
+    );
+    if (clean.length !== m.content.length) {
+      console.warn(
+        `[membrane] provideToolResults: stripped ${m.content.length - clean.length} ` +
+        `tool block(s) from an injected mid-turn message (user-side content only)`
+      );
+      batch.altered.push(index);
+    }
+    if (clean.length > 0) batch.messages.push({ index, message: { ...m, content: clean } });
+  });
+  return batch;
 }
 
 // ============================================================================
@@ -75,6 +122,11 @@ export class YieldingStreamImpl implements YieldingStream {
   // dropped rather than accumulated for a reader that is never coming back.
   private consumerDeparted = false;
 
+  // Set once a terminal event (complete, error or aborted) is queued. The
+  // stream ends there: emit() queues nothing after it, a later cancel()'s
+  // aborted event included.
+  private terminalQueued = false;
+
   // Held so the listener can be removed at terminal: a long-lived caller
   // signal shared across many streams otherwise accumulates one closure per
   // stream, none of which are ever released.
@@ -82,14 +134,23 @@ export class YieldingStreamImpl implements YieldingStream {
     this.cancel();
   };
 
+  // The running loop's builder for what an aborted event carries
+  // (setAbortSnapshot): what the loop has recorded, built as the loop's own
+  // catch builds it for a provider or deadline abort.
+  private abortSnapshot: (() => AbortedSnapshot) | undefined;
+
   constructor(
     private readonly options: YieldingStreamOptions,
     private readonly runInference: (stream: YieldingStreamImpl) => Promise<void>
   ) {
     this.abortController = new AbortController();
 
-    // Link external signal if provided
-    if (options.signal) {
+    // Link the caller's signal. One that has already fired never dispatches
+    // 'abort' again, so it cancels here: the consumer gets one aborted event
+    // and no provider call is made.
+    if (options.signal?.aborted) {
+      this.cancel();
+    } else if (options.signal) {
       options.signal.addEventListener('abort', this.onExternalAbort, { once: true });
     }
   }
@@ -147,26 +208,11 @@ export class YieldingStreamImpl implements YieldingStream {
     // at this point would leave the stream parked in waiting_for_tools with
     // an unresolvable promise — wedging the caller's whole turn over a
     // notification is far worse than delivering it without its tool blocks.
-    const injectedMessages = options?.injectedMessages
-      ?.map((m) => {
-        const clean = m.content.filter(
-          (block) => block.type !== 'tool_use' && block.type !== 'tool_result'
-        );
-        if (clean.length !== m.content.length) {
-          console.warn(
-            `[membrane] provideToolResults: stripped ${m.content.length - clean.length} ` +
-            `tool block(s) from an injected mid-turn message (user-side content only)`
-          );
-        }
-        return { ...m, content: clean };
-      })
-      .filter((m) => m.content.length > 0);
+    const supplied = options?.injectedMessages;
+    const injected = supplied && supplied.length > 0 ? cleanInjectedBatch(supplied) : undefined;
 
     // Resolve the promise and transition state
-    this.pendingToolResults.resolve({
-      results,
-      ...(injectedMessages && injectedMessages.length > 0 ? { injectedMessages } : {}),
-    });
+    this.pendingToolResults.resolve({ results, ...(injected ? { injected } : {}) });
     this.pendingToolResults = null;
     this.state = { status: 'streaming' };
     this._toolDepth++;
@@ -175,6 +221,16 @@ export class YieldingStreamImpl implements YieldingStream {
   cancel(): void {
     if (this.state.status === 'done' || this.state.status === 'error') {
       return; // Already terminated
+    }
+
+    // What the loop had when the cancel came, unless the consumer has left
+    // and nothing will read it. A builder that throws costs the event all
+    // four fields, not the cancel: the event goes out bare, as before.
+    let partial: AbortedSnapshot = {};
+    try {
+      if (!this.consumerDeparted) partial = this.abortSnapshot?.() ?? {};
+    } catch {
+      // the bare aborted event
     }
 
     this.abortController.abort();
@@ -186,7 +242,7 @@ export class YieldingStreamImpl implements YieldingStream {
     }
 
     // Emit aborted event and wake the iterator so it can deliver it
-    this.emit({ type: 'aborted', reason: 'user' });
+    this.emit({ type: 'aborted', reason: 'user', ...partial });
     this.producerDone = true;
     this.state = { status: 'done' };
     this.releaseExternalSignal();
@@ -206,12 +262,7 @@ export class YieldingStreamImpl implements YieldingStream {
           // Check for queued events
           const event = this.eventQueue.shift();
           if (event) {
-            // Check if this is a terminal event
-            if (
-              event.type === 'complete' ||
-              event.type === 'error' ||
-              event.type === 'aborted'
-            ) {
+            if (isTerminalEvent(event)) {
               this.state = { status: 'done' };
             }
             return { value: event, done: false };
@@ -261,6 +312,12 @@ export class YieldingStreamImpl implements YieldingStream {
     // The consumer has left for good; queueing here would grow without bound
     // for a reader that cannot observe it.
     if (this.consumerDeparted) return;
+    // The stream has ended, and nothing belongs after its terminal event: not
+    // what a loop emits as it runs on to its next check after a cancel (its
+    // wait had resolved before the abort reached it), nor the aborted event
+    // of a cancel() that came after the loop's own terminal.
+    if (this.terminalQueued) return;
+    if (isTerminalEvent(event)) this.terminalQueued = true;
     this.eventQueue.push(event);
     this.notifyEventWaiter();
   }
@@ -270,6 +327,13 @@ export class YieldingStreamImpl implements YieldingStream {
    * Called by the inference loop when tool calls are detected.
    */
   async requestToolExecution(event: ToolCallsEvent): Promise<ToolResultsPayload> {
+    // A cancelled stream has no one to run the tools: refuse at once, as
+    // cancel() refuses a wait already pending, so the loop unwinds through its
+    // catch rather than parking on a wait nothing will settle.
+    if (this.isCancelled) {
+      throw new Error('Stream cancelled');
+    }
+
     // Emit the tool calls event
     this.emit(event);
 
@@ -286,10 +350,22 @@ export class YieldingStreamImpl implements YieldingStream {
   }
 
   /**
+   * Give the stream the loop's builder for what an aborted event carries:
+   * cancel() calls it for the aborted event it emits, as the loop's own catch
+   * does for a provider or deadline abort.
+   */
+  setAbortSnapshot(build: () => AbortedSnapshot): void {
+    this.abortSnapshot = build;
+  }
+
+  /**
    * Mark the producer as done (inference loop finished).
    */
   markDone(): void {
     this.producerDone = true;
+    // The loop has finished, so let go of its builder: held here, it would
+    // keep the loop's whole state reachable for as long as the stream is.
+    this.abortSnapshot = undefined;
     this.releaseExternalSignal();
     this.notifyEventWaiter();
   }

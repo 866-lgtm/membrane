@@ -37,8 +37,19 @@ export interface FormatterConfig {
 }
 
 export interface BuildOptions {
+  /** The caller owns a later complete-request cache-budget check/clamp (Membrane
+   * checks after hooks). Standalone builds check by default. CM-owned markers
+   * always assert here because they may not be displaced. */
+  deferCacheBudgetCheck?: boolean;
+
   /** How to handle multiple participants */
   participantMode: 'simple' | 'multiuser';
+
+  /**
+   * Where to record alterations: indices into `messages` whose non-empty
+   * content the build did not carry verbatim (utils/fidelity.ts).
+   */
+  fidelity?: import('../utils/fidelity.js').FidelityNotes;
 
   /** Name of the assistant participant */
   assistantParticipant: string;
@@ -83,9 +94,24 @@ export interface BuildOptions {
   /** Context prefix for simulacrum seeding (injected as first cached assistant message) */
   contextPrefix?: string;
 
+  /**
+   * Whether an assistant turn's Anthropic server-tool blocks (web search and
+   * the like, kept on zero-width carriers) go back as the blocks themselves.
+   * Membrane sets this from its adapter's `replaysAnthropicServerBlocks`,
+   * which only AnthropicAdapter declares. Off, they are left out before
+   * cache markers are placed and messages merged, exactly as a carrier was
+   * before they went back at all. Off by default, as membrane's own flag is:
+   * a direct caller building for the Anthropic API, such as a token count,
+   * passes true to build what membrane sends it, and one building for another
+   * wire gets none.
+   */
+  anthropicServerBlocks?: boolean;
+
   /** Custom content for the synthetic user message when first message is assistant role.
    *  In prefill formatters: defaults to '<cmd>cat untitled.txt</cmd>' with a CLI simulation
-   *  system prompt when no system prompt is configured, or '[Start]' when a system prompt is set. */
+   *  system prompt when no system prompt is configured, or '[Start]' when a system prompt is set.
+   *  In native construction: the leading user turn the tool-pair normalizer synthesizes,
+   *  '[continuing]' by default and in place of text that is only whitespace. */
   prefillUserMessage?: string;
 
   /**
@@ -98,9 +124,10 @@ export interface BuildOptions {
   /**
    * IDs of tool_use blocks the caller knows are currently in-flight
    * (e.g. a yielding stream that has emitted the tool_use but is still
-   * waiting on the result). If a trailing unmatched tool_use's id is in
-   * this set, the normalizer signals `ready: false` instead of injecting
-   * a synthetic `[pending]` result. Default: empty (always synthesize).
+   * waiting on the result). If an unmatched tool_use's id is in this set,
+   * wherever it sits, the normalizer leaves it unmatched and signals
+   * `ready: false` instead of injecting a synthetic `[pending]` result.
+   * Default: empty (always synthesize). Membrane's own requests pass none.
    */
   pendingToolCallIds?: ReadonlySet<string>;
 
@@ -119,12 +146,49 @@ export interface BuildOptions {
  */
 export type NormalizeEvent =
   | { kind: 'block_re_roled'; blockType: string; from: 'user' | 'assistant'; to: 'user' | 'assistant' }
+  /**
+   * A tool_result was moved so it sits in the user envelope immediately
+   * following its own tool_use. `fromEnvelope > toEnvelope` is phase 3's
+   * hoist: the result lived downstream of its cycle and was pulled back into
+   * it. `fromEnvelope < toEnvelope` is the converse sweep: the result had
+   * been appended ahead of its own cycle and was pushed down into it.
+   */
   | { kind: 'tool_result_hoisted'; toolUseId: string; fromEnvelope: number; toEnvelope: number }
   | { kind: 'interloper_deferred'; blockType: string; fromEnvelope: number }
   | { kind: 'synthetic_pending_result'; toolUseId: string; reason: 'trailing' | 'mid_stream' }
-  | { kind: 'orphan_tool_result_textified'; toolUseId: string }
+  /**
+   * A tool_result whose tool_use id appears nowhere in the message list was
+   * rewritten as a text block. `recoveredChars` is the length of the payload
+   * carried across — array-form content is flattened, so a zero here means
+   * the result genuinely had no recoverable text, never that structure was
+   * dropped on the floor.
+   */
+  | { kind: 'orphan_tool_result_textified'; toolUseId: string; recoveredChars: number }
+  /**
+   * A tool_result whose tool_use exists but whose own cycle is already
+   * satisfied (a duplicate re-append after a cancellation or stream restart)
+   * was rewritten as a text block. It could not be relocated without
+   * displacing the real result, and dropping it would lose content.
+   *
+   * `reason` names which duplicate shape the producer emitted, since the two
+   * point at different producer bugs:
+   *   - `'cycle_closed'`      → the copy is outside its paired envelope and
+   *                             its own cycle already holds a result, so it
+   *                             had nowhere to be relocated to.
+   *   - `'duplicate_in_cycle'`→ the copy arrived inside its own cycle's user
+   *                             envelope, behind a result that already
+   *                             answered that call. Pairing is one-to-one, so
+   *                             the first result consumes the id and every
+   *                             later copy of it is textified here.
+   */
+  | {
+      kind: 'stray_tool_result_textified';
+      toolUseId: string;
+      fromEnvelope: number;
+      recoveredChars: number;
+      reason: 'cycle_closed' | 'duplicate_in_cycle';
+    }
   | { kind: 'pending_in_flight'; toolUseId: string }
-  | { kind: 'cache_suppressed_for_synthetic'; envelopeIndex: number }
   | {
       /**
        * Fires when the first envelope after re-roling is assistant and a
@@ -189,19 +253,24 @@ export interface BuildResult {
   accumulatedBaseOffset?: number;
 
   /**
-   * `false` only when the tool-pair normalizer detected a trailing
-   * unmatched tool_use whose id is in `pendingToolCallIds` — i.e. the
-   * caller (yielding stream) is mid-cycle and the request should not be
-   * shipped yet. Callers that don't pass `pendingToolCallIds` will never
-   * see `false` here.
+   * `false` only when the tool-pair normalizer left an unmatched tool_use
+   * because its id is in `pendingToolCallIds`, wherever it sits — i.e. the
+   * caller is mid-cycle and the request should not be shipped yet. Callers
+   * that don't pass `pendingToolCallIds` will never see `false` from the
+   * built-in formatters. Membrane refuses a build reporting `false` with
+   * `MembraneNotReadyError`.
    */
   ready?: boolean;
 }
 
 export interface ProviderMessage {
-  role: 'user' | 'assistant';
+  /** 'system' only for a mid-conversation system message (SystemChangeContent), which a formatter that `rendersSystemChanges` builds. */
+  role: 'user' | 'assistant' | 'system';
   content: unknown;
 }
+
+/** A user or assistant turn: what the tool-pair normalizer and the role merge take and give. */
+export type ProviderTurnMessage = ProviderMessage & { role: 'user' | 'assistant' };
 
 // ============================================================================
 // Stream Parser
@@ -276,15 +345,60 @@ export interface StreamParser {
 // Prefill Formatter Interface
 // ============================================================================
 
+/** Source context when parsing visible text between native thinking blocks. */
+export interface ContentParseContext {
+  /** Complete visible response text, excluding provider thinking blocks. */
+  readonly visibleText: string;
+  /** Start of the current content span in visibleText, in String.slice units. */
+  readonly offset: number;
+}
+
 export interface PrefillFormatter {
   /** Formatter name for identification */
   readonly name: string;
 
-  /** Whether this formatter uses prefill (vs native pass-through) */
+  /**
+   * Whether this formatter builds prefill transcripts (vs native pass-through):
+   * a fact about the formatter, not about one build. AnthropicXmlFormatter
+   * says true and still builds a native conversation in native mode; whether
+   * a given build ends in a prefill is its `BuildResult.assistantPrefill`.
+   * Membrane doesn't read this flag.
+   */
   readonly usesPrefill: boolean;
+
+  /**
+   * Whether this formatter can carry provider-native tool definitions —
+   * i.e. whether `buildMessages` can populate `BuildResult.nativeTools`.
+   *
+   * `Membrane.resolveToolMode` reads this to pick the default tool mode:
+   * native wherever the formatter can carry it, XML/prefill only for a
+   * formatter that genuinely cannot (a text-completion surface) or when the
+   * caller opts in explicitly.
+   */
+  readonly supportsNativeTools: boolean;
+
+  /** Whether this formatter can encode tool definitions/results in an XML protocol. */
+  readonly supportsXmlTools: boolean;
 
   /** Participant prefix template for native tool requests. Uses {name}; defaults to '{name}: '. */
   readonly nameFormat?: string;
+
+  /**
+   * True when `buildMessages` records, in `BuildOptions.fidelity`, every
+   * consumer message whose non-empty content it did not carry verbatim (see
+   * utils/fidelity.ts). A formatter that doesn't declare this leaves a
+   * round's fidelity unknown.
+   */
+  readonly reportsAlterations?: boolean;
+
+  /**
+   * True when `buildMessages` sends a message holding `system_change` blocks
+   * (SystemChangeContent) as a mid-conversation `role: 'system'` message. Only
+   * NativeFormatter declares it; AnthropicXmlFormatter doesn't, even in its
+   * native tool mode. Membrane refuses, before sending, a request carrying one
+   * unless both this and the adapter's `sendsSystemChanges` hold.
+   */
+  readonly rendersSystemChanges?: boolean;
 
   /**
    * The tool mode this formatter instance was EXPLICITLY constructed with, if
@@ -349,6 +463,11 @@ export interface PrefillFormatter {
    * Extracts text, thinking, tool_use blocks, etc.
    *
    * `tools` is used exactly as in {@link PrefillFormatter.parseToolCalls}.
+   * When context is supplied, content is a span of the complete visible text.
+   * Preserve whole-response operations (such as prefix trimming) using that
+   * context. Custom parsers and decorators must honor/forward it rather than
+   * treating an internal span as a fresh response. Calls without context keep
+   * whole-response semantics.
    */
-  parseContentBlocks(content: string, tools?: ToolDefinition[]): ContentBlock[];
+  parseContentBlocks(content: string, tools?: ToolDefinition[], context?: ContentParseContext): ContentBlock[];
 }

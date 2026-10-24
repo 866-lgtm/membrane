@@ -15,11 +15,12 @@ import type {
   ToolResult,
   ParsedToolCalls,
   ContentBlock,
+  ToolResultContent,
   ToolResultContentBlock,
   ToolDefinition,
 } from '../types/index.js';
 import { createHash } from 'node:crypto';
-import { resolveImageMediaType, isAcceptedImageMediaType, strippedImagePlaceholder } from './image-media.js';
+import { dataUrlImage, imageForRequest, isAcceptedImage, linkImageNote, type RasterImageMediaType } from './image-media.js';
 import { readToolSchema, type ParameterDeclaration, type ToolSchemaReading } from './tool-schema.js';
 
 // ============================================================================
@@ -214,7 +215,8 @@ function withoutFraming(value: string): string {
  *
  * What happens next depends on the parameter's declaration, as
  * {@link readToolSchema} reads it — the same reading the XML tool
- * instructions are rendered from:
+ * instructions are rendered from, except that they withhold a null the
+ * schema's other keywords leave out (#150):
  *   - typed `string` → the text as written, less one layout newline on each
  *                 side ({@link withoutFraming}). No JSON.parse, no trim: an
  *                 exact-match edit tool must be able to send leading and
@@ -595,6 +597,55 @@ export function endsWithPartialToolBlock(text: string): boolean {
 const STRUCTURAL_TAG_RE =
   /<\/?(?:antml:)?(?:function_calls|function_results|invoke|result|stdout|error|tool_name)\b/;
 
+/** A tool-result image's data and the label it came with, whether it carries
+ *  them in a `source` or MCP-style as `data` and `mimeType`. A `data:` URL
+ *  holds its image inline, so its bytes and label are read from it; any other
+ *  url source's image is at its URL, so none is read, not even data the
+ *  source also carries, as the native path reads one
+ *  (toolResultContentForRequest). The XML replay of a split (anthropic-xml's
+ *  sentSplit) reads a stored result's images with it too, so the two read the
+ *  same blocks as images. */
+export function toolResultImage(block: unknown): { data: unknown; declared: unknown } {
+  const b = block as { source?: { type?: unknown; url?: unknown; data?: unknown; mediaType?: unknown; media_type?: unknown }; data?: unknown; mimeType?: unknown };
+  if (!b.source) return { data: b.data, declared: b.mimeType };
+  if (b.source.type === 'url') {
+    const inline = dataUrlImage(b.source.url);
+    return { data: inline?.data, declared: inline?.declared };
+  }
+  return { data: b.source.data, declared: b.source.mediaType ?? b.source.media_type };
+}
+
+/** A tool-result image as an xml tool loop takes it: its media type and
+ *  data when the request can send it, or the note that stands in its place.
+ *  One at a URL a provider would fetch gets the link's note, since these
+ *  results carry no links; any other, a `data:` URL's among them, is
+ *  imageForRequest's decision, which also notes an image that came without
+ *  its data. */
+function xmlResultImage(
+  block: unknown,
+): { mediaType: RasterImageMediaType; data: string; note?: undefined } | { note: { type: 'text'; text: string } } {
+  const { data, declared } = toolResultImage(block);
+  const source = (block as { source?: unknown }).source;
+  // toolResultImage reads no data from a url source only when it isn't a data: URL.
+  if (data === undefined && typeof source === 'object' && source !== null && (source as { type?: unknown }).type === 'url') {
+    return { note: linkImageNote((source as { url?: unknown }).url) };
+  }
+  const image = imageForRequest(data, declared);
+  return image.placeholder ? { note: image.placeholder } : { mediaType: image.mediaType, data: data as string };
+}
+
+/** The text that stands for a tool-result image where XML can't carry it:
+ *  the format and size of an image the request would send, saying the model
+ *  isn't seeing it, or the note for one it wouldn't send. A note can quote
+ *  what the caller gave (a link, a label), so callers guard it as they guard
+ *  the result's own text. */
+function imageNote(block: Extract<ToolResultContentBlock, { type: 'image' }>): string {
+  const image = xmlResultImage(block);
+  if (image.note) return image.note.text;
+  const sizeKb = Math.round((image.data.length * 0.75) / 1024);
+  return `[Image: ${image.mediaType}, ~${sizeKb}KB, not shown to you]`;
+}
+
 function renderResultContentString(result: ToolResult): string {
   if (typeof result.content === 'string') {
     return result.content;
@@ -604,10 +655,9 @@ function renderResultContentString(result: ToolResult): string {
     if (block.type === 'text') {
       parts.push(block.text);
     } else if (block.type === 'image') {
-      // For XML mode, we can't embed images directly
-      // Add a note about the image for the model
-      const sizeKb = Math.round((block.source.data.length * 0.75) / 1024);
-      parts.push(`[Image: ${block.source.mediaType}, ~${sizeKb}KB]`);
+      // For XML mode, we can't embed images directly. The note says the
+      // model isn't seeing it, so the size isn't read as its contents.
+      parts.push(imageNote(block));
     }
   }
   return parts.join('\n');
@@ -696,10 +746,15 @@ export interface ToolDefinitionForPrompt {
      * `type="undefined"` or a type the parser will not apply.
      */
     type?: string;
-    /** The declaration also admits null: renders `nullable="true"`. */
+    /** The reading's `instructedNullable` (#150): renders `nullable="true"`. */
     nullable?: boolean;
     description?: string;
     required?: boolean;
+    /**
+     * The reading's `enum`, each value as `String()` prints it.
+     * {@link formatToolDefinitions} prints the list where it can show each
+     * value exactly.
+     */
     enum?: string[];
   }>;
 }
@@ -709,7 +764,10 @@ export interface ToolDefinitionForPrompt {
  * input schema by the same reading the XML parameter parser applies
  * ({@link readToolSchema}): the type the model is told a parameter has is the
  * type its value is parsed by, and a parameter the parser cannot type states
- * none.
+ * none. Its null mark is the reading's `instructedNullable`, which keywords
+ * that leave null out withhold though the parse admits null (#150), and its
+ * `enum` lists the values the reading finds behind `$ref`s, in branches and
+ * across root alternatives as well as on the declaring node.
  */
 export function toolDefinitionForPrompt(tool: ToolDefinition): ToolDefinitionForPrompt {
   const { parameters } = readToolSchema(tool.inputSchema);
@@ -721,10 +779,10 @@ export function toolDefinitionForPrompt(tool: ToolDefinition): ToolDefinitionFor
         name,
         {
           type: declaration.type,
-          nullable: declaration.nullable || undefined,
+          nullable: declaration.instructedNullable || undefined,
           description: declaration.description,
           required: declaration.required,
-          enum: declaration.enum,
+          enum: declaration.enum?.map(String),
         },
       ])
     ),
@@ -732,7 +790,32 @@ export function toolDefinitionForPrompt(tool: ToolDefinition): ToolDefinitionFor
 }
 
 /**
- * Format tool definitions as XML for system prompt
+ * Whether `enum="…"`, which joins the values with commas, shows each value
+ * exactly, so the model can split the list and write a value as it is (#176).
+ * A value holding `"` would end the attribute, and one holding `,` would read
+ * as two values. A control character (a line break or a tab among them), a
+ * line or paragraph separator, or a lone surrogate can't be shown as it is.
+ * An empty value, or whitespace at either end, leaves the value's bounds
+ * unclear, and an empty list has no value to show.
+ */
+function listsExactly(values: readonly string[]): boolean {
+  return (
+    values.length > 0 &&
+    values.every(
+      value => value !== '' && value === value.trim() && !/[",\p{Cc}\p{Cs}\p{Zl}\p{Zp}]/u.test(value)
+    )
+  );
+}
+
+/**
+ * Format tool definitions as XML for system prompt.
+ *
+ * A parameter's `enum` values print raw, unlike its name and type, since the
+ * parser doesn't decode entities in a value the model writes: an entity shown
+ * here, such as `&quot;`, would be copied into the call and kept. Where the
+ * attribute can't show every value exactly ({@link listsExactly}), the
+ * parameter's line has no `enum` at all, rather than a list the model would
+ * split wrongly.
  */
 export function formatToolDefinitions(tools: ToolDefinitionForPrompt[]): string {
   const parts: string[] = ['<tools>'];
@@ -747,7 +830,9 @@ export function formatToolDefinitions(tools: ToolDefinitionForPrompt[]): string 
       if (param.type) attrs.push(`type="${escapeXml(param.type)}"`);
       if (param.nullable) attrs.push('nullable="true"');
       if (param.required) attrs.push('required="true"');
-      if (param.enum) attrs.push(`enum="${param.enum.join(',')}"`);
+      // `String` prints a null member as `null`; `join` alone printed it as an empty item (#150).
+      const values = param.enum?.map(String);
+      if (values && listsExactly(values)) attrs.push(`enum="${values.join(',')}"`);
       
       parts.push(`<parameter ${attrs.join(' ')}>`);
       if (param.description) {
@@ -928,6 +1013,11 @@ const LEGACY_ERROR_REGEX = /<error>\n?([\s\S]*?)\n?<\/error>/g;
  * Parse accumulated assistant text into structured ContentBlock[].
  * Extracts thinking blocks, tool calls, tool results, and plain text.
  *
+ * The XML replay groups stored results and calls by how many of them this
+ * parse reads from their raw text (AnthropicXmlFormatter's rawXmlCount), so a
+ * change that reads fewer from a text it once read more from would send that
+ * text more than once.
+ *
  * @param text - The accumulated assistant output text
  * @param options - Optional parsing context
  * @param options.startInsideBlock - Block type we're starting inside (from prefill context)
@@ -965,6 +1055,8 @@ export function parseAccumulatedIntoBlocks(
    * dispatched under the head's name, and the head itself never ran.
    */
   unclosedInvokeHeads: number;
+  /** Each results block the parse kept, in document order (ResultSpan). */
+  resultSpans: ResultSpan[];
 } {
   // If we're starting inside a block from prefill, prepend a synthetic opening tag
   // so the regex can match the closing tag properly
@@ -1172,10 +1264,18 @@ export function parseAccumulatedIntoBlocks(
   }
 
   // Survivors are already in document order, so positions are too.
+  const firstResult = new Map<BlockPosition, number>();
   for (const pos of positions) {
     if (pos.calls) toolCalls.push(...pos.calls);
-    if (pos.results) toolResults.push(...pos.results);
+    if (pos.results) {
+      firstResult.set(pos, toolResults.length);
+      toolResults.push(...pos.results);
+    }
   }
+
+  // Offsets are into processedText, which a synthetic opener may precede.
+  const opener = processedText.length - text.length;
+  const resultSpans: ResultSpan[] = [];
 
   // Build final blocks array, inserting text blocks between special blocks
   // Use processedText for slicing since positions are relative to it
@@ -1190,6 +1290,10 @@ export function parseAccumulatedIntoBlocks(
     }
 
     // Add the special block(s)
+    const result = firstResult.get(pos);
+    if (result !== undefined && Array.isArray(pos.block)) {
+      resultSpans.push({ at: pos.start - opener, block: blocks.length, result, count: pos.block.length });
+    }
     if (Array.isArray(pos.block)) {
       blocks.push(...pos.block);
     } else {
@@ -1217,7 +1321,21 @@ export function parseAccumulatedIntoBlocks(
     emptyToolBlocks,
     splicedToolBlocks,
     unclosedInvokeHeads,
+    resultSpans,
   };
+}
+
+/**
+ * A results block as parseAccumulatedIntoBlocks kept it: where it starts in
+ * the text parsed (before any synthetic opener), the index of its first
+ * tool_result block in `blocks` and of its first entry in `toolResults`, and
+ * how many it holds. The two lists hold its results in the same order.
+ */
+export interface ResultSpan {
+  at: number;
+  block: number;
+  result: number;
+  count: number;
 }
 
 // ============================================================================
@@ -1281,17 +1399,13 @@ export interface ProviderImageBlock {
 }
 
 /**
- * Check if any tool result contains image content
+ * Whether any tool result holds an image the request will send as an image:
+ * one whose data is an accepted format. It asks without deciding, so the
+ * placeholder's warning prints once, where the chosen path decides the image.
  */
 export function hasImageInToolResults(results: ToolResult[]): boolean {
-  for (const result of results) {
-    if (Array.isArray(result.content)) {
-      if (result.content.some(block => block.type === 'image')) {
-        return true;
-      }
-    }
-  }
-  return false;
+  return results.some((result) => Array.isArray(result.content)
+    && result.content.some((block) => block.type === 'image' && isAcceptedImage(toolResultImage(block).data)));
 }
 
 /**
@@ -1314,6 +1428,9 @@ export interface SplitTurnContent {
 
   /** Whether any images were found */
   hasImages: boolean;
+
+  /** Index, in the results given, of the result whose images were split out; -1 when none were. */
+  imageResult: number;
 }
 
 /**
@@ -1356,17 +1473,19 @@ export function formatToolResultsForSplitTurn(results: ToolResult[]): SplitTurnC
         if (block.type === 'text') {
           textParts.push(guardResultContent(block.text));
         } else if (block.type === 'image') {
-          const mediaType = resolveImageMediaType(block.source.data, block.source.mediaType);
-          if (!isAcceptedImageMediaType(mediaType)) {
-            textParts.push(strippedImagePlaceholder(mediaType).text);
+          const image = xmlResultImage(block);
+          if (image.note) {
+            // A note can quote the caller's text (a link, a label), so it
+            // passes the guard the result's own text does.
+            textParts.push(guardResultContent(image.note.text));
           } else {
             resultHasImages = true;
             resultImages.push({
               type: 'image',
               source: {
                 type: 'base64',
-                media_type: mediaType!,
-                data: block.source.data,
+                media_type: image.mediaType,
+                data: image.data,
               },
             });
           }
@@ -1414,6 +1533,7 @@ export function formatToolResultsForSplitTurn(results: ToolResult[]): SplitTurnC
       images: [],
       afterImageXml: '',
       hasImages: false,
+      imageResult: -1,
     };
   }
 
@@ -1422,6 +1542,7 @@ export function formatToolResultsForSplitTurn(results: ToolResult[]): SplitTurnC
     images,
     afterImageXml,
     hasImages: true,
+    imageResult: imageInsertionPoint,
   };
 }
 
@@ -1439,14 +1560,90 @@ function formatSingleResultXml(result: ToolResult): string {
         xml += guardResultContent(block.text);
       } else if (block.type === 'image') {
         // For remaining results after split, images become text placeholders
-        const sizeKb = Math.round((block.source.data.length * 0.75) / 1024);
-        xml += `[Image: ${block.source.mediaType}, ~${sizeKb}KB]`;
+        xml += guardResultContent(imageNote(block));
       }
     }
   }
 
   xml += resultCloseXml(result);
   return xml;
+}
+
+/**
+ * A round split to send its images: the results block it wrote into the
+ * document (`xml`), where that block starts in the turn's new text, which
+ * the final parse reads (`docAt`), where in the block the images went
+ * (`at`), which result's images they were (`imageResult`), and the results
+ * the tools returned.
+ */
+export interface SplitResultsRound {
+  xml: string;
+  docAt: number;
+  at: number;
+  imageResult: number;
+  results: readonly ToolResult[];
+}
+
+/**
+ * Give the result whose images a split round sent its content as the tool
+ * returned it, images included, and the place in the round's text where they
+ * went (`rawXmlImagesAt`), in the blocks and in the tool results alike. The
+ * document holds only the results' text: the user turn that carried the
+ * images is outside it, so a result parsed from the document would otherwise
+ * keep no trace of them.
+ *
+ * A round takes the results block that starts where it wrote its own, so a
+ * block the model wrote, quoted or copied takes nothing, wherever it sits.
+ * That block's text has to be the round's, which holds unless the text
+ * changed after the round wrote it, and the parse has to list as many
+ * results and errors as the round wrote, which then pair in order, each kind
+ * as the parse lists it. A round whose block the parse didn't find where it
+ * was written (an unclosed <function_results> earlier in the turn makes the
+ * parse read both as one block) or whose block didn't parse into its results
+ * takes nothing: its images are lost, as before, and never go to another
+ * result. Returns the parse's own lists when nothing matched, and
+ * otherwise copies with a new object for each entry that changed.
+ */
+export function attachSplitResults(
+  parsed: { blocks: ContentBlock[]; toolResults: ToolResult[]; resultSpans: readonly ResultSpan[] },
+  rounds: readonly SplitResultsRound[],
+): { blocks: ContentBlock[]; toolResults: ToolResult[] } {
+  let blocks: ContentBlock[] | null = null;
+  let toolResults: ToolResult[] | null = null;
+  for (const round of rounds) {
+    const span = parsed.resultSpans.find((s) => s.at === round.docAt);
+    if (!span) continue;
+    const group = parsed.blocks.slice(span.block, span.block + span.count) as ToolResultContent[];
+    if (group[0]?.rawXml !== round.xml) continue;
+    const results = round.results.filter((r) => !r.isError);
+    const errors = round.results.filter((r) => r.isError);
+    // A result whose text didn't parse back would shift the pairing onto a neighbour.
+    const parsedErrors = group.filter((block) => block.isError).length;
+    if (parsedErrors !== errors.length || group.length - parsedErrors !== results.length) continue;
+    const sent = round.results[round.imageResult];
+    if (!sent) continue;
+    let r = 0;
+    let e = 0;
+    for (let i = 0; i < group.length; i++) {
+      const block = group[i]!;
+      if ((block.isError ? errors[e++] : results[r++]) !== sent) continue;
+      blocks ??= [...parsed.blocks];
+      blocks[span.block + i] = { ...block, content: copyResultContent(sent.content), rawXmlImagesAt: round.at };
+      toolResults ??= [...parsed.toolResults];
+      const entry = parsed.toolResults[span.result + i]!;
+      toolResults[span.result + i] = { ...entry, content: copyResultContent(sent.content) as ToolResult['content'] };
+    }
+  }
+  return { blocks: blocks ?? parsed.blocks, toolResults: toolResults ?? parsed.toolResults };
+}
+
+/** A tool result's content, copied so the stored block shares no object with the executor's. */
+function copyResultContent(content: ToolResult['content']): ToolResultContent['content'] {
+  if (typeof content === 'string') return content;
+  return content.map((block) => {
+    const source = (block as { source?: object }).source;
+    return (source ? { ...block, source: { ...source } } : { ...block }) as ContentBlock;
+  });
 }
 
 // ============================================================================

@@ -83,9 +83,10 @@ export interface WireCacheSurfaces {
  * ONE walk serves both the count and the clamp's strip, so a marker the
  * counter can see is always a marker the clamp can strip. A collector that
  * stopped at the top level would count four while five rode to the wire, and
- * the provider would reject the request the belt just declared legal.
+ * the provider would reject the request the belt just declared legal. The
+ * Anthropic adapter's keepalive reads a request's breakpoints through it too.
  */
-function collectMarkedBlocks(surfaces: WireCacheSurfaces): Array<Record<string, unknown>> {
+export function collectMarkedBlocks(surfaces: WireCacheSurfaces): Array<Record<string, unknown>> {
   const marked: Array<Record<string, unknown>> = [];
   const collectIfMarked = (candidate: unknown) =>
     walkBlockTree(candidate, 0, (block) => {
@@ -115,12 +116,14 @@ function collectMarkedBlocks(surfaces: WireCacheSurfaces): Array<Record<string, 
  * Omit empty system arrays and take ownership of nonempty system surfaces
  * before they can reach the clamp. All request builders use the same rule.
  *
- * `request.system` accepts caller-marked blocks, and the builders pass that
- * array through by reference when they add no marker of their own. The clamp
- * strips markers IN PLACE at the wire boundary — correct for blocks membrane
- * built, catastrophic for the caller's own array, which a long-lived caller
- * reuses turn after turn: one over-budget request would silently delete the
- * caller's breakpoints for the life of that object. Copying the array and its
+ * A caller's own system array can carry caller-marked blocks, whether it
+ * comes as a formatter's `systemPrompt` or as `request.system` passed untyped
+ * (the field is typed as a string), and a builder that adds no marker of its
+ * own can pass its blocks through by reference (`NativeFormatter` does). The
+ * clamp strips markers IN PLACE at the wire boundary — correct for blocks
+ * membrane built, catastrophic for the caller's own array, which a long-lived
+ * caller reuses turn after turn: one over-budget request would silently delete
+ * the caller's breakpoints for the life of that object. Copying the array and its
  * blocks at build time keeps the clamp's mutations inside the request.
  *
  * The copy descends exactly as far as marker discovery does: a shallow

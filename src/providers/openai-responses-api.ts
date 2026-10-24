@@ -9,9 +9,12 @@
  * exposes the response's ordered output array verbatim for the next turn.
  */
 
+import { unreportedUsage } from '../utils/usage.js';
 import { createHash, randomUUID } from 'node:crypto';
-import { normalizeResponsesInput } from './responses-input.js';
+import { nativeInputForRequest, normalizeResponsesInput } from './responses-input.js';
+import { blockHandedIn, convertMcpMedia } from '../utils/mcp-media.js';
 import { fetchWithCredentials, type CredentialResolver } from './credentials.js';
+import { assertMessagePrefillSupported } from './request-capabilities.js';
 
 import type {
   ContentBlock,
@@ -24,15 +27,14 @@ import type {
 import {
   MembraneError,
   abortError,
-  authError,
-  contextLengthError,
+  errorFromHttpResponse,
+  invalidRequestError,
+  isTypedAbortError,
   networkError,
-  rateLimitError,
-  creditExhaustionError,
-  isCreditExhaustion,
-  serverError,
+  withRawRequest,
 } from '../types/index.js';
-import { createCombinedSignal, SSELineParser, safeParseJson, isDeadlineAbort, deadlineTimeoutError, throwOnStreamErrorFrame } from './utils.js';
+import { errorFromThrown } from '../types/errors.js';
+import { createCombinedSignal, SSELineParser, toolUseInputFromText, isDeadlineAbort, deadlineTimeoutError, throwOnStreamErrorFrame, isEventObject } from './utils.js';
 
 // ============================================================================
 // Provider-native Responses API types
@@ -127,7 +129,8 @@ export interface OpenAIResponsesAPIAdapterConfig {
   mode?: 'api' | 'subscription';
   /** Request priority service in subscription mode (default: false). */
   fastMode?: boolean;
-  /** Called once if a subscription response reports a non-priority tier. */
+  /** Called once if a subscription response reports a non-priority tier. If
+   * it throws, the error is logged with console.warn and the response stands. */
   onFastModeFallback?: (serviceTier: string) => void;
   /** Subscription mode: base of the prompt-cache routing id sent as the
    * `session_id` header and as `prompt_cache_key`. Each request appends a digest
@@ -151,6 +154,44 @@ export interface OpenAIResponsesAPIAdapterConfig {
   extraHeaders?: Record<string, string>;
 }
 
+/**
+ * The `strict` a function tool is sent with: an explicit boolean as given,
+ * `false` when omitted or null (see {@link OpenAIResponsesAPIAdapter.convertTools}),
+ * and a refusal naming the tool for anything else. The refusal's message says
+ * what kind of value it found, quoting only a short string, so the message
+ * doesn't copy a caller's value whole. The refusal carries `rawRequest`, the
+ * request as far as it was built when refused: provider params merged, and
+ * the tools and input as the caller gave them, the refused tool among them.
+ * It's evidence of what was refused, not a body to send. Without it, Membrane
+ * would give the error the last request it sent in the turn, where there was
+ * one, which isn't the one refused.
+ */
+function functionToolStrictness(toolName: unknown, strict: unknown, position: number, rawRequest: unknown): boolean {
+  if (strict === undefined || strict === null) return false;
+  if (typeof strict === 'boolean') return strict;
+  const spelled = typeof strict === 'string'
+    ? strict.length <= MAX_QUOTED_STRICT_CHARS ? JSON.stringify(strict) : `a ${strict.length}-character string`
+    : Array.isArray(strict)
+      ? 'an array'
+      : typeof strict === 'function'
+        ? 'a function'
+        : typeof strict === 'object'
+          ? 'an object'
+          : `${typeof strict} ${String(strict)}`;
+  const tool = typeof toolName === 'string' && toolName !== ''
+    ? `function tool ${JSON.stringify(toolName)}`
+    : `the function tool at tools[${position}], which has no name,`;
+  throw invalidRequestError(
+    `OpenAI Responses API: ${tool} has strict set to ` +
+      `${spelled}; strict must be true, false, null or omitted (omitted and null are sent as false).`,
+    undefined,
+    rawRequest,
+  );
+}
+
+/** The longest `strict` string a refusal quotes; a longer one is given by its length. */
+const MAX_QUOTED_STRICT_CHARS = 40;
+
 /** A cache key is any JSON string, a header value is not: anything beyond
  * short visible ASCII is sent as a digest, which is just as stable. */
 function headerSafeSessionId(key: string): string {
@@ -165,6 +206,13 @@ function headerSafeSessionId(key: string): string {
 
 export class OpenAIResponsesAPIAdapter implements ProviderAdapter {
   readonly name: string = 'openai-responses-api';
+  /**
+   * Carries native input items verbatim, and reports what it can't: what
+   * subscription-mode normalization leaves out or changes, and, in either
+   * mode, a native input_image whose data: URL holds no image the API
+   * accepts, which goes as the placeholder.
+   */
+  readonly reportsContentAlterations = true;
 
   /**
    * Reads `usage.input_tokens_details.cached_tokens` from OpenAI's account-wide
@@ -229,7 +277,10 @@ export class OpenAIResponsesAPIAdapter implements ProviderAdapter {
     options?: ProviderRequestOptions
   ): Promise<OpenAIResponsesAPIProviderResponse> {
     if (this.subscription) return this.stream(request, { onChunk: () => {} }, options);
-    const responsesRequest = this.buildRequest(request);
+    const responsesRequest = this.buildRequest(request, options?.onContentAltered);
+    // A gateway's Responses endpoint can serve a Claude model, which refuses
+    // an input ending in an assistant turn: refuse it here, typed, before HTTP.
+    assertMessagePrefillSupported(responsesRequest.model, responsesRequest.input, options, this.name, responsesRequest);
     options?.onRequest?.(responsesRequest);
 
     const { signal, cleanup } = createCombinedSignal(options?.signal, options?.timeoutMs);
@@ -252,8 +303,9 @@ export class OpenAIResponsesAPIAdapter implements ProviderAdapter {
     callbacks: StreamCallbacks,
     options?: ProviderRequestOptions
   ): Promise<OpenAIResponsesAPIProviderResponse> {
-    const responsesRequest = this.buildRequest(request);
+    const responsesRequest = this.buildRequest(request, options?.onContentAltered);
     responsesRequest.stream = true;
+    assertMessagePrefillSupported(responsesRequest.model, responsesRequest.input, options, this.name, responsesRequest);
     options?.onRequest?.(responsesRequest);
 
     const { signal, cleanup } = createCombinedSignal(options?.signal, options?.timeoutMs);
@@ -279,6 +331,11 @@ export class OpenAIResponsesAPIAdapter implements ProviderAdapter {
         } catch {
           return;
         }
+        // JSON that isn't an object (`null`, a number, a string, an array)
+        // carries no event, so its frame is dropped, as on the other adapters.
+        if (!isEventObject(event)) return;
+        // A provider event is progress (comments never reach here).
+        options?.onProgress?.();
         events.push(event);
 
         if (event.type === 'response.output_text.delta') {
@@ -365,7 +422,13 @@ export class OpenAIResponsesAPIAdapter implements ProviderAdapter {
           typeof returnedTier === 'string' && returnedTier && returnedTier !== 'priority' &&
           !this.warnedFastFallback) {
         this.warnedFastFallback = true;
-        this.onFastModeFallback?.(returnedTier);
+        try {
+          this.onFastModeFallback?.(returnedTier);
+        } catch (error) {
+          // The response it reports on has arrived and stands. A retry would
+          // pay for another call and wouldn't run the callback again.
+          console.warn('[membrane:openai-responses] onFastModeFallback threw; the response stands:', error);
+        }
       }
       const parsed = this.parseResponse(terminalResponse, request.model, responsesRequest);
       parsed.content.forEach((block, index) => callbacks.onContentBlock?.(index, block));
@@ -409,7 +472,27 @@ export class OpenAIResponsesAPIAdapter implements ProviderAdapter {
     }, this.credentials ?? { token: this.apiKey });
   }
 
-  private buildRequest(request: ProviderRequest): OpenAIResponsesAPIRequest {
+  /**
+   * Subscription mode's input, built from membrane's content blocks. Media in
+   * MCP's form becomes membrane's first, for a caller that builds a request
+   * directly (Membrane's own builds have converted it already,
+   * utils/mcp-media.ts), and a report about a block names the one the caller
+   * handed in. API mode takes native items as they are, so it converts
+   * nothing.
+   */
+  private subscriptionInput(
+    messages: ProviderRequest['messages'],
+    onContentAltered?: (block?: unknown) => void,
+  ): ReturnType<typeof normalizeResponsesInput> {
+    const converted = convertMcpMedia(messages as unknown[]) as ProviderRequest['messages'];
+    const handedIn = blockHandedIn(messages as unknown[], converted as unknown[]);
+    return normalizeResponsesInput(
+      converted,
+      onContentAltered && ((block?: unknown) => onContentAltered(handedIn(block))),
+    );
+  }
+
+  private buildRequest(request: ProviderRequest, onContentAltered?: (block?: unknown) => void): OpenAIResponsesAPIRequest {
     if (!Array.isArray(request.messages)) {
       throw new Error('OpenAI Responses API input must be a provider-native input-item array');
     }
@@ -426,7 +509,7 @@ export class OpenAIResponsesAPIAdapter implements ProviderAdapter {
     if (instructions) responsesRequest.instructions = instructions;
     if (request.temperature !== undefined) responsesRequest.temperature = request.temperature;
     if (request.topP !== undefined) responsesRequest.top_p = request.topP;
-    if (request.tools?.length) responsesRequest.tools = this.convertTools(request.tools);
+    if (request.tools?.length) responsesRequest.tools = request.tools;
 
     // Same mapping as the Chat Completions adapter: OpenAI accepts only
     // "in_memory" or "24h" here, and Membrane's 5m/1h are Anthropic
@@ -460,11 +543,20 @@ export class OpenAIResponsesAPIAdapter implements ProviderAdapter {
       responsesRequest.include = this.mergeEncryptedReasoningInclude(include);
     }
 
+    // Strictness is a property of the tools that reach the wire, whether they
+    // came as request.tools or as a provider-params override of them.
+    if (Array.isArray(responsesRequest.tools)) {
+      responsesRequest.tools = this.convertTools(responsesRequest.tools, responsesRequest);
+    }
+
     // These invariants define the adapter's stateless native-item contract and
     // cannot be overridden through provider params.
+    // The API takes native items as they are, but an input_image whose data:
+    // URL holds no image would be refused on every request, so it goes as the
+    // placeholder in either mode.
     responsesRequest.input = this.subscription
-      ? normalizeResponsesInput(request.messages)
-      : request.messages as OpenAIResponsesInputItem[];
+      ? this.subscriptionInput(request.messages, onContentAltered)
+      : nativeInputForRequest(request.messages, onContentAltered);
     responsesRequest.store = false;
     responsesRequest.include = this.mergeEncryptedReasoningInclude(responsesRequest.include);
     if (forceThinkFirst) this.applyForceThinkFirst(responsesRequest);
@@ -530,22 +622,42 @@ export class OpenAIResponsesAPIAdapter implements ProviderAdapter {
     return text || undefined;
   }
 
-  private convertTools(tools: unknown[]): unknown[] {
-    return tools.map((rawTool: any) => {
+  /**
+   * Every function tool this converts reaches the wire with a boolean `strict`.
+   *
+   * Left out, strictness is whatever the provider defaults to, and strict
+   * validation treats every property as one the model must send. A tool schema
+   * written as plain JSON Schema means the opposite: a property outside
+   * `required` may be omitted. So an omitted or null `strict` is sent as
+   * `false`, stating what the schema means, as the Codex client (a plain
+   * `strict: bool` on every function tool) and pi's Responses conversion
+   * (default `false`) do. An explicit boolean is the caller's choice and is
+   * kept. Any other value is refused rather than coerced: true and false each
+   * change what the model may send, so neither is a safe guess.
+   *
+   * This holds on all three function paths: a flat Responses function, a
+   * nested Chat-style `{ type: 'function', function }` (whose `strict` is read
+   * from the function, or from the wrapper when the function's is omitted or
+   * null), and a definition built from `inputSchema`/`input_schema`/
+   * `parameters`. Every other tool passes through as the caller wrote it: a
+   * non-function tool, which has no such field, and a container such as a
+   * Responses namespace tool, whose member functions keep whatever `strict`
+   * they were given. Membrane builds no container tools, so one arrives only
+   * as a caller wrote it, in the API's own shape. A refusal carries
+   * `rawRequest`, the request as far as it was built, as its own.
+   */
+  private convertTools(tools: unknown[], rawRequest: unknown): unknown[] {
+    return tools.map((rawTool: any, position) => {
       if (rawTool?.type && rawTool.type !== 'function') return rawTool;
 
-      // Responses function definitions are flat. Accept them verbatim, while
-      // also adapting Membrane and Chat Completions function schemas.
-      //
-      // The Responses API defaults an omitted `strict` to TRUE (Chat
-      // Completions defaults it to false). Strict mode makes every property
-      // required, so the model fills optional arguments with zero values
-      // ("", 0) that handlers then read as real input. Adapted schemas are not
-      // written for strict mode, so they keep Chat Completions semantics: not
-      // strict unless the tool says so. Verbatim Responses tools are untouched.
-      if (rawTool?.type === 'function' && rawTool.name) return rawTool;
+      // Responses function definitions are flat: kept as given, apart from
+      // strict. Membrane and Chat Completions function schemas are adapted.
+      if (rawTool?.type === 'function' && rawTool.name) {
+        return { ...rawTool, strict: functionToolStrictness(rawTool.name, rawTool.strict, position, rawRequest) };
+      }
       if (rawTool?.type === 'function' && rawTool.function) {
-        return { type: 'function', ...rawTool.function, strict: rawTool.function.strict ?? false };
+        const fn = rawTool.function;
+        return { type: 'function', ...fn, strict: functionToolStrictness(fn.name, fn.strict ?? rawTool.strict, position, rawRequest) };
       }
       return {
         type: 'function',
@@ -556,7 +668,7 @@ export class OpenAIResponsesAPIAdapter implements ProviderAdapter {
           rawTool?.inputSchema ??
           rawTool?.input_schema ??
           { type: 'object', properties: {} },
-        strict: rawTool?.strict ?? false,
+        strict: functionToolStrictness(rawTool?.name, rawTool?.strict, position, rawRequest),
       };
     });
   }
@@ -572,18 +684,21 @@ export class OpenAIResponsesAPIAdapter implements ProviderAdapter {
   ): OpenAIResponsesAPIProviderResponse {
     const outputItems = Array.isArray(response.output) ? response.output : [];
     const content = this.outputToContent(outputItems);
-    const cachedTokens = response.usage?.input_tokens_details?.cached_tokens ?? 0;
+    // A reported 0 is a fact (no cache read); only an unreported count is absent.
+    const cachedTokens = response.usage?.input_tokens_details?.cached_tokens;
 
     return {
       content,
       outputItems,
       stopReason: this.getStopReason(response, outputItems),
+      providerStopReason: response.incomplete_details?.reason ?? response.status,
       stopSequence: undefined,
       usage: {
         inputTokens: response.usage?.input_tokens ?? 0,
         outputTokens: response.usage?.output_tokens ?? 0,
-        cacheReadTokens: cachedTokens > 0 ? cachedTokens : undefined,
+        ...(typeof cachedTokens === 'number' ? { cacheReadTokens: cachedTokens } : {}),
       },
+      ...unreportedUsage(response.usage?.input_tokens, response.usage?.output_tokens),
       model: response.model ?? requestedModel,
       rawRequest,
       raw: response,
@@ -665,7 +780,7 @@ export class OpenAIResponsesAPIAdapter implements ProviderAdapter {
           type: 'tool_use',
           id: callId,
           name: typeof item.name === 'string' ? item.name : '',
-          input: safeParseJson(typeof item.arguments === 'string' ? item.arguments : '{}'),
+          ...toolUseInputFromText(item.arguments),
           itemId: item.id,
           outputIndex,
           rawItem: item,
@@ -739,8 +854,13 @@ export class OpenAIResponsesAPIAdapter implements ProviderAdapter {
     )) return 'refusal';
 
     const reason = response.incomplete_details?.reason;
-    if (response.status === 'incomplete' && reason?.includes('max_output_tokens')) {
-      return 'max_tokens';
+    if (response.status === 'incomplete' && reason) {
+      if (reason.includes('max_output_tokens')) return 'max_tokens';
+      // A filtered response is a refusal, as on the sibling OpenAI adapters.
+      if (reason === 'content_filter') return 'refusal';
+      // Any other incomplete reason travels as the provider's own token, so
+      // membrane discloses and logs it instead of reading a clean end_turn.
+      return reason;
     }
     return 'end_turn';
   }
@@ -793,35 +913,9 @@ export class OpenAIResponsesAPIAdapter implements ProviderAdapter {
 
   private async assertSuccessfulHTTPResponse(response: Response, rawRequest: unknown): Promise<void> {
     if (response.ok) return;
-    const detail = await response.text();
-    const message = `OpenAI Responses API error: ${response.status} ${detail}`;
-    const status = response.status;
-    if (status === 401 || status === 403) {
-      throw new MembraneError({ type: 'auth', message, retryable: false, httpStatus: status, rawError: detail, rawRequest });
-    }
-    if (status === 429) {
-      const retryAfter = response.headers.get('retry-after');
-      const seconds = retryAfter == null ? NaN : Number(retryAfter);
-      const date = retryAfter == null ? NaN : Date.parse(retryAfter);
-      const delay = Number.isFinite(seconds) ? Math.max(0, seconds * 1000)
-        : Number.isFinite(date) ? Math.max(0, date - Date.now()) : undefined;
-      throw rateLimitError(message, delay, detail, rawRequest);
-    }
-    if (isCreditExhaustion(detail, status)) throw creditExhaustionError(message, detail, rawRequest);
-    if (status >= 500) throw serverError(message, status, detail, rawRequest);
-    if (status === 400 && /context_length|maximum context|token limit|too long/i.test(detail)) {
-      throw contextLengthError(message, detail, rawRequest);
-    }
-    throw new MembraneError({ type: 'invalid_request', message, retryable: false, httpStatus: status, rawError: detail, rawRequest });
+    throw errorFromHttpResponse(this.name, response, await response.text(), rawRequest);
   }
 
-  /**
-   * A terminal response can carry a structured `error` object on a 200, from
-   * the stream's terminal frame or from a non-streaming body. That payload
-   * never reaches an HTTP-status boundary classifier — the status was 200 —
-   * so it is classified here, by the same helper and the same token lists as
-   * every other provider error payload.
-   */
   private assertSuccessfulAPIResponse(
     response: OpenAIResponsesAPIResponse,
     rawRequest?: unknown,
@@ -832,61 +926,10 @@ export class OpenAIResponsesAPIAdapter implements ProviderAdapter {
   }
 
   private handleError(error: unknown, rawRequest?: unknown): MembraneError {
-    // A deadline abort is a timeout and stays one. Collapsing it into a bare
-    // abortError() here is what erased the identity before Membrane's
-    // caller-signal > timeout > error ladder could read it.
     if (isDeadlineAbort(error)) return deadlineTimeoutError(error, rawRequest);
-    if (error instanceof MembraneError) return error;
-    if (error instanceof Error) {
-      const message = error.message;
-      // 402 / insufficient credits: transient at account scale, never a
-      // property of the request (see isCreditExhaustion).
-      if (isCreditExhaustion(message)) {
-        return creditExhaustionError(message, error, rawRequest);
-      }
-      if (message.includes('429') || message.includes('rate_limit')) {
-        const retryMatch = message.match(/retry after (\d+)/i);
-        const retryAfter = retryMatch?.[1] ? Number(retryMatch[1]) * 1000 : undefined;
-        return rateLimitError(message, retryAfter, error, rawRequest);
-      }
-      if (
-        message.includes('401') ||
-        message.includes('invalid_api_key') ||
-        message.includes('Incorrect API key')
-      ) {
-        return authError(message, error, rawRequest);
-      }
-      if (
-        message.includes('context_length') ||
-        message.includes('maximum context') ||
-        message.includes('too long')
-      ) {
-        return contextLengthError(message, error, rawRequest);
-      }
-      if (
-        message.includes('500') ||
-        message.includes('502') ||
-        message.includes('503') ||
-        message.includes('server_error')
-      ) {
-        return serverError(message, undefined, error, rawRequest);
-      }
-      if (error.name === 'AbortError') return abortError(undefined, rawRequest);
-      if (
-        message.includes('network') ||
-        message.includes('fetch') ||
-        message.includes('ECONNREFUSED')
-      ) {
-        return networkError(message, error, rawRequest);
-      }
-    }
+    if (error instanceof MembraneError) return withRawRequest(error, rawRequest);
+    if (isTypedAbortError(error)) return abortError(undefined, rawRequest);
 
-    return new MembraneError({
-      type: 'unknown',
-      message: error instanceof Error ? error.message : String(error),
-      retryable: false,
-      rawError: error,
-      rawRequest,
-    });
+    return errorFromThrown(error, rawRequest);
   }
 }

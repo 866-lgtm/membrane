@@ -2,6 +2,8 @@
  * Content block types for normalized messages
  */
 
+import type { ToolDefinition } from './tools.js';
+
 // ============================================================================
 // Cache Control (Anthropic prompt caching)
 // ============================================================================
@@ -40,10 +42,27 @@ export interface TextContent {
   cache_control?: CacheControl;
   /**
    * Opaque provider-native item this block was derived from (e.g. an OpenAI
-   * Responses output item). Provider-native formatters replay it verbatim;
-   * other providers must ignore it. A zero-width carrier (`text: ''` plus
-   * `rawItem`) has no normalized equivalent and must be filtered out of
-   * requests for providers that reject empty text blocks (Anthropic).
+   * Responses output item, or an Anthropic server-tool block). Formatters
+   * for its own wire replay it verbatim; other providers must ignore it. A
+   * zero-width carrier (`text: ''` plus `rawItem`) has no normalized
+   * equivalent. Membrane's build for an adapter that declares
+   * `replaysAnthropicServerBlocks` (AnthropicAdapter) sends one holding an
+   * Anthropic server-tool block as that block, in the assistant turn that
+   * produced it (`utils/anthropic-server-blocks.ts`), unless the block can't
+   * go alone there: a server call with no result after it in its turn, or a
+   * result with no call before it, is left out and its message reported, and
+   * the request's final message, if it's the assistant's, keeps its lone
+   * calls. Membrane's build for any other adapter, Bedrock's included, leaves
+   * it out; an adapter's own `buildRequest` sends what it is given. Every
+   * Anthropic-shaped build filters out any other carrier, since Anthropic
+   * rejects empty text blocks. Text serializations leave it out.
+   *
+   * Where it is replayed, it goes out in place of this block's other fields,
+   * which are not read: a consumer that changes the block's content
+   * (compression, redaction) must drop or replace `rawItem` too, or the
+   * change won't reach the provider, and round reports count the block as
+   * carried when its item is (utils/fidelity.ts). A path that leaves out a
+   * zero-width carrier reports its message altered.
    */
   rawItem?: unknown;
 }
@@ -119,19 +138,43 @@ export interface ToolUseContent {
    * both corrupts the record and teaches the model a syntax the parser
    * does not accept (membrane#36). Analogous to `signature` on a thinking
    * block. Absent on native-tools blocks and on legacy stored blocks.
+   *
+   * Replayed in place of the block's other fields (`name`, `input`), which
+   * the prefill path then doesn't read: a consumer that changes the call
+   * (truncating its input, say) must drop or replace `rawXml` too, or the
+   * change won't reach the provider, and round reports count the block as
+   * carried when its raw text is (utils/fidelity.ts).
    */
   rawXml?: string;
   /**
-   * Raw accumulated argument text that FAILED to parse as JSON, kept verbatim.
+   * The model's arguments as they came, kept verbatim, when they weren't a
+   * JSON object.
    *
-   * Present only when the provider's streamed `input_json_delta` fragments did
-   * not assemble into valid JSON — a call truncated mid-arguments (max_tokens)
-   * is the usual cause. `input` then holds whatever the provider's
-   * content_block_start carried, which for Anthropic is `{}`: a wire-valid
-   * tool call with empty arguments, indistinguishable from a genuine no-arg
-   * call once it is written to durable history. Presence of this field means
-   * `input` is NOT the model's arguments, so a consumer can refuse the block
-   * (or attempt its own repair) instead of trusting a plausible `{}`.
+   * Present when the argument text a provider sent didn't parse, or parsed to
+   * something other than an object (null, a number, a string, a boolean or an
+   * array), and when an Anthropic or Bedrock stream ended before a call's
+   * block finished (no content_block_stop), whatever had arrived of its
+   * arguments, even nothing: then it is the empty string. A call truncated by
+   * max_tokens is the usual cause. Where arguments come as a value rather
+   * than text (Gemini's, or an `input` that isn't an object), it holds that
+   * value as JSON. It is also set on every tool_use block of a streamed
+   * Anthropic or Bedrock response whose block events broke the API's order
+   * (a block started while another was open or out of index order, a delta
+   * or stop while no block was open or for a block other than the open one,
+   * or a delta a tool call can't take), holding the arguments the
+   * call had, as JSON when they had parsed: such a stream can't vouch for
+   * which call any arguments belong to, so none of its calls is taken as
+   * complete. (In Bedrock a start above the next index fails the call
+   * instead, over the block it skipped.)
+   * `input` is then `{}`, or for a streamed Anthropic or Bedrock call
+   * whatever its content_block_start carried: a wire-valid tool call with
+   * empty arguments, indistinguishable from a genuine no-arg call
+   * once it is written to durable history. Presence of this field, the empty
+   * string included, means `input` is NOT the model's arguments, so a
+   * consumer can refuse the block (or attempt its own repair) instead of
+   * trusting a plausible `{}`. The call's ToolCall carries it too. A
+   * request sends `input` as stored, so round reports don't count a marked
+   * call as altered: this field records the replacement.
    */
   unparseableInput?: string;
 
@@ -153,9 +196,40 @@ export interface ToolResultContent {
    * Verbatim document text this result was parsed from in prefill/XML mode:
    * the full `<function_results>…</function_results>` block as the harness
    * originally placed it in the document, shared by every result parsed
-   * from that block. Replayed exactly on the prefill path (membrane#36).
+   * from that block. Replayed exactly on the prefill path (membrane#36), in
+   * place of the block's other fields (`content`, `toolName`, `isError`): a
+   * consumer that changes the result (truncating it, say) must drop or
+   * replace `rawXml` too, or the change won't reach the provider, and round
+   * reports count the block as carried when its raw text is
+   * (utils/fidelity.ts). Where `rawXmlImagesAt` is set, the replay can also
+   * send the images the turn sent, from `content`, at that place (see there).
    */
   rawXml?: string;
+  /**
+   * Set on the result whose images an XML tool loop sent in a user turn of
+   * their own, splitting its results block: the offset in `rawXml` where the
+   * split fell. Its `content` then holds what the tool returned, images
+   * included. The prefill path replays `rawXml` split at that offset, with
+   * the images from `content` that an XML split sends (the accepted image
+   * formats) between the two parts, as the turn sent it, and the images are
+   * carried with the raw text. It sends `rawXml` whole instead when the
+   * offset no longer falls where a result or error in the block closes, or when
+   * `content` holds no image a split sends; if `content` still holds an image
+   * then, the request leaves it out and the round report counts the message
+   * altered. A message that also carries images of its own goes to the
+   * provider as one user turn, with these images where the split fell. What
+   * the turn added after the block, such as the thinking opener a thinking
+   * turn writes there, replays as it did before. A consumer that changes the
+   * result, removing an image included, drops this with `rawXml`: the result
+   * then renders from `content`, with a note where an image isn't sent.
+   * Results with the same `rawXml` replay as one block, its text sent once,
+   * for as many results as the parser reads from that text; more results
+   * with the same text are another round's, and replay as a block of their
+   * own, as does a second result with this mark. The count is the parser's
+   * reading today, so it holds while the parser reads the text as the turn's
+   * parse did.
+   */
+  rawXmlImagesAt?: number;
   /** See {@link TextContent.rawItem}. */
   rawItem?: unknown;
 }
@@ -189,6 +263,54 @@ export interface RedactedThinkingContent {
 }
 
 // ============================================================================
+// System Changes
+// ============================================================================
+
+/**
+ * A change, from this point in the conversation on, to the tools the model is
+ * offered and to its system text, made without editing the request's `tools`
+ * or `system`, so the prompt cache before it still holds.
+ *
+ * A message holding one holds nothing else; NativeFormatter refuses a message
+ * that mixes it with other blocks. Its participant isn't read: the block's
+ * type decides how it goes out.
+ *
+ * NativeFormatter sends each such message, through AnthropicAdapter, as a
+ * mid-conversation `role: 'system'` message: each of `removeTools` as a
+ * `tool_removal` naming the tool, then each of `defineTools` as a
+ * `tool_addition` carrying its full definition, then each of `addSystem` that
+ * isn't only whitespace as a text block (one that is is left out and the
+ * message reported altered): that order within each block, and the blocks in the message's
+ * order, so a removal in a later block withdraws a tool an earlier one
+ * defined. A tool a change defines can be called like one in `tools`, and a
+ * call to it comes back under its name. It goes at the first
+ * point at or after its place where the API accepts one: after a user turn,
+ * a tool-result turn included, and before an assistant turn or at the end,
+ * reading the turns as the adapter's empty-text cleanup leaves them.
+ * With no such point, as after a final assistant message, the request is
+ * refused before sending. Through any other formatter or adapter, Membrane
+ * refuses a request that carries one before sending. Both refusals, and the
+ * API's own refusal on a model without mid-conversation system messages, are
+ * MembraneErrors with `systemChangeRefused: true`. Through NativeFormatter and
+ * AnthropicAdapter, a malformed change, mixed with other blocks or defining a
+ * tool whose wire name another holds, is refused as unsupported, without the
+ * flag. Through anything else the refusal for the formatter or adapter comes
+ * first, with it, unless the formatter can't carry the request's tools at all
+ * (`tools` as the request's changes leave them, definitions added and
+ * removals taken away): that refusal comes before
+ * it, without the flag, since making the change in `tools` would meet it too.
+ */
+export interface SystemChangeContent {
+  type: 'system_change';
+  /** Tools withdrawn from here on, by name. */
+  removeTools?: string[];
+  /** Tools offered from here on, each by its full definition: a new tool, or a redefinition of one by its name. */
+  defineTools?: ToolDefinition[];
+  /** System text added from here on, one text block each; only whitespace is left out. */
+  addSystem?: string[];
+}
+
+// ============================================================================
 // Union Type
 // ============================================================================
 
@@ -207,7 +329,9 @@ export type ContentBlock =
   | ToolResultContent
   // Thinking
   | ThinkingContent
-  | RedactedThinkingContent;
+  | RedactedThinkingContent
+  // System changes
+  | SystemChangeContent;
 
 // ============================================================================
 // Type Guards
@@ -251,6 +375,10 @@ export function isThinkingContent(block: ContentBlock): block is ThinkingContent
 
 export function isRedactedThinkingContent(block: ContentBlock): block is RedactedThinkingContent {
   return block.type === 'redacted_thinking';
+}
+
+export function isSystemChangeContent(block: ContentBlock): block is SystemChangeContent {
+  return block.type === 'system_change';
 }
 
 export function isMediaContent(

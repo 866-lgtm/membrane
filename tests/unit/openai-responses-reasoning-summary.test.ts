@@ -13,6 +13,7 @@ import {
 } from '../../src/providers/openai-responses-api.js';
 import { Membrane } from '../../src/membrane.js';
 import { OpenAIResponsesFormatter } from '../../src/formatters/openai-responses.js';
+import { FidelityNotes } from '../../src/utils/fidelity.js';
 import type { ContentBlock, ProviderRequest } from '../../src/types/index.js';
 
 function providerRequest(overrides: Partial<ProviderRequest> = {}): ProviderRequest {
@@ -143,6 +144,26 @@ describe('Responses reasoning summary round trip', () => {
       expect(formatter.buildMessages([{ participant: 'Agent', content }], options).messages)
         .toEqual([reasoningItem, answerItem]);
     }
+  });
+
+  it('counts the summary as carried by the reasoning item it sits beside, and only there', () => {
+    const formatter = new OpenAIResponsesFormatter();
+    const summary = { type: 'thinking' as const, thinking: 'summary text', tokenEstimate: 0 };
+    const carried = new FidelityNotes();
+    formatter.buildMessages([{ participant: 'Agent', content: [
+      summary,
+      { type: 'redacted_thinking' as const, data: 'enc-sum', rawItem: reasoningItem },
+      { type: 'text' as const, text: 'The pond is 1.6m deep.', rawItem: answerItem },
+    ] }], { ...options, fidelity: carried });
+    expect([...carried.altered]).toEqual([]);
+
+    // With no reasoning item replayed beside it, nothing carries it.
+    const alone = new FidelityNotes();
+    formatter.buildMessages([{ participant: 'Agent', content: [
+      summary,
+      { type: 'text' as const, text: 'The pond is 1.6m deep.', rawItem: answerItem },
+    ] }], { ...options, fidelity: alone });
+    expect([...alone.altered]).toEqual([0]);
   });
 
   it('replays a reasoning item shared by several blocks once', () => {

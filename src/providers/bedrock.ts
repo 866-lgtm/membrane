@@ -4,6 +4,9 @@
  * Uses the Anthropic Messages API format through AWS Bedrock.
  */
 
+import { unreportedUsage } from '../utils/usage.js';
+import { assertMessagePrefillSupported } from './request-capabilities.js';
+
 import type {
   ProviderAdapter,
   ProviderRequest,
@@ -15,20 +18,29 @@ import type {
 import {
   MembraneError,
   invalidRequestError,
-  rateLimitError,
-  contextLengthError,
-  authError,
-  serverError,
   abortError,
+  errorFromHttpResponse,
+  errorFromProviderStatus,
+  isTypedAbortError,
+  networkError,
+  withRawRequest,
 } from '../types/index.js';
+import { errorFromThrown } from '../types/errors.js';
 import { stripEmptyTextRequest } from '../utils/empty-text.js';
-import { createCombinedSignal, isDeadlineAbort, deadlineTimeoutError, assertTerminalEventObserved } from './utils.js';
+import { isUnsignedThinking } from '../utils/thinking-carriers.js';
+import { createCombinedSignal, isDeadlineAbort, deadlineTimeoutError, assertTerminalEventObserved, toolUseInputFromText, toolUseInputFromValue, streamIndex, isEventObject, isToolCallBlock, isToolCallArgumentsDelta } from './utils.js';
 import {
   INTERLEAVED_THINKING_BETA,
+  THINKING_BINDING_BETA,
+  THINKING_DISPLAY_UPDATES_BETA,
   needsInterleavedThinkingBeta,
+  readInputTransformations,
+  sendsBlockBinding,
+  sendsDisplayUpdates,
   thinkingEnabled,
-  detectImageMediaType,
 } from './anthropic.js';
+import { imageForRequest, urlImageForRequest } from '../utils/image-media.js';
+import { convertMcpMedia, isSourcelessMedia } from '../utils/mcp-media.js';
 
 // ============================================================================
 // Adapter Configuration
@@ -81,7 +93,11 @@ interface BedrockMessageRequest {
   top_k?: number;
   stop_sequences?: string[];
   tools?: unknown[];
-  thinking?: { type: 'enabled'; budget_tokens: number };
+  /** As membrane builds it: enabled with a budget, or adaptive, either with
+   *  `display` and binding controls when they're set. */
+  thinking?:
+    | { type: 'enabled'; budget_tokens: number; display?: 'summarized' | 'omitted' | 'updates'; block_binding?: { prefix_mismatch_behavior: 'error' | 'drop_block' } }
+    | { type: 'adaptive'; display?: 'summarized' | 'omitted' | 'updates'; block_binding?: { prefix_mismatch_behavior: 'error' | 'drop_block' } };
   /** Beta flags. On bedrock-runtime these ride in the body, not a header. */
   anthropic_beta?: string[];
 }
@@ -98,6 +114,8 @@ interface BedrockMessageResponse {
     id?: string;
     name?: string;
     input?: unknown;
+    /** Set by the stream assembly, never by Bedrock (ToolUseContent.unparseableInput). */
+    unparseableInput?: string;
   }>;
   model: string;
   stop_reason: 'end_turn' | 'max_tokens' | 'stop_sequence' | 'tool_use' | null;
@@ -108,6 +126,8 @@ interface BedrockMessageResponse {
     cache_creation_input_tokens?: number;
     cache_read_input_tokens?: number;
   };
+  /** The thinking-binding report (with THINKING_BINDING_BETA). */
+  input_transformations?: unknown;
 }
 
 interface BedrockStreamEvent {
@@ -136,6 +156,8 @@ interface BedrockStreamEvent {
     cache_creation_input_tokens?: number | null;
     cache_read_input_tokens?: number | null;
   };
+  /** On message_delta, after a server-side model fallback: the serving model's report. */
+  input_transformations?: unknown;
 }
 
 /**
@@ -274,6 +296,15 @@ async function signRequest(
 
 export class BedrockAdapter implements ProviderAdapter {
   readonly name = 'bedrock';
+  /**
+   * Reports what it leaves out: whitespace-only text its cleanup removes, an
+   * image whose data the API doesn't accept, which goes as the placeholder
+   * (at the top level or nested in a tool result), and a passthrough
+   * `messages` that replaces the built ones. Otherwise it carries message
+   * content as built, nested tool-result blocks included; only wire fields
+   * (sourceUrl, cache ttl, media_type spelling) change.
+   */
+  readonly reportsContentAlterations = true;
   readonly cacheReceiptBasis = 'wire-request' as const;
 
   /**
@@ -372,13 +403,14 @@ export class BedrockAdapter implements ProviderAdapter {
     options?: ProviderRequestOptions
   ): Promise<ProviderResponse> {
     const bedrockModelId = this.toBedrockModelId(request.model);
-    const bedrockRequest = this.buildRequest(request, bedrockModelId);
+    const bedrockRequest = this.buildRequest(request, bedrockModelId, options?.onContentAltered);
     const fullRequest = { modelId: bedrockModelId, ...bedrockRequest };
+    assertMessagePrefillSupported(bedrockModelId, fullRequest.messages, options, this.name, fullRequest);
     options?.onRequest?.(fullRequest);
 
     const { signal: combinedSignal, cleanup } = createCombinedSignal(options?.signal, options?.timeoutMs);
     try {
-      const response = await this.invokeModel(bedrockModelId, bedrockRequest, combinedSignal);
+      const response = await this.invokeModel(bedrockModelId, bedrockRequest, combinedSignal, fullRequest);
       return this.parseResponse(response, fullRequest);
     } catch (error) {
       throw this.handleError(error, fullRequest);
@@ -393,13 +425,14 @@ export class BedrockAdapter implements ProviderAdapter {
     options?: ProviderRequestOptions
   ): Promise<ProviderResponse> {
     const bedrockModelId = this.toBedrockModelId(request.model);
-    const bedrockRequest = this.buildRequest(request, bedrockModelId);
+    const bedrockRequest = this.buildRequest(request, bedrockModelId, options?.onContentAltered);
     const fullRequest = { modelId: bedrockModelId, ...bedrockRequest, stream: true };
+    assertMessagePrefillSupported(bedrockModelId, fullRequest.messages, options, this.name, fullRequest);
     options?.onRequest?.(fullRequest);
 
     const { signal: combinedSignal, cleanup } = createCombinedSignal(options?.signal, options?.timeoutMs);
     try {
-      return await this.invokeModelWithStream(bedrockModelId, bedrockRequest, callbacks, combinedSignal);
+      return await this.invokeModelWithStream(bedrockModelId, bedrockRequest, callbacks, combinedSignal, fullRequest, options?.onProgress);
     } catch (error) {
       throw this.handleError(error, fullRequest);
     } finally {
@@ -407,7 +440,14 @@ export class BedrockAdapter implements ProviderAdapter {
     }
   }
 
-  private buildRequest(request: ProviderRequest, bedrockModelId?: string): BedrockMessageRequest {
+  private buildRequest(request: ProviderRequest, bedrockModelId?: string, onContentAltered?: (block?: unknown) => void): BedrockMessageRequest {
+    // Wire copies of the request's own blocks, so a block the cleanup drops
+    // is reported as the block membrane built (and can attribute).
+    const originals = new WeakMap<object, unknown>();
+    const remember = <T>(copy: T, original: unknown): T => {
+      if (copy !== original && copy !== null && typeof copy === 'object') originals.set(copy as object, original);
+      return copy;
+    };
     // Strip provider-specific fields (e.g., sourceUrl for Gemini) from image blocks
     // before sending to Bedrock/Anthropic, which rejects extra inputs.
     //
@@ -419,44 +459,90 @@ export class BedrockAdapter implements ProviderAdapter {
     // caller that sets cacheTtl. (Connectome issue #35.)
     // Bedrock is strict about the wire shape of image sources: internal blocks
     // carry camelCase `mediaType`, the API requires snake_case `media_type`.
-    // The Anthropic adapter converts on both paths (toAnthropicContent /
-    // toAnthropicToolResultContent); without the same conversion here a
-    // tool-returned image 400s with "media_type: Field required" mid-turn
+    // The Anthropic adapter converts on both paths (top-level images in its
+    // buildRequest, nested ones through toAnthropicToolResultContent); without
+    // the same conversion here a tool-returned image 400s with
+    // "media_type: Field required" mid-turn
     // (observed on eidoverse snapshot results, 2026-08-08). Applies to
     // top-level image blocks AND images nested inside tool_result content.
-    const toWireImage = (block: any): any => {
+    // Data that is no image the API accepts goes as imageForRequest's
+    // placeholder text instead, keeping any cache breakpoint the image
+    // carried; `onPlaceholder` hears each one.
+    const toWireImage = (block: any, onPlaceholder: () => void): any => {
       const source = block.source;
+      if (source?.type === 'url') {
+        // A data: URL holds its image inline, so it goes as base64 data or
+        // the placeholder; any other URL goes as it is.
+        const image = urlImageForRequest(source.url);
+        if (image.placeholder) {
+          onPlaceholder();
+          return block.cache_control ? { ...image.placeholder, cache_control: block.cache_control } : image.placeholder;
+        }
+        return image.data ? { ...block, source: { type: 'base64', media_type: image.mediaType, data: image.data } } : block;
+      }
       if (!source || source.type !== 'base64') return block;
       const { mediaType, media_type, ...restSource } = source;
+      const image = imageForRequest(source.data, media_type ?? mediaType);
+      if (image.placeholder) {
+        onPlaceholder();
+        return block.cache_control ? { ...image.placeholder, cache_control: block.cache_control } : image.placeholder;
+      }
       return {
         ...block,
         source: {
           ...restSource,
-          media_type: detectImageMediaType(source.data, (media_type ?? mediaType) as string),
+          media_type: image.mediaType,
         },
       };
     };
     const sanitizedMessages = (request.messages as any[]).map((msg: any) => {
       if (!Array.isArray(msg.content)) return msg;
+      // Media in MCP's form becomes membrane's first, for a caller that
+      // builds a request directly (Membrane's own builds have converted it
+      // already, utils/mcp-media.ts), as the Anthropic adapter converts it. A
+      // report about a block names the one the caller handed in.
+      const converted = convertMcpMedia(msg.content as unknown[]) as any[];
       return {
         ...msg,
-        content: msg.content.map((block: any) => {
-          if (block.type === 'image' && block.sourceUrl !== undefined) {
-            const { sourceUrl, ...rest } = block;
-            return stripCacheTtl(toWireImage(rest));
+        content: msg.content.flatMap((original: any, index: number) => {
+          const block = converted[index];
+          if (isSourcelessMedia(block)) {
+            // Media with no source object (MCP's form that didn't convert)
+            // has no form the API takes: left out, and reported.
+            onContentAltered?.(original);
+            return [];
           }
-          if (block.type === 'image') {
-            return stripCacheTtl(toWireImage(block));
+          if (isUnsignedThinking(block)) {
+            // Another provider's reasoning has no signature, and the
+            // Anthropic API refuses a thinking block without a valid one
+            // (#191): left out, and reported, as the Anthropic adapter does.
+            onContentAltered?.(original);
+            return [];
           }
-          if (block.type === 'tool_result' && Array.isArray(block.content)) {
-            return stripCacheTtl({
-              ...block,
-              content: block.content.map((inner: any) =>
-                inner?.type === 'image' ? toWireImage(inner) : inner,
-              ),
-            });
-          }
-          return stripCacheTtl(block);
+          return [remember((() => {
+            if (block.type === 'image' && block.sourceUrl !== undefined) {
+              const { sourceUrl, ...rest } = block;
+              return stripCacheTtl(toWireImage(rest, () => onContentAltered?.(original)));
+            }
+            if (block.type === 'image') {
+              return stripCacheTtl(toWireImage(block, () => onContentAltered?.(original)));
+            }
+            if (block.type === 'tool_result' && Array.isArray(block.content)) {
+              let altered = false;
+              // Media with no source object has no form the API takes here
+              // either: left out, and the result reported, as at the top.
+              const content = block.content.flatMap((inner: any) => {
+                if (isSourcelessMedia(inner)) {
+                  altered = true;
+                  return [];
+                }
+                return [inner?.type === 'image' ? toWireImage(inner, () => { altered = true; }) : inner];
+              });
+              if (altered) onContentAltered?.(original);
+              return stripCacheTtl({ ...block, content });
+            }
+            return stripCacheTtl(block);
+          })(), original)];
         }),
       };
     });
@@ -514,6 +600,8 @@ export class BedrockAdapter implements ProviderAdapter {
     // Apply extra params, excluding internal membrane fields
     if (request.extra) {
       const { normalizedMessages, prompt, ...rest } = request.extra as Record<string, unknown>;
+      // A passthrough `messages` replaces the built messages wholesale.
+      if (rest.messages !== undefined) onContentAltered?.();
       Object.assign(params, rest);
     }
 
@@ -537,15 +625,28 @@ export class BedrockAdapter implements ProviderAdapter {
       const existing = params.anthropic_beta ?? [];
       params.anthropic_beta = [...new Set([...existing, INTERLEAVED_THINKING_BETA])];
     }
+    // Thinking-binding controls need their beta, the same way.
+    if (sendsBlockBinding(params)) {
+      const existing = params.anthropic_beta ?? [];
+      params.anthropic_beta = [...new Set([...existing, THINKING_BINDING_BETA])];
+    }
+    // So does `display: 'updates'` (progress notes between tool calls).
+    if (sendsDisplayUpdates(params)) {
+      const existing = params.anthropic_beta ?? [];
+      params.anthropic_beta = [...new Set([...existing, THINKING_DISPLAY_UPDATES_BETA])];
+    }
 
-    stripEmptyTextRequest(params);
+    stripEmptyTextRequest(params, onContentAltered
+      ? (dropped) => onContentAltered(dropped !== null && typeof dropped === 'object' ? originals.get(dropped) ?? dropped : dropped)
+      : undefined);
     return params;
   }
 
   private async invokeModel(
     modelId: string,
     request: BedrockMessageRequest,
-    signal?: AbortSignal
+    signal: AbortSignal | undefined,
+    rawRequest: unknown
   ): Promise<BedrockMessageResponse> {
     const url = new URL(
       `${this.baseURL ?? `https://bedrock-runtime.${this.region}.amazonaws.com`}/model/${encodeURIComponent(modelId)}/invoke`
@@ -577,8 +678,7 @@ export class BedrockAdapter implements ProviderAdapter {
     });
 
     if (!response.ok) {
-      const errorText = await response.text();
-      throw new BedrockError(response.status, errorText);
+      throw errorFromHttpResponse(this.name, response, await response.text(), rawRequest);
     }
 
     return response.json() as Promise<BedrockMessageResponse>;
@@ -588,7 +688,9 @@ export class BedrockAdapter implements ProviderAdapter {
     modelId: string,
     request: BedrockMessageRequest,
     callbacks: StreamCallbacks,
-    signal?: AbortSignal
+    signal: AbortSignal | undefined,
+    rawRequest: unknown,
+    onProgress?: () => void,
   ): Promise<ProviderResponse> {
     const url = new URL(
       `${this.baseURL ?? `https://bedrock-runtime.${this.region}.amazonaws.com`}/model/${encodeURIComponent(modelId)}/invoke-with-response-stream`
@@ -620,22 +722,57 @@ export class BedrockAdapter implements ProviderAdapter {
     });
 
     if (!response.ok) {
-      const errorText = await response.text();
-      throw new BedrockError(response.status, errorText);
+      throw errorFromHttpResponse(this.name, response, await response.text(), rawRequest);
     }
 
     // Parse the binary event stream
     const contentBlocks: Array<{ type: string; text?: string; thinking?: string; signature?: string }> = [];
+    // Indices of blocks content_block_stop finalized. A tool call truncated by
+    // max_tokens never gets one, as in the Anthropic adapter.
+    const stoppedBlocks = new Set<number>();
     let currentBlockIndex = -1;
+    // Block events come in the API's order: a start while no block is open,
+    // at the next index, then that block's deltas (a tool call's carry only
+    // its arguments: isToolCallBlock, isToolCallArgumentsDelta) and its stop.
+    // A start above the next index is placed, as it always was, and the slots
+    // it skips fail the call below as lost blocks; the Anthropic adapter takes
+    // that start as out of order instead. A stream that ends with a block
+    // open, as a max_tokens cut does, is in order. Reading stops at
+    // message_delta, as in the Anthropic adapter, so a block still open there
+    // is cut off in both. The first event that isn't in order
+    // means the stream can't vouch for which call any arguments belong to:
+    // no later block event is applied, a block still open stays unstopped
+    // (marked below), and every tool_use block in the response is marked,
+    // with one warning.
+    let blockOrderBroken = false;
+    // A start that names no block, while none is open, is skipped as it
+    // always was: until the next start, the deltas and stop after it join no
+    // block rather than breaking block order, and a later block still fails
+    // the call over the block the message lost. A start while a block is
+    // open, or at an index below the next, breaks block order whatever it
+    // names.
+    let skippedStart = false;
+    const blockOpen = (): boolean =>
+      currentBlockIndex >= 0 && contentBlocks[currentBlockIndex] !== undefined && !stoppedBlocks.has(currentBlockIndex);
+    const breakBlockOrder = (what: string): void => {
+      if (blockOrderBroken) return;
+      blockOrderBroken = true;
+      console.warn('[membrane:bedrock] Skipping malformed stream event:', `${what}; no later block event is applied, and every tool_use block in the response is marked`);
+    };
     let finalMessage: BedrockMessageResponse | undefined;
     let inputTokens = 0;
     let outputTokens = 0;
+    // Whether the stream reported each count (an unreported one stays a 0 default).
+    let inputReported = false;
+    let outputReported = false;
     let cacheCreationTokens: number | undefined;
     let cacheReadTokens: number | undefined;
-    let stopReason: string = 'end_turn';
+    let stopReason: string | undefined;
     let sawTerminalEvent = false;
     let stopSequence: string | undefined;
     let fullText = '';
+    // Final in message_start, replaced by a message_delta's after a fallback.
+    let inputTransformations: unknown;
 
     const reader = response.body?.getReader();
     if (!reader) {
@@ -645,7 +782,7 @@ export class BedrockAdapter implements ProviderAdapter {
     let buffer = new Uint8Array(0);
 
     try {
-      while (true) {
+      read: while (true) {
         const { done, value } = await reader.read();
         if (done) break;
 
@@ -719,134 +856,211 @@ export class BedrockAdapter implements ProviderAdapter {
               // Use exception type as message
             }
             throw new BedrockError(
-              exceptionType.toLowerCase().includes('throttl') ? 429 : 500,
-              `Bedrock stream error (${exceptionType}): ${errorMessage}`
+              BEDROCK_STREAM_EXCEPTION_STATUS.get(exceptionType.toLowerCase()) ?? 500,
+              `Bedrock stream error (${exceptionType}): ${errorMessage}`,
+              exceptionType
             );
           }
 
           // Parse the JSON payload
           if (eventType === 'chunk' && payloadBytes.length > 0) {
+            // Decode first. An event that doesn't decode, carries no bytes,
+            // or decodes to JSON that isn't an object (`null`, a number, a
+            // string, an array) is skipped, with a warning. Nothing after the
+            // decode is caught here, so an error there, a caller's callback
+            // included, fails the stream.
+            let decoded: unknown;
+            let skipped: unknown = 'no event in its bytes';
             try {
               const payloadJson = JSON.parse(new TextDecoder().decode(payloadBytes));
               if (payloadJson.bytes) {
-                // Decode base64 payload
                 // Decode base64 → bytes → UTF-8 string (atob returns Latin-1, mangling multi-byte emoji)
                 const binaryStr = atob(payloadJson.bytes);
                 const bytes = new Uint8Array(binaryStr.length);
                 for (let i = 0; i < binaryStr.length; i++) {
                   bytes[i] = binaryStr.charCodeAt(i);
                 }
-                const eventData = JSON.parse(new TextDecoder().decode(bytes)) as BedrockStreamEvent;
+                decoded = JSON.parse(new TextDecoder().decode(bytes));
+                skipped = 'bytes that decode to no object';
+              }
+            } catch (e) {
+              skipped = e;
+            }
+            const eventData = isEventObject(decoded) ? decoded as BedrockStreamEvent : undefined;
+            if (eventData === undefined) console.warn('[membrane:bedrock] Skipping malformed stream event:', skipped);
 
-                // Check for error events within the stream
-                if (eventData.type === 'error') {
-                  throw new BedrockError(
-                    500,
-                    `Bedrock stream error: ${(eventData as any).error?.message || JSON.stringify(eventData)}`
-                  );
+            if (eventData !== undefined) {
+              // A decoded model event is progress; a ping only proves the
+              // connection.
+              if ((eventData as { type?: string }).type !== 'ping') onProgress?.();
+
+              // Check for error events within the stream
+              if (eventData.type === 'error') {
+                // Anthropic's own error event: its error.type
+                // (overloaded_error, rate_limit_error, ...) is the code
+                // the shared table reads a status from; one it doesn't
+                // know stays a 500.
+                const streamError = (eventData as any).error;
+                throw new BedrockError(
+                  undefined,
+                  `Bedrock stream error: ${streamError?.message || JSON.stringify(eventData)}`,
+                  typeof streamError?.type === 'string' ? streamError.type : undefined
+                );
+              }
+
+              if (eventData.type === 'message_start' && eventData.message) {
+                // Cache metrics ride the same usage objects as on the direct
+                // API. Dropping them (pre-2026-07-31) made caching look
+                // permanently inert on Bedrock streams: complete() surfaced
+                // them, stream() zeroed them, and every ledger/pricing
+                // consumer downstream saw zeros. (Connectome issue #35.)
+                inputTransformations = eventData.message.input_transformations;
+                const startUsage = eventData.message.usage;
+                inputTokens = startUsage?.input_tokens ?? 0;
+                inputReported = typeof startUsage?.input_tokens === 'number';
+                if (startUsage?.cache_creation_input_tokens != null) {
+                  cacheCreationTokens = startUsage.cache_creation_input_tokens;
                 }
-
-                if (eventData.type === 'message_start' && eventData.message) {
-                  // Cache metrics ride the same usage objects as on the direct
-                  // API. Dropping them (pre-2026-07-31) made caching look
-                  // permanently inert on Bedrock streams: complete() surfaced
-                  // them, stream() zeroed them, and every ledger/pricing
-                  // consumer downstream saw zeros. (Connectome issue #35.)
-                  const startUsage = eventData.message.usage;
-                  inputTokens = startUsage?.input_tokens ?? 0;
-                  if (startUsage?.cache_creation_input_tokens != null) {
-                    cacheCreationTokens = startUsage.cache_creation_input_tokens;
+                if (startUsage?.cache_read_input_tokens != null) {
+                  cacheReadTokens = startUsage.cache_read_input_tokens;
+                }
+              } else if (eventData.type === 'content_block_start') {
+                // Order first: a start while a block is open, or at an index
+                // below the next (one already used, or a slot a start above
+                // the next skipped), breaks block order whatever it names.
+                // Then a block whose index names no slot (an absent index is
+                // slot 0, as streamIndex reads it), or that isn't an object,
+                // an array included, can't be placed: it's skipped, with the
+                // warning, and its deltas and stop join no block, though a
+                // text delta's text still streams.
+                const startIndex = streamIndex(eventData.index);
+                const startBlock: unknown = eventData.content_block;
+                if (blockOrderBroken || blockOpen() || (startIndex !== undefined && startIndex < contentBlocks.length)) {
+                  breakBlockOrder('a content_block_start while a block is open or at an index below the next');
+                } else if (startIndex === undefined || startBlock === null || typeof startBlock !== 'object' || Array.isArray(startBlock)) {
+                  console.warn('[membrane:bedrock] Skipping malformed stream event:', 'a content_block_start that names no block');
+                  currentBlockIndex = -1;
+                  skippedStart = true;
+                } else {
+                  skippedStart = false;
+                  currentBlockIndex = startIndex;
+                  contentBlocks[currentBlockIndex] = startBlock as { type: string };
+                  callbacks.onContentBlock?.(currentBlockIndex, startBlock);
+                }
+              } else if (eventData.type === 'content_block_delta') {
+                const deltaIndex = streamIndex((eventData as { index?: unknown }).index, currentBlockIndex);
+                if (blockOrderBroken || (!skippedStart && (!blockOpen() || deltaIndex !== currentBlockIndex))) {
+                  breakBlockOrder('a content_block_delta for a block other than the open one');
+                } else if (isToolCallBlock(contentBlocks[currentBlockIndex]) && !isToolCallArgumentsDelta(eventData.delta)) {
+                  // A tool call's deltas carry only its arguments. (After a
+                  // skipped start currentBlockIndex is -1, which holds no block.)
+                  breakBlockOrder('a content_block_delta that a tool call can\'t take');
+                } else if (eventData.delta?.type === 'text_delta' && eventData.delta.text) {
+                  fullText += eventData.delta.text;
+                  callbacks.onChunk(eventData.delta.text);
+                  if (contentBlocks[currentBlockIndex]) {
+                    contentBlocks[currentBlockIndex]!.text = (contentBlocks[currentBlockIndex]!.text ?? '') + eventData.delta.text;
                   }
-                  if (startUsage?.cache_read_input_tokens != null) {
-                    cacheReadTokens = startUsage.cache_read_input_tokens;
+                } else if (eventData.delta?.type === 'thinking_delta' && eventData.delta.thinking) {
+                  callbacks.onChunk(eventData.delta.thinking);
+                  if (contentBlocks[currentBlockIndex]) {
+                    contentBlocks[currentBlockIndex]!.thinking = (contentBlocks[currentBlockIndex]!.thinking ?? '') + eventData.delta.thinking;
                   }
-                } else if (eventData.type === 'content_block_start') {
-                  currentBlockIndex = eventData.index ?? 0;
-                  contentBlocks[currentBlockIndex] = eventData.content_block as { type: string };
-                  callbacks.onContentBlock?.(currentBlockIndex, eventData.content_block);
-                } else if (eventData.type === 'content_block_delta') {
-                  if (eventData.delta?.type === 'text_delta' && eventData.delta.text) {
-                    fullText += eventData.delta.text;
-                    callbacks.onChunk(eventData.delta.text);
-                    if (contentBlocks[currentBlockIndex]) {
-                      contentBlocks[currentBlockIndex]!.text = (contentBlocks[currentBlockIndex]!.text ?? '') + eventData.delta.text;
-                    }
-                  } else if (eventData.delta?.type === 'thinking_delta' && eventData.delta.thinking) {
-                    callbacks.onChunk(eventData.delta.thinking);
-                    if (contentBlocks[currentBlockIndex]) {
-                      contentBlocks[currentBlockIndex]!.thinking = (contentBlocks[currentBlockIndex]!.thinking ?? '') + eventData.delta.thinking;
-                    }
-                  } else if (eventData.delta?.type === 'signature_delta' && (eventData.delta as any).signature) {
-                    if (contentBlocks[currentBlockIndex]) {
-                      contentBlocks[currentBlockIndex]!.signature = (contentBlocks[currentBlockIndex]!.signature ?? '') + (eventData.delta as any).signature;
-                    }
-                  } else if (eventData.delta?.type === 'input_json_delta' && (eventData.delta as any).partial_json !== undefined) {
-                    // Tool-call arguments stream as input_json_delta fragments.
-                    // Dropping these (pre-2026-07-21 behavior) gutted every
-                    // tool_use block: stop_reason said tool_use but the block
-                    // lost its input — and then its id/name in final assembly.
-                    const blk = contentBlocks[currentBlockIndex] as (typeof contentBlocks)[number] & { partialJson?: string };
-                    if (blk) {
-                      blk.partialJson = (blk.partialJson ?? '') + (eventData.delta as any).partial_json;
-                    }
+                } else if (eventData.delta?.type === 'signature_delta' && (eventData.delta as any).signature) {
+                  if (contentBlocks[currentBlockIndex]) {
+                    contentBlocks[currentBlockIndex]!.signature = (contentBlocks[currentBlockIndex]!.signature ?? '') + (eventData.delta as any).signature;
+                    // Reported as it accumulates, so a stream that ends before
+                    // content_block_stop still keeps the signature it received.
+                    callbacks.onThinkingSignature?.(currentBlockIndex, contentBlocks[currentBlockIndex]!.signature!);
                   }
-                } else if (eventData.type === 'content_block_stop') {
-                  // Mirror the Anthropic adapter: fire onContentBlock a second
-                  // time with the finalised block so consumers can distinguish
-                  // start from stop. Without this, downstream code that depends
-                  // on the dual-fire convention (e.g. membrane's native
-                  // yielding path) silently drops block_complete on Bedrock.
-                  const blockIdx = (eventData as { index?: number }).index ?? currentBlockIndex;
+                } else if (eventData.delta?.type === 'input_json_delta' && (eventData.delta as any).partial_json !== undefined) {
+                  // Tool-call arguments stream as input_json_delta fragments.
+                  // Dropping these (pre-2026-07-21 behavior) gutted every
+                  // tool_use block: stop_reason said tool_use but the block
+                  // lost its input — and then its id/name in final assembly.
+                  const blk = contentBlocks[currentBlockIndex] as (typeof contentBlocks)[number] & { partialJson?: string };
+                  if (blk) {
+                    blk.partialJson = (blk.partialJson ?? '') + (eventData.delta as any).partial_json;
+                  }
+                }
+              } else if (eventData.type === 'content_block_stop') {
+                // Mirror the Anthropic adapter: fire onContentBlock a second
+                // time with the finalised block so consumers can distinguish
+                // start from stop. Without this, downstream code that depends
+                // on the dual-fire convention (e.g. membrane's native
+                // yielding path) silently drops block_complete on Bedrock.
+                const blockIdx = streamIndex((eventData as { index?: unknown }).index, currentBlockIndex);
+                if (skippedStart) {
+                  // After a skipped start no block is open. A stop joins no
+                  // block, as the skipped block's deltas do, whatever index it
+                  // names, the skipped start's own slot included: nothing is
+                  // applied or reported, and a slot no block filled still
+                  // fails the call below.
+                } else if (blockOrderBroken || !blockOpen() || blockIdx !== currentBlockIndex) {
+                  // A stop for no block, or for a block never started,
+                  // included.
+                  breakBlockOrder('a content_block_stop for a block other than the open one');
+                } else {
+                  stoppedBlocks.add(blockIdx);
                   // Finalize tool_use blocks: parse accumulated argument JSON
                   // into `input` before the block_complete fire, so consumers
                   // of the dual-fire convention see a complete tool call.
-                  const stoppedBlk = contentBlocks[blockIdx] as ((typeof contentBlocks)[number] & { partialJson?: string; input?: unknown }) | undefined;
+                  const stoppedBlk = contentBlocks[blockIdx] as ((typeof contentBlocks)[number] & { partialJson?: string; input?: unknown; unparseableInput?: string }) | undefined;
                   if (stoppedBlk?.type === 'tool_use' && stoppedBlk.partialJson !== undefined) {
-                    try { stoppedBlk.input = JSON.parse(stoppedBlk.partialJson || '{}'); } catch { /* keep prior input */ }
+                    // As in the Anthropic adapter: arguments that don't parse,
+                    // or parse to anything but an object, leave the input
+                    // content_block_start carried, and the raw text marks it.
+                    const parsed = toolUseInputFromText(stoppedBlk.partialJson);
+                    if (parsed.unparseableInput === undefined) stoppedBlk.input = parsed.input;
+                    else stoppedBlk.unparseableInput = parsed.unparseableInput;
                   }
                   callbacks.onContentBlock?.(blockIdx, contentBlocks[blockIdx]);
-                } else if (eventData.type === 'message_delta') {
-                  sawTerminalEvent = true;
-                  if (eventData.usage) {
-                    outputTokens = eventData.usage.output_tokens;
-                    // message_delta carries cumulative cache metrics — use as
-                    // authoritative when present (same contract as the
-                    // Anthropic adapter).
-                    if (eventData.usage.cache_creation_input_tokens != null) {
-                      cacheCreationTokens = eventData.usage.cache_creation_input_tokens;
-                    }
-                    if (eventData.usage.cache_read_input_tokens != null) {
-                      cacheReadTokens = eventData.usage.cache_read_input_tokens;
-                    }
+                }
+              } else if (eventData.type === 'message_delta') {
+                sawTerminalEvent = true;
+                if (Array.isArray(eventData.input_transformations)) inputTransformations = eventData.input_transformations;
+                if (eventData.usage) {
+                  outputTokens = eventData.usage.output_tokens;
+                  if (typeof eventData.usage.output_tokens === 'number') outputReported = true;
+                  // message_delta carries cumulative cache metrics — use as
+                  // authoritative when present (same contract as the
+                  // Anthropic adapter).
+                  if (eventData.usage.cache_creation_input_tokens != null) {
+                    cacheCreationTokens = eventData.usage.cache_creation_input_tokens;
                   }
-                  if (eventData.delta?.stop_reason) {
-                    stopReason = eventData.delta.stop_reason;
-                  }
-                  // WHICH stop sequence fired, not just that one did. Dropping
-                  // this (pre-2026-07-26) broke prefill/XML tool use on
-                  // Bedrock entirely: membrane's tool gate matches
-                  // stopSequence === '</function_calls>', so calls were never
-                  // parsed or executed, the close tag was never restored, and
-                  // the turn continuation looped forever on the dangling
-                  // block (~6 output tokens per full-prefill round).
-                  if (eventData.delta?.stop_sequence) {
-                    stopSequence = eventData.delta.stop_sequence;
+                  if (eventData.usage.cache_read_input_tokens != null) {
+                    cacheReadTokens = eventData.usage.cache_read_input_tokens;
                   }
                 }
+                if (eventData.delta?.stop_reason) {
+                  stopReason = eventData.delta.stop_reason;
+                }
+                // WHICH stop sequence fired, not just that one did. Dropping
+                // this (pre-2026-07-26) broke prefill/XML tool use on
+                // Bedrock entirely: membrane's tool gate matches
+                // stopSequence === '</function_calls>', so calls were never
+                // parsed or executed, the close tag was never restored, and
+                // the turn continuation looped forever on the dangling
+                // block (~6 output tokens per full-prefill round).
+                if (eventData.delta?.stop_sequence) {
+                  stopSequence = eventData.delta.stop_sequence;
+                }
               }
-            } catch (e) {
-              // Re-throw BedrockErrors (from error events above)
-              if (e instanceof BedrockError) throw e;
-              // Skip genuinely malformed events (e.g. truncated JSON)
-              console.warn('[membrane:bedrock] Skipping malformed stream event:', e);
             }
           }
 
           // Remove processed message from buffer
           buffer = buffer.slice(totalLength);
+          // message_delta ends the message: as in the Anthropic adapter,
+          // nothing after it is read, and the finally lets the body go.
+          if (sawTerminalEvent) break read;
         }
       }
     } finally {
+      // A read loop that ends early, on a callback's error or any other,
+      // leaves the body unread: cancel it, so the provider stops sending and
+      // the connection is let go. After a full read it does nothing.
+      void reader.cancel().catch(() => {});
       reader.releaseLock();
     }
 
@@ -863,12 +1077,28 @@ export class BedrockAdapter implements ProviderAdapter {
     // reported as a clean end_turn. message_delta is the terminal event.
     assertTerminalEventObserved(sawTerminalEvent, 'Bedrock', { modelId, ...request });
 
+    // A block start skipped as malformed leaves its slot empty, and a block's
+    // index is its place in the message, so a slot before the last block that
+    // no block filled is a block the message lost. The request was never
+    // answered in full, as when a stream ends before its terminal event, so it
+    // fails the same retryable way rather than returning the message without
+    // that block. The scan stops at the first empty slot.
+    let slot = 0;
+    while (slot < contentBlocks.length && slot in contentBlocks) slot++;
+    if (slot < contentBlocks.length) {
+      throw networkError(
+        `Bedrock stream lost content block ${slot}: no block start placed it`,
+        undefined,
+        { modelId, ...request }
+      );
+    }
+
     // Build response from accumulated data
     finalMessage = {
       id: 'msg_stream',
       type: 'message',
       role: 'assistant',
-      content: contentBlocks.map(b => {
+      content: contentBlocks.map((b, blockIdx) => {
         if (b.type === 'thinking') {
           return { type: 'thinking' as const, thinking: b.thinking ?? '', signature: b.signature };
         }
@@ -880,17 +1110,31 @@ export class BedrockAdapter implements ProviderAdapter {
           // Preserve id/name and the input accumulated from input_json_delta
           // fragments — the generic text mapping below would strip them and
           // parseResponse would then drop the block (requires id && name).
-          const tb = b as { type: string; id?: string; name?: string; input?: unknown; partialJson?: string };
-          let input: unknown = tb.input ?? {};
-          if (tb.partialJson) {
-            try { input = JSON.parse(tb.partialJson); } catch { /* keep prior input */ }
+          const tb = b as { type: string; id?: string; name?: string; input?: unknown; partialJson?: string; unparseableInput?: string };
+          // A block content_block_stop finalized keeps what it set there. One
+          // the stream left open keeps the input content_block_start carried,
+          // and whatever argument text arrived marks it, none included, as in
+          // the Anthropic adapter: the call never finished, so nothing says
+          // its arguments were complete, even text that parses.
+          let unparseableInput = stoppedBlocks.has(blockIdx) ? tb.unparseableInput : (tb.partialJson ?? '');
+          let input = tb.input ?? {};
+          // After a break in block order no call counts as complete, those
+          // finished before it included: one not already marked keeps its
+          // arguments, as JSON, in the marker, and an empty input. One already
+          // marked keeps its marker and the input its start carried.
+          if (blockOrderBroken && unparseableInput === undefined) {
+            unparseableInput = JSON.stringify(input);
+            input = {};
           }
-          return { type: 'tool_use', id: tb.id, name: tb.name, input } as unknown as { type: 'text'; text?: string };
+          return {
+            type: 'tool_use', id: tb.id, name: tb.name, input,
+            ...(unparseableInput !== undefined ? { unparseableInput } : {}),
+          } as unknown as { type: 'text'; text?: string };
         }
         return { type: b.type as 'text', text: b.text };
       }),
       model: modelId,
-      stop_reason: stopReason as BedrockMessageResponse['stop_reason'],
+      stop_reason: (stopReason ?? 'end_turn') as BedrockMessageResponse['stop_reason'],
       stop_sequence: stopSequence ?? null,
       usage: {
         input_tokens: inputTokens,
@@ -898,9 +1142,16 @@ export class BedrockAdapter implements ProviderAdapter {
         ...(cacheCreationTokens != null ? { cache_creation_input_tokens: cacheCreationTokens } : {}),
         ...(cacheReadTokens != null ? { cache_read_input_tokens: cacheReadTokens } : {}),
       },
+      ...(Array.isArray(inputTransformations) ? { input_transformations: inputTransformations } : {}),
     };
 
-    return this.parseResponse(finalMessage, { modelId, ...request, stream: true });
+    const parsed = this.parseResponse(finalMessage, rawRequest);
+    const { unreportedUsage: _fromSynthetic, ...rest } = parsed;
+    return {
+      ...rest,
+      ...unreportedUsage(inputReported ? inputTokens : undefined, outputReported ? outputTokens : undefined),
+      providerStopReason: stopReason,
+    };
   }
 
   private parseResponse(response: BedrockMessageResponse, rawRequest: unknown): ProviderResponse {
@@ -910,11 +1161,15 @@ export class BedrockAdapter implements ProviderAdapter {
       if (block.type === 'text' && block.text) {
         content.push({ type: 'text', text: block.text });
       } else if (block.type === 'tool_use' && block.id && block.name) {
+        // The stream assembly's marker wins over the value's JSON: it holds
+        // the arguments as they came, or after a break in block order as JSON
+        // when they had parsed (ToolUseContent.unparseableInput).
         content.push({
           type: 'tool_use',
           id: block.id,
           name: block.name,
-          input: block.input as Record<string, unknown>,
+          ...toolUseInputFromValue(block.input),
+          ...(block.unparseableInput !== undefined ? { unparseableInput: block.unparseableInput } : {}),
         });
       } else if (block.type === 'thinking') {
         // Signature-only thinking blocks (display:'omitted') have an empty
@@ -933,6 +1188,7 @@ export class BedrockAdapter implements ProviderAdapter {
     return {
       content,
       stopReason: response.stop_reason ?? 'end_turn',
+      providerStopReason: response.stop_reason ?? undefined,
       stopSequence: response.stop_sequence ?? undefined,
       usage: {
         inputTokens: response.usage.input_tokens,
@@ -940,53 +1196,39 @@ export class BedrockAdapter implements ProviderAdapter {
         cacheCreationTokens: response.usage.cache_creation_input_tokens,
         cacheReadTokens: response.usage.cache_read_input_tokens,
       },
+      ...unreportedUsage(response.usage?.input_tokens, response.usage?.output_tokens),
+      ...readInputTransformations(response.input_transformations, (rawRequest as { messages?: unknown } | undefined)?.messages),
       model: response.model,
       rawRequest,
       raw: response,
     };
   }
 
+  /**
+   * HTTP failures are classified at the fetch boundary. What reaches here is
+   * a synthesized stream-event failure (BedrockError, which carries the
+   * status its exception type implies, and the type itself as the provider
+   * code), a typed abort, or a non-HTTP throwable.
+   */
   private handleError(error: unknown, rawRequest?: unknown): MembraneError {
-    // A deadline abort is a timeout and stays one. Collapsing it into a bare
-    // abortError() here is what erased the identity before Membrane's
-    // caller-signal > timeout > error ladder could read it.
     if (isDeadlineAbort(error)) return deadlineTimeoutError(error, rawRequest);
-    // Already-classified failures (e.g. the stream-integrity guards) keep
-    // their type and retryability instead of being re-derived from a string.
-    if (error instanceof MembraneError) return error;
+    if (error instanceof MembraneError) return withRawRequest(error, rawRequest);
+    if (isTypedAbortError(error)) return abortError(undefined, rawRequest);
 
     if (error instanceof BedrockError) {
-      const status = error.status;
-      const message = error.message;
-
-      if (status === 429) {
-        return rateLimitError(message, undefined, error, rawRequest);
-      }
-
-      if (status === 401 || status === 403) {
-        return authError(message, error, rawRequest);
-      }
-
-      if (message.includes('context') || message.includes('too long') || message.includes('token')) {
-        return contextLengthError(message, error, rawRequest);
-      }
-
-      if (status >= 500) {
-        return serverError(message, status, error, rawRequest);
-      }
+      return errorFromProviderStatus({
+        provider: this.name,
+        status: error.status,
+        fallbackStatus: 500,
+        code: error.code,
+        body: error.message,
+        message: error.message,
+        rawError: error,
+        rawRequest,
+      });
     }
 
-    if (error instanceof Error && error.name === 'AbortError') {
-      return abortError(undefined, rawRequest);
-    }
-
-    return new MembraneError({
-      type: 'unknown',
-      message: error instanceof Error ? error.message : String(error),
-      retryable: false,
-      rawError: error,
-      rawRequest,
-    });
+    return errorFromThrown(error, rawRequest);
   }
 }
 
@@ -996,10 +1238,29 @@ export class BedrockAdapter implements ProviderAdapter {
 
 class BedrockError extends Error {
   constructor(
-    public status: number,
-    message: string
+    /** Undefined when the code decides it (a 500 if the table doesn't know the code). */
+    public status: number | undefined,
+    message: string,
+    /** The exception's own type, or an in-band error event's error.type. */
+    public code?: string
   ) {
     super(message);
     this.name = 'BedrockError';
   }
 }
+
+/**
+ * The status each exception Bedrock sends inside a response stream implies:
+ * the HTTP status AWS documents for the same exception. AWS documents
+ * modelStreamErrorException as a 424 and asks for a retry, and a 424 would
+ * read here as a bad request, so it stays a retryable 500. A type not listed
+ * is a 500 too, as every non-throttling exception was.
+ */
+const BEDROCK_STREAM_EXCEPTION_STATUS = new Map<string, number>([
+  ['validationexception', 400],
+  ['modeltimeoutexception', 408],
+  ['throttlingexception', 429],
+  ['internalserverexception', 500],
+  ['modelstreamerrorexception', 500],
+  ['serviceunavailableexception', 503],
+]);

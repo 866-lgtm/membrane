@@ -117,13 +117,30 @@ describe.each(adapters)('%s adapter: Membrane.complete with tool-result image hi
     return fetchMock.mock.calls[0]![1].body as string;
   }
 
-  it('sends a placeholder instead of the base64 payload as text', async () => {
+  it('never sends the base64 payload as text', async () => {
     const body = await sentBody([{ type: 'text', text: 'Screenshot taken' }, imageBlock()]);
-    expect(body).not.toContain(PAYLOAD_PROBE);
     expect(body).toContain('Screenshot taken');
-    // The placeholder sits inside a JSON string that is itself JSON-encoded.
-    expect(body).toContain('tool results reach this model as text only');
-    expect(body.length).toBeLessThan(5_000);
+    if (_name === 'Gemini') {
+      expect(body).not.toContain(PAYLOAD_PROBE);
+      // The placeholder sits inside a JSON string that is itself JSON-encoded.
+      expect(body).toContain('tool results reach this model as text only');
+      expect(body.length).toBeLessThan(5_000);
+      return;
+    }
+    // Chat Completions wires hoist the image into a user message after the
+    // tool results, as an image_url part: the model sees it as an image, and
+    // the tool message carries text only.
+    const messages = JSON.parse(body).messages as Array<{ role: string; content: unknown }>;
+    const toolIndex = messages.findIndex((m) => m.role === 'tool');
+    const tool = messages[toolIndex]!;
+    expect(typeof tool.content).toBe('string');
+    expect(tool.content as string).not.toContain(PAYLOAD_PROBE);
+    expect(tool.content as string).toContain('attached in the following user message');
+    const follow = messages[toolIndex + 1]!;
+    expect(follow.role).toBe('user');
+    const parts = follow.content as Array<{ type: string; image_url?: { url: string } }>;
+    expect(parts.some((p) => p.type === 'text')).toBe(true);
+    expect(parts.find((p) => p.type === 'image_url')?.image_url?.url.startsWith('data:image/png;base64,' + PNG_HEADER)).toBe(true);
   });
 
   it('keeps text-only tool results exactly as JSON.stringify produced them', async () => {

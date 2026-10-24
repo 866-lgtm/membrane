@@ -198,10 +198,46 @@ export interface StreamOptions {
   timeoutMs?: number;
 
   /**
-   * Abort a call whose stream goes silent for this many ms. Parity with
-   * YieldingStreamOptions.idleTimeoutMs; the adapter owns the default.
+   * Anthropic idle deadline after the first SDK event (default: 600000 ms).
+   * Nonempty Web response-body bytes, including SSE keepalives, refresh it;
+   * other SDK-supported bodies refresh it on SDK events. This does not bound
+   * total duration or generation progress. Parity with YieldingStreamOptions.
    */
   idleTimeoutMs?: number;
+
+  /**
+   * Progress deadline, per provider call (default: off, as for any value
+   * that isn't a positive number of ms). Every parsed provider event renews
+   * it (an SDK event, an SSE data frame that parses to an object);
+   * keepalives, SSE comments and raw bytes don't, so a connection that stays
+   * up while the model sends nothing
+   * still ends. On expiry the call aborts as a `TimeoutAbortError` (type
+   * `timeout`, aborted reason `'timeout'`). It bounds the wait for the first
+   * event too. Time between provider calls, such as tool execution, never
+   * counts. A stretch with no parsed event counts as no progress whatever the
+   * model is doing: reasoning a provider doesn't stream, while it sends only
+   * keepalives, can expire it, so set it above the longest such stretch you
+   * expect (Anthropic thinking with `display: "omitted"` sends no deltas
+   * while it thinks, which can last minutes). An adapter that streams no
+   * events, such as `OpenAIResponsesAdapter` (the Images API), can't renew
+   * it, so for it the deadline bounds the whole call. Parity with
+   * YieldingStreamOptions.
+   */
+  progressTimeoutMs?: number;
+
+  /**
+   * Whether membrane retries the call's failed provider calls itself. Default
+   * true: a provider call that fails with a retryable error before it
+   * delivered anything is sent again, in any round, on the `retry` config's
+   * schedules. With `false`, membrane retries none of the call's failed
+   * requests, whatever the error and whatever the config says: the failure is
+   * thrown as it came, with the provider's advice on it (`retryable`, and a
+   * stated wait on `retryAfterMs`), and `hooks.onError`, which is asked
+   * before each retry, isn't asked. For a caller whose own layer retries. One
+   * other send stays: the one resend with refreshed credentials that an
+   * adapter with a credential resolver makes after an HTTP 401.
+   */
+  retry?: boolean;
 
   /** Request ID for correlation */
   requestId?: string;
@@ -226,7 +262,12 @@ export interface StreamOptions {
   /** Called for structured block events (thinking, tool_use, tool_result) */
   onBlock?: OnBlockCallback;
 
-  /** Called with raw provider request before sending (for logging) */
+  /**
+   * Called with raw provider request before each attempt (for logging). A
+   * request membrane retries after a failure calls it again, so it counts
+   * attempts, not rounds. A credential resolver's resend after an HTTP 401 is
+   * part of the attempt it follows, and doesn't call it again.
+   */
   onRequest?: OnRequestCallback;
 
   /** Called with raw provider response after each API call (for logging) */
@@ -270,7 +311,8 @@ export interface CompleteOptions {
 
   /**
    * Re-issue the request when it ends with `stop_reason: 'refusal'`, up to
-   * this many times. Default 0 (off).
+   * this many times. Default 0 (off); a value that isn't a finite number of
+   * at least 0 asks for none.
    *
    * Safe and invisible on this path: nothing has been emitted to the caller
    * yet, so a discarded attempt leaves no trace beyond its output tokens
@@ -283,13 +325,41 @@ export interface CompleteOptions {
    */
   refusalRetries?: number;
 
+  /**
+   * Whether membrane retries the call's failed request itself. Default true:
+   * a request that fails with a retryable error is sent again on the `retry`
+   * config's schedules. With `false`, membrane retries none of the call's
+   * failed requests, whatever the error and whatever the config says: the
+   * failure is thrown as it came, with the provider's advice on it
+   * (`retryable`, and a stated wait on `retryAfterMs`), and `hooks.onError`,
+   * which is asked before each retry, isn't asked. For a caller whose own
+   * layer retries. Two sends stay: a refusal re-issue, which the call asks
+   * for with `refusalRetries`, and the one resend with refreshed credentials
+   * that an adapter with a credential resolver makes after an HTTP 401.
+   */
+  retry?: boolean;
+
   /** Request timeout */
   timeoutMs?: number;
+
+  /**
+   * Progress deadline, per provider call (default: off); see
+   * StreamOptions.progressTimeoutMs. A non-streaming call reports no progress
+   * until its response arrives, so on most adapters it bounds the whole call.
+   * `OpenAIResponsesAPIAdapter` in subscription mode answers `complete()` by
+   * streaming, so there its events renew it. On expiry `complete()` throws a
+   * `TimeoutAbortError`.
+   */
+  progressTimeoutMs?: number;
 
   /** Request ID for correlation */
   requestId?: string;
 
-  /** Called with raw provider request before sending (for logging) */
+  /**
+   * Called with raw provider request before each attempt (for logging). A
+   * request membrane retries after a failure calls it again; a credential
+   * resolver's resend after an HTTP 401 doesn't.
+   */
   onRequest?: OnRequestCallback;
 
   /** Called with raw provider response after API call (for logging) */

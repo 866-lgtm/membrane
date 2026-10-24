@@ -70,6 +70,21 @@ describe.each([
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
+  it.each(['complete', 'stream'] as const)('%s ends at once with a consumer error that reads as retryable, never retried', async (method) => {
+    const fetchMock = vi.fn().mockImplementation(async () => anthropicMessage());
+    vi.stubGlobal('fetch', fetchMock);
+    const failure = Object.assign(new Error('zz receipt sink reset'), { code: 'ECONNRESET' });
+    const onError = vi.fn(async () => 'retry' as const);
+    const membrane = new Membrane(create(), {
+      formatter: new NativeFormatter(),
+      retry: { maxRetries: 3, retryDelayMs: 1, maxRetryDelayMs: 2 },
+      hooks: { onError },
+    });
+    await expect(membrane[method]({ ...request, onCacheWireReceipt: () => { throw failure; } })).rejects.toThrow(failure.message);
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(onError).not.toHaveBeenCalled();
+  });
+
   it('leaves calls whose receipt consumer succeeds untouched', async () => {
     const fetchMock = vi.fn().mockImplementation(async () => anthropicMessage());
     vi.stubGlobal('fetch', fetchMock);
@@ -99,11 +114,12 @@ describe('wire-request receipt guard on a generic adapter', () => {
     stream(_req: ProviderRequest, _callbacks: StreamCallbacks, options?: ProviderRequestOptions) { return this.send(options); }
   }
 
-  it('aborts through the signal and rethrows the original error', async () => {
+  it('aborts through the signal and rethrows the consumer\'s error, not retryable, with the original as cause', async () => {
     const adapter = new WireBasisAdapter();
     const failure = new Error('receipt consumer exploded');
     await expect(new Membrane(adapter, { formatter: new NativeFormatter() })
-      .stream({ ...request, onCacheWireReceipt: () => { throw failure; } })).rejects.toThrow(failure.message);
+      .stream({ ...request, onCacheWireReceipt: () => { throw failure; } }))
+      .rejects.toMatchObject({ message: failure.message, retryable: false, cause: failure });
     expect(adapter.sent).toBe(0);
   });
 

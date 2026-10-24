@@ -14,6 +14,8 @@ export type StopReason =
   | 'max_tokens'     // Hit token limit
   | 'stop_sequence'  // Hit stop sequence
   | 'tool_use'       // Stopped for tool use
+  | 'pause_turn'     // Provider paused a long-running turn; the caller is
+                     // expected to resume it (Anthropic pause_turn)
   | 'refusal'        // Content refused by safety
   | 'abort'          // Request was aborted
   | 'no_progress'    // Stall guard ended the turn (issue #39): consecutive
@@ -131,6 +133,19 @@ export interface StopInfo {
   wasTruncated: boolean;
 
   /**
+   * The provider's own stop token, verbatim, as the adapter reports it in
+   * ProviderResponse.providerStopReason. When the adapter reports none, its
+   * stopReason if membrane doesn't map that token, so the token isn't lost
+   * behind the end_turn it becomes; that may be the adapter's own word rather
+   * than the provider's. Omitted when the adapter reports no providerStopReason
+   * and its stopReason is a token membrane maps. A null or empty value counts
+   * as none in either field.
+   * This can differ from the normalized reason (for example, OpenAI's length,
+   * or a provider's token beside a stop sequence membrane found itself).
+   */
+  providerReason?: string;
+
+  /**
    * XML tool mode: the turn ended with a tool block still open — a
    * `<function_calls>` opener with no closer, or text cut mid-tag. The loop
    * does not resume on a length stop, so this is the shape a max_tokens
@@ -235,7 +250,66 @@ export interface ResponseDetails {
   timing: TimingInfo;
   model: ModelInfo;
   cache: CacheInfo;
+
+  /**
+   * Rounds where the provider broke its own response contract and membrane
+   * noticed, one entry per occurrence, in round order. Absent when there
+   * were none.
+   */
+  anomalies?: ResponseAnomaly[];
 }
+
+// ============================================================================
+// Provider anomalies
+// ============================================================================
+
+/**
+ * A round the provider ended with a literal `stop_reason: end_turn` while its
+ * content held client tool calls. A round with no provider stop token (an
+ * adapter that reports none, or an OpenAI-family server that sends no
+ * `finish_reason`) is not this case: it runs nothing, as before. The provider
+ * contract is
+ * that a response carrying a tool call stops with `tool_use`; a caller that
+ * gates on the stop reason runs nothing and the turn ends with the calls
+ * unanswered, silently.
+ *
+ * When every call in the round is complete (its block stopped and its input
+ * parsed to an object), membrane treats the round as `tool_use`: the calls
+ * run (or are returned to the caller) exactly as for a `tool_use` stop, and
+ * `treatedAsToolUse` is true. When any call is incomplete the round keeps its
+ * reported stop, nothing runs, and `treatedAsToolUse` is false. Either way
+ * `providerStopReason` here keeps the round's own token. `details.stop`
+ * describes the response's final round: from `complete()` that is this one,
+ * while a loop that ran the calls goes on to a later round unless its tool
+ * depth limit ends it first.
+ */
+export interface ToolUseWithEndTurnAnomaly {
+  kind: 'tool_use_with_end_turn';
+
+  /** 0-based round index within this call (the index round reports use). */
+  round: number;
+
+  /** The provider's stop token: always `end_turn`, the only token that qualifies. */
+  providerStopReason: 'end_turn';
+
+  /** The round's tool calls, in content order. */
+  toolNames: string[];
+  toolUseIds: string[];
+
+  /** Whether membrane treated the round as a `tool_use` stop. */
+  treatedAsToolUse: boolean;
+
+  /** Model that served the round. */
+  model: string;
+
+  /** The provider's response id (Anthropic message id), when it sent one. */
+  messageId?: string;
+
+  /** The provider's request id (Anthropic `request-id` header), when known. */
+  requestId?: string;
+}
+
+export type ResponseAnomaly = ToolUseWithEndTurnAnomaly;
 
 // ============================================================================
 // Raw Access

@@ -4,6 +4,11 @@
  * A selective boundary that transforms what passes through.
  */
 
+import { restoreToolName, toolsOffered } from './utils/tool-names.js';
+import { toolUseInputFromValue } from './providers/utils.js';
+import { StreamedThinking } from './utils/streamed-thinking.js';
+import { LocalStopSequences, firstStop, membraneBlockType } from './utils/local-stop-sequences.js';
+
 import type {
   NormalizedRequest,
   NormalizedResponse,
@@ -11,21 +16,29 @@ import type {
   ContentBlock,
   ProviderAdapter,
   ProviderResponse,
+  ProviderInputTransformation,
+  NormalizedMessage,
+  StreamCallbacks,
   ModelRegistry,
   MembraneConfig,
+  MembraneLogger,
   StreamOptions,
   CompleteOptions,
   BasicUsage,
   DetailedUsage,
   DiscardedAttemptsUsage,
   StopReason,
+  StopInfo,
+  ResponseAnomaly,
   TimingInfo,
   CacheInfo,
   ToolCall,
   ToolResult,
   ToolContext,
+  ToolUseContent,
   RetryConfig,
   ToolDefinition,
+  ErrorInfo,
 } from './types/index.js';
 import { lastCacheableBlockIndex } from './formatters/native.js';
 import {
@@ -44,8 +57,10 @@ import {
 import {
   DEFAULT_RETRY_CONFIG,
   MembraneError,
+  MembraneNotReadyError,
   classifyError,
-  isOverloadedError,
+  isTypedAbortError,
+  withRawRequest,
   isTimeoutAbortError,
   isTextContent,
   isAbortedResponse,
@@ -53,6 +68,8 @@ import {
 } from './types/index.js';
 import type { BuildResult } from './formatters/types.js';
 import { computeCacheWireReceipt } from './cache-wire-receipt.js';
+import { awaitCallerCode, runCallerCode, isDeadlineExpiry, errorFromThrown, systemChangeRefusedError } from './types/errors.js';
+import { createProgressDeadline, setLongTimeout } from './providers/utils.js';
 import {
   parseToolCalls,
   formatToolResults,
@@ -60,7 +77,9 @@ import {
   endsWithPartialToolBlock,
   hasImageInToolResults,
   formatToolResultsForSplitTurn,
+  attachSplitResults,
   type ProviderImageBlock,
+  type SplitResultsRound,
 } from './utils/tool-parser.js';
 import { IncrementalXmlParser, type ProcessChunkResult } from './utils/stream-parser.js';
 import type { ChunkMeta, BlockEvent, MembraneBlockType, MembraneBlock } from './types/streaming.js';
@@ -69,16 +88,22 @@ import type {
   YieldingStreamOptions,
   StreamEvent,
   ToolCallsEvent,
+  RoundReport,
+  RoundUsage,
+  ThinkingBindingEntry,
 } from './types/yielding-stream.js';
 import type { PrefillFormatter, StreamParser } from './formatters/types.js';
 import { AnthropicXmlFormatter } from './formatters/anthropic-xml.js';
 import {
   normalizeToolPairs,
   mergeConsecutiveRoles,
+  MembraneNormalizerError,
   PREFIX_REWRITING_NORMALIZE_EVENT_KINDS,
 } from './formatters/normalize-tool-pairs.js';
 import { YieldingStreamImpl } from './yielding-stream.js';
+import { classifyFailure, membraneRetrySettings, retryDecision, type RetrySettings } from './retry.js';
 import { calculateCost, warnUnpricedModel } from './utils/cost.js';
+import { isAnthropicServerBlock } from './utils/anthropic-server-blocks.js';
 import {
   TurnUsageAccumulator,
   calculateCacheHitRatio,
@@ -86,20 +111,33 @@ import {
   warnUnconvertibleProviderItem,
 } from './utils/usage.js';
 import {
-  resolveImageMediaType,
-  isAcceptedImageMediaType,
-  strippedImagePlaceholder,
   shedImagesToFitByteBudget, assertWithinByteBudget,
 } from './utils/image-media.js';
+import { convertMcpMedia } from './utils/mcp-media.js';
 import { getDefaultPricing } from './registry/default-pricing.js';
+import { FidelityNotes, isRawItemCarrier, requestFingerprint, type MessageOrigin } from './utils/fidelity.js';
+
+/** Anthropic's thinking-binding controls, as a thinking config carries them. */
+type BlockBindingParam = { prefix_mismatch_behavior: 'error' | 'drop_block' };
+type ThinkingDisplay = 'summarized' | 'omitted' | 'updates';
 
 // ============================================================================
 // Membrane Class
 // ============================================================================
 
+/** One block as an attempt received it: its start payload, final payload, streamed chunks, and any signature received before it finished. */
+interface ReceivedBlock {
+  index?: number;
+  start?: Record<string, unknown>;
+  final?: unknown;
+  streamed: string;
+  signature?: string;
+}
+
 /**
  * Block-lifecycle tracking shared by the two native-tools streaming paths
- * (`streamWithNativeTools` and `runNativeToolsYielding`).
+ * (`streamWithNativeTools` and `runNativeToolsYielding`), and the record of
+ * what the current attempt has received, for partialContent if it aborts.
  *
  * Providers signal blocks through `onContentBlock(index, block)`, but not all
  * of them the same way: the Anthropic and Bedrock adapters fire it twice per
@@ -111,6 +149,22 @@ import { getDefaultPricing } from './registry/default-pricing.js';
  * the paired semantics and adds `flush()`, which the caller runs once the
  * provider stream has returned: every started block that never saw a second
  * callback is completed from the last block payload seen for it.
+ *
+ * The same convention decides what an aborted attempt received. A block is
+ * finished at its second sighting (an image, reported once, when it arrives),
+ * and kept as that final payload. Unfinished text and thinking are kept as
+ * their start payload plus the chunks streamed into them, and an unfinished
+ * thinking block keeps the signature received so far (onThinkingSignature).
+ * An unfinished tool call is not content yet: its start payload's empty
+ * `input` is a placeholder, not the call's arguments, so it is left out.
+ *
+ * A single-final adapter reports its finished blocks only after its terminal
+ * response, one callback each, and their completion is not observable under
+ * this callback contract before the provider call returns. If a caller's
+ * callback throws while they are being reported, the call never returns:
+ * those blocks stay first sightings here, so a tool call among them is left
+ * out. Once the provider's call has returned, the round's returned content
+ * is what it received.
  */
 class NativeBlockTracker {
   currentType: MembraneBlockType = 'text';
@@ -118,31 +172,83 @@ class NativeBlockTracker {
   private readonly started = new Map<number, MembraneBlockType>();
   private readonly completed = new Set<number>();
   private readonly lastSeen = new Map<number, unknown>();
+  /** This attempt's blocks in arrival order; an entry without an index is text no block event announced. */
+  private received: ReceivedBlock[] = [];
+  private readonly receivedByIndex = new Map<number, ReceivedBlock>();
 
-  constructor(private readonly emit: ((event: BlockEvent) => void) | undefined) {}
-
-  static mapApiBlockType(apiType: string | undefined): MembraneBlockType {
-    if (apiType === 'thinking' || apiType === 'redacted_thinking' || apiType === 'reasoning') return 'thinking';
-    if (apiType === 'tool_use' || apiType === 'function_call' || apiType === 'tool_call') return 'tool_call';
-    return 'text';
-  }
+  constructor(
+    private readonly emit: ((event: BlockEvent) => void) | undefined,
+    /** A tool call's name as the caller knows it (restoreToolName), for native rounds. */
+    private readonly restoreName?: (name: string) => string,
+  ) {}
 
   /** Provider block callback: first sighting of an index starts it, a second completes it. */
   onProviderBlock(index: number, block: unknown): void {
     const type = (block as { type?: string } | undefined)?.type;
     // Images use the content-block callback and final response, not the
     // text/thinking/tool logical-block event vocabulary.
-    if (type === 'image' || type === 'generated_image') return;
+    if (type === 'image' || type === 'generated_image') {
+      this.record(index, block, true);
+      return;
+    }
     this.lastSeen.set(index, block);
     if (!this.started.has(index)) {
-      const mbType = NativeBlockTracker.mapApiBlockType((block as { type?: string } | undefined)?.type);
+      const mbType = membraneBlockType(type);
       this.started.set(index, mbType);
       this.currentType = mbType;
       this.blockIndex = index;
+      this.record(index, block, false);
       this.emit?.({ event: 'block_start', index, block: { type: mbType } });
       return;
     }
+    this.record(index, block, true);
     this.complete(index, block);
+  }
+
+  /** A thinking block's signature so far; its finished payload supersedes it. */
+  onThinkingSignature(index: number, signature: string): void {
+    const entry = this.receivedByIndex.get(index);
+    if (entry && entry.final === undefined) entry.signature = signature;
+  }
+
+  /** A streamed chunk, recorded against the block it belongs to. */
+  onChunk(chunk: string): void {
+    const open = this.started.has(this.blockIndex) && !this.completed.has(this.blockIndex)
+      ? this.receivedByIndex.get(this.blockIndex)
+      : undefined;
+    if (open) {
+      open.streamed += chunk;
+      return;
+    }
+    const last = this.received[this.received.length - 1];
+    if (last && last.index === undefined) last.streamed += chunk;
+    else this.received.push({ streamed: chunk });
+  }
+
+  /**
+   * What this attempt received, in arrival order, as provider blocks for
+   * `parseProviderContent`: see the class comment for what counts.
+   */
+  partialContent(): unknown[] {
+    const blocks: unknown[] = [];
+    for (const entry of this.received) {
+      if (entry.final !== undefined) {
+        blocks.push(entry.final);
+      } else if (entry.index === undefined) {
+        if (entry.streamed) blocks.push({ type: 'text', text: entry.streamed });
+      } else if (entry.start?.type === 'text') {
+        if (entry.streamed) blocks.push({ ...entry.start, text: entry.streamed });
+      } else if (entry.start?.type === 'thinking') {
+        blocks.push({
+          ...entry.start,
+          ...(entry.signature !== undefined ? { signature: entry.signature } : {}),
+          thinking: entry.streamed,
+        });
+      } else if (entry.start?.type === 'redacted_thinking') {
+        blocks.push({ ...entry.start });
+      }
+    }
+    return blocks;
   }
 
   /**
@@ -163,13 +269,27 @@ class NativeBlockTracker {
     this.started.clear();
     this.completed.clear();
     this.lastSeen.clear();
+    this.received = [];
+    this.receivedByIndex.clear();
+  }
+
+  /** Copy each payload: an adapter may keep mutating the object it reported (Bedrock's start blocks do). */
+  private record(index: number, block: unknown, finished: boolean): void {
+    const payload = block && typeof block === 'object' ? { ...(block as Record<string, unknown>) } : undefined;
+    let entry = this.receivedByIndex.get(index);
+    if (!entry) {
+      entry = { index, streamed: '' };
+      this.receivedByIndex.set(index, entry);
+      this.received.push(entry);
+    }
+    if (finished) entry.final = payload ?? block;
+    else entry.start = payload;
   }
 
   private complete(index: number, block: unknown): void {
     if (this.completed.has(index)) return;
     this.completed.add(index);
-    const mbType = this.started.get(index)
-      ?? NativeBlockTracker.mapApiBlockType((block as { type?: string } | undefined)?.type);
+    const mbType = this.started.get(index) ?? membraneBlockType((block as { type?: string } | undefined)?.type);
     const apiBlock = block as {
       text?: string;
       thinking?: string;
@@ -182,17 +302,175 @@ class NativeBlockTracker {
     else if (mbType === 'thinking') mb.content = apiBlock?.thinking;
     else if (mbType === 'tool_call') {
       mb.toolId = apiBlock?.id;
-      mb.toolName = apiBlock?.name;
+      mb.toolName = apiBlock?.name !== undefined && this.restoreName ? this.restoreName(apiBlock.name) : apiBlock?.name;
       mb.input = apiBlock?.input as Record<string, unknown> | undefined;
     }
     this.emit?.({ event: 'block_complete', index, block: mb });
+    if (this.blockIndex === index) this.currentType = 'text';
   }
+}
+
+/**
+ * The call a caller runs, from its tool_use block, with the block's marker
+ * when `input` isn't the model's arguments.
+ */
+function toolCallOf(block: ToolUseContent): ToolCall {
+  return {
+    id: block.id,
+    name: block.name,
+    input: block.input,
+    ...(block.unparseableInput !== undefined ? { unparseableInput: block.unparseableInput } : {}),
+  };
+}
+
+/**
+ * An error raised while building a request: the formatter reported it not
+ * ready, or the tool-pair normalizer refused the history. Nothing reached the
+ * provider, the refusal is deterministic, and its own type tells the caller
+ * what to do, so Membrane passes it through instead of classifying and
+ * wrapping it like a transport error.
+ */
+function isBuildRefusal(error: unknown): error is MembraneError {
+  return error instanceof MembraneNotReadyError || error instanceof MembraneNormalizerError;
+}
+
+/** Whether a wire message's content holds a tool call. */
+function holdsToolUse(content: unknown): boolean {
+  return Array.isArray(content) && content.some((block) => (block as { type?: unknown } | null)?.type === 'tool_use');
+}
+
+/**
+ * Hand a request's receipt consumer its receipt for `described`. The receipt
+ * is membrane's to compute; what the consumer throws is the caller's.
+ */
+function deliverCacheWireReceipt(request: NormalizedRequest, described: unknown): void {
+  const consumer = request.onCacheWireReceipt;
+  if (!consumer) return;
+  const receipt = computeCacheWireReceipt(described);
+  runCallerCode(() => consumer.call(request, receipt));
+}
+
+/**
+ * Stop reasons membrane has already logged as unmapped (see mapStopReason),
+ * as the log line printed them (see shownStopReason). A server can send a
+ * fresh token on every response (one carrying an id, say), so the set stops
+ * growing at MAX_LOGGED_STOP_REASONS.
+ */
+const warnedStopReasons = new Set<string>();
+const MAX_LOGGED_STOP_REASONS = 64;
+/** Longest stop-reason token printed whole; real tokens are short. */
+const MAX_LOGGED_STOP_REASON_CHARS = 128;
+
+/**
+ * A stop reason as the unmapped-reason log line prints it, which is also the
+ * key it's logged once by. A string is printed as a JSON string, so a newline
+ * can't forge a log line, cut to a token's length. An adapter can return a
+ * stop reason outside its type, passing on a server's value or written in
+ * JavaScript. A number, null or undefined is then printed by its value, which
+ * is short and holds no quote or line break, and anything else by its kind,
+ * each marked as not a string. Such a value is never read as a string, so
+ * printing it can't throw and fail the call, and a fresh object on every
+ * response is one reason rather than a new one each time.
+ */
+function shownStopReason(reason: unknown): string {
+  if (typeof reason === 'string') {
+    return JSON.stringify(
+      reason.length > MAX_LOGGED_STOP_REASON_CHARS ? `${reason.slice(0, MAX_LOGGED_STOP_REASON_CHARS)}…` : reason
+    );
+  }
+  const byValue = reason == null || typeof reason === 'number';
+  return `${byValue ? String(reason) : typeof reason} (not a string)`;
+}
+
+/** A stop token an adapter reported: a non-empty string. */
+function isStopToken(value: unknown): value is string {
+  return typeof value === 'string' && value !== '';
+}
+
+/**
+ * Feed a provider chunk to an XML loop's parser, up to the first stop.
+ *
+ * The stop that ends first in the round's text so far, from `checkFrom`, is
+ * found before the parser sees the chunk, and the parser takes only the text
+ * before it. So what goes out up to a stop is the parser's own emissions,
+ * each labelled by the block it belongs to, as on every other chunk: a chunk
+ * that closes a <thinking> block before the stop, or holds the end of a tool
+ * call before its own `</function_calls>` stop, doesn't go out as visible
+ * text. A chunk with nothing before the stop, as when the stop began in an
+ * earlier chunk, gives nothing, not even the empty piece a plain parser would
+ * send. `head` is the round's accepted text when a stop was found.
+ */
+function parseUpToStop(
+  parser: StreamParser,
+  chunk: string,
+  checkFrom: number,
+  stops: readonly string[],
+): { found: { stop: string; at: number } | undefined; head: string; emissions: ProcessChunkResult['emissions'] } {
+  const before = parser.getAccumulated();
+  const text = before + chunk;
+  // The stop that ends first, where a provider applying the request's stops
+  // would end, whatever order they're listed in.
+  const found = firstStop(text.slice(checkFrom), stops);
+  if (!found) return { found, head: text, emissions: parser.processChunk(chunk).emissions };
+  // Where the accepted text ends and the stop begins.
+  const cut = checkFrom + found.at;
+  const taken = chunk.slice(0, Math.max(0, cut - before.length));
+  return { found, head: text.slice(0, cut), emissions: taken ? parser.processChunk(taken).emissions : [] };
+}
+
+/**
+ * The retry config a Membrane runs on: each field the caller gave, and the
+ * default for each field left out. A field given as `undefined` counts as left
+ * out, as the optional fields of `MembraneConfig.retry` invite
+ * (`{ maxRetries: opts.maxRetries }` with the option unset). Any other value
+ * must be a finite number of at least 0, or the constructor throws, naming
+ * the field, rather than let a bad value quietly change how calls are
+ * retried.
+ */
+function resolveRetryConfig(given: MembraneConfig['retry']): RetryConfig {
+  const { overloaded, ...base } = given ?? {};
+  const { overloaded: overloadedDefaults, ...baseDefaults } = DEFAULT_RETRY_CONFIG;
+  return {
+    ...resolveRetryFields(baseDefaults, base, 'retry'),
+    overloaded: resolveRetryFields(overloadedDefaults, overloaded, 'retry.overloaded'),
+  };
+}
+
+function resolveRetryFields<T extends { [K in keyof T]: number }>(
+  defaults: T,
+  given: Partial<T> | undefined,
+  path: string,
+): T {
+  const resolved = { ...defaults };
+  for (const key of Object.keys(defaults) as (keyof T & string)[]) {
+    const value: unknown = given?.[key];
+    if (value === undefined) continue;
+    if (typeof value !== 'number') {
+      throw new TypeError(`[membrane] ${path}.${key} must be a number, got ${value === null ? 'null' : typeof value}`);
+    }
+    if (!Number.isFinite(value) || value < 0) {
+      throw new RangeError(`[membrane] ${path}.${key} must be a finite number of at least 0, got ${value}`);
+    }
+    resolved[key] = value as T[typeof key];
+  }
+  return resolved;
+}
+
+/**
+ * The re-issues a call's `refusalRetries` asks for: a finite number of at
+ * least 0, and none for anything else, as for the call's other numeric
+ * options, so a `NaN` can't keep re-issuing while the model keeps refusing.
+ */
+function refusalBudget(asked: number | undefined): number {
+  return typeof asked === 'number' && Number.isFinite(asked) ? Math.max(0, asked) : 0;
 }
 
 export class Membrane {
   private adapter: ProviderAdapter;
   private registry?: ModelRegistry;
-  private retryConfig: RetryConfig;
+  /** The retry decision's settings for this membrane's resolved retry config
+   *  (membraneRetrySettings), made once: the config doesn't change. */
+  private retrySettings: RetrySettings;
   private config: MembraneConfig;
   private formatter: PrefillFormatter;
 
@@ -202,11 +480,7 @@ export class Membrane {
   ) {
     this.adapter = adapter;
     this.registry = config.registry;
-    this.retryConfig = {
-      ...DEFAULT_RETRY_CONFIG,
-      ...config.retry,
-      overloaded: { ...DEFAULT_RETRY_CONFIG.overloaded, ...config.retry?.overloaded },
-    };
+    this.retrySettings = membraneRetrySettings(resolveRetryConfig(config.retry));
     this.config = config;
     // Use provided formatter or default to AnthropicXmlFormatter
     this.formatter = config.formatter ?? new AnthropicXmlFormatter();
@@ -225,8 +499,11 @@ export class Membrane {
   ): Promise<NormalizedResponse> {
     const startTime = Date.now();
     let attempts = 0;
+    // The transport-error budget's count: passes since the last refusal
+    // re-issue, which starts it again.
+    let tries = 0;
     let rawRequest: unknown;
-    // Counted separately from `attempts` (the transport-error budget): a
+    // Counted separately from `tries` (the transport-error budget): a
     // refusal is a successful HTTP call with an unwanted verdict, and letting
     // it consume error retries would couple two unrelated budgets.
     let refusalRetriesUsed = 0;
@@ -234,6 +511,8 @@ export class Membrane {
     // billed HTTP call; reporting only the surviving attempt's usage
     // under-reports the turn by one full call per retry.
     let discardedUsage: DiscardedAttemptsUsage | undefined;
+    // The waits before each pass that sent the request again, in order.
+    const retryDelaysMs: number[] = [];
 
     // One selection for the whole call: mode resolution and the build must
     // name the same formatter instance (see resolveActiveFormatter).
@@ -241,9 +520,11 @@ export class Membrane {
 
     while (true) {
       attempts++;
+      tries++;
 
       try {
-        const { providerRequest, prefillResult } = this.transformRequest(request, activeFormatter);
+        const { providerRequest, prefillResult, toolMode } = this.transformRequest(request, activeFormatter);
+        const xmlToolProtocol = toolMode === 'xml' && activeFormatter.supportsXmlTools;
 
         // Route through the single canonical hook helper so any future
         // change to hook semantics (logging, retry interaction, error
@@ -259,30 +540,50 @@ export class Membrane {
           : clampCacheMarkers(finalRequest, 'complete').total;
         const useWireReceipt = this.adapter.cacheReceiptBasis === 'wire-request';
         let receiptEmitted = false;
-        if (!useWireReceipt) request.onCacheWireReceipt?.(computeCacheWireReceipt(finalRequest));
+        if (!useWireReceipt) deliverCacheWireReceipt(request, finalRequest);
         const receiptGuard = useWireReceipt && request.onCacheWireReceipt
           ? this.wireReceiptGuard(options.signal)
           : undefined;
 
-        const adapterCall = this.adapter.complete(finalRequest, {
-          signal: receiptGuard ? receiptGuard.signal : options.signal,
-          timeoutMs: options.timeoutMs,
-          onRequest: (req) => {
-            rawRequest = req;
-            if (useWireReceipt) {
-              markersInRequest = countWireCacheMarkers(req as Parameters<typeof countWireCacheMarkers>[0]);
-              if (!receiptEmitted) {
-                receiptEmitted = true;
-                receiptGuard?.emit(() => request.onCacheWireReceipt?.(computeCacheWireReceipt(req)));
+        // One progress deadline per provider call. A non-streaming call
+        // reports no progress before its response, so this bounds the call.
+        const progress = createProgressDeadline(
+          receiptGuard ? receiptGuard.signal : options.signal,
+          options.progressTimeoutMs,
+        );
+        let rawProviderResponse: ProviderResponse;
+        try {
+          const adapterCall = this.adapter.complete(finalRequest, {
+            requestContext: {
+              formatterName: activeFormatter.name,
+              toolMode,
+              toolsDeclared: Boolean(request.tools?.length),
+              requiresAssistantPrefill: false,
+            },
+            signal: progress.signal,
+            timeoutMs: options.timeoutMs,
+            ...(progress.renew ? { onProgress: progress.renew } : {}),
+            onRequest: (req) => {
+              rawRequest = req;
+              if (useWireReceipt) {
+                markersInRequest = countWireCacheMarkers(req as Parameters<typeof countWireCacheMarkers>[0]);
+                if (!receiptEmitted) {
+                  receiptEmitted = true;
+                  receiptGuard?.emit(() => deliverCacheWireReceipt(request, req));
+                }
               }
-            }
-            options.onRequest?.(req);
-          },
-        });
-        const rawProviderResponse = receiptGuard ? await receiptGuard.settle(adapterCall) : await adapterCall;
-        // Restate usage in the one convention before any ratio or price sees it.
+              runCallerCode(() => options.onRequest?.(req));
+            },
+          });
+          rawProviderResponse = receiptGuard ? await receiptGuard.settle(adapterCall) : await adapterCall;
+        } finally {
+          progress.cleanup();
+        }
+        // Restate usage in the one convention before any ratio or price sees it,
+        // and the stop token as membrane carries it (see providerReasonFor).
         const providerResponse: ProviderResponse = {
           ...rawProviderResponse,
+          providerStopReason: this.providerReasonFor(rawProviderResponse),
           usage: normalizeUsageToCacheExcluded(
             rawProviderResponse.usage,
             this.adapter.name,
@@ -291,7 +592,7 @@ export class Membrane {
         };
 
         // Call onResponse callback with raw response from API
-        options.onResponse?.(providerResponse.raw);
+        runCallerCode(() => options.onResponse?.(providerResponse.raw));
 
         const response = this.transformResponse(
           providerResponse,
@@ -299,6 +600,7 @@ export class Membrane {
           { ...prefillResult, cacheMarkersApplied: markersInRequest },
           startTime,
           attempts,
+          xmlToolProtocol,
           rawRequest
         );
 
@@ -309,9 +611,10 @@ export class Membrane {
         // should see the attempt that actually stands, not the discarded one.
         if (
           response.stopReason === 'refusal' &&
-          refusalRetriesUsed < Math.max(0, options.refusalRetries ?? 0)
+          refusalRetriesUsed < refusalBudget(options.refusalRetries)
         ) {
           refusalRetriesUsed++;
+          tries = 0;
           discardedUsage = this.mergeDiscardedAttempts(
             discardedUsage,
             this.discardedAttemptFrom(response.usage)
@@ -326,42 +629,55 @@ export class Membrane {
           response.details.usage.discardedAttempts =
             this.pricedDiscardedAttempts(discardedUsage, request.config.model);
         }
+        if (retryDelaysMs.length > 0) response.details.timing.retryDelaysMs = retryDelaysMs;
 
         // Call afterResponse hook
-        if (this.config.hooks?.afterResponse) {
-          return await this.config.hooks.afterResponse(response, providerResponse.raw);
+        const hooks = this.config.hooks;
+        if (hooks?.afterResponse) {
+          return await awaitCallerCode(() => hooks.afterResponse!(response, providerResponse.raw));
         }
 
         return response;
 
       } catch (error) {
-        const errorInfo = classifyError(error);
-        errorInfo.rawRequest = rawRequest;
+        // The caller's signal fired: a cancellation, whatever the in-flight
+        // error is named (AbortSignal.timeout() rejects with a TimeoutError),
+        // a refused build included, and never retried. The error stays on it
+        // as evidence. stream()'s paths judge the signal first too.
+        if (options.signal?.aborted) {
+          const cancelled = isTypedAbortError(error)
+            ? this.attachRawRequest(error, rawRequest)
+            : new MembraneError({
+                type: 'abort',
+                message: 'Request was aborted',
+                retryable: false,
+                rawError: error,
+                rawRequest,
+              });
+          throw cancelled;
+        }
+        // A refused build never reached the provider, and its own type is
+        // the answer. Rethrow it as it is instead of wrapping it as a
+        // transport error.
+        if (isBuildRefusal(error)) throw error;
+        const classifiedError = this.attachRawRequest(error, rawRequest);
+        const errorInfo = classifyError(classifiedError);
 
-        // Rate limits (429) always retry up to 5 attempts regardless of
-        // config, and overloaded (529) always retries on its own longer
-        // schedule — both are transient by definition, and the default
-        // maxRetries of 0 would otherwise turn a capacity blip into a dead
-        // turn. Other retryable errors only retry when maxRetries > 0.
-        // overloaded.maxRetries: 0 disables the dedicated policy entirely;
-        // the 529 then follows the base config like any retryable server
-        // error (exactly the pre-policy behavior), rather than being
-        // silently re-promoted to the long schedule by a positive base limit.
-        const isRateLimit = errorInfo.type === 'rate_limit';
-        const isOverloaded =
-          isOverloadedError(errorInfo) && this.retryConfig.overloaded.maxRetries > 0;
-        const effectiveMax = isRateLimit
-          ? Math.max(this.retryConfig.maxRetries, 5)
-          : isOverloaded
-            ? Math.max(this.retryConfig.maxRetries, this.retryConfig.overloaded.maxRetries)
-            : this.retryConfig.maxRetries;
+        // The one retry policy (retryPlan): a 529 on the overloaded schedule
+        // (the base one when overloaded.maxRetries is 0), a 429 with its floor
+        // of five, any other retryable error within maxRetries. Terminal
+        // billing/quota codes are excluded by classification (on
+        // AnthropicAdapter the API's x-should-retry has the last word), and a
+        // deadline on a sent request is the caller's.
+        const plan = this.retryPlan(errorInfo, tries, isDeadlineExpiry(classifiedError), options.retry);
 
-        if (errorInfo.retryable && attempts < effectiveMax) {
+        if (plan.retry) {
           // Check hook for retry decision
-          if (this.config.hooks?.onError) {
-            const decision = await this.config.hooks.onError(errorInfo, attempts);
+          const hooks = this.config.hooks;
+          if (hooks?.onError) {
+            const decision = await awaitCallerCode(() => hooks.onError!(errorInfo, tries));
             if (decision === 'abort') {
-              throw new MembraneError(errorInfo);
+              throw classifiedError;
             }
           }
 
@@ -369,16 +685,31 @@ export class Membrane {
           // sleep must fail like every other failure of this method — a
           // MembraneError — rather than escaping the loop as a raw
           // DOMException whose shape no caller of complete() expects.
-          const delay = this.calculateRetryDelay(attempts, isOverloaded);
+          const delay = plan.delayMs;
+          // Reported only with a response: a cancellation ends the wait by
+          // throwing, so a wait that didn't happen is never reported.
+          retryDelaysMs.push(delay);
           try {
             await this.sleep(delay, options.signal);
           } catch (sleepError) {
-            throw this.attachRawRequest(sleepError, rawRequest);
+            // The caller's signal fired: that is a cancellation whatever it
+            // was aborted with (a plain Error, a string), not an unknown
+            // failure. The reason stays on the error as evidence.
+            const ended = options.signal?.aborted
+              ? new MembraneError({
+                  type: 'abort',
+                  message: 'Request was aborted',
+                  retryable: false,
+                  rawError: sleepError,
+                  rawRequest,
+                })
+              : this.attachRawRequest(sleepError, rawRequest);
+            throw ended;
           }
           continue;
         }
 
-        throw new MembraneError(errorInfo);
+        throw classifiedError;
       }
     }
   }
@@ -422,17 +753,36 @@ export class Membrane {
           'with complete() per round).'
         );
       }
-      const response = await this.complete(request, options);
+      let response: NormalizedResponse;
+      try {
+        response = await this.complete(request, options);
+      } catch (error) {
+        // A cancellation is an AbortedResponse on every stream() path, this
+        // one included: the caller's signal (complete() then rejects with an
+        // abort MembraneError) or an adapter's own deadline. Nothing was
+        // streamed, so nothing partial is reported.
+        if (this.isCancellation(error, options.signal)) {
+          return this.buildAbortedResponse(
+            '',
+            { inputTokens: 0, outputTokens: 0 },
+            [],
+            [],
+            this.abortReason(error, options.signal),
+            []
+          );
+        }
+        throw error;
+      }
       // Synthesize onChunk callbacks so callers that depend on them still work
       if (options.onChunk && 'content' in response) {
         for (let i = 0; i < response.content.length; i++) {
           const block = response.content[i]!;
           if (block.type === 'text' && block.text) {
-            options.onChunk(block.text, {
+            runCallerCode(() => options.onChunk!(block.text, {
               type: 'text',
               visible: true,
               blockIndex: i,
-            });
+            }));
           }
         }
       }
@@ -442,96 +792,33 @@ export class Membrane {
     // Determine tool mode against the formatter that will build the request
     const activeFormatter = this.resolveActiveFormatter(options.formatter);
     const toolMode = this.resolveToolMode(request, activeFormatter);
-    const useNative = toolMode === 'native' && !!request.tools && request.tools.length > 0;
 
-    // Overloaded (529) pre-emission retry. The streaming paths have no retry
-    // loop of their own, so a capacity error used to kill the turn outright —
-    // and 529s most often arrive INSTEAD of a stream, before anything reaches
-    // the caller, where retrying is transparent. Once any callback has
-    // delivered output (tokens, blocks, usage), retrying would replay content
-    // the caller already consumed, so mid-stream errors still throw.
-    let attempts = 0;
-    const retryDelaysMs: number[] = [];
-    while (true) {
-      attempts++;
-      let emitted = false;
-      const mark = <A extends unknown[], R>(fn?: (...args: A) => R) =>
-        fn && ((...args: A): R => { emitted = true; return fn(...args); });
-      const tracked: StreamOptions = {
-        ...options,
-        onChunk: mark(options.onChunk),
-        onContentBlockUpdate: mark(options.onContentBlockUpdate),
-        onToolCalls: mark(options.onToolCalls),
-        onPreToolContent: mark(options.onPreToolContent),
-        onUsage: mark(options.onUsage),
-        onBlock: mark(options.onBlock),
-        onResponse: mark(options.onResponse),
-        // onRequest fires before the send — it is not an emission.
-      };
+    // Each callback is the caller's code, so what it throws is never
+    // retried (see callerCodeError). The tool executor and the pre-tool
+    // callback are awaited, so their rejections are the caller's too, and
+    // onRequest, which fires before the send, is the caller's code as well.
+    const callerCode = <A extends unknown[], R>(fn?: (...args: A) => R) =>
+      fn && ((...args: A): R => runCallerCode(() => fn(...args)));
+    const awaitedCallerCode = <A extends unknown[], R>(fn?: (...args: A) => Promise<R> | R) =>
+      fn && ((...args: A): Promise<R> => awaitCallerCode(() => fn(...args)));
+    const callerOptions: StreamOptions = {
+      ...options,
+      onChunk: callerCode(options.onChunk),
+      onContentBlockUpdate: callerCode(options.onContentBlockUpdate),
+      onToolCalls: awaitedCallerCode(options.onToolCalls),
+      onPreToolContent: awaitedCallerCode(options.onPreToolContent),
+      onUsage: callerCode(options.onUsage),
+      onBlock: callerCode(options.onBlock),
+      onResponse: callerCode(options.onResponse),
+      onRequest: callerCode(options.onRequest),
+    };
 
-      try {
-        const result = useNative
-          ? await this.streamWithNativeTools(request, tracked, activeFormatter)
-          : await this.streamWithXmlTools(request, tracked, activeFormatter);
-        // The inner paths count their own provider calls but cannot see this
-        // wrapper's discarded attempts. Each failed attempt here died before
-        // emitting anything (that is the precondition for retrying), so it
-        // cost at least the one call it failed on — ADD those to the inner
-        // count rather than overwriting it, or a turn that retried twice and
-        // then ran three tool rounds would report 2 calls instead of 5.
-        if (attempts > 1 && 'details' in result) {
-          result.details.timing.attempts += attempts - 1;
-          result.details.timing.retryDelaysMs = retryDelaysMs;
-        }
-        return result;
-      } catch (error) {
-        const errorInfo = classifyError(error);
-        // Same semantics as complete(): maxRetries bounds total attempts,
-        // the overloaded floor applies over the base config, and
-        // overloaded.maxRetries: 0 opts out of stream retries entirely
-        // (streaming had no retry before this policy existed).
-        const overloadedEnabled = this.retryConfig.overloaded.maxRetries > 0;
-        const maxOverloaded = Math.max(
-          this.retryConfig.maxRetries,
-          this.retryConfig.overloaded.maxRetries
-        );
-        if (!emitted && overloadedEnabled && isOverloadedError(errorInfo) && attempts < maxOverloaded) {
-          // Honor the same pre-retry hook contract as complete(): hosts use
-          // onError for circuit-breaking, and its 'abort' decision must work
-          // on the streaming path too.
-          if (this.config.hooks?.onError) {
-            const decision = await this.config.hooks.onError(errorInfo, attempts);
-            if (decision === 'abort') {
-              throw error;
-            }
-          }
-          const delay = this.calculateRetryDelay(attempts, true);
-          retryDelaysMs.push(delay);
-          // An abort during the backoff window is still a cancellation of
-          // this stream, and stream() documents cancellation as an
-          // AbortedResponse. Letting the sleep's rejection escape made that
-          // contract depend on which millisecond the abort landed in.
-          // Nothing has been emitted on this path (that is the precondition
-          // for retrying at all), so there is no partial content to report.
-          try {
-            await this.sleep(delay, options.signal);
-          } catch (sleepError) {
-            if (this.isAbortError(sleepError)) {
-              return this.buildAbortedResponse(
-                '',
-                { inputTokens: 0, outputTokens: 0 },
-                [],
-                [],
-                this.abortReason(sleepError, options.signal)
-              );
-            }
-            throw sleepError;
-          }
-          continue;
-        }
-        throw error;
-      }
-    }
+    // A provider call that fails before it delivers anything is sent again
+    // inside streamOnce, on every streaming path and in every round: nothing
+    // has reached the caller from it, so retrying replays nothing.
+    return toolMode === 'native'
+      ? this.streamWithNativeTools(request, callerOptions, activeFormatter)
+      : this.streamWithXmlTools(request, callerOptions, activeFormatter);
   }
 
   /**
@@ -587,30 +874,17 @@ export class Membrane {
     request: NormalizedRequest,
     formatter: PrefillFormatter = this.formatter
   ): 'xml' | 'native' {
-    // Explicit mode takes precedence
-    if (request.toolMode && request.toolMode !== 'auto') {
-      return request.toolMode;
+    for (const field of ['supportsNativeTools', 'supportsXmlTools'] as const) {
+      if (typeof formatter[field] !== 'boolean') {
+        throw unsupportedError(`Formatter "${formatter.name}" must declare ${field} as a boolean.`);
+      }
     }
-
-    // A formatter constructed with an explicit mode states its caller's choice
-    if (formatter.configuredToolMode) {
-      return formatter.configuredToolMode;
+    const mode = request.toolMode && request.toolMode !== 'auto' ? request.toolMode
+      : formatter.configuredToolMode ?? (formatter.supportsNativeTools ? 'native' : 'xml');
+    if (toolsOffered(request).length && !(mode === 'native' ? formatter.supportsNativeTools : formatter.supportsXmlTools)) {
+      throw unsupportedError(`Formatter "${formatter.name}" cannot carry ${mode} tool definitions. Choose a formatter supporting that carrier, or leave out the tools (those in tools and those a system change's defineTools offers).`);
     }
-
-    // Auto mode: choose based on formatter
-    // NativeFormatter → native tools via API
-    // AnthropicXmlFormatter (default) → XML tools in prefill
-    if (formatter.name === 'native' || formatter.name === 'openai-responses') {
-      return 'native';
-    }
-
-    // Also handle known native-tool providers regardless of formatter
-    if (this.adapter.name === 'openrouter') {
-      return 'native';
-    }
-
-    // Default to XML for prefill compatibility
-    return 'xml';
+    return mode;
   }
 
   /**
@@ -639,12 +913,16 @@ export class Membrane {
       signal,
       timeoutMs,
       idleTimeoutMs,
+      progressTimeoutMs,
+      retry,
     } = options;
 
     // The formatter stream() selected: the same instance that resolved the
     // mode and will build the request, so the parser can never be reading a
     // different format than the one on the wire.
     const formatter = activeFormatter;
+    const xmlToolProtocol = formatter.supportsXmlTools;
+    const streamedThinking = new StreamedThinking();
 
     // Initialize parser from formatter for format-specific tracking
     const parser = formatter.createStreamParser();
@@ -661,8 +939,11 @@ export class Membrane {
     // re-issues inside streamOnce) and continuation rounds.
     let providerCalls = 0;
     let rounds = 0;
+    // The waits before each call that was sent again (see streamOnce).
+    const retryDelaysMs: number[] = [];
     const contentBlocks: ContentBlock[] = [];
     let lastStopReason: StopReason = 'end_turn';
+    let lastProviderStopReason: string | undefined;
     let lastStopSequence: string | undefined;
     let rawRequest: unknown;
     let rawResponse: unknown;
@@ -670,6 +951,9 @@ export class Membrane {
     // Track executed tool calls and results
     const executedToolCalls: ToolCall[] = [];
     const executedToolResults: ToolResult[] = [];
+    // Rounds split to send their images, so the final parse can give each
+    // results block what its tools returned (attachSplitResults).
+    const splitRounds: SplitResultsRound[] = [];
 
     // Track non-text content blocks from provider (e.g., generated_image from Gemini)
     // These can't be handled by the text-based XML parser, so we capture and append them
@@ -682,7 +966,7 @@ export class Membrane {
     const providerThinkingBlocks: ContentBlock[] = [];
 
     // Transform initial request using the formatter
-    let { providerRequest, prefillResult } = this.transformRequest(request, formatter);
+    let { providerRequest, prefillResult } = this.transformRequest(request, formatter, 'xml');
 
     // Initialize parser with prefill content so it knows about any open tags
     // (e.g., <thinking> in the prefill means API response continues inside thinking)
@@ -735,7 +1019,7 @@ export class Membrane {
     let consecutiveStalledResumptions = 0;
     let enteredViaResumption = false;
     let prevRoundStopSequence: string | undefined;
-    const warnLog = this.config.logger ?? console;
+    const warnLog = this.warnLogger();
 
     /** Count an automatic resumption; emits the visibility warning at the
      *  threshold and returns false when the cap says the turn should end. */
@@ -773,6 +1057,53 @@ export class Membrane {
         // this index and doesn't count as model progress.
         const checkFromIndex = parser.getAccumulated().length;
 
+        let typedCallbacks = false;
+        let sawChunk = false;
+        const textStarts = new Map<number, number>();
+        streamedThinking.beginRound(parser.getAccumulated().length - initialPrefillLength);
+        const tracker = new NativeBlockTracker((event) => { if (typedCallbacks) onBlock?.(event); });
+        // The parser's emissions go out in order: its block events unless the
+        // provider's typed blocks report them, and its text with its block's
+        // label.
+        const forward = (emissions: ProcessChunkResult['emissions']) => {
+          for (const emission of emissions) {
+            if (emission.kind === 'blockEvent') {
+              if (!typedCallbacks) onBlock?.(emission.event);
+            } else {
+              onChunk?.(emission.text, typedCallbacks ? { ...emission.meta, blockIndex: tracker.blockIndex } : emission.meta);
+            }
+          }
+        };
+        // Under typed blocks the stream carries the provider's blocks, and by
+        // a round's end the provider's last block has completed, so what the
+        // parser held back then isn't streamed, as on main, though the
+        // provider's block and the content keep it. Neither is what a flush
+        // before a break sends: the stream carries none of the parser's block
+        // events under typed blocks, and a put-back stop has already gone out
+        // whole (below).
+        const forwardOwn = (emissions: ProcessChunkResult['emissions']) => {
+          if (!typedCallbacks) forward(emissions);
+        };
+        const onProviderBlock = (index: number, block: unknown) => {
+          if (!xmlToolProtocol && (!detectedStopSequence || textStarts.has(index))) {
+            const type = (block as { type?: string } | undefined)?.type;
+            if (!sawChunk && (type === 'text' || type === 'thinking' || type === 'redacted_thinking')) typedCallbacks = true;
+            const accepted = truncatedAccumulated ?? parser.getAccumulated();
+            const offset = accepted.length - initialPrefillLength;
+            // Logical completion reports accepted text, not a suffix
+            // discarded by the parser's local stop-sequence boundary.
+            let reported = block;
+            if (type === 'text') {
+              const start = textStarts.get(index);
+              if (start === undefined) textStarts.set(index, offset);
+              else reported = { ...(block as object), text: accepted.slice(initialPrefillLength + start) };
+            }
+            streamedThinking.onBlock(index, reported, offset);
+            tracker.onProviderBlock(index, reported);
+          }
+          onContentBlockUpdate?.(index, block as ContentBlock);
+        };
+
         // Stream from provider
         const streamResult = await this.streamOnce(
           providerRequest,
@@ -784,57 +1115,40 @@ export class Membrane {
               }
 
               // Process chunk with enriched streaming API
-              const { emissions } = parser.processChunk(chunk);
-
-              // Check for stop sequences only in NEW content (not already-processed)
-              const accumulated = parser.getAccumulated();
-              const newContent = accumulated.slice(checkFromIndex);
-
-              for (const stopSeq of prefillResult.stopSequences) {
-                const idx = newContent.indexOf(stopSeq);
-                if (idx !== -1) {
-                  // Found stop sequence - mark it and truncate
-                  const absoluteIdx = checkFromIndex + idx;
-                  detectedStopSequence = stopSeq;
-                  truncatedAccumulated = accumulated.slice(0, absoluteIdx);
-
-                  // Emit only the portion up to stop sequence with metadata
-                  const alreadyEmitted = accumulated.length - chunk.length;
-                  if (absoluteIdx > alreadyEmitted) {
-                    const truncatedChunk = accumulated.slice(alreadyEmitted, absoluteIdx);
-                    const meta: ChunkMeta = {
-                      type: parser.getCurrentBlockType(),
-                      visible: parser.getCurrentBlockType() === 'text',
-                      blockIndex: 0, // Approximate
-                    };
-                    onChunk?.(truncatedChunk, meta);
-                  }
-                  return;
-                }
+              sawChunk = true;
+              if (!xmlToolProtocol && tracker.currentType === 'thinking') {
+                streamedThinking.onThinkingChunk(tracker.blockIndex, chunk);
+                onChunk?.(chunk, { type: 'thinking', visible: false, blockIndex: tracker.blockIndex });
+                return;
               }
-
-              // Emit in correct interleaved order using emissions array
-              for (const emission of emissions) {
-                if (emission.kind === 'blockEvent') {
-                  onBlock?.(emission.event);
-                } else {
-                  onChunk?.(emission.text, emission.meta);
-                }
+              // Only visible text enters a plain formatter's parser, and only
+              // the text before a stop: the stop is found in the round's new
+              // text first, so what goes out up to it is labelled by the block
+              // each piece belongs to, as on every other chunk.
+              const { found, head, emissions } = parseUpToStop(parser, chunk, checkFromIndex, prefillResult.stopSequences);
+              if (found) {
+                detectedStopSequence = found.stop;
+                truncatedAccumulated = head;
               }
+              forward(emissions);
             },
-            onContentBlock: onContentBlockUpdate
-              ? (index: number, block: unknown) => onContentBlockUpdate(index, block as ContentBlock)
-              : undefined,
+            onContentBlock: onProviderBlock,
+            // Only a thinking span already recorded takes it (see onProviderBlock).
+            onThinkingSignature: (index, signature) => streamedThinking.onSignature(index, signature),
           },
           {
             signal,
             timeoutMs,
             idleTimeoutMs,
+            progressTimeoutMs,
+            retry,
             normalizedRequest: request,
+            formatterName: formatter.name,
+            requiresAssistantPrefill: true,
             // The tag-based parser tracks thinking via <thinking> tags — ask the
             // provider to wrap native thinking deltas so they don't stream as
             // visible text (see ProviderRequestOptions.wrapThinkingTags)
-            wrapThinkingTags: true,
+            wrapThinkingTags: xmlToolProtocol,
             onWireCacheMarkers: (count) => { prefillResult.cacheMarkersApplied = count; },
             onRequest: (req) => {
               rawRequest = req;
@@ -843,13 +1157,20 @@ export class Membrane {
           }
         );
 
+        if (typedCallbacks) tracker.flush();
         rounds++;
         providerCalls += streamResult.providerCalls;
+        retryDelaysMs.push(...streamResult.retryDelaysMs);
 
-        // If we detected stop sequence manually, fix up the parser and result
+        // A stop found here ends the round at the text before it. The parser
+        // took only that text, so it ends the round as it would a round the
+        // provider stopped, unless the stop began in an earlier chunk, which
+        // it took whole: then it starts again from the accepted text.
         if (detectedStopSequence && truncatedAccumulated !== null) {
-          parser.reset();
-          parser.push(truncatedAccumulated);
+          if (parser.getAccumulated() !== truncatedAccumulated) {
+            parser.reset();
+            parser.push(truncatedAccumulated);
+          }
           streamResult.stopReason = 'stop_sequence';
           streamResult.stopSequence = detectedStopSequence;
         }
@@ -870,6 +1191,7 @@ export class Membrane {
         onResponse?.(rawResponse);
 
         lastStopReason = this.mapStopReason(streamResult.stopReason);
+        lastProviderStopReason = streamResult.providerStopReason;
         lastStopSequence = streamResult.stopSequence ?? undefined;
 
         // Accumulate usage (including cache metrics), priced at this round's
@@ -878,13 +1200,10 @@ export class Membrane {
         const usageSoFar = turnUsage.addRound(streamResult.model, streamResult.usage);
         onUsage?.(usageSoFar);
 
-        // Flush the parser to complete any in-progress streaming block
-        const flushResult = parser.flush();
-        for (const emission of flushResult.emissions) {
-          if (emission.kind === 'blockEvent') {
-            onBlock?.(emission.event);
-          }
-        }
+        // Flush the parser: the block in progress completes, and the text it
+        // held back at the round's end (a possible tag's start) goes out with
+        // it. Under typed blocks neither is streamed (forwardOwn).
+        forwardOwn(parser.flush().emissions);
 
         // Get accumulated text from parser
         const accumulated = parser.getAccumulated();
@@ -922,7 +1241,7 @@ export class Membrane {
         enteredViaResumption = false;
 
         // Check for tool calls (if handler provided)
-        if (onToolCalls && streamResult.stopSequence === '</function_calls>') {
+        if (xmlToolProtocol && onToolCalls && streamResult.stopSequence === '</function_calls>') {
           // Append the closing tag (we truncated before it, or API stopped before it)
           const closeTag = '</function_calls>';
           parser.push(closeTag);
@@ -1002,10 +1321,22 @@ export class Membrane {
             // Track the tool results
             executedToolResults.push(...results);
 
-            // Check if results contain images (requires split-turn injection)
-            if (hasImageInToolResults(results)) {
-              // Use split-turn injection for images
-              const splitContent = formatToolResultsForSplitTurn(results);
+            // Check if results contain images (requires split-turn injection).
+            // The split is for images that will be sent: when every image
+            // would become a placeholder, there is nothing to put in the user
+            // turn, and the standard path carries the placeholders as text.
+            // The check doesn't decide, so each image is decided once, on
+            // whichever path carries it.
+            const splitContent = hasImageInToolResults(results) ? formatToolResultsForSplitTurn(results) : null;
+            if (splitContent?.hasImages) {
+              splitRounds.push({
+                xml: splitContent.beforeImageXml + splitContent.afterImageXml,
+                // The block goes into the document next, so it starts here.
+                docAt: parser.getAccumulated().length - initialPrefillLength,
+                at: splitContent.beforeImageXml.length,
+                imageResult: splitContent.imageResult,
+                results,
+              });
 
               // Emit block events for tool results (image path)
               const toolResultBlockIndex = parser.getBlockIndex();
@@ -1066,8 +1397,8 @@ export class Membrane {
               // Reset parser state for new streaming iteration
               parser.resetForNewIteration();
             } else {
-              // Standard path: no images, use simple XML injection
-              const resultsXml = formatToolResults(results);
+              // Standard path: no image to send, use simple XML injection
+              const resultsXml = splitContent ? splitContent.beforeImageXml : formatToolResults(results);
 
               // Emit block events for tool results
               const toolResultBlockIndex = parser.getBlockIndex();
@@ -1147,24 +1478,37 @@ export class Membrane {
 
         if (lastStopReason === 'stop_sequence' && modelOpenedNewBlock) {
           // False positive! The stop sequence (e.g., "\nUser:") appeared inside XML content
-          // Re-add the consumed stop sequence and resume streaming
+          // Re-add the consumed stop sequence and resume streaming. It's the
+          // model's text, inside the block it opened, so it goes through the
+          // parser as a chunk does. No block is in progress after the round's
+          // flush, so text starts a new block of its type, and a closing tag,
+          // such as a </function_calls> stop with no call run, sends no block
+          // event.
           if (streamResult.stopSequence) {
-            parser.push(streamResult.stopSequence);
-            const meta: ChunkMeta = {
-              type: parser.getCurrentBlockType(),
-              visible: parser.getCurrentBlockType() === 'text',
-              blockIndex: 0,
-            };
-            onChunk?.(streamResult.stopSequence, meta);
+            // Under typed blocks the stop's text goes out as one piece at
+            // index 0, as main sent it, labelled with the block it sits in,
+            // read before the parser takes it, so a closing tag is labelled
+            // with the block it closes.
+            const type = parser.getCurrentBlockType();
+            const putBack = parser.processChunk(streamResult.stopSequence).emissions;
+            if (typedCallbacks) {
+              onChunk?.(streamResult.stopSequence, { type, visible: type === 'text', blockIndex: 0 });
+            } else {
+              forward(putBack);
+            }
           }
 
-          // Resume streaming - but limit resumptions to prevent infinite loops
+          // Resume streaming - but limit resumptions to prevent infinite loops.
+          // A turn that ends at either break below completes the block the
+          // stop's text opened, streamed unless under typed blocks.
           toolDepth++; // Count this as a "depth" to limit iterations
           if (toolDepth > maxToolDepth) {
+            forwardOwn(parser.flush().emissions);
             break;
           }
           if (!registerResumptionRound()) {
             lastStopReason = 'round_limit';
+            forwardOwn(parser.flush().emissions);
             break;
           }
           enteredViaResumption = true;
@@ -1174,8 +1518,8 @@ export class Membrane {
             prefillResult,
             parser.getAccumulated()
           );
-          // Reset parser state for new streaming iteration
-          parser.resetForNewIteration();
+          // The parser isn't reset for the next round, so a block the stop's
+          // text started goes on there.
           continue;
         }
 
@@ -1190,10 +1534,11 @@ export class Membrane {
 
       const response = this.buildFinalResponse(
         newContent,
-        contentBlocks,
+        xmlToolProtocol ? contentBlocks : streamedThinking.content(newContent, (value, context) => formatter.parseContentBlocks(value, request.tools, context)),
         lastStopReason,
         turnUsage,
         request,
+        xmlToolProtocol,
         prefillResult,
         startTime,
         providerCalls,
@@ -1203,6 +1548,8 @@ export class Membrane {
         executedToolResults,
         initialBlockType,
         lastStopSequence,
+        lastProviderStopReason,
+        splitRounds
       );
 
       // Append non-text content blocks (e.g., generated_image) that the XML parser can't handle
@@ -1214,11 +1561,12 @@ export class Membrane {
       this.mergeProviderThinkingBlocks(response.content, providerThinkingBlocks);
 
       response.details.timing.rounds = rounds;
+      if (retryDelaysMs.length > 0) response.details.timing.retryDelaysMs = retryDelaysMs;
 
       return response;
     } catch (error) {
-      // Check if this is an abort error
-      if (this.isAbortError(error)) {
+      // A cancellation, by the caller's signal or a typed abort.
+      if (this.isCancellation(error, signal)) {
         // Only use NEW content (after initial prefill) for partial content
         const fullAccumulated = parser.getAccumulated();
         const newContent = fullAccumulated.slice(initialPrefillLength);
@@ -1229,8 +1577,9 @@ export class Membrane {
           executedToolCalls,
           executedToolResults,
           this.abortReason(error, signal),
-          initialBlockType,
-          request.tools
+          xmlToolProtocol
+            ? attachSplitResults(parseAccumulatedIntoBlocks(newContent, { tools: request.tools, ...(initialBlockType ? { startInsideBlock: initialBlockType } : {}) }), splitRounds).blocks
+            : streamedThinking.content(newContent, (value, context) => formatter.parseContentBlocks(value, request.tools, context))
         );
       }
       // Re-throw with rawRequest attached for logging
@@ -1260,6 +1609,8 @@ export class Membrane {
       signal,
       timeoutMs,
       idleTimeoutMs,
+      progressTimeoutMs,
+      retry,
     } = options;
 
     let toolDepth = 0;
@@ -1273,7 +1624,12 @@ export class Membrane {
     // re-issues inside streamOnce) and continuation rounds.
     let providerCalls = 0;
     let rounds = 0;
+    // The waits before each call that was sent again (see streamOnce).
+    const retryDelaysMs: number[] = [];
     let lastStopReason: StopReason = 'end_turn';
+    // Rounds the provider ended with end_turn while returning tool calls.
+    const anomalies: ResponseAnomaly[] = [];
+    let lastProviderStopReason: string | undefined;
     let lastStopSequence: string | undefined;
     let rawRequest: unknown;
     let rawResponse: unknown;
@@ -1288,6 +1644,11 @@ export class Membrane {
     // Build messages array that we'll update with tool results
     let messages = [...request.messages];
     let allContentBlocks: ContentBlock[] = [];
+    // What the current round has received, for partialContent if it aborts:
+    // the tracker's record while the provider streams, then the content the
+    // provider returned until it joins allContentBlocks. An abort can still
+    // come after the provider returns, from a caller's callback.
+    let roundReceived: (() => ContentBlock[]) | undefined;
     let markersInLastRequest = 0;
 
     try {
@@ -1303,16 +1664,26 @@ export class Membrane {
         // runNativeToolsYielding uses (#19). Before this, meta.type was
         // hardcoded to 'text' on every chunk and onBlock was never invoked
         // from this path (#20).
-        const tracker = new NativeBlockTracker(onBlock ? (event) => onBlock(event) : undefined);
+        // A reply calls from the tools this round's messages offer, a change
+        // in them included.
+        const offered = toolsOffered({ tools: request.tools, messages });
+        const tracker = new NativeBlockTracker(onBlock ? (event) => onBlock(event) : undefined, (name) => restoreToolName(name, offered));
+        roundReceived = () => this.parseProviderContent(tracker.partialContent(), offered);
         const streamResult = await this.streamOnce(
           providerRequest,
           {
             onChunk: (chunk) => {
-              textAccumulated += chunk;
-              allTextAccumulated += chunk;
+              tracker.onChunk(chunk);
+              const visible = tracker.currentType === 'text';
+              // The text accumulators hold visible text only: a provider's
+              // thinking deltas arrive here too, and they stay typed.
+              if (visible) {
+                textAccumulated += chunk;
+                allTextAccumulated += chunk;
+              }
               const meta: ChunkMeta = {
                 type: tracker.currentType,
-                visible: tracker.currentType === 'text',
+                visible,
                 blockIndex: tracker.blockIndex,
               };
               onChunk?.(chunk, meta);
@@ -1322,12 +1693,18 @@ export class Membrane {
               // Deprecated pass-through, kept for callers still on it.
               onContentBlockUpdate?.(index, block as ContentBlock);
             },
+            onThinkingSignature: (index, signature) => tracker.onThinkingSignature(index, signature),
           },
           {
             signal,
             timeoutMs,
             idleTimeoutMs,
+            progressTimeoutMs,
+            retry,
             normalizedRequest: request,
+            formatterName: activeFormatter.name,
+            requiresAssistantPrefill: false,
+            promptMessages: messages,
             onRequest: (req) => {
               rawRequest = req;
               onRequest?.(req);
@@ -1343,11 +1720,17 @@ export class Membrane {
           }
         );
 
+        // The provider has finished the round: from here, what it received is
+        // the content it returned.
+        const responseBlocks = this.parseProviderContent(streamResult.content, offered);
+        roundReceived = () => responseBlocks;
+
         // Single-callback adapters (OpenAI Responses) report each finalised
         // block once, after the stream: complete whatever never saw a stop.
         tracker.flush();
         rounds++;
         providerCalls += streamResult.providerCalls;
+        retryDelaysMs.push(...streamResult.retryDelaysMs);
 
         rawResponse = streamResult.raw;
 
@@ -1355,7 +1738,16 @@ export class Membrane {
         onResponse?.(rawResponse);
 
         lastStopReason = this.mapStopReason(streamResult.stopReason);
+        lastProviderStopReason = streamResult.providerStopReason;
         lastStopSequence = streamResult.stopSequence ?? undefined;
+        // Complete tool calls the provider stopped with end_turn run as a
+        // tool_use round (ToolUseWithEndTurnAnomaly); details.stop keeps the
+        // provider's own token.
+        const endTurnTools = this.toolUseWithEndTurn(responseBlocks, lastStopReason, streamResult, rounds - 1);
+        if (endTurnTools) {
+          anomalies.push(endTurnTools);
+          if (endTurnTools.treatedAsToolUse) lastStopReason = 'tool_use';
+        }
 
         // Accumulate usage (including cache metrics), priced at this round's
         // model. NOT inlined into the optional call — `onUsage?.(addRound())`
@@ -1363,9 +1755,8 @@ export class Membrane {
         const usageSoFar = turnUsage.addRound(streamResult.model, streamResult.usage);
         onUsage?.(usageSoFar);
 
-        // Parse content blocks from response
-        const responseBlocks = this.parseProviderContent(streamResult.content);
         allContentBlocks.push(...responseBlocks);
+        roundReceived = undefined;
 
         // Check for tool_use blocks
         const toolUseBlocks = responseBlocks.filter(
@@ -1383,11 +1774,7 @@ export class Membrane {
           }
 
           // Convert to normalized ToolCall[]
-          const toolCalls: ToolCall[] = toolUseBlocks.map(block => ({
-            id: block.id,
-            name: block.name,
-            input: block.input as Record<string, unknown>,
-          }));
+          const toolCalls: ToolCall[] = toolUseBlocks.map(toolCallOf);
 
           // Track tool calls
           executedToolCalls.push(...toolCalls);
@@ -1459,16 +1846,13 @@ export class Membrane {
         stopReason: lastStopReason,
         usage: totalUsage,
         details: {
-          stop: {
-            reason: lastStopReason,
-            triggeredSequence: lastStopSequence,
-            wasTruncated: lastStopReason === 'max_tokens',
-          },
+          stop: this.buildStopInfo(lastStopReason, lastProviderStopReason, lastStopSequence),
           usage: { ...totalUsage },
           timing: {
             totalDurationMs: durationMs,
             attempts: providerCalls,
             rounds,
+            ...(retryDelaysMs.length > 0 ? { retryDelaysMs } : {}),
           },
           model: {
             requested: request.config.model,
@@ -1482,6 +1866,7 @@ export class Membrane {
             tokensRead: totalUsage.cacheReadTokens ?? 0,
             hitRatio: this.calculateCacheHitRatio(totalUsage),
           },
+          ...(anomalies.length ? { anomalies } : {}),
         },
         raw: {
           request: rawRequest,
@@ -1489,14 +1874,15 @@ export class Membrane {
         },
       };
     } catch (error) {
-      // Check if this is an abort error
-      if (this.isAbortError(error)) {
+      // A cancellation, by the caller's signal or a typed abort.
+      if (this.isCancellation(error, signal)) {
         return this.buildAbortedResponse(
           allTextAccumulated,
           turnUsage.total,
           executedToolCalls,
           executedToolResults,
-          this.abortReason(error, signal)
+          this.abortReason(error, signal),
+          [...allContentBlocks, ...(roundReceived?.() ?? [])]
         );
       }
       // Re-throw with rawRequest attached for logging
@@ -1553,220 +1939,26 @@ export class Membrane {
     request: NormalizedRequest,
     messages: typeof request.messages,
     toolLoopRebuild = false,
-    activeFormatter: PrefillFormatter = this.formatter
+    activeFormatter: PrefillFormatter = this.formatter,
+    fidelity?: FidelityNotes,
   ): any {
-    // Provider-native formatters own their complete input-item shape. The
-    // legacy implementation below is intentionally Anthropic-specific; using
-    // it for Responses would normalize away item IDs, encrypted reasoning,
-    // assistant phases, and compaction items.
-    if (activeFormatter.name === 'openai-responses') {
-      return this.transformRequest({ ...request, messages }, activeFormatter).providerRequest;
-    }
+    const { providerRequest, prefixRewritten } = this.transformRequest(request, activeFormatter, 'native', messages, fidelity);
+    // Responses formatters own their input-item representation and cache policy.
+    if (activeFormatter.name === 'openai-responses') return providerRequest;
 
-    // Convert messages to provider format
-    const providerMessages: any[] = [];
-    
-    const assistantName = request.assistantParticipant
-      ?? this.config.assistantParticipant ?? 'Claude';
-
+    const mergedMessages = providerRequest.messages;
+    const system = providerRequest.system;
+    const tools = providerRequest.tools;
     const promptCaching = request.promptCaching ?? this.config.defaultPromptCaching ?? true;
-    const cacheControl = promptCaching ? { type: 'ephemeral' as const, ...(request.cacheTtl ? { ttl: request.cacheTtl } : {}) } : undefined;
-
-    // Anthropic allows at most 4 cache_control breakpoints per request. The
-    // message breakpoints are the valuable ones (they cache the longest prefixes,
-    // and every one already includes tools+system at the front of the request).
-    // So tools/system get a breakpoint only as a FALLBACK — when no marker
-    // exists anywhere on the wire — otherwise they're redundant and would push
-    // the total past 4, which the API hard-rejects (the agent goes
-    // unresponsive). The fallback gate reads a RECOUNT of the built artifacts
-    // (see below), never a running tally: a running tally cannot see a
-    // caller-marked system block, and double-counts a message breakpoint that
-    // lands on a block already carrying stale cache_control.
-    for (const msg of messages) {
-      const isAssistant = msg.participant === assistantName;
-      const role = isAssistant ? 'assistant' : 'user';
-
-      // Convert content blocks
-      const content: any[] = [];
-      const includeNamePrefix = !isAssistant;
-      let hasText = false;
-      for (const block of msg.content) {
-        if (block.type === 'text') {
-          // Empty text blocks are rejected by the Anthropic API. In
-          // particular, zero-width rawItem carriers (opaque Responses items,
-          // see parseProviderContent) must not leak here. Filter BEFORE the
-          // name prefix below would make them non-empty.
-          if (block.text === '') continue;
-          let text = block.text;
-          if (includeNamePrefix && msg.participant && !hasText) {
-            text = (activeFormatter.nameFormat ?? '{name}: ').replace('{name}', () => msg.participant) + text;
-          }
-          hasText = true;
-          const textBlock: Record<string, unknown> = { type: 'text', text };
-          if ((block as any).cache_control) {
-            // A block-level passthrough occupies one of the 4 breakpoint slots
-            // exactly like a marked message; the recount below sees it.
-            // (Imported/seeded conversations carry stale request-time
-            // cache_control on stored blocks — first seen wedging Sill
-            // 2026-07-25: 3 cm markers + 2 stale Arc-export blocks = 5 → hard
-            // 400 on every inference.)
-            textBlock.cache_control = (block as any).cache_control;
-          }
-          content.push(textBlock);
-        } else if (block.type === 'tool_use') {
-          content.push({
-            type: 'tool_use',
-            id: block.id,
-            name: sanitizeToolName(block.name),
-            input: block.input,
-          });
-        } else if (block.type === 'tool_result') {
-          content.push({
-            type: 'tool_result',
-            tool_use_id: block.toolUseId,
-            content: block.content,
-            is_error: block.isError,
-          });
-        } else if (block.type === 'thinking') {
-          // Round-trip thinking blocks verbatim including the signature — the
-          // API validates it and (on display:'omitted' models) decrypts it to
-          // reconstruct prior reasoning. Empty thinking + signature is valid.
-          content.push({
-            type: 'thinking',
-            thinking: (block as { thinking?: string }).thinking ?? '',
-            ...((block as { signature?: string }).signature
-              ? { signature: (block as { signature?: string }).signature }
-              : {}),
-          });
-        } else if (block.type === 'redacted_thinking') {
-          content.push({ ...(block as unknown as Record<string, unknown>) });
-        } else if (block.type === 'image') {
-          if (block.source.type === 'base64') {
-            const mediaType = resolveImageMediaType(block.source.data, block.source.mediaType);
-            if (!isAcceptedImageMediaType(mediaType)) {
-              // API-unacceptable media type (e.g. image/svg): degrade to a
-              // loud text placeholder instead of poisoning the whole request
-              // (one bad stored block otherwise 400s every compile forever).
-              content.push(strippedImagePlaceholder(mediaType));
-            } else {
-              const imageBlock: Record<string, unknown> = {
-                type: 'image',
-                source: {
-                  type: 'base64',
-                  media_type: mediaType,
-                  data: block.source.data,
-                },
-              };
-              // Preserve sourceUrl for providers that use URL-as-text (Gemini 3.x)
-              if (block.sourceUrl) {
-                imageBlock.sourceUrl = block.sourceUrl;
-              }
-              content.push(imageBlock);
-            }
-          }
-        }
-      }
-
-      // Apply cache_control to the last CACHEABLE block of messages with a
-      // cacheBreakpoint. The API rejects cache_control on thinking /
-      // redacted_thinking blocks (400 "thinking.cache_control: Extra inputs
-      // are not permitted"), so a breakpoint landing on a thinking-terminated
-      // message must step back to the last non-thinking block — and is skipped
-      // entirely when the message is thinking-only.
-      //
-      // 2026-07-14: this is the THIRD request builder to need the rule. The
-      // 2026-07-01 fix hardened NativeFormatter's two sites but not this one,
-      // which is the live Connectome path (native tools + thinking) — so the
-      // 400 came back the moment a breakpoint landed on a thinking-only turn.
-      // The rule now lives in ONE exported helper that every builder calls.
-      if (msg.cacheBreakpoint && cacheControl && content.length > 0) {
-        const bpIdx = lastCacheableBlockIndex(content as Array<Record<string, unknown>>);
-        if (bpIdx >= 0) {
-          content[bpIdx].cache_control = cacheControl;
-        }
-      }
-
-      providerMessages.push({ role, content });
-    }
-
-    // Wire-boundary safety net: repair upstream-produced violations of
-    // Anthropic's tool-cycle structural rules (orphan tool_use, mis-roled
-    // blocks, consecutive same-role envelopes from upstream chunkers that
-    // dropped a tool_result). Mirrors NativeFormatter.buildMessages — the
-    // streaming-native path (runNativeToolsYielding) used to bypass this
-    // and exposed every agent inference to the 400 family.
-    //
-    // Synthesized [pending] tool_results land in fresh user envelopes;
-    // the normalizer also suppresses cache_control on those envelopes
-    // so an in-flight gap can't poison the prompt cache. Merging after
-    // normalize collapses any same-role neighbours the upstream may have
-    // produced before they reach the API's alternating-role check.
-    //
-    // `pendingToolCallIds` is intentionally not threaded here: by the
-    // time runNativeToolsYielding rebuilds the request between
-    // tool-execution rounds, it has already appended the corresponding
-    // tool_results to `messages`. Any unmatched tool_use that reaches
-    // this splice is upstream stranding (the bug class this fix exists
-    // to catch) — `[pending]` is exactly the right synthesis.
-    // A synthesized [pending] tool_result's bytes are rewritten when the
-    // real result lands — the floating-marker block below must not cache
-    // past one. `synthetic_pending_result` (not the downstream
-    // cache_suppressed_for_synthetic, which only fires when a marker was
-    // actually stripped) is the root condition.
-    // Every repair that REWRITES prefix bytes stands the float down, not just
-    // the synthetic [pending] result: a textified orphan tool_result is
-    // rewritten the same way when its real pairing arrives, so caching at or
-    // past one poisons the prefix identically. The kinds live in one exported
-    // set so a normalizer that grows a new prefix-rewriting repair cannot
-    // silently escape this guard.
-    let prefixRewritten = false;
-    const normalized = normalizeToolPairs(providerMessages, {
-      onEvent: (e) => {
-        if (PREFIX_REWRITING_NORMALIZE_EVENT_KINDS.has(e.kind)) prefixRewritten = true;
-      },
-    });
-    const mergedMessages = mergeConsecutiveRoles(normalized.messages);
-
-    // ONE recount of the constructed wire artifacts, taken BEFORE the
-    // tools/system fallback decision so the fallback and the float share a
-    // single truth. Counted post-normalize, so phase-5.5 cache suppression is
-    // already reflected. `request.system` is the caller's own system content:
-    // it explicitly accepts pre-marked blocks, and those are real wire markers
-    // that no running tally ever saw (three of them plus both fallbacks = 5 on
-    // the wire = a 400 on every inference of that config).
-    const upstreamWireMarkers = countWireCacheMarkers({
-      messages: mergedMessages,
-      system: request.system,
-    });
-
-    // Convert tools to provider format.
-    // Native tool names must match ^[a-zA-Z0-9_-]{1,128}$ — sanitize colons
-    // from the module:tool namespace convention. Reversed in parseProviderContent.
-    const tools = request.tools?.map((tool, idx) => {
-      const t: Record<string, unknown> = {
-        name: sanitizeToolName(tool.name),
-        description: tool.description,
-        input_schema: tool.inputSchema,
-      };
-      // Cache the tool list (last tool) only as a fallback — a marked message
-      // breakpoint already caches the tools as part of its prefix.
-      if (cacheControl && upstreamWireMarkers === 0 && request.tools && idx === request.tools.length - 1) {
-        t.cache_control = cacheControl;
-      }
-      return t;
-    });
-
-    // Wrap system prompt with cache_control only as a fallback (no message
-    // breakpoint marked); otherwise a message breakpoint already caches
-    // tools+system as part of its prefix.
-    let system: unknown = ownSystemBlocks(request.system);
-    if (cacheControl && upstreamWireMarkers === 0 && typeof system === 'string' && system.length > 0) {
-      system = [{ type: 'text', text: system, cache_control: cacheControl }];
-    } else if (cacheControl && upstreamWireMarkers === 0 && Array.isArray(system) && system.length > 0) {
-      const blocks = system as Record<string, unknown>[];
-      system = blocks.map((block, idx) =>
-        idx === blocks.length - 1 ? { ...block, cache_control: cacheControl } : block
-      );
+    const membraneOwned = (request.cacheMarkers ?? 'membrane-system') === 'membrane-system';
+    const cacheControl = promptCaching && membraneOwned
+      ? { type: 'ephemeral' as const, ...(request.cacheTtl ? { ttl: request.cacheTtl } : {}) }
+      : undefined;
+    // A formatter already applies the system fallback. For the native loop,
+    // retain the tool-list fallback only when no caller marker exists upstream.
+    const upstreamWireMarkers = countWireCacheMarkers({ messages: mergedMessages, system: request.system });
+    if (cacheControl && upstreamWireMarkers === 0 && Array.isArray(tools) && tools.length) {
+      tools[tools.length - 1] = { ...tools[tools.length - 1], cache_control: cacheControl };
     }
 
     // ------------------------------------------------------------------
@@ -1788,16 +1980,21 @@ export class Membrane {
     // budget (Anthropic allows 4 cache_control including tools/system).
     // Upstream markers are never displaced or stripped — if they fill all
     // 4 slots the float is withheld (with a warning) and behavior is
-    // exactly pre-float. With 2+ slots free, the previous round's
-    // endpoint is marked too: a wide parallel-tool round can append more
-    // blocks than the provider's ~20-block backward search covers, which
-    // would orphan the previous round's cache entry behind an unmarked
+    // exactly pre-float. With 2+ slots free, the message before the
+    // assistant turn that made the round's calls is marked too, which is
+    // usually the previous request's last message (the exception is named
+    // where the targets are chosen): a wide parallel-tool round can append
+    // more blocks than the provider's ~20-block backward search covers,
+    // which would orphan the previous round's cache entry behind an unmarked
     // boundary.
     //
-    // Skipped when the normalizer synthesized a [pending] tool_result:
-    // those bytes are rewritten when the real result lands, and caching
-    // past them poisons the prefix — the same rationale as the
-    // normalizer's phase 5.5 cache suppression.
+    // Skipped after any repair that rewrites prefix bytes (the kinds in
+    // PREFIX_REWRITING_NORMALIZE_EVENT_KINDS: a synthesized [pending]
+    // result, a textified orphan or duplicate result): those bytes are
+    // rewritten when the real pairing lands, so caching at or past one
+    // poisons the prefix. A repair that only moves blocks (a hoist, a
+    // relocation, results-first) is a fixed function of the history, so the
+    // prefix it leaves is as stable as the history.
     // ------------------------------------------------------------------
     const floatingEnabled =
       request.floatingCacheMarker ?? this.config.defaultFloatingCacheMarker ?? true;
@@ -1809,9 +2006,23 @@ export class Membrane {
       if (residuum <= 0) {
         this.warnFloatBudgetExhausted(wireMarkers);
       } else {
-        // Newest message first; then the previous round's endpoint (two
-        // wire messages back: [..., prevResults, assistant, results]).
-        const targets = [mergedMessages.length - 1, mergedMessages.length - 3];
+        // Newest message first; then the message before the assistant turn
+        // that made this round's tool calls (the newest assistant message
+        // holding a tool_use, with any assistant messages just before it),
+        // [..., prevEnd, assistant, results]. That is the previous request's
+        // last message wherever a system message of changes went and
+        // whatever was injected with the results, an assistant-role message
+        // included, except when the previous request ended with an assistant
+        // message, such as one injected with the results: it joins the new
+        // assistant turn, and the second marker lands on the message before
+        // that turn, which the previous request didn't mark. Only the newest
+        // marker's ~20-block backward search then reaches the previous
+        // request's cache entry, so a round wider than that writes again what
+        // it could have read.
+        let callingTurn = mergedMessages.length - 1;
+        while (callingTurn >= 0 && !(mergedMessages[callingTurn]?.role === 'assistant' && holdsToolUse(mergedMessages[callingTurn]?.content))) callingTurn--;
+        while (callingTurn > 0 && mergedMessages[callingTurn - 1]?.role === 'assistant') callingTurn--;
+        const targets = [mergedMessages.length - 1, callingTurn - 1];
         for (const mi of targets) {
           if (residuum <= 0 || mi < 0) continue;
           const content = mergedMessages[mi]?.content;
@@ -1827,40 +2038,13 @@ export class Membrane {
       }
     }
 
-    // Build thinking config for native extended thinking (budget clamped to max_tokens)
-    // Fable/Mythos models: thinking is always on and unconfigurable; sampling params are removed.
-    // Sending thinking config or temperature returns a 400 — omit both entirely.
-    const alwaysOnThinking = Membrane.isAlwaysThinkingModel(request.config.model);
-    const thinking = alwaysOnThinking ? undefined : this.buildThinkingParam(request.config);
-
-    // Anthropic requires temperature=1 when extended thinking is enabled
-    const temperature = alwaysOnThinking ? undefined : (thinking ? 1 : request.config.temperature);
-
-    // Byte-wall policy point (see transformRequest): loud failure unless the
-    // caller explicitly owns image loss.
-    if (request.shedOversizeImages) {
-      shedImagesToFitByteBudget(mergedMessages, undefined, 'buildNativeToolRequest');
-    } else {
-      assertWithinByteBudget(mergedMessages, undefined, 'buildNativeToolRequest');
-    }
-
-    return {
-      model: request.config.model,
-      maxTokens: request.config.maxTokens,
-      temperature,
-      messages: mergedMessages,
-      system,
-      tools,
-      thinking,
-      cacheTtl: request.cacheTtl ?? this.config.defaultCacheTtl,
-      extra: request.providerParams,
-    };
+    return providerRequest;
   }
 
   /**
    * Parse provider response content into normalized blocks
    */
-  private parseProviderContent(content: unknown): ContentBlock[] {
+  private parseProviderContent(content: unknown, tools?: readonly { name: string }[]): ContentBlock[] {
     if (!content) return [];
     
     if (Array.isArray(content)) {
@@ -1875,10 +2059,13 @@ export class Membrane {
           blocks.push({
             type: 'tool_use',
             id: item.id,
-            name: unsanitizeToolName(item.name),
-            input: item.input,
-            // Arguments that never parsed: carry the marker through so a
-            // consumer can refuse the block instead of trusting `input`.
+            name: restoreToolName(item.name, tools),
+            // `input` reaches callers as the object ToolUseContent promises,
+            // whatever the adapter gave.
+            ...toolUseInputFromValue(item.input),
+            // The adapter's marker, present when `input` isn't the model's
+            // arguments (ToolUseContent.unparseableInput), so a consumer can
+            // refuse the block instead of trusting `input`.
             ...(item.unparseableInput !== undefined ? { unparseableInput: item.unparseableInput } : {}),
             ...(item.rawItem ? { rawItem: item.rawItem } : {}),
           });
@@ -1906,18 +2093,19 @@ export class Membrane {
           // tool records have no normalized ContentBlock equivalent. Retain a
           // zero-width carrier so Chronicle and the Responses formatter can
           // replay the raw item without surfacing synthetic prompt text.
-          // Anthropic-bound conversion paths filter these out (empty text
-          // blocks are a 400 there); the Responses formatter replays rawItem.
+          // The Responses formatter replays a Responses item; Anthropic-shaped
+          // requests send an Anthropic server-tool block back as itself and
+          // filter any other carrier out (empty text blocks are a 400 there).
           //
           // An item with a `type` this switch does not know (server_tool_use,
           // web_search_tool_result, search_result, mcp_tool_use, or whatever a
           // provider adds next) used to fall out of this chain and vanish. It
-          // gets the same carrier treatment, holding the item itself, plus a
-          // one-time warning so the gap surfaces instead of being inferred
-          // later from missing content.
-          const carriedRawItem = item.rawItem ?? item;
-          if (!item.rawItem) warnUnconvertibleProviderItem(item.type);
-          blocks.push({ type: 'text', text: '', rawItem: carriedRawItem });
+          // gets the same carrier treatment, holding the item itself. An
+          // Anthropic server-tool block is a known type there (a build that
+          // replays them sends it back as itself), so only another type gets
+          // a one-time warning, which surfaces the gap instead of leaving it
+          // to be inferred later from missing content.
+          blocks.push(providerItemCarrier(item));
         }
       }
       return blocks;
@@ -2078,6 +2266,17 @@ export class Membrane {
   // ==========================================================================
 
   /**
+   * The logger membrane warns through: the configured one, or console. The
+   * configured logger's warn() is the caller's code, so what it throws leaves
+   * as callerCodeError: a log sink's failure ends the call and isn't resent.
+   */
+  private warnLogger(): Pick<MembraneLogger, 'warn'> {
+    const logger = this.config.logger;
+    if (!logger) return console;
+    return { warn: (...args) => runCallerCode(() => logger.warn(...args)) };
+  }
+
+  /**
    * Fail loudly when a wire-request receipt consumer throws.
    *
    * Wire-request receipts are emitted from inside the adapter's `onRequest`,
@@ -2087,7 +2286,8 @@ export class Membrane {
    * the call before any provider request. Keep that contract for wire-request
    * receipts too: remember the failure, abort the adapter call through its
    * signal (adapters invoke `onRequest` before sending, so nothing goes out),
-   * and rethrow the consumer's original error once the adapter settles.
+   * and rethrow the consumer's error, as callerCodeError made it, once the
+   * adapter settles.
    */
   private wireReceiptGuard(callerSignal: AbortSignal | undefined) {
     const controller = new AbortController();
@@ -2121,15 +2321,19 @@ export class Membrane {
    * Returns the (possibly modified) request, or the original if no hook is
    * configured. This is the single point that all request-build sites should
    * route through before invoking the adapter, so observers / mutators
-   * (logging, redaction, model rewriting) see every API call regardless of
+   * (logging, redaction, model rewriting) see every request regardless of
    * whether it came from `complete()`, `stream()`, or `streamYielding()`.
+   * The streaming paths run it once per round: a call membrane sends again
+   * after a failure goes out as the hook left it. `complete()` runs it on
+   * every pass.
    */
   private async applyBeforeRequestHook(
     normalizedRequest: NormalizedRequest,
     providerRequest: unknown,
   ): Promise<unknown> {
-    if (!this.config.hooks?.beforeRequest) return providerRequest;
-    const result = await this.config.hooks.beforeRequest(normalizedRequest, providerRequest);
+    const hooks = this.config.hooks;
+    if (!hooks?.beforeRequest) return providerRequest;
+    const result = await awaitCallerCode(() => hooks.beforeRequest!(normalizedRequest, providerRequest));
     return result ?? providerRequest;
   }
 
@@ -2138,10 +2342,11 @@ export class Membrane {
    * Used by transformRequest, buildContinuationRequest, and buildContinuationRequestWithImages.
    */
   private getBaseProviderParams(config: NormalizedRequest['config']) {
-    // Fable/Mythos models: thinking always on (unconfigurable), sampling params removed — omit both.
+    // Fable/Mythos models: thinking always on, so no sampling params and,
+    // unless binding controls are asked for, no thinking config (buildThinkingParam).
     const alwaysOnThinking = Membrane.isAlwaysThinkingModel(config.model);
     // Build thinking config for native extended thinking
-    const thinking = alwaysOnThinking ? undefined : this.buildThinkingParam(config);
+    const thinking = this.buildThinkingParam(config);
     // Anthropic requires temperature=1 when extended thinking is enabled
     const temperature = alwaysOnThinking ? undefined : (thinking ? 1 : config.temperature);
     return {
@@ -2158,9 +2363,17 @@ export class Membrane {
   }
 
   /**
-   * Models with always-on, unconfigurable thinking (Claude Fable/Mythos family).
-   * These reject `thinking` config and sampling params (`temperature`, `top_p`, `top_k`)
-   * with a 400 — callers must omit them entirely.
+   * Models with always-on thinking (Claude Fable/Mythos family). Membrane
+   * sends them no sampling params (`temperature`, `top_p`, `top_k`) and no
+   * thinking config, which the family has rejected with a 400. The exception
+   * is the binding controls (`thinking.blockBinding`), sent as
+   * `{ type: 'adaptive', block_binding }`, which Fable 5 and Fable 5.1
+   * accepted on 2026-10-10 (Fable 5.1 also accepted a budgeted config then),
+   * and with `display` beside it when set, which they accepted on 2026-10-12.
+   * They think whatever `thinking.enabled` says, so the binding goes whenever
+   * it's asked for. `display: 'updates'` is the other exception: it is sent
+   * as `{ type: 'adaptive', display: 'updates' }`, because without it these
+   * models return their progress notes between tool calls empty.
    */
   private static isAlwaysThinkingModel(model: string | undefined): boolean {
     return /\b(fable|mythos)\b/i.test(model ?? '');
@@ -2176,14 +2389,26 @@ export class Membrane {
    * the API will reject.
    */
   private buildThinkingParam(config: NormalizedRequest['config']):
-    | { type: 'adaptive'; display?: 'summarized' | 'omitted' }
-    | { type: 'enabled'; budget_tokens: number; display?: 'summarized' | 'omitted' }
+    | { type: 'adaptive'; display?: ThinkingDisplay; block_binding?: BlockBindingParam }
+    | { type: 'enabled'; budget_tokens: number; display?: ThinkingDisplay; block_binding?: BlockBindingParam }
     | undefined {
+    const blockBinding = config.thinking?.blockBinding;
+    const binding = blockBinding
+      ? { block_binding: { prefix_mismatch_behavior: blockBinding.prefixMismatchBehavior } }
+      : {};
+    const display = config.thinking?.display;
+    // Thinking is always on for these: a thinking config is sent only to carry
+    // binding controls or progress updates, with display as the other configs
+    // carry it.
+    if (Membrane.isAlwaysThinkingModel(config.model)) {
+      return blockBinding || display === 'updates'
+        ? { type: 'adaptive', ...(display ? { display } : {}), ...binding }
+        : undefined;
+    }
     if (!config.thinking?.enabled) return undefined;
 
-    const display = config.thinking.display;
     if ((config.thinking.type ?? 'enabled') === 'adaptive') {
-      return { type: 'adaptive', ...(display ? { display } : {}) };
+      return { type: 'adaptive', ...(display ? { display } : {}), ...binding };
     }
 
     const requested = config.thinking.budgetTokens ?? 5000;
@@ -2193,7 +2418,7 @@ export class Membrane {
       // Can't fit a valid thinking budget under max_tokens — skip thinking
       return undefined;
     }
-    return { type: 'enabled', budget_tokens: budget, ...(display ? { display } : {}) };
+    return { type: 'enabled', budget_tokens: budget, ...(display ? { display } : {}), ...binding };
   }
 
   /**
@@ -2205,10 +2430,41 @@ export class Membrane {
    * a re-derivation so that the formatter which BUILDS is the same one that
    * resolved the tool mode and drives the loop.
    */
-  private transformRequest(request: NormalizedRequest, activeFormatter: PrefillFormatter = this.formatter): {
+  private transformRequest(
+    request: NormalizedRequest,
+    activeFormatter: PrefillFormatter = this.formatter,
+    toolMode: 'xml' | 'native' = this.resolveToolMode(request, activeFormatter),
+    nativeLoopMessages?: NormalizedRequest['messages'],
+    fidelity?: FidelityNotes,
+  ): {
     providerRequest: any;
     prefillResult: BuildResult;
+    prefixRewritten: boolean;
+    toolMode: 'xml' | 'native';
   } {
+    // A formatter that does not report its alterations leaves the round's
+    // fidelity unknown: an empty alteration list from it would prove nothing.
+    if (fidelity && !activeFormatter.reportsAlterations) fidelity.uninstrumented = true;
+    // Every path's messages enter the build here, the native loop's each
+    // round: media in MCP's form becomes membrane's, so the formatters and
+    // the adapters after them read one form. A copy where anything converts:
+    // the caller's messages stay as they were, and the indices the build
+    // records alterations by are theirs.
+    const messages = convertMcpMedia(nativeLoopMessages ?? request.messages);
+    // A system change goes only where both ends can send it; anywhere else it
+    // would be left out (another formatter reports it only as an alteration),
+    // so the request is refused before sending, as one the API refuses for its
+    // change is (SystemChangeContent).
+    if (
+      !(activeFormatter.rendersSystemChanges && this.adapter.sendsSystemChanges) &&
+      messages.some((message) => message.content.some((block) => block.type === 'system_change'))
+    ) {
+      throw systemChangeRefusedError(
+        `A system_change block goes only through a formatter that renders it (NativeFormatter) and an adapter that sends it (AnthropicAdapter); ` +
+        `this request has formatter "${activeFormatter.name}" and adapter "${this.adapter.name}". ` +
+        'Send it through those two, or make the change in the request\'s tools and system instead.'
+      );
+    }
     // Extract user-provided stop sequences
     const additionalStopSequences = Array.isArray(request.stopSequences)
       ? request.stopSequences
@@ -2219,15 +2475,25 @@ export class Membrane {
       ?? this.config.maxParticipantsForStop
       ?? 10;
 
+    let prefixRewritten = false;
+    // Keep ordinary request properties on their original receiver; only the
+    // native loop's current messages are a separate build input.
     // Use formatter's buildMessages for all request building
-    const buildResult = activeFormatter.buildMessages(request.messages, {
+    const buildResult = activeFormatter.buildMessages(messages, {
+      onNormalize: event => {
+        if (PREFIX_REWRITING_NORMALIZE_EVENT_KINDS.has(event.kind)) prefixRewritten = true;
+        // The caller's view of every repair, textifications included: without
+        // it a result turned into text would reach the model unannounced.
+        runCallerCode(() => this.config.hooks?.onNormalize?.(event));
+      },
+      deferCacheBudgetCheck: true,
       participantMode: 'multiuser',
       assistantParticipant: request.assistantParticipant ?? this.config.assistantParticipant ?? 'Claude',
       tools: request.tools,
       // One resolution for every entry point: complete() used to build from the
       // formatter's constructor-time mode alone, so request.toolMode was a
       // second, disconnected source of truth on this path.
-      toolMode: this.resolveToolMode(request, activeFormatter),
+      toolMode,
       thinking: request.config.thinking,
       systemPrompt: request.system,
       promptCaching: request.promptCaching ?? this.config.defaultPromptCaching ?? true, // Default true for backward compat
@@ -2237,7 +2503,20 @@ export class Membrane {
       maxParticipantsForStop,
       contextPrefix: request.contextPrefix,
       prefillUserMessage: request.prefillUserMessage,
+      anthropicServerBlocks: this.adapter.replaysAnthropicServerBlocks === true,
+      ...(fidelity ? { fidelity } : {}),
     });
+
+    // Honor readiness at the shared formatter-build boundary used by
+    // complete(), stream(), and streamYielding(), including native loops.
+    // Membrane passes no in-flight set (pendingToolCallIds), so the built-in
+    // formatters always report ready here; a formatter that reports not
+    // ready (a custom one, or a subclass that passes its own in-flight set)
+    // is refused, and its caller waits for those results and rebuilds.
+    // Ordinary loops await tool results before rebuilding.
+    if (buildResult.ready === false) {
+      throw new MembraneNotReadyError(activeFormatter.name);
+    }
 
     // Byte-wall policy point (2026-07-12): transformRequest serves BOTH
     // complete() and the streaming path through EVERY adapter. Oversize
@@ -2245,7 +2524,8 @@ export class Membrane {
     // caller explicitly owns image loss via `shedOversizeImages` (and the
     // shed itself reports at error grade). No silent transport mutation.
     if (request.shedOversizeImages) {
-      shedImagesToFitByteBudget(buildResult.messages, undefined, 'transformRequest');
+      const shed = shedImagesToFitByteBudget(buildResult.messages, undefined, 'transformRequest');
+      if (shed > 0 && fidelity) fidelity.unattributed = true;
     } else {
       assertWithinByteBudget(buildResult.messages, undefined, 'transformRequest');
     }
@@ -2259,31 +2539,146 @@ export class Membrane {
       stopSequences: buildResult.stopSequences,
       tools: buildResult.nativeTools,
       cacheTtl: request.cacheTtl ?? this.config.defaultCacheTtl,
-      extra: {
-        ...request.providerParams,
-        normalizedMessages: request.messages,
-      },
+      // The legacy native loop did not put opaque normalized metadata into
+      // its semantic request. Prompt serializers receive those messages in
+      // options instead. Complete/XML/Responses keep their existing contract.
+      extra: nativeLoopMessages && activeFormatter.name !== 'openai-responses'
+        ? request.providerParams
+        : { ...request.providerParams, normalizedMessages: messages },
     };
 
-    // The API rejects extended thinking combined with an assistant prefill.
     // Prefill-style builds (XML formatter) use the thinking config for the
-    // literal `<thinking>` text prefix instead of the API feature — drop the
-    // API param when the built request actually ends in an assistant prefill.
-    // Chat-style builds (no prefill) keep it.
+    // literal `<thinking>` text prefix instead of the API feature, so the API
+    // param would buy a second, redundant reasoning channel — drop it when
+    // the built request actually ends in an assistant prefill. Chat-style
+    // builds (no prefill) keep it.
+    //
+    // Whether a provider REFUSES the combination is model-dependent, not API
+    // law: measured live 2026-08-25, claude-haiku-4-5 accepted
+    // `thinking: {type:'enabled'}` on a prefill-terminated conversation
+    // (HTTP 200). Refusing models exist, so the drop stays; it just is not
+    // the reason.
     if (buildResult.assistantPrefill) {
       stripThinkingForPrefill(providerRequest);
     }
 
-    return { providerRequest, prefillResult: buildResult };
+    return { providerRequest, prefillResult: buildResult, prefixRewritten, toolMode };
+  }
+
+  /**
+   * A round's report (UsageEvent.round), from the notes of the build that
+   * produced its request. `origins` maps the build's message indices back to
+   * the consumer's coordinates (native loop); without it, the indices
+   * already are `NormalizedRequest.messages` indices (XML loop).
+   */
+  private static roundReport(input: {
+    index: number;
+    stopReason: StopReason;
+    usage: DetailedUsage | undefined;
+    /** Counts the provider did not report (ProviderResponse.unreportedUsage): left out. */
+    unreported?: ReadonlyArray<'inputTokens' | 'outputTokens'>;
+    fidelity: FidelityNotes;
+    origins?: readonly MessageOrigin[];
+    /** Injected positions altered before any build (tool blocks stripped on supply). */
+    injectedAlterations?: ReadonlyArray<readonly [number, number]>;
+    injectedBatch?: { batch: number; applied: number };
+    /**
+     * The provider's report on the request's input (the response's
+     * `inputTransformations`), and the messages the build was handed, in its
+     * indices, for finding each block in its message.
+     */
+    thinking?: { entries: readonly ProviderInputTransformation[]; messages: readonly NormalizedMessage[] };
+  }): RoundReport {
+    const messages: number[] = [];
+    const injected = new Map<string, [number, number]>();
+    const alterInjected = (batch: number, index: number) => injected.set(`${batch}:${index}`, [batch, index]);
+    for (const [batch, index] of input.injectedAlterations ?? []) alterInjected(batch, index);
+    for (const at of input.fidelity.altered) {
+      const origin: MessageOrigin = input.origins ? (input.origins[at] ?? { kind: 'own' }) : { kind: 'input', index: at };
+      if (origin.kind === 'input') messages.push(origin.index);
+      else if (origin.kind === 'injected') alterInjected(origin.batch, origin.index);
+    }
+    messages.sort((a, b) => a - b);
+    // One entry per position, however many steps altered it.
+    const injectedPairs = [...injected.values()].sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+    // Counts only, and only those the provider reported.
+    const usage: RoundUsage = {};
+    const counts = ['inputTokens', 'outputTokens', 'cacheCreationTokens', 'cacheReadTokens', 'thinkingTokens'] as const;
+    for (const field of counts) {
+      const value = input.usage?.[field];
+      if (typeof value === 'number' && !(input.unreported as readonly string[] | undefined)?.includes(field)) usage[field] = value;
+    }
+    return {
+      index: input.index,
+      stopReason: input.stopReason,
+      usage,
+      ...(input.injectedBatch ? { injectedBatch: input.injectedBatch } : {}),
+      altered: { messages, injected: injectedPairs },
+      fidelity: input.fidelity.established ? 'established' : 'unknown',
+      ...(input.thinking
+        ? { thinking: Membrane.thinkingReport(input.thinking.entries, input.fidelity, input.origins, input.thinking.messages) }
+        : {}),
+    };
+  }
+
+  /**
+   * The provider's account of the signed thinking it removed or let through
+   * (RoundReport.thinking). Each block is placed where the build says it came
+   * from: the message that owns the request's block, through `origins`, and
+   * the block in that message with the same signature (or redacted data).
+   */
+  private static thinkingReport(
+    entries: readonly ProviderInputTransformation[],
+    fidelity: FidelityNotes,
+    origins: readonly MessageOrigin[] | undefined,
+    messages: readonly NormalizedMessage[],
+  ): NonNullable<RoundReport['thinking']> {
+    const dropped: ThinkingBindingEntry[] = [];
+    const mismatchAllowed: ThinkingBindingEntry[] = [];
+    for (const entry of entries) {
+      const list = entry.type === 'thinking_dropped' ? dropped
+        : entry.type === 'thinking_mismatch_allowed' ? mismatchAllowed
+          : undefined;
+      if (!list) continue;
+      const placed: ThinkingBindingEntry = { reason: entry.reason ?? '', path: entry.path ?? '' };
+      const at = fidelity.ownerOf(entry.block);
+      if (at !== undefined) {
+        const origin: MessageOrigin = origins ? (origins[at] ?? { kind: 'own' }) : { kind: 'input', index: at };
+        if (origin.kind === 'input') placed.message = origin.index;
+        else if (origin.kind === 'injected') placed.injected = [origin.batch, origin.index];
+        else if (origin.round !== undefined) placed.round = origin.round;
+        const index = Membrane.thinkingBlockIndex(messages[at]?.content, entry.block);
+        if (index !== undefined && (placed.message ?? placed.injected ?? placed.round) !== undefined) placed.block = index;
+      }
+      list.push(placed);
+    }
+    return { dropped, mismatchAllowed };
+  }
+
+  /** The one block of `content` a request's thinking block was built from: same type, and the same signature or redacted data. */
+  private static thinkingBlockIndex(content: readonly ContentBlock[] | undefined, sent: unknown): number | undefined {
+    const wire = sent as { type?: unknown; signature?: unknown; data?: unknown } | null | undefined;
+    const key = wire?.type === 'thinking' ? 'signature' : wire?.type === 'redacted_thinking' ? 'data' : undefined;
+    if (!content || !key || typeof wire![key] !== 'string') return undefined;
+    let found: number | undefined;
+    for (let i = 0; i < content.length; i++) {
+      const block = content[i] as unknown as { type?: unknown; signature?: unknown; data?: unknown };
+      if (block.type !== wire!.type || block[key] !== wire![key]) continue;
+      if (found !== undefined) return undefined;
+      found = i;
+    }
+    return found;
   }
 
   private async streamOnce(
     request: any,
-    callbacks: { onChunk: (chunk: string) => void; onContentBlock?: (index: number, block: unknown) => void },
+    callbacks: StreamCallbacks,
     options: {
       signal?: AbortSignal;
       timeoutMs?: number;
       idleTimeoutMs?: number;
+      /** See StreamOptions.progressTimeoutMs: one renewable deadline per provider call. */
+      progressTimeoutMs?: number;
       onRequest?: (rawRequest: unknown) => void;
       /** See ProviderRequestOptions.wrapThinkingTags */
       wrapThinkingTags?: boolean;
@@ -2296,6 +2691,10 @@ export class Membrane {
        * separate `streamOnceWithoutHook` so the bypass is intentional.
        */
       normalizedRequest: NormalizedRequest;
+      formatterName: string;
+      requiresAssistantPrefill: boolean;
+      /** Current participant messages for prompt transports, outside receipts. */
+      promptMessages?: NormalizedRequest['messages'];
       /**
        * Re-issue this attempt when the provider ends it with
        * `stop_reason: 'refusal'` (see RetryingEvent). Default 0 = off, so
@@ -2303,28 +2702,46 @@ export class Membrane {
        */
       refusalRetries?: number;
       /**
-       * REQUIRED to enable streaming retries. Called immediately before a
-       * re-issue so the caller can discard the abandoned attempt: reset its
-       * accumulators and tell its own consumer to drop what it emitted.
+       * REQUIRED for a refusal re-issue (refusalRetries) on this path.
+       * Called immediately before the re-issue so the caller can discard the
+       * abandoned attempt: reset its accumulators and tell its own consumer
+       * to drop what it emitted.
        *
-       * Without it a retry would silently concatenate two attempts, so a
-       * caller that does not pass this simply does not get retries — an
+       * Without it a re-issue would silently concatenate two attempts, so a
+       * caller that does not pass this simply does not get re-issues — an
        * unaware consumer can never be corrupted by enabling the option
-       * somewhere upstream.
+       * somewhere upstream. A call that failed before it delivered anything
+       * is sent again without it, since there is nothing to discard.
        */
       onRetrying?: (info: { attempt: number; maxAttempts: number; category?: string }) => void;
+      /** See StreamOptions.retry: with false, retryPlan plans no retry. */
+      retry?: boolean;
       /**
        * Starts with the post-hook/post-clamp input count. Wire-request
        * adapters update it from onRequest; default adapters retain the
        * semantic count. Callers keep the latest value for telemetry.
        */
       onWireCacheMarkers?: (markerCount: number) => void;
+      /**
+       * The round's fidelity notes (utils/fidelity.ts). A beforeRequest hook
+       * that changed either of its arguments makes them unattributed: the
+       * provider request by replacement or in place, or the normalized
+       * request in place. An in-place change also marks them
+       * `mutatedInPlace`, so the loops keep later rounds unknown. An
+       * adapter's report of altered content alters the message its block
+       * came from, or makes them unattributed when it can't be attributed.
+       * An adapter that doesn't declare `reportsContentAlterations` makes
+       * them uninstrumented.
+       */
+      fidelity?: FidelityNotes;
     }
   ): Promise<
     import('./types/provider.js').ProviderResponse & {
       discardedUsage?: DiscardedAttemptsUsage;
-      /** Provider calls this helper made, including refusal re-issues. */
+      /** Provider calls this helper made, including refusal re-issues and retries. */
       providerCalls: number;
+      /** The waits before each retry of a failed call, in order; empty when none failed. */
+      retryDelaysMs: number[];
     }
   > {
     // Strip `normalizedRequest` before forwarding to the adapter — it's
@@ -2332,8 +2749,28 @@ export class Membrane {
     // compatibility won't catch the excess field (checked only on object
     // literals, not on variables). Leaving it in would silently leak the
     // normalized form into every adapter's options.
-    const { normalizedRequest, refusalRetries, onRetrying, onWireCacheMarkers, ...adapterOptions } = options;
+    const { normalizedRequest, formatterName, requiresAssistantPrefill, refusalRetries, onRetrying, retry, onWireCacheMarkers, progressTimeoutMs, fidelity, ...adapterOptions } = options;
+    // Fingerprint around the hook only when both a hook and a reader exist
+    // (the yielding loops pass notes only when they emit usage events, which
+    // carry the round report): an observer or a no-op hook keeps fidelity
+    // established. Serializing the request is the price of reporting a
+    // hooked round. The hook is handed two objects, and a change made in
+    // place to either is also remembered: the provider request shares
+    // structure with state later rounds reuse, and the normalized request is
+    // what later rounds are built from (the native loop's working messages
+    // are its own objects).
+    const hooked = fidelity !== undefined && this.config.hooks?.beforeRequest !== undefined;
+    const beforeHook = hooked ? requestFingerprint(request) : undefined;
+    const normalizedBefore = hooked ? requestFingerprint(normalizedRequest) : undefined;
     const finalRequest = (await this.applyBeforeRequestHook(normalizedRequest, request)) as typeof request;
+    if (beforeHook !== undefined) {
+      const handed = requestFingerprint(request);
+      const normalizedChanged = requestFingerprint(normalizedRequest) !== normalizedBefore;
+      if (handed !== beforeHook || normalizedChanged) fidelity!.mutatedInPlace = true;
+      const sent = finalRequest === request ? handed : requestFingerprint(finalRequest);
+      if (sent !== beforeHook || normalizedChanged) fidelity!.unattributed = true;
+    }
+    if (fidelity && !this.adapter.reportsContentAlterations) fidelity.uninstrumented = true;
 
     // Check every streaming path's post-hook representation. Only adapters
     // opting into wire-request receipts reconcile it with their final body;
@@ -2344,13 +2781,23 @@ export class Membrane {
     onWireCacheMarkers?.(markerCount);
     const useWireReceipt = this.adapter.cacheReceiptBasis === 'wire-request';
     let receiptEmitted = false;
-    if (!useWireReceipt) normalizedRequest.onCacheWireReceipt?.(computeCacheWireReceipt(finalRequest));
+    // The adapter's content-alteration reports for the attempt in flight.
+    let attemptAlterations: unknown[] = [];
+    if (!useWireReceipt) deliverCacheWireReceipt(normalizedRequest, finalRequest);
     const receiptGuard = useWireReceipt && normalizedRequest.onCacheWireReceipt
       ? this.wireReceiptGuard(adapterOptions.signal)
       : undefined;
     const observedOptions = {
       ...adapterOptions,
+      requestContext: {
+        formatterName,
+        toolMode: requiresAssistantPrefill ? 'xml' as const : 'native' as const,
+        toolsDeclared: Boolean(normalizedRequest.tools?.length),
+        requiresAssistantPrefill,
+      },
       ...(receiptGuard ? { signal: receiptGuard.signal } : {}),
+      // Collected per attempt: only the attempt that stands describes the round.
+      ...(fidelity ? { onContentAltered: (block?: unknown) => { attemptAlterations.push(block); } } : {}),
       onRequest: (wireRequest: unknown) => {
         if (useWireReceipt) {
           const wireCount = countWireCacheMarkers(wireRequest as Parameters<typeof countWireCacheMarkers>[0]);
@@ -2359,7 +2806,7 @@ export class Membrane {
           // so receipt queues stay aligned with the one accepted usage event.
           if (!receiptEmitted) {
             receiptEmitted = true;
-            receiptGuard?.emit(() => normalizedRequest.onCacheWireReceipt?.(computeCacheWireReceipt(wireRequest)));
+            receiptGuard?.emit(() => deliverCacheWireReceipt(normalizedRequest, wireRequest));
           }
         }
         adapterOptions.onRequest?.(wireRequest);
@@ -2368,31 +2815,121 @@ export class Membrane {
 
     // Retries are only safe when the caller can discard the abandoned
     // attempt, so they require BOTH a budget and an onRetrying hook.
-    const maxAttempts = onRetrying ? Math.max(0, refusalRetries ?? 0) : 0;
+    const maxAttempts = onRetrying ? refusalBudget(refusalRetries) : 0;
     let retried = 0;
     // Every re-issued attempt was a completed, billed provider call. The
     // caller's usage accumulator only ever sees the surviving result, so the
     // abandoned spend rides back out on the result itself.
     let discardedUsage: DiscardedAttemptsUsage | undefined;
     let providerCalls = 0;
+    // Sends since the last refusal re-issue, which starts the count again: the
+    // transport-error budget, which the retry decision, its wait and onError
+    // read.
+    let tries = 0;
+    const retryDelaysMs: number[] = [];
     while (true) {
       providerCalls++;
-      const streamCall = this.adapter.stream(finalRequest, callbacks, observedOptions);
-      const rawResult = receiptGuard ? await receiptGuard.settle(streamCall) : await streamCall;
+      tries++;
+      attemptAlterations = [];
+      // A native attempt ends at the request's first stop whether or not the
+      // provider applied it (see LocalStopSequences). The explicit-XML loops
+      // keep their own parser-aware stop handling. The stop is settled on each
+      // attempt before the refusal check below, so an attempt that stopped
+      // locally is never re-issued for a refusal that came after its stop.
+      const localStops = requiresAssistantPrefill ? undefined : new LocalStopSequences(finalRequest.stopSequences, callbacks);
+      // Whether this call has delivered anything. The callers' accumulators
+      // and their consumers only ever see a call through these callbacks, so
+      // a call that failed before any of them ran left nothing behind: it can
+      // be sent again without a rollback and without replaying anything.
+      let delivered = false;
+      const sent = localStops?.callbacks ?? callbacks;
+      const attemptCallbacks: StreamCallbacks = {
+        onChunk: (chunk) => { delivered = true; sent.onChunk(chunk); },
+        ...(sent.onContentBlock
+          ? { onContentBlock: (index: number, block: unknown) => { delivered = true; sent.onContentBlock!(index, block); } }
+          : {}),
+        ...(sent.onThinkingSignature
+          ? { onThinkingSignature: (index: number, signature: string) => { delivered = true; sent.onThinkingSignature!(index, signature); } }
+          : {}),
+      };
+      let attemptResult: ProviderResponse | undefined;
+      let failure: { error: unknown } | undefined;
+      // Each attempt gets its own progress deadline, made here and cleaned up
+      // before anything decides whether to send it again: refusal re-issues
+      // and retries each get a new one, and time outside the attempt (the
+      // wait before a retry, tool execution) never counts.
+      const progress = createProgressDeadline(observedOptions.signal, progressTimeoutMs);
+      try {
+        const streamCall = this.adapter.stream(
+          finalRequest,
+          attemptCallbacks,
+          progress.renew ? { ...observedOptions, signal: progress.signal, onProgress: progress.renew } : observedOptions,
+        );
+        attemptResult = receiptGuard ? await receiptGuard.settle(streamCall) : await streamCall;
+      } catch (error) {
+        // Held text was received: deliver it so partialContent keeps it. The
+        // attempt's own error is the one to report, whatever delivery does.
+        try { localStops?.release(); } catch { /* keep the original error */ }
+        failure = { error };
+      } finally {
+        progress.cleanup();
+      }
+      // Whether to send the call again is decided once the send is over, so
+      // nothing that belongs to the send stays live through the wait.
+      if (failure) {
+        // Typed once, as every path's caller gets it: a failure that isn't a
+        // MembraneError yet is typed by errorFromThrown, so the retry is
+        // decided on the type that is thrown.
+        const typed = errorFromThrown(failure.error);
+        // A call that delivered anything can't be sent again.
+        if (delivered) throw typed;
+        // The call's signal first, as complete() reads the caller's: a
+        // cancellation plans no retry and asks onError nothing, and each path
+        // reports it as the cancellation it is.
+        if (adapterOptions.signal?.aborted) throw typed;
+        const errorInfo = classifyError(typed);
+        const plan = this.retryPlan(errorInfo, tries, isDeadlineExpiry(typed), retry);
+        if (!plan.retry) throw typed;
+        // The same pre-retry hook contract as complete(): hosts use onError
+        // for circuit-breaking, and its 'abort' decision ends the call here.
+        const hooks = this.config.hooks;
+        if (hooks?.onError) {
+          const decision = await awaitCallerCode(() => hooks.onError!(errorInfo, tries));
+          if (decision === 'abort') throw typed;
+        }
+        const delayMs = plan.delayMs;
+        // Reported only with a response this helper returns: a cancellation,
+        // even one that landed while onError decided, ends the wait below by
+        // throwing, so a wait that didn't happen is never reported.
+        retryDelaysMs.push(delayMs);
+        // The call's signal ends the wait: the caller's, or on streamYielding
+        // the stream's own, which cancel() aborts. Each path reports that as
+        // the cancellation it is (an AbortedResponse, an aborted event), with
+        // what earlier rounds delivered.
+        await this.sleep(delayMs, adapterOptions.signal);
+        continue;
+      }
+      const rawResult = localStops ? localStops.finish(attemptResult!) : attemptResult!;
       // Restate usage in the one convention before any accumulator, ratio or
       // price sees it — this is the only door streamed usage enters through.
+      // The stop token is settled here too, from the adapter's own stop, before
+      // a local stop sequence, or the XML loop's, replaces its stopReason.
       const result: ProviderResponse = {
         ...rawResult,
+        providerStopReason: this.providerReasonFor(attemptResult!),
         usage: normalizeUsageToCacheExcluded(rawResult.usage, this.adapter.name, this.adapter.usageCacheConvention),
       };
       if (result.stopReason !== 'refusal' || retried >= maxAttempts) {
+        for (const block of attemptAlterations) fidelity?.alterBlock(block);
         return {
           ...result,
           providerCalls,
+          retryDelaysMs,
           ...(discardedUsage ? { discardedUsage } : {}),
         };
       }
       retried++;
+      tries = 0;
       discardedUsage = this.mergeDiscardedAttempts(
         discardedUsage,
         this.discardedAttemptFrom(result.usage)
@@ -2438,8 +2975,11 @@ export class Membrane {
     
     return stripThinkingForPrefill({
       ...this.getBaseProviderParams(originalRequest.config),
-      // Continuations always end in an assistant prefill — the API rejects
-      // extended thinking combined with prefill, so never send the param here
+      // Continuations always end in an assistant prefill, and prefill builds
+      // carry thinking as literal `<thinking>` text rather than the API
+      // feature — so never send the param here. (Not a validation rule:
+      // haiku-4-5 accepted thinking+prefill live 2026-08-25. See
+      // transformRequest.)
       thinking: undefined,
       messages,
       system: ownSystemBlocks(prefillResult.systemContent) ?? undefined,
@@ -2530,8 +3070,11 @@ export class Membrane {
 
     return stripThinkingForPrefill({
       ...this.getBaseProviderParams(originalRequest.config),
-      // Continuations always end in an assistant prefill — the API rejects
-      // extended thinking combined with prefill, so never send the param here
+      // Continuations always end in an assistant prefill, and prefill builds
+      // carry thinking as literal `<thinking>` text rather than the API
+      // feature — so never send the param here. (Not a validation rule:
+      // haiku-4-5 accepted thinking+prefill live 2026-08-25. See
+      // transformRequest.)
       thinking: undefined,
       messages,
       system: ownSystemBlocks(prefillResult.systemContent) ?? undefined,
@@ -2561,6 +3104,7 @@ export class Membrane {
     },
     startTime: number,
     attempts: number,
+    xmlToolProtocol: boolean,
     rawRequest?: unknown
   ): NormalizedResponse {
     // Extract text from response
@@ -2569,6 +3113,8 @@ export class Membrane {
 
     // Build raw text for rawAssistantText
     let rawAssistantText = '';
+    // The tools the request offers, read once at the first call.
+    let offered: readonly { name: string }[] | undefined;
 
     if (Array.isArray(providerResponse.content)) {
       for (const block of providerResponse.content) {
@@ -2576,17 +3122,19 @@ export class Membrane {
           content.push({ type: 'text', text: block.text });
           rawAssistantText += block.text;
         } else if (block.type === 'tool_use') {
-          content.push({
+          offered ??= toolsOffered(request);
+          const name = restoreToolName(block.name, offered);
+          // As in parseProviderContent: `input` is an object, and the
+          // adapter's marker comes through.
+          const toolUse: ToolUseContent = {
             type: 'tool_use',
             id: block.id,
-            name: block.name,
-            input: block.input,
-          });
-          toolCalls.push({
-            id: block.id,
-            name: block.name,
-            input: block.input,
-          });
+            name,
+            ...toolUseInputFromValue(block.input),
+            ...(block.unparseableInput !== undefined ? { unparseableInput: block.unparseableInput } : {}),
+          };
+          content.push(toolUse);
+          toolCalls.push(toolCallOf(toolUse));
         } else if (block.type === 'thinking') {
           content.push({
             type: 'thinking',
@@ -2605,6 +3153,12 @@ export class Membrane {
             data: block.data,
             mimeType: block.mimeType,
           });
+        } else if (block && (block.rawItem || block.type)) {
+          // A provider block with no normalized form (an Anthropic server-tool
+          // block, an opaque Responses item) used to vanish here, so a turn
+          // that used a server tool reached the history without it. Keep it
+          // as the tool loops do.
+          content.push(providerItemCarrier(block));
         }
       }
     } else if (typeof providerResponse.content === 'string') {
@@ -2614,14 +3168,16 @@ export class Membrane {
 
     // If we stopped on a closing XML tag, append it to the text so parsers can complete
     // the block. The API stops BEFORE the stop sequence, but we need the closing tag.
-    const stoppedOnClosingTag = providerResponse.stopReason === 'stop_sequence' &&
+    const stoppedOnClosingTag = xmlToolProtocol && providerResponse.stopReason === 'stop_sequence' &&
       providerResponse.stopSequence?.startsWith('</');
     if (stoppedOnClosingTag && providerResponse.stopSequence) {
       rawAssistantText += providerResponse.stopSequence;
-      // Update the last text content block if it exists
+      // Update the last text content block if it exists. A zero-width
+      // carrier is a text block holding a provider item, not text, so it keeps
+      // its empty text and stays a carrier.
       for (let i = content.length - 1; i >= 0; i--) {
         const block = content[i]!;
-        if (block.type === 'text') {
+        if (block.type === 'text' && !isRawItemCarrier(block)) {
           (block as { type: 'text'; text: string }).text += providerResponse.stopSequence;
           break;
         }
@@ -2631,7 +3187,7 @@ export class Membrane {
     // Parse XML tool calls from text if no native tool_use blocks were found
     // This handles prefill mode where tools are XML in the text
     let emptyToolBlocks = 0;
-    if (toolCalls.length === 0 && rawAssistantText.includes('<function_calls>')) {
+    if (xmlToolProtocol && toolCalls.length === 0 && rawAssistantText.includes('<function_calls>')) {
       const parsed = parseToolCalls(rawAssistantText, { tools: request.tools });
       if (parsed?.calls.length) {
         for (const tc of parsed.calls) {
@@ -2641,10 +3197,17 @@ export class Membrane {
         emptyToolBlocks = 1;
       }
     }
-    const unclosedToolBlock = endsWithPartialToolBlock(rawAssistantText);
+    const unclosedToolBlock = xmlToolProtocol && endsWithPartialToolBlock(rawAssistantText);
 
-    const stopReason = this.mapStopReason(providerResponse.stopReason);
-    this.reportToolParseDiagnostics({ unclosedToolBlock, emptyToolBlocks }, stopReason);
+    let stopReason = this.mapStopReason(providerResponse.stopReason);
+    if (xmlToolProtocol) this.reportToolParseDiagnostics({ unclosedToolBlock, emptyToolBlocks }, stopReason);
+    // complete() runs no tools, but its caller decides on the stop reason as
+    // a loop does: native calls the provider stopped with end_turn come back
+    // as a tool_use stop (ToolUseWithEndTurnAnomaly).
+    const endTurnTools = xmlToolProtocol
+      ? undefined
+      : this.toolUseWithEndTurn(content, stopReason, providerResponse, 0);
+    if (endTurnTools?.treatedAsToolUse) stopReason = 'tool_use';
     const durationMs = Date.now() - startTime;
     // `NormalizedResponse.usage` is typed DetailedUsage and the streaming paths
     // already return the whole thing; complete() used to narrow it to
@@ -2667,12 +3230,7 @@ export class Membrane {
       stopReason,
       usage,
       details: {
-        stop: {
-          reason: stopReason,
-          triggeredSequence: providerResponse.stopSequence,
-          wasTruncated: stopReason === 'max_tokens',
-          unclosedToolBlock,
-        },
+        stop: { ...this.buildStopInfo(stopReason, providerResponse.providerStopReason, providerResponse.stopSequence), unclosedToolBlock },
         usage,
         timing: {
           totalDurationMs: durationMs,
@@ -2689,6 +3247,7 @@ export class Membrane {
           tokensRead: providerResponse.usage.cacheReadTokens ?? 0,
           hitRatio: this.calculateCacheHitRatio(providerResponse.usage),
         },
+        ...(endTurnTools ? { anomalies: [endTurnTools] } : {}),
       },
       raw: {
         request: rawRequest ?? null,
@@ -2714,7 +3273,7 @@ export class Membrane {
     },
     stopReason: StopReason
   ): void {
-    const warnLog = this.config.logger ?? console;
+    const warnLog = this.warnLogger();
 
     if (diagnostics.unclosedToolBlock) {
       warnLog.warn(
@@ -2757,6 +3316,7 @@ export class Membrane {
     stopReason: StopReason,
     turnUsage: TurnUsageAccumulator,
     request: NormalizedRequest,
+    xmlToolProtocol: boolean,
     prefillResult: {
       cacheMarkersApplied?: number;
     },
@@ -2768,6 +3328,8 @@ export class Membrane {
     executedToolResults: ToolResult[] = [],
     startInsideBlock: 'thinking' | 'tool_call' | 'tool_result' | null = null,
     triggeredSequence?: string,
+    providerStopReason?: string,
+    splitRounds: readonly SplitResultsRound[] = [],
   ): NormalizedResponse {
     const usage = turnUsage.total;
     // Parse accumulated text into structured content blocks
@@ -2778,7 +3340,7 @@ export class Membrane {
 
     let unclosedToolBlock = false;
 
-    if (contentBlocks.length > 0) {
+    if (contentBlocks.length > 0 || !xmlToolProtocol) {
       // Native mode - content blocks already structured
       finalContent = contentBlocks;
       toolCalls = executedToolCalls;
@@ -2792,9 +3354,12 @@ export class Membrane {
         ...(startInsideBlock ? { startInsideBlock } : {}),
       };
       const parsed = parseAccumulatedIntoBlocks(accumulated, parseOptions);
-      finalContent = parsed.blocks;
+      // A round split to send images wrote only its results' text into the
+      // document; its blocks and tool results take what the tools returned.
+      const attached = attachSplitResults(parsed, splitRounds);
+      finalContent = attached.blocks;
       toolCalls = parsed.toolCalls.length > 0 ? parsed.toolCalls : executedToolCalls;
-      toolResults = parsed.toolResults.length > 0 ? parsed.toolResults : executedToolResults;
+      toolResults = attached.toolResults.length > 0 ? attached.toolResults : executedToolResults;
       unclosedToolBlock = parsed.unclosedToolBlock;
       this.reportToolParseDiagnostics(parsed, stopReason);
     }
@@ -2809,12 +3374,7 @@ export class Membrane {
       stopReason,
       usage,
       details: {
-        stop: {
-          reason: stopReason,
-          triggeredSequence,
-          wasTruncated: stopReason === 'max_tokens',
-          unclosedToolBlock,
-        },
+        stop: { ...this.buildStopInfo(stopReason, providerStopReason, triggeredSequence), unclosedToolBlock },
         // Priced per round by the accumulator and summed — NOT re-derived here
         // from the turn totals, which would re-bill every round at the last
         // model's rate.
@@ -2844,6 +3404,81 @@ export class Membrane {
   }
 
   /**
+   * A native round whose provider stop was literally `end_turn` while its
+   * content holds client tool calls (see ToolUseWithEndTurnAnomaly). The
+   * provider contract is a `tool_use` stop for any response carrying a tool
+   * call; production Anthropic responses broke it on 2026-10-19, and every
+   * native loop, gating tool execution on `tool_use`, silently dropped the
+   * calls and ended the turn.
+   *
+   * Returns undefined when the round is not this case. Otherwise the record,
+   * with `treatedAsToolUse` true when every call is complete — its block
+   * stopped and its input parsed to an object (no `unparseableInput`) — so
+   * the caller can run the round as a `tool_use` stop. A length, refusal,
+   * stop-sequence or pause stop never qualifies, nor does a provider token
+   * membrane doesn't map (it reads as end_turn but isn't the provider saying
+   * end_turn), nor a round with no provider token at all (an adapter that
+   * reports none, or an OpenAI-family server sending no `finish_reason`):
+   * those behave as before, and nothing runs. Warns once per occurrence, with
+   * the ids a provider report needs.
+   */
+  private toolUseWithEndTurn(
+    responseBlocks: ContentBlock[],
+    mappedStopReason: StopReason,
+    provider: {
+      providerStopReason?: string;
+      model?: string;
+      responseId?: string;
+      requestId?: string;
+    },
+    round: number,
+  ): ResponseAnomaly | undefined {
+    // Only the provider's own, literal `end_turn`: a missing token is not the
+    // provider saying end_turn, and runs nothing, as before.
+    if (mappedStopReason !== 'end_turn' || provider.providerStopReason !== 'end_turn') return undefined;
+    const calls = responseBlocks.filter(
+      (b): b is ContentBlock & { type: 'tool_use' } => b.type === 'tool_use'
+    );
+    if (calls.length === 0) return undefined;
+    const incomplete = calls.filter((c) => c.unparseableInput !== undefined);
+    const treatedAsToolUse = incomplete.length === 0;
+    const anomaly: ResponseAnomaly = {
+      kind: 'tool_use_with_end_turn',
+      round,
+      providerStopReason: 'end_turn',
+      toolNames: calls.map((c) => c.name),
+      toolUseIds: calls.map((c) => c.id),
+      treatedAsToolUse,
+      model: provider.model ?? '',
+      ...(provider.responseId ? { messageId: provider.responseId } : {}),
+      ...(provider.requestId ? { requestId: provider.requestId } : {}),
+    };
+    this.warnLogger().warn(
+      `[membrane] ${provider.model || '(unknown model)'} ended round ${round} with ` +
+      `stop_reason end_turn but returned ${calls.length} tool call(s) ` +
+      `(${anomaly.toolNames.join(', ')}); ` +
+      (treatedAsToolUse
+        ? 'all complete, treating the round as tool_use'
+        : `${incomplete.length} incomplete (${incomplete.map((c) => c.id).join(', ')}), leaving the round as end_turn, nothing runs`) +
+      ` — message ${provider.responseId ?? '(no id)'}, request ${provider.requestId ?? '(no id)'}`,
+    );
+    return anomaly;
+  }
+
+  private buildStopInfo(
+    reason: StopReason,
+    providerReason: string | undefined,
+    triggeredSequence: string | undefined
+  ): StopInfo {
+    return {
+      reason,
+      triggeredSequence,
+      wasTruncated: reason === 'max_tokens',
+      ...(providerReason !== undefined ? { providerReason } : {}),
+    };
+  }
+
+  /**
    * Fold one discarded (billed but abandoned) attempt's usage into a carry.
    * Returns a NEW object so a caller's earlier snapshot is never mutated.
    */
@@ -2858,10 +3493,11 @@ export class Membrane {
     next.attempts += add.attempts;
     next.inputTokens += add.inputTokens;
     next.outputTokens += add.outputTokens;
-    if (add.cacheCreationTokens) {
+    // As in the turn total: a count any attempt reported, a 0 included.
+    if (add.cacheCreationTokens != null) {
       next.cacheCreationTokens = (next.cacheCreationTokens ?? 0) + add.cacheCreationTokens;
     }
-    if (add.cacheReadTokens) {
+    if (add.cacheReadTokens != null) {
       next.cacheReadTokens = (next.cacheReadTokens ?? 0) + add.cacheReadTokens;
     }
     return next;
@@ -2874,8 +3510,8 @@ export class Membrane {
       attempts: 1,
       inputTokens: detailed.inputTokens ?? 0,
       outputTokens: detailed.outputTokens ?? 0,
-      ...(detailed.cacheCreationTokens ? { cacheCreationTokens: detailed.cacheCreationTokens } : {}),
-      ...(detailed.cacheReadTokens ? { cacheReadTokens: detailed.cacheReadTokens } : {}),
+      ...(detailed.cacheCreationTokens != null ? { cacheCreationTokens: detailed.cacheCreationTokens } : {}),
+      ...(detailed.cacheReadTokens != null ? { cacheReadTokens: detailed.cacheReadTokens } : {}),
     };
   }
 
@@ -2889,8 +3525,8 @@ export class Membrane {
     return estimatedCost ? { ...discarded, estimatedCost } : discarded;
   }
 
-  private mapStopReason(providerReason: string): StopReason {
-    switch (providerReason) {
+  private mapStopReason(adapterReason: string): StopReason {
+    switch (adapterReason) {
       case 'end_turn':
         return 'end_turn';
       case 'max_tokens':
@@ -2899,17 +3535,69 @@ export class Membrane {
         return 'stop_sequence';
       case 'tool_use':
         return 'tool_use';
+      case 'pause_turn':
+        // A long-running turn the provider paused and the caller is expected
+        // to resume. Reported as end_turn, it looked finished.
+        return 'pause_turn';
       case 'refusal':
         // Safety refusal (e.g., Fable 5 reasoning_extraction). Must survive
         // mapping — downstream consumers react to refusals (chapterx adds a
         // Discord reaction). Defaulting this to end_turn silently hid them.
         return 'refusal';
-      default:
+      default: {
+        // Unknown reasons still normalize to end_turn — callers switch on a
+        // closed union — but never silently: the raw token is disclosed as
+        // details.stop.providerReason (the adapter's providerStopReason when
+        // it's a non-empty string, or else this stop reason when it is one;
+        // see providerReasonFor) and the mapping is logged, once per reason
+        // per process (a compatible server may send its own token on every
+        // response). Provider enums grow, and the last time this default
+        // swallowed a member it hid safety refusals in production.
+        const shown = shownStopReason(adapterReason);
+        if (!warnedStopReasons.has(shown) && warnedStopReasons.size < MAX_LOGGED_STOP_REASONS) {
+          warnedStopReasons.add(shown);
+          console.warn(
+            `[membrane] Unmapped adapter stop reason ${shown} normalized to end_turn ` +
+              '(details.stop.providerReason carries the adapter\'s providerStopReason if that\'s a non-empty string, ' +
+              'else this stop reason if it\'s one; logged once per reason)'
+          );
+          if (warnedStopReasons.size === MAX_LOGGED_STOP_REASONS) {
+            console.warn(
+              `[membrane] ${MAX_LOGGED_STOP_REASONS} distinct unmapped stop reasons logged; further ones are not ` +
+                '(details.stop.providerReason still carries the adapter\'s providerStopReason if that\'s a non-empty ' +
+                'string, else the stop reason if it\'s one)'
+            );
+          }
+        }
         return 'end_turn';
+      }
     }
   }
 
-  private calculateCacheHitRatio(usage: Pick<DetailedUsage, 'inputTokens' | 'cacheReadTokens'>): number {
+  /**
+   * The stop token details.stop.providerReason carries for an adapter's
+   * result: its providerStopReason, the provider's own word, when it gives
+   * one. Otherwise its stopReason when membrane doesn't map that token, so the
+   * token isn't lost behind the end_turn it becomes; that may be the adapter's
+   * own word rather than the provider's. A token membrane maps, given alone,
+   * leaves none: it may already be the adapter's normalization. Only a
+   * non-empty string counts as a token, in either field.
+   *
+   * mapStopReason maps each token it knows to itself, so a token it changes is
+   * one it doesn't map; reading it here logs that token, once per process.
+   * Both doors an adapter's result enters by, complete()'s and streamOnce,
+   * settle the token here, before membrane's own stop, a stop sequence the
+   * XML loop or LocalStopSequences finds, replaces the adapter's stopReason.
+   */
+  private providerReasonFor(
+    result: Pick<ProviderResponse, 'stopReason' | 'providerStopReason'>
+  ): string | undefined {
+    if (isStopToken(result.providerStopReason)) return result.providerStopReason;
+    const token: unknown = result.stopReason;
+    return isStopToken(token) && this.mapStopReason(token) !== token ? token : undefined;
+  }
+
+  private calculateCacheHitRatio(usage: Pick<DetailedUsage, 'inputTokens' | 'cacheCreationTokens' | 'cacheReadTokens'>): number {
     return calculateCacheHitRatio(usage);
   }
 
@@ -2940,7 +3628,7 @@ export class Membrane {
   ): import('./types/provider.js').ModelPricing | undefined {
     const servedModel = actualModel && actualModel !== requestedModel ? actualModel : undefined;
     const fromRegistry = (modelId: string | undefined) =>
-      modelId === undefined ? undefined : this.registry?.getPricing(modelId);
+      modelId === undefined ? undefined : runCallerCode(() => this.registry?.getPricing(modelId));
     const fromBuiltin = (modelId: string | undefined) =>
       modelId === undefined ? undefined : getDefaultPricing(modelId);
 
@@ -2968,21 +3656,63 @@ export class Membrane {
     return calculateCost(usage, pricing);
   }
 
-  private calculateRetryDelay(attempt: number, overloaded = false): number {
-    const { retryDelayMs, backoffMultiplier, maxRetryDelayMs } = overloaded
-      ? this.retryConfig.overloaded
-      : this.retryConfig;
-    const delay = Math.min(retryDelayMs * Math.pow(backoffMultiplier, attempt - 1), maxRetryDelayMs);
-    // Equal jitter on the overloaded schedule only: a capacity storm is
-    // exactly the case where a fleet retrying in sync re-creates the
-    // stampede it's backing off from. [delay/2, delay) keeps the wait long.
-    return overloaded ? Math.floor(delay / 2 + Math.random() * (delay / 2)) : delay;
+  /**
+   * The one retry policy, read the same way by complete() and streamOnce() for
+   * every adapter: membrane is the one layer that retries a call's requests
+   * (AnthropicAdapter turns its SDK client's own retries off for them).
+   * Whether a request that failed with this error, after `attempt` tries, is
+   * sent again, and after how long: membrane's retry decision (retry.ts) on
+   * its settings for this membrane's retry config (membraneRetrySettings).
+   * The callers send again only what failed before delivering anything.
+   *
+   * A 529 takes the overloaded schedule, with jitter, or with
+   * overloaded.maxRetries 0 the base schedule and count; a 429 gets at least
+   * five attempts; any other retryable error (a 5xx, a 408, a connection
+   * failure) the base schedule within maxRetries. A 429 whose provider code
+   * says the account is out of quota is not a rate limit in that sense: it is
+   * classified non-retryable at the boundary, and gets no floor. A deadline
+   * that ran out on a sent request (`deadline`) is the caller's, and so is a
+   * stated wait longer than its schedule's ceiling, a minute or the
+   * schedule's maxRetryDelayMs where that's longer, which the caller gets on
+   * the error's retryAfterMs.
+   *
+   * With the call's `retry: false` nothing is retried, these floors included:
+   * the error goes to the caller.
+   *
+   * Credit exhaustion (`creditExhausted`: a 402, or an insufficient-credits or
+   * -quota code) is retryable, but not here: it goes to the caller at once,
+   * with its wait on `retryAfterMs`, and onError isn't asked. Membrane's
+   * schedule would wait out that minute and send again, up to the 429 floor
+   * of five tries, holding the call for minutes against an empty account
+   * inside the hold the caller would place on the same wait. The caller,
+   * which owns the pause (a framework's provider hold, a compression lane's
+   * backoff), sends it again once the wait has passed.
+   */
+  private retryPlan(
+    errorInfo: ErrorInfo,
+    attempt: number,
+    deadline: boolean,
+    retry: boolean | undefined,
+  ): { retry: true; delayMs: number } | { retry: false } {
+    if (retry === false) return { retry: false };
+    if (errorInfo.creditExhausted) return { retry: false };
+    const decision = retryDecision(
+      classifyFailure({ ...errorInfo, deadline }),
+      attempt,
+      errorInfo.retryAfterMs,
+      this.retrySettings,
+    );
+    return decision.retry ? decision : { retry: false };
   }
 
-  private attachRawRequest(error: unknown, rawRequest: unknown): Error {
-    const errorInfo = classifyError(error);
-    errorInfo.rawRequest = rawRequest;
-    return new MembraneError(errorInfo);
+  private attachRawRequest(error: unknown, rawRequest: unknown): MembraneError {
+    // A build refusal (the formatter reported not ready, or the normalizer
+    // refused the history; native streaming builds through the shared
+    // formatter build every round) carries no request of its own: pass it
+    // through as it is.
+    if (isBuildRefusal(error)) return error;
+    if (error instanceof MembraneError) return withRawRequest(error, rawRequest);
+    return errorFromThrown(error, rawRequest);
   }
 
   private sleep(ms: number, signal?: AbortSignal): Promise<void> {
@@ -2991,33 +3721,49 @@ export class Membrane {
         reject(signal.reason ?? new DOMException('The operation was aborted.', 'AbortError'));
         return;
       }
-      const timer = setTimeout(resolve, ms);
-      signal?.addEventListener('abort', () => {
-        clearTimeout(timer);
-        reject(signal.reason ?? new DOMException('The operation was aborted.', 'AbortError'));
-      }, { once: true });
+      const onAbort = () => {
+        cancel();
+        reject(signal?.reason ?? new DOMException('The operation was aborted.', 'AbortError'));
+      };
+      // The listener goes when the timer fires: a long-lived caller signal
+      // would otherwise keep one per retry sleep until it aborts. A wait past
+      // the platform timer's limit (about 24.8 days), which a stated wait
+      // under a large maxRetryDelayMs can be, is waited in full rather than
+      // after 1 ms.
+      const cancel = setLongTimeout(() => {
+        signal?.removeEventListener('abort', onAbort);
+        resolve();
+      }, ms);
+      signal?.addEventListener('abort', onAbort, { once: true });
     });
   }
 
   /**
-   * Check if an error is an abort error
+   * Check if an error is an abort error.
+   *
+   * Typed only — name === 'AbortError', a DOMException AbortError, or a
+   * MembraneError of type 'abort' (which is what every adapter throws for a
+   * cancelled request). The old substring arms turned any error whose text
+   * merely contained "abort" into a well-formed AbortedResponse{reason:
+   * 'user'}: a host tool failing with "...aborted..." inside the same try
+   * became a phantom user cancellation, and the real error was destroyed.
+   * Everything else now throws through attachRawRequest.
    */
   private isAbortError(error: unknown): boolean {
-    // An adapter's own deadline: a timeout by classification, still an abort
-    // by provenance, so the streaming paths hand back the partial content
-    // they collected instead of throwing.
-    if (isTimeoutAbortError(error)) return true;
-    if (error instanceof Error) {
-      // Standard AbortError
-      if (error.name === 'AbortError') return true;
-      // Anthropic SDK abort
-      if (error.message.includes('aborted') || error.message.includes('abort')) return true;
-    }
-    // DOMException for browser environments
-    if (typeof DOMException !== 'undefined' && error instanceof DOMException) {
-      return error.name === 'AbortError';
-    }
-    return false;
+    return isTimeoutAbortError(error) || isTypedAbortError(error);
+  }
+
+  /**
+   * Whether a caught failure is a cancellation, judged by provenance first.
+   * If the caller's own signal has fired, the request was cancelled whatever
+   * the in-flight error is named: `AbortSignal.timeout()` rejects a fetch with
+   * a DOMException named `TimeoutError`, not `AbortError`, and classifying that
+   * by its name would report the caller's own deadline as a provider timeout
+   * on one path and a cancellation on another. Otherwise only a typed abort
+   * counts (see isAbortError).
+   */
+  private isCancellation(error: unknown, signal?: AbortSignal): boolean {
+    return signal?.aborted === true || this.isAbortError(error);
   }
 
   /**
@@ -3043,17 +3789,8 @@ export class Membrane {
     toolCalls: ToolCall[],
     toolResults: ToolResult[],
     reason: 'user' | 'timeout' | 'error',
-    startInsideBlock: 'thinking' | 'tool_call' | 'tool_result' | null = null,
-    tools?: ToolDefinition[]
+    blocks: ContentBlock[]
   ): AbortedResponse {
-    // Parse accumulated text into content blocks for partial content
-    // If we started inside a block (from prefill), pass that context
-    const parseOptions = {
-      tools,
-      ...(startInsideBlock ? { startInsideBlock } : {}),
-    };
-    const { blocks } = parseAccumulatedIntoBlocks(accumulated, parseOptions);
-
     return {
       aborted: true,
       partialContent: blocks.length > 0 ? blocks : undefined,
@@ -3113,7 +3850,7 @@ export class Membrane {
     // and a partial implementation would corrupt the turn instead of
     // retrying it. Fail LOUD and OFF rather than silently mis-retrying.
     if (toolMode !== 'native' && (options.refusalRetries ?? 0) > 0) {
-      (this.config.logger ?? console).warn(
+      this.warnLogger().warn(
         '[membrane] refusalRetries is ignored in XML tool mode ' +
         '(native-only for now) — the turn will surface the refusal as before.',
       );
@@ -3174,17 +3911,21 @@ export class Membrane {
     let consecutiveStalledResumptions = 0;
     let enteredViaResumption = false;
     let prevRoundStopSequence: string | undefined;
-    const warnLog = this.config.logger ?? console;
+    const warnLog = this.warnLogger();
 
     // Initialize parser from the formatter streamYielding selected, so the
     // parser and the build below read the same format.
     const formatter = activeFormatter;
+    const xmlToolProtocol = formatter.supportsXmlTools;
+    const streamedThinking = new StreamedThinking();
     const parser = formatter.createStreamParser();
     let toolDepth = 0;
     // Honest turn telemetry: provider calls actually made (including refusal
     // re-issues inside streamOnce) and continuation rounds.
     let providerCalls = 0;
     let rounds = 0;
+    // The waits before each call that was sent again (see streamOnce).
+    const retryDelaysMs: number[] = [];
     // Once-per-stream latch for the injectedMessages-unsupported warning.
     let warnedInjectionUnsupported = false;
     // See streamWithXmlTools: one accumulator per turn, pricing each round
@@ -3195,6 +3936,7 @@ export class Membrane {
     );
     const contentBlocks: ContentBlock[] = [];
     let lastStopReason: StopReason = 'end_turn';
+    let lastProviderStopReason: string | undefined;
     let lastStopSequence: string | undefined;
     let rawRequest: unknown;
     let rawResponse: unknown;
@@ -3210,9 +3952,19 @@ export class Membrane {
     // Track executed tool calls and results
     const executedToolCalls: ToolCall[] = [];
     const executedToolResults: ToolResult[] = [];
+    // Rounds split to send their images, so the final parse can give each
+    // results block what its tools returned (attachSplitResults).
+    const splitRounds: SplitResultsRound[] = [];
 
-    // Transform initial request using the formatter
-    let { providerRequest, prefillResult } = this.transformRequest(request, formatter);
+    // Transform initial request using the formatter. Its fidelity notes hold
+    // for every round: continuations carry the same converted messages.
+    const buildFidelity = new FidelityNotes();
+    let { providerRequest, prefillResult } = this.transformRequest(request, formatter, 'xml', undefined, buildFidelity);
+    // Injected batches supplied to this stream; this path carries none of them.
+    let injectedBatches = 0;
+    // Set once a beforeRequest hook changed its request in place: later
+    // continuations reuse that state, so their fidelity stays unknown.
+    let hookAlteredState = false;
 
     // Initialize parser with prefill content
     let initialPrefillLength = 0;
@@ -3259,28 +4011,76 @@ export class Membrane {
       return true;
     };
 
+    // What an aborted event carries: the text so far and the tool rounds run.
+    // One builder for both aborts: the catch below uses it for a provider or
+    // deadline abort, and cancel() for the one it emits. The arrays are
+    // copies, since this loop can still record a round after a cancel.
+    const abortedPartial = () => {
+      const newContent = parser.getAccumulated().slice(initialPrefillLength);
+      return {
+        partialContent: xmlToolProtocol
+          ? attachSplitResults(parseAccumulatedIntoBlocks(newContent, { tools: request.tools, ...(initialBlockType ? { startInsideBlock: initialBlockType } : {}) }), splitRounds).blocks
+          : streamedThinking.content(newContent, (value, context) => formatter.parseContentBlocks(value, request.tools, context)),
+        rawAssistantText: newContent,
+        toolCalls: [...executedToolCalls],
+        toolResults: [...executedToolResults],
+      };
+    };
+    stream.setAbortSnapshot(abortedPartial);
+
     try {
       // Tool execution loop
       while (toolDepth <= maxToolDepth) {
-        // Check for cancellation
-        if (stream.isCancelled) {
-          const fullAccumulated = parser.getAccumulated();
-          const newContent = fullAccumulated.slice(initialPrefillLength);
-          stream.emit({
-            type: 'aborted',
-            reason: 'user',
-            partialContent: parseAccumulatedIntoBlocks(newContent, { tools: request.tools }).blocks,
-            rawAssistantText: newContent,
-            toolCalls: executedToolCalls,
-            toolResults: executedToolResults,
-          });
-          return;
-        }
+        // A cancelled stream stops here. cancel() is the only way to cancel
+        // it, and it has already emitted the terminal aborted event, so
+        // reporting again would deliver a second one.
+        if (stream.isCancelled) return;
 
         // Track if we manually detected a stop sequence
         let detectedStopSequence: string | null = null;
         let truncatedAccumulated: string | null = null;
         const checkFromIndex = parser.getAccumulated().length;
+        // This round's notes: the build's, plus what the hook and the adapter do.
+        const roundFidelity = buildFidelity.copy();
+
+        let typedCallbacks = false;
+        let sawChunk = false;
+        const textStarts = new Map<number, number>();
+        streamedThinking.beginRound(parser.getAccumulated().length - initialPrefillLength);
+        const tracker = new NativeBlockTracker((event) => { if (typedCallbacks && emitBlocks) stream.emit({ type: 'block', event }); });
+        // The parser's emissions go out in order (see streamWithXmlTools).
+        const forward = (emissions: ProcessChunkResult['emissions']) => {
+          for (const emission of emissions) {
+            if (emission.kind === 'blockEvent') {
+              if (emitBlocks && !typedCallbacks) stream.emit({ type: 'block', event: emission.event });
+            } else if (emitTokens) {
+              stream.emit({ type: 'tokens', content: emission.text, meta: typedCallbacks ? { ...emission.meta, blockIndex: tracker.blockIndex } : emission.meta });
+            }
+          }
+        };
+        // Under typed blocks, what the parser held back at a round's end
+        // isn't streamed, as on main (see streamWithXmlTools).
+        const forwardOwn = (emissions: ProcessChunkResult['emissions']) => {
+          if (!typedCallbacks) forward(emissions);
+        };
+        const onProviderBlock = (index: number, block: unknown) => {
+          if (!xmlToolProtocol && (!detectedStopSequence || textStarts.has(index))) {
+            const type = (block as { type?: string } | undefined)?.type;
+            if (!sawChunk && (type === 'text' || type === 'thinking' || type === 'redacted_thinking')) typedCallbacks = true;
+            const accepted = truncatedAccumulated ?? parser.getAccumulated();
+            const offset = accepted.length - initialPrefillLength;
+            // Logical completion reports accepted text, not a suffix
+            // discarded by the parser's local stop-sequence boundary.
+            let reported = block;
+            if (type === 'text') {
+              const start = textStarts.get(index);
+              if (start === undefined) textStarts.set(index, offset);
+              else reported = { ...(block as object), text: accepted.slice(initialPrefillLength + start) };
+            }
+            streamedThinking.onBlock(index, reported, offset);
+            tracker.onProviderBlock(index, reported);
+          }
+        };
 
         // Stream from provider
         const streamResult = await this.streamOnce(
@@ -3292,70 +4092,58 @@ export class Membrane {
               }
 
               // Process chunk with enriched streaming API
-              const { emissions } = parser.processChunk(chunk);
-
-              // Check for stop sequences only in NEW content
-              const accumulated = parser.getAccumulated();
-              const newContent = accumulated.slice(checkFromIndex);
-
-              for (const stopSeq of prefillResult.stopSequences) {
-                const idx = newContent.indexOf(stopSeq);
-                if (idx !== -1) {
-                  const absoluteIdx = checkFromIndex + idx;
-                  detectedStopSequence = stopSeq;
-                  truncatedAccumulated = accumulated.slice(0, absoluteIdx);
-
-                  // Emit only the portion up to stop sequence
-                  const alreadyEmitted = accumulated.length - chunk.length;
-                  if (emitTokens && absoluteIdx > alreadyEmitted) {
-                    const truncatedChunk = accumulated.slice(alreadyEmitted, absoluteIdx);
-                    const meta: ChunkMeta = {
-                      type: parser.getCurrentBlockType(),
-                      visible: parser.getCurrentBlockType() === 'text',
-                      blockIndex: 0,
-                    };
-                    stream.emit({ type: 'tokens', content: truncatedChunk, meta });
-                  }
-                  return;
-                }
+              sawChunk = true;
+              if (!xmlToolProtocol && tracker.currentType === 'thinking') {
+                streamedThinking.onThinkingChunk(tracker.blockIndex, chunk);
+                if (emitTokens) stream.emit({ type: 'tokens', content: chunk, meta: { type: 'thinking', visible: false, blockIndex: tracker.blockIndex } });
+                return;
               }
-
-              // Emit in correct interleaved order
-              for (const emission of emissions) {
-                if (emission.kind === 'blockEvent') {
-                  if (emitBlocks) {
-                    stream.emit({ type: 'block', event: emission.event });
-                  }
-                } else {
-                  if (emitTokens) {
-                    stream.emit({ type: 'tokens', content: emission.text, meta: emission.meta });
-                  }
-                }
+              // Only visible text enters a plain formatter's parser, and only
+              // the text before a stop (see streamWithXmlTools).
+              const { found, head, emissions } = parseUpToStop(parser, chunk, checkFromIndex, prefillResult.stopSequences);
+              if (found) {
+                detectedStopSequence = found.stop;
+                truncatedAccumulated = head;
               }
+              forward(emissions);
             },
-            onContentBlock: undefined,
+            onContentBlock: onProviderBlock,
+            // Only a thinking span already recorded takes it (see onProviderBlock).
+            onThinkingSignature: (index, signature) => streamedThinking.onSignature(index, signature),
           },
           {
             signal: stream.signal,
             timeoutMs: options.timeoutMs,
             idleTimeoutMs: options.idleTimeoutMs,
+            progressTimeoutMs: options.progressTimeoutMs,
+            retry: options.retry,
             normalizedRequest: request,
+            formatterName: formatter.name,
+            requiresAssistantPrefill: true,
             // The tag-based parser tracks thinking via <thinking> tags — ask
             // the provider to wrap native thinking deltas so they don't
             // stream as visible text (same as streamWithXmlTools).
-            wrapThinkingTags: true,
+            wrapThinkingTags: xmlToolProtocol,
             onWireCacheMarkers: (count) => { prefillResult.cacheMarkersApplied = count; },
             onRequest: (req: unknown) => { rawRequest = req; },
+            // Only a reported round needs its notes, and a hook's fingerprint with them.
+            ...(emitUsage ? { fidelity: roundFidelity } : {}),
           }
         );
 
+        if (typedCallbacks) tracker.flush();
         rounds++;
         providerCalls += streamResult.providerCalls;
+        retryDelaysMs.push(...streamResult.retryDelaysMs);
 
-        // If we detected stop sequence manually, fix up the parser and result
+        // A stop found here ends the round at the text before it (see
+        // streamWithXmlTools): the parser starts again from the accepted text
+        // only when the stop began in an earlier chunk, which it took whole.
         if (detectedStopSequence && truncatedAccumulated !== null) {
-          parser.reset();
-          parser.push(truncatedAccumulated);
+          if (parser.getAccumulated() !== truncatedAccumulated) {
+            parser.reset();
+            parser.push(truncatedAccumulated);
+          }
           streamResult.stopReason = 'stop_sequence';
           streamResult.stopSequence = detectedStopSequence;
         }
@@ -3369,21 +4157,36 @@ export class Membrane {
 
         rawResponse = streamResult.raw;
         lastStopReason = this.mapStopReason(streamResult.stopReason);
+        lastProviderStopReason = streamResult.providerStopReason;
         lastStopSequence = streamResult.stopSequence ?? undefined;
 
         // Accumulate usage (including cache metrics), priced at this round's model
         const usageSoFar = turnUsage.addRound(streamResult.model, streamResult.usage);
+        if (roundFidelity.mutatedInPlace) hookAlteredState = true;
+        if (hookAlteredState) roundFidelity.unattributed = true;
         if (emitUsage) {
-          stream.emit({ type: 'usage', usage: usageSoFar });
+          stream.emit({
+            type: 'usage',
+            usage: usageSoFar,
+            round: Membrane.roundReport({
+              index: rounds - 1,
+              stopReason: lastStopReason,
+              usage: turnUsage.lastRound?.usage,
+              unreported: streamResult.unreportedUsage,
+              fidelity: roundFidelity,
+              // The prefill transcript carries no injected message.
+              ...(injectedBatches > 0 ? { injectedBatch: { batch: injectedBatches - 1, applied: 0 } } : {}),
+              ...(streamResult.inputTransformations
+                ? { thinking: { entries: streamResult.inputTransformations, messages: request.messages } }
+                : {}),
+            }),
+          });
         }
 
-        // Flush the parser
-        const flushResult = parser.flush();
-        for (const emission of flushResult.emissions) {
-          if (emission.kind === 'blockEvent' && emitBlocks) {
-            stream.emit({ type: 'block', event: emission.event });
-          }
-        }
+        // Flush the parser: the block in progress completes, and the text it
+        // held back at the round's end goes out with it. Under typed blocks
+        // neither is streamed (forwardOwn).
+        forwardOwn(parser.flush().emissions);
 
         // Stall accounting (issue #39): only rounds ENTERED via automatic
         // resumption can stall; the turn ends only after several consecutive
@@ -3414,7 +4217,7 @@ export class Membrane {
         enteredViaResumption = false;
 
         // Check for tool calls
-        if (streamResult.stopSequence === '</function_calls>') {
+        if (xmlToolProtocol && streamResult.stopSequence === '</function_calls>') {
           const closeTag = '</function_calls>';
           parser.push(closeTag);
 
@@ -3472,6 +4275,9 @@ export class Membrane {
               depth: toolDepth,
               previousResults: executedToolResults,
               accumulated: parser.getAccumulated().slice(initialPrefillLength),
+              // The continuation is an assistant prefill: no user envelope
+              // exists to carry injected messages.
+              supportsInjectedMessages: false,
             };
 
             // Yield control for tool execution
@@ -3481,7 +4287,7 @@ export class Membrane {
               context,
             };
 
-            const { results, injectedMessages } = await stream.requestToolExecution(toolCallsEvent);
+            const { results, injected } = await stream.requestToolExecution(toolCallsEvent);
 
             // Backfill tool names for the legacy XML result rendering
             // (<result><tool_name>…</tool_name><stdout>…) when the executor
@@ -3497,7 +4303,10 @@ export class Membrane {
             // to append to. Warn (once per stream — long turns have many
             // rounds) rather than drop silently; the messages remain in the
             // caller's context window and reach the model on the next turn.
-            if (injectedMessages && injectedMessages.length > 0 && !warnedInjectionUnsupported) {
+            // A supplied batch still takes its number, so batches stay in the
+            // consumer's coordinates (RoundReport).
+            if (injected) injectedBatches++;
+            if (injected && !warnedInjectionUnsupported) {
               warnedInjectionUnsupported = true;
               console.warn(
                 `[membrane] provideToolResults injectedMessages ignored: XML tool mode ` +
@@ -3508,9 +4317,19 @@ export class Membrane {
             // Track the tool results
             executedToolResults.push(...results);
 
-            // Check if results contain images
-            if (hasImageInToolResults(results)) {
-              const splitContent = formatToolResultsForSplitTurn(results);
+            // Check if results contain images that will be sent (see the
+            // streaming path: an all-placeholder result takes the standard
+            // path, and each image is decided once)
+            const splitContent = hasImageInToolResults(results) ? formatToolResultsForSplitTurn(results) : null;
+            if (splitContent?.hasImages) {
+              splitRounds.push({
+                xml: splitContent.beforeImageXml + splitContent.afterImageXml,
+                // The block goes into the document next, so it starts here.
+                docAt: parser.getAccumulated().length - initialPrefillLength,
+                at: splitContent.beforeImageXml.length,
+                imageResult: splitContent.imageResult,
+                results,
+              });
 
               // Emit block events for tool results
               if (emitBlocks) {
@@ -3577,8 +4396,8 @@ export class Membrane {
               prefillResult.assistantPrefill = parser.getAccumulated();
               parser.resetForNewIteration();
             } else {
-              // Standard path: no images
-              const resultsXml = formatToolResults(results);
+              // Standard path: no image to send
+              const resultsXml = splitContent ? splitContent.beforeImageXml : formatToolResults(results);
 
               if (emitBlocks) {
                 stream.emit({
@@ -3660,24 +4479,34 @@ export class Membrane {
           currentDepths.thinking > prefillDepths.thinking;
 
         if (lastStopReason === 'stop_sequence' && modelOpenedNewBlock) {
+          // The stop's text is the model's, inside the block it opened: it
+          // goes through the parser as a chunk does. No block is in progress
+          // after the round's flush, so text starts a new block of its type,
+          // and a closing tag sends no block event.
           if (streamResult.stopSequence) {
-            parser.push(streamResult.stopSequence);
-            if (emitTokens) {
-              const meta: ChunkMeta = {
-                type: parser.getCurrentBlockType(),
-                visible: parser.getCurrentBlockType() === 'text',
-                blockIndex: 0,
-              };
-              stream.emit({ type: 'tokens', content: streamResult.stopSequence, meta });
+            // Under typed blocks the stop's text goes out as one piece,
+            // labelled with the block it sits in (see streamWithXmlTools).
+            const type = parser.getCurrentBlockType();
+            const putBack = parser.processChunk(streamResult.stopSequence).emissions;
+            if (typedCallbacks) {
+              if (emitTokens) {
+                stream.emit({ type: 'tokens', content: streamResult.stopSequence, meta: { type, visible: type === 'text', blockIndex: 0 } });
+              }
+            } else {
+              forward(putBack);
             }
           }
 
+          // A turn that ends at either break below completes the block the
+          // stop's text opened, streamed unless under typed blocks.
           toolDepth++;
           if (toolDepth > maxToolDepth) {
+            forwardOwn(parser.flush().emissions);
             break;
           }
           if (!registerResumptionRound()) {
             lastStopReason = 'round_limit';
+            forwardOwn(parser.flush().emissions);
             break;
           }
           enteredViaResumption = true;
@@ -3687,7 +4516,7 @@ export class Membrane {
             prefillResult,
             parser.getAccumulated()
           );
-          parser.resetForNewIteration();
+          // A block the stop's text started goes on in the next round.
           continue;
         }
 
@@ -3701,10 +4530,11 @@ export class Membrane {
 
       const response = this.buildFinalResponse(
         newContent,
-        contentBlocks,
+        xmlToolProtocol ? contentBlocks : streamedThinking.content(newContent, (value, context) => formatter.parseContentBlocks(value, request.tools, context)),
         lastStopReason,
         turnUsage,
         request,
+        xmlToolProtocol,
         prefillResult,
         startTime,
         providerCalls,
@@ -3714,6 +4544,8 @@ export class Membrane {
         executedToolResults,
         initialBlockType,
         lastStopSequence,
+        lastProviderStopReason,
+        splitRounds
       );
 
       // Merge provider thinking signatures into parser-derived thinking blocks
@@ -3721,20 +4553,17 @@ export class Membrane {
 
       response.content.push(...extraContentBlocks);
       response.details.timing.rounds = rounds;
+      if (retryDelaysMs.length > 0) response.details.timing.retryDelaysMs = retryDelaysMs;
 
       stream.emit({ type: 'complete', response });
     } catch (error) {
+      // cancel() has already emitted the terminal aborted event, for the
+      // consumer's cancel and for the caller's signal alike (linked through
+      // onExternalAbort), and it rejects a pending tool wait with a plain
+      // Error. Reporting again here would deliver a second aborted.
+      if (stream.isCancelled) return;
       if (this.isAbortError(error)) {
-        const fullAccumulated = parser.getAccumulated();
-        const newContent = fullAccumulated.slice(initialPrefillLength);
-        stream.emit({
-          type: 'aborted',
-          reason: this.abortReason(error, stream.signal),
-          partialContent: parseAccumulatedIntoBlocks(newContent, { tools: request.tools }).blocks,
-          rawAssistantText: newContent,
-          toolCalls: executedToolCalls,
-          toolResults: executedToolResults,
-        });
+        stream.emit({ type: 'aborted', reason: this.abortReason(error, stream.signal), ...abortedPartial() });
       } else {
         throw error;
       }
@@ -3778,7 +4607,12 @@ export class Membrane {
     // re-issues inside streamOnce) and continuation rounds.
     let providerCalls = 0;
     let rounds = 0;
+    // The waits before each call that was sent again (see streamOnce).
+    const retryDelaysMs: number[] = [];
     let lastStopReason: StopReason = 'end_turn';
+    // Rounds the provider ended with end_turn while returning tool calls.
+    const anomalies: ResponseAnomaly[] = [];
+    let lastProviderStopReason: string | undefined;
     let lastStopSequence: string | undefined;
     let rawRequest: unknown;
     let rawResponse: unknown;
@@ -3790,26 +4624,53 @@ export class Membrane {
     let discardedUsage: DiscardedAttemptsUsage | undefined;
 
     let messages = [...request.messages];
+    // Where each working message came from, so a round's alterations are
+    // reported in the consumer's coordinates (RoundReport).
+    const origins: MessageOrigin[] = request.messages.map((_, index) => ({ kind: 'input' as const, index }));
+    // Injected batches supplied to this stream; the newest one's size, as
+    // supplied; and the positions their cleaning altered (every batch is
+    // retained, so these are reported on every later round).
+    let injectedBatches = 0;
+    let newestBatchSize = 0;
+    const injectedAlterations: Array<[number, number]> = [];
+    // Set once a beforeRequest hook changed its request in place: nested
+    // blocks are shared with the consumer's messages, so later rounds stay
+    // unknown.
+    let hookAlteredState = false;
     let allContentBlocks: ContentBlock[] = [];
+    // What the current round has received, for partialContent if it aborts:
+    // the tracker's record while the provider streams, then the content the
+    // provider returned until it joins allContentBlocks. An abort can still
+    // come after the provider returns, from a caller's callback.
+    let roundReceived: (() => ContentBlock[]) | undefined;
     let markersInLastRequest = 0;
+
+    // What an aborted event carries, from one builder for both aborts, as in
+    // the XML loop: the catch below uses it, and so does cancel(). The arrays
+    // are copies, since this loop can still record a round after a cancel.
+    const abortedPartial = () => ({
+      partialContent: [...allContentBlocks, ...(roundReceived?.() ?? [])],
+      rawAssistantText: allTextAccumulated,
+      toolCalls: [...executedToolCalls],
+      toolResults: [...executedToolResults],
+    });
+    stream.setAbortSnapshot(abortedPartial);
 
     try {
       // Tool execution loop
       while (toolDepth <= maxToolDepth) {
-        // Check for cancellation
-        if (stream.isCancelled) {
-          stream.emit({
-            type: 'aborted',
-            reason: 'user',
-            rawAssistantText: allTextAccumulated,
-            toolCalls: executedToolCalls,
-            toolResults: executedToolResults,
-          });
-          return;
-        }
+        // A cancelled stream stops here. cancel() is the only way to cancel
+        // it, and it has already emitted the terminal aborted event, so
+        // reporting again would deliver a second one.
+        if (stream.isCancelled) return;
 
-        // Build provider request with native tools
-        const providerRequest = this.buildNativeToolRequest(request, messages, toolDepth > 0, activeFormatter);
+        // Build provider request with native tools, recording what it alters.
+        const roundFidelity = new FidelityNotes();
+        const providerRequest = this.buildNativeToolRequest(request, messages, toolDepth > 0, activeFormatter, roundFidelity);
+        // Every supplied batch is in `messages` by now, the newest whole: each
+        // supplied position is carried, or reported altered if cleaning took
+        // its tool blocks (a position supplied empty carried nothing).
+        const carriedBatch = injectedBatches > 0 ? { batch: injectedBatches - 1, applied: newestBatchSize } : undefined;
 
         // Stream from provider
         let textAccumulated = '';
@@ -3820,22 +4681,32 @@ export class Membrane {
         // every token chunk is tagged with the membrane block it belongs to.
         // Without this, thinking_delta chunks get mislabelled as 'text' and
         // downstream consumers (TUIs, WebUIs) can't render them distinctly.
+        // A reply calls from the tools this round's messages offer, a change
+        // injected mid-turn included.
+        const offered = toolsOffered({ tools: request.tools, messages });
         const tracker = new NativeBlockTracker(
           emitBlocks ? (event) => stream.emit({ type: 'block', event }) : undefined,
+          (name) => restoreToolName(name, offered),
         );
+        roundReceived = () => this.parseProviderContent(tracker.partialContent(), offered);
         const streamResult = await this.streamOnce(
           providerRequest,
           {
             onChunk: (chunk) => {
               if (stream.isCancelled) return;
 
-              textAccumulated += chunk;
-              allTextAccumulated += chunk;
+              tracker.onChunk(chunk);
+              const visible = tracker.currentType === 'text';
+              // Visible text only, as in streamWithNativeTools.
+              if (visible) {
+                textAccumulated += chunk;
+                allTextAccumulated += chunk;
+              }
 
               if (emitTokens) {
                 const meta: ChunkMeta = {
                   type: tracker.currentType,
-                  visible: tracker.currentType === 'text',
+                  visible,
                   blockIndex: tracker.blockIndex,
                 };
                 stream.emit({ type: 'tokens', content: chunk, meta });
@@ -3845,12 +4716,21 @@ export class Membrane {
               if (stream.isCancelled) return;
               tracker.onProviderBlock(index, block);
             },
+            onThinkingSignature: (index, signature) => {
+              if (stream.isCancelled) return;
+              tracker.onThinkingSignature(index, signature);
+            },
           },
           {
             signal: stream.signal,
             timeoutMs: options.timeoutMs,
             idleTimeoutMs: options.idleTimeoutMs,
+            progressTimeoutMs: options.progressTimeoutMs,
+            retry: options.retry,
             normalizedRequest: request,
+            formatterName: activeFormatter.name,
+            requiresAssistantPrefill: false,
+            promptMessages: messages,
             onRequest: (req: unknown) => { rawRequest = req; },
             // Telemetry reports what this request actually SHIPPED with —
             // builder breakpoints, stale passthrough, fallback, float, plus
@@ -3860,6 +4740,8 @@ export class Membrane {
             onWireCacheMarkers: (markerCount: number) => {
               markersInLastRequest = markerCount;
             },
+            // Only a reported round needs its notes, and a hook's fingerprint with them.
+            ...(emitUsage ? { fidelity: roundFidelity } : {}),
             refusalRetries: options.refusalRetries,
             // Discard the refused attempt: roll the accumulators back to
             // where this attempt began and tell the consumer to drop what it
@@ -3880,15 +4762,31 @@ export class Membrane {
           }
         );
 
+        // The provider has finished the round: from here, what it received is
+        // the content it returned.
+        const responseBlocks = this.parseProviderContent(streamResult.content, offered);
+        roundReceived = () => responseBlocks;
+
         // Single-callback adapters (OpenAI Responses) report each finalised
         // block once, after the stream: complete whatever never saw a stop.
         tracker.flush();
         rounds++;
         providerCalls += streamResult.providerCalls;
+        retryDelaysMs.push(...streamResult.retryDelaysMs);
 
         rawResponse = streamResult.raw;
         lastStopReason = this.mapStopReason(streamResult.stopReason);
+        lastProviderStopReason = streamResult.providerStopReason;
         lastStopSequence = streamResult.stopSequence ?? undefined;
+        // Complete tool calls the provider stopped with end_turn run as a
+        // tool_use round (ToolUseWithEndTurnAnomaly); details.stop keeps the
+        // provider's own token. Decided before the round report, so it
+        // reports the stop the loop acted on.
+        const endTurnTools = this.toolUseWithEndTurn(responseBlocks, lastStopReason, streamResult, rounds - 1);
+        if (endTurnTools) {
+          anomalies.push(endTurnTools);
+          if (endTurnTools.treatedAsToolUse) lastStopReason = 'tool_use';
+        }
 
         // Attempts this round re-issued past a refusal are billed calls whose
         // output was discarded — carry their spend to the final response.
@@ -3896,13 +4794,30 @@ export class Membrane {
 
         // Accumulate usage (including cache metrics), priced at this round's model
         const usageSoFar = turnUsage.addRound(streamResult.model, streamResult.usage);
+        if (roundFidelity.mutatedInPlace) hookAlteredState = true;
+        if (hookAlteredState) roundFidelity.unattributed = true;
         if (emitUsage) {
-          stream.emit({ type: 'usage', usage: usageSoFar });
+          stream.emit({
+            type: 'usage',
+            usage: usageSoFar,
+            round: Membrane.roundReport({
+              index: rounds - 1,
+              stopReason: lastStopReason,
+              usage: turnUsage.lastRound?.usage,
+              unreported: streamResult.unreportedUsage,
+              fidelity: roundFidelity,
+              origins,
+              injectedAlterations,
+              ...(carriedBatch ? { injectedBatch: carriedBatch } : {}),
+              ...(streamResult.inputTransformations
+                ? { thinking: { entries: streamResult.inputTransformations, messages } }
+                : {}),
+            }),
+          });
         }
 
-        // Parse content blocks from response
-        const responseBlocks = this.parseProviderContent(streamResult.content);
         allContentBlocks.push(...responseBlocks);
+        roundReceived = undefined;
 
         // Check for tool_use blocks
         const toolUseBlocks = responseBlocks.filter(
@@ -3911,11 +4826,7 @@ export class Membrane {
 
         if (toolUseBlocks.length > 0 && lastStopReason === 'tool_use') {
           // Convert to normalized ToolCall[]
-          const toolCalls: ToolCall[] = toolUseBlocks.map(block => ({
-            id: block.id,
-            name: block.name,
-            input: block.input as Record<string, unknown>,
-          }));
+          const toolCalls: ToolCall[] = toolUseBlocks.map(toolCallOf);
 
           // Track tool calls
           executedToolCalls.push(...toolCalls);
@@ -3928,9 +4839,14 @@ export class Membrane {
             previousResults: executedToolResults,
             accumulated: allTextAccumulated,
             // Full normalized blocks for this round, in provider order —
-            // lets consumers persist the assistant turn verbatim (signed
-            // thinking must precede tool_use in the same turn).
+            // lets consumers persist the assistant turn verbatim. Order is a
+            // content-correctness rule, not current API law: sonnet-4-6
+            // accepted a signed thinking block replayed after its tool_use
+            // (measured 2026-08-25). See ToolContext.roundContent.
             roundContent: responseBlocks,
+            // Injected messages supplied in reply are appended after the
+            // tool results if another round starts.
+            supportsInjectedMessages: true,
           };
 
           // Yield control for tool execution
@@ -3940,7 +4856,7 @@ export class Membrane {
             context,
           };
 
-          const { results, injectedMessages } = await stream.requestToolExecution(toolCallsEvent);
+          const { results, injected } = await stream.requestToolExecution(toolCallsEvent);
 
           // Track tool results
           executedToolResults.push(...results);
@@ -3963,7 +4879,9 @@ export class Membrane {
             participant: assistantName,
             content: responseBlocks,
           });
+          origins.push({ kind: 'own', round: rounds - 1 });
 
+          origins.push({ kind: 'own' });
           messages.push({
             participant: userName,
             content: results.map(r => ({
@@ -3981,14 +4899,22 @@ export class Membrane {
           // tool_result envelopes (e.g. ChatCompletions role:'tool') carry
           // them as ordinary user messages. Signed-thinking adjacency is
           // unaffected: the assistant turn above is round-tripped verbatim.
-          if (injectedMessages) {
-            for (const injected of injectedMessages) {
+          //
+          // Positions are the consumer's: a message the cleaning dropped
+          // leaves its position empty, and every position that lost tool
+          // blocks stays altered for as long as the batch is retained.
+          if (injected) {
+            const batch = injectedBatches++;
+            newestBatchSize = injected.size;
+            for (const { index, message } of injected.messages) {
               messages.push({
-                participant: injected.participant ?? userName,
-                content: injected.content,
-                ...(injected.metadata ? { metadata: injected.metadata } : {}),
+                participant: message.participant ?? userName,
+                content: message.content,
+                ...(message.metadata ? { metadata: message.metadata } : {}),
               });
+              origins.push({ kind: 'injected', batch, index });
             }
+            for (const index of injected.altered) injectedAlterations.push([batch, index]);
           }
 
           toolDepth++;
@@ -4010,11 +4936,7 @@ export class Membrane {
         stopReason: lastStopReason,
         usage: totalUsage,
         details: {
-          stop: {
-            reason: lastStopReason,
-            triggeredSequence: lastStopSequence,
-            wasTruncated: lastStopReason === 'max_tokens',
-          },
+          stop: this.buildStopInfo(lastStopReason, lastProviderStopReason, lastStopSequence),
           usage: {
             ...totalUsage,
             ...(discardedUsage
@@ -4025,6 +4947,7 @@ export class Membrane {
             totalDurationMs: durationMs,
             attempts: providerCalls,
             rounds,
+            ...(retryDelaysMs.length > 0 ? { retryDelaysMs } : {}),
           },
           model: {
             requested: request.config.model,
@@ -4038,6 +4961,7 @@ export class Membrane {
             tokensRead: totalUsage.cacheReadTokens ?? 0,
             hitRatio: this.calculateCacheHitRatio(totalUsage),
           },
+          ...(anomalies.length ? { anomalies } : {}),
         },
         raw: {
           request: rawRequest,
@@ -4047,14 +4971,10 @@ export class Membrane {
 
       stream.emit({ type: 'complete', response });
     } catch (error) {
+      // As above: a cancelled stream has already reported its abort.
+      if (stream.isCancelled) return;
       if (this.isAbortError(error)) {
-        stream.emit({
-          type: 'aborted',
-          reason: this.abortReason(error, stream.signal),
-          rawAssistantText: allTextAccumulated,
-          toolCalls: executedToolCalls,
-          toolResults: executedToolResults,
-        });
+        stream.emit({ type: 'aborted', reason: this.abortReason(error, stream.signal), ...abortedPartial() });
       } else {
         throw error;
       }
@@ -4062,17 +4982,16 @@ export class Membrane {
   }
 }
 
-// Native tool names must match ^[a-zA-Z0-9_-]{1,128}$.
-// Tool names use `--` namespacing, which is already API-valid; the only
-// character that ever needs escaping is a literal colon, encoded losslessly as
-// `__` and back. We deliberately do NOT escape underscores — they are valid,
-// and escaping them (the previous `_u`/`_c` scheme) garbled every
-// underscore-containing tool name in the request the model actually sees
-// (`send_message` → `send_umessage`), polluting its reasoning for no benefit.
-function sanitizeToolName(name: string): string {
-  return name.replace(/:/g, '__');
-}
-
-function unsanitizeToolName(name: string): string {
-  return name.replace(/__/g, ':');
+/**
+ * The zero-width carrier for a provider item no normalized ContentBlock
+ * represents (an Anthropic server-tool block, an opaque Responses item): the
+ * item rides on it as `rawItem`, so a formatter for its wire can send it back,
+ * and normalized consumers see no text. An item that already holds its native
+ * form as `rawItem` is carried as that form, and so is an Anthropic server-tool
+ * block, which is its own native form; any other is new to this module, and
+ * warns once per type.
+ */
+function providerItemCarrier(item: { type?: unknown; rawItem?: unknown }): ContentBlock {
+  if (!item.rawItem && !isAnthropicServerBlock(item)) warnUnconvertibleProviderItem(String(item.type));
+  return { type: 'text', text: '', rawItem: item.rawItem ?? item };
 }

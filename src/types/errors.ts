@@ -2,6 +2,8 @@
  * Error types for membrane
  */
 
+import { classifyFailure } from '../retry.js';
+
 // ============================================================================
 // Error Serialization Helper
 // ============================================================================
@@ -83,6 +85,12 @@ export interface ErrorInfo {
 
   /** Raw request that caused the error (for logging) */
   rawRequest?: unknown;
+
+  /** See {@link MembraneError.systemChangeRefused}. */
+  systemChangeRefused?: boolean;
+
+  /** See {@link MembraneError.creditExhausted}. */
+  creditExhausted?: boolean;
 }
 
 // ============================================================================
@@ -97,6 +105,34 @@ export class MembraneError extends Error {
   readonly providerErrorCode?: string;
   readonly rawError?: unknown;
   readonly rawRequest?: unknown;
+  /**
+   * True when the request was refused for the system change it carried (a
+   * `system_change` block, SystemChangeContent): by the API, on a model
+   * without mid-conversation system messages or tool changes, or by membrane
+   * before sending, when the formatter or adapter can't send one or no point
+   * in the conversation takes it. The same request with the change applied to
+   * `tools` and `system` instead would not meet this refusal. Through
+   * NativeFormatter and AnthropicAdapter, a change refused as malformed (mixed
+   * with other blocks in its message, or a definition whose wire name another
+   * tool holds) isn't marked: the caller's fix is to the change, not a
+   * fallback. Through anything else the formatter or adapter refusal comes
+   * first, and is marked, unless the formatter can't carry the request's tools
+   * at all (`tools` as the request's changes leave them): that refusal comes
+   * before it, unmarked, since the change made in
+   * `tools` would meet it too.
+   */
+  readonly systemChangeRefused?: boolean;
+  /**
+   * True when the provider refused the call because the ACCOUNT is out of
+   * credit or quota (HTTP 402, or an `insufficient_credits` /
+   * `insufficient_quota` / `payment_required` code), not for anything in the
+   * request. Such an error is a retryable `rate_limit` carrying a wait on
+   * `retryAfterMs` (the provider's, or CREDIT_EXHAUSTION_RETRY_AFTER_MS), so
+   * a caller that holds on stated waits pauses and sends the same request
+   * again once credit is back. Membrane's own retries leave it to that
+   * caller (see Membrane's retryPlan).
+   */
+  readonly creditExhausted?: boolean;
 
   constructor(info: ErrorInfo) {
     super(info.message);
@@ -109,6 +145,8 @@ export class MembraneError extends Error {
     // Serialize error objects so they don't become {} when JSON.stringify'd
     this.rawError = serializeError(info.rawError);
     this.rawRequest = info.rawRequest;
+    if (info.systemChangeRefused) this.systemChangeRefused = true;
+    if (info.creditExhausted) this.creditExhausted = true;
   }
 
   toErrorInfo(): ErrorInfo {
@@ -121,7 +159,38 @@ export class MembraneError extends Error {
       providerErrorCode: this.providerErrorCode,
       rawError: this.rawError,
       rawRequest: this.rawRequest,
+      ...(this.systemChangeRefused ? { systemChangeRefused: true } : {}),
+      ...(this.creditExhausted ? { creditExhausted: true } : {}),
     };
+  }
+}
+
+/**
+ * A build reported `ready: false` — the caller declared one of the request's
+ * `tool_use` ids still in flight (`BuildOptions.pendingToolCallIds`), so the
+ * tool-pair normalizer left it unmatched rather than papering over it with a
+ * synthetic `[pending]` result. Shipping that request would produce exactly
+ * the 400 the normalizer exists to prevent.
+ *
+ * Not retryable as-is: the request is deterministic, and the fix is to wait
+ * for the in-flight result to land, append it, and rebuild.
+ */
+export class MembraneNotReadyError extends MembraneError {
+  readonly formatterName: string;
+
+  constructor(formatterName: string) {
+    super({
+      type: 'invalid_request',
+      message:
+        `Request is not ready to send: formatter '${formatterName}' returned ready=false, ` +
+        `meaning a tool_use in this request has no result yet and its id was declared ` +
+        `in-flight via pendingToolCallIds. Wait for the in-flight tool result, append it to ` +
+        `the conversation, and rebuild — sending now would ship an unmatched tool_use.`,
+      retryable: false,
+      rawError: undefined,
+    });
+    this.name = 'MembraneNotReadyError';
+    this.formatterName = formatterName;
   }
 }
 
@@ -263,93 +332,873 @@ export function unsupportedError(message: string, rawRequest?: unknown): Membran
   });
 }
 
+/** Membrane's own refusal, before sending, of a request for the system change it carries. */
+export function systemChangeRefusedError(message: string, rawRequest?: unknown): MembraneError {
+  return new MembraneError({
+    type: 'unsupported',
+    message,
+    retryable: false,
+    rawError: undefined,
+    rawRequest,
+    systemChangeRefused: true,
+  });
+}
+
+/**
+ * Mark an error an adapter already classified as the API refusing the
+ * request's system change, keeping its identity, as withRawRequest does.
+ */
+export function markSystemChangeRefused(error: MembraneError): MembraneError {
+  try {
+    Object.defineProperty(error, 'systemChangeRefused', { value: true, enumerable: true, configurable: true });
+  } catch { /* A frozen error still propagates unchanged. */ }
+  return error;
+}
+
+// ============================================================================
+// Credit Exhaustion
+// ============================================================================
+
+/**
+ * The wait a credit-exhaustion error carries when the provider states none.
+ * Long enough that a caller holding on it doesn't hammer an empty account,
+ * short enough that a refill or top-up is picked up within a minute.
+ */
+export const CREDIT_EXHAUSTION_RETRY_AFTER_MS = 60_000;
+
+/** Provider codes that say the account is out of credit or quota. */
+const CREDIT_EXHAUSTION_CODES = new Set(['insufficient_credits', 'insufficient_quota', 'payment_required']);
+
+/** The same codes as a provider's own message spells them. */
+const CREDIT_EXHAUSTION_TEXT = /insufficient[ _]credits|insufficient[ _]quota|payment[ _]required/i;
+
+/**
+ * A 402 as a message spells a status: the adapters' `API error 402`, `HTTP
+ * 402`, `status: 402`, a JSON body's `"code": 402`, or the OpenAI SDK's
+ * leading `402 …`. Never a bare 402 in prose.
+ */
+const CREDIT_STATUS_IN_MESSAGE = /(?:^|error:?\s*|http\s+|status\s*:?\s*|"code"\s*:\s*)402\b/i;
+
+/**
+ * Whether a failure is account-level credit or quota exhaustion: HTTP 402
+ * Payment Required, or a provider's own insufficient-credits/quota code
+ * (OpenRouter and other OpenAI-compatible gateways answer 402
+ * `insufficient_credits`; OpenAI answers 429 `insufficient_quota`), in an
+ * HTTP response or an HTTP-200 SSE error frame alike.
+ *
+ * A fact about the account, not the request: the identical request succeeds
+ * once credit is topped up or a quota window refills. Typed non-retryable, a
+ * bounded caller spends its attempts on it at once and gives the work up (a
+ * compression merge burned its five attempts in a second and went to
+ * quarantine on a credit dip that cleared minutes later), so it is typed as a
+ * retryable rate limit with a wait instead (creditExhaustionClassification).
+ * Other billing codes (`billing_hard_limit_reached`, `billing_not_active`,
+ * `account_deactivated`, `quota_exceeded`) and the account refusals Anthropic
+ * sends as a 400 keep their terminal types.
+ *
+ * `message` is read for the codes as text, and for a 402 only where it
+ * spells a status (CREDIT_STATUS_IN_MESSAGE).
+ */
+export function isCreditExhaustion(message: string, httpStatus?: number, code?: string): boolean {
+  if (httpStatus === 402) return true;
+  if (code !== undefined && CREDIT_EXHAUSTION_CODES.has(code.toLowerCase())) return true;
+  return CREDIT_EXHAUSTION_TEXT.test(message) || CREDIT_STATUS_IN_MESSAGE.test(message);
+}
+
+/**
+ * Whether a classified failure is credit exhaustion. With an HTTP status, only
+ * a 402, or a 400/429 whose provider code or own message names one of the
+ * codes: a 5xx stays a server error, and a 401/403 an auth failure, whatever
+ * their text says.
+ */
+function creditExhaustionAt(status: number | undefined, code: string | undefined, text: string): boolean {
+  if (status !== undefined && status !== 402 && status !== 400 && status !== 429) return false;
+  return isCreditExhaustion(text, status, code);
+}
+
+/** The status a credit-exhaustion error reports: the provider's, else 402. */
+function creditExhaustionStatus(status: number | undefined, message: string): number {
+  if (status !== undefined) return status;
+  return /(?:^|error:?\s*|http\s+|status\s*:?\s*)429\b/i.test(message) ? 429 : 402;
+}
+
+/**
+ * A credit-exhaustion error from a message alone, for a caller or adapter
+ * that has no response to classify: a retryable `rate_limit` with the default
+ * wait, keeping the provider's code when the message names one.
+ */
+export function creditExhaustionError(message: string, raw?: unknown, rawRequest?: unknown): MembraneError {
+  const code = message.match(/insufficient_credits|insufficient_quota|payment_required/i)?.[0]?.toLowerCase();
+  return new MembraneError({
+    type: 'rate_limit',
+    message,
+    retryable: true,
+    retryAfterMs: CREDIT_EXHAUSTION_RETRY_AFTER_MS,
+    httpStatus: creditExhaustionStatus(undefined, message),
+    ...(code ? { providerErrorCode: code } : {}),
+    creditExhausted: true,
+    rawError: raw,
+    rawRequest,
+  });
+}
+
+// ============================================================================
+// HTTP Boundary Classification
+// ============================================================================
+
+/**
+ * The part of a `Response` this module needs. Structural so a stubbed
+ * response in a test is as good as a real one.
+ */
+export interface HttpErrorResponseLike {
+  status: number;
+  headers?: { get(name: string): string | null } | undefined;
+}
+
+interface ProviderErrorFields {
+  message?: string;
+  code?: string;
+  param?: string;
+  retryAfterMs?: number;
+  /** google.rpc.ErrorInfo `reason` from `details[]`, e.g. `API_KEY_INVALID`. */
+  reason?: string;
+  /** A google.rpc.QuotaFailure in `details[]` names a quota no retry within a call or a backoff can outlast. */
+  terminalQuota?: boolean;
+  /**
+   * The upstream provider's own message, when a router wraps it: OpenRouter
+   * puts the provider's raw error body in `error.metadata.raw` beside a
+   * generic "Provider returned error". Read for classification only, and
+   * only as that body's own message: a body with none, rendered, could echo
+   * the request.
+   */
+  upstreamMessage?: string;
+}
+
+/**
+ * Provider error codes/types that carry an implied HTTP status. Used only
+ * when no status is in hand — an in-band error object inside a 200, or an
+ * SDK error whose status is undefined (Anthropic rethrows mid-stream SSE
+ * `error` events exactly that way).
+ */
+const PROVIDER_ERROR_CODE_STATUS: Record<string, number> = {
+  invalid_request_error: 400,
+  invalid_argument: 400,
+  failed_precondition: 400,
+  context_length_exceeded: 400,
+  authentication_error: 401,
+  invalid_api_key: 401,
+  unauthenticated: 401,
+  permission_error: 403,
+  permission_denied: 403,
+  not_found_error: 404,
+  not_found: 404,
+  request_too_large: 413,
+  rate_limit_error: 429,
+  rate_limit_exceeded: 429,
+  insufficient_quota: 429,
+  resource_exhausted: 429,
+  api_error: 500,
+  server_error: 500,
+  internal: 500,
+  unavailable: 503,
+  overloaded_error: 529,
+};
+
+/**
+ * 429s that will never succeed on retry: the account, not the request rate,
+ * is the problem. Distinguishable only because the boundary now carries the
+ * provider's own error code.
+ */
+const NON_RETRYABLE_RATE_LIMIT_CODES = new Set([
+  'insufficient_quota',
+  'billing_hard_limit_reached',
+  'billing_not_active',
+  'account_deactivated',
+  'quota_exceeded',
+  'insufficient_credits',
+]);
+
+/**
+ * The forms providers use for a request that exceeds the model's context.
+ * Anthropic: "input length and `max_tokens` exceed context limit: N + M >
+ * L" and "prompt is too long: N tokens > M maximum"; Gemini: "The input
+ * token count (N) exceeds the maximum number of input tokens allowed (M)";
+ * OpenAI: `context_length_exceeded` / "maximum context length". Read only
+ * under a 400/422 (or with no status at all, after the 5xx arm), and with a
+ * status only over the provider's own error message (see
+ * errorFromProviderStatus). A bare "too long" is not among them: a provider
+ * says that of a field, such as a string past its maximum length, which no
+ * shorter history fixes. The prompt or input said to be too long, with or
+ * without "is" (Bedrock's "Input is too long for requested model."), is.
+ * The status-less path reads the same forms (classifyMessage).
+ */
+const CONTEXT_LENGTH_PATTERN =
+  /context[ _-]?(?:length|limit|window)|maximum context|too many tokens|token limit|(?:prompt|input)(?: is)? too long|exceeds? the maximum number of (?:input )?tokens|input token count/i;
+
+// "rate limit" only where no letter precedes it, so "moderate limit" and
+// "generate limit" aren't rate limits, while "user_rate_limit" still is.
+const RATE_LIMIT_PATTERN = /\b429\b|(?<![a-z])rate[ _-]?limit|too many requests/i;
+
+const SERVER_STATUS_PATTERN = /\b(500|502|503|504|529)\b/;
+
+/**
+ * Structured evidence that a 400 is a credential failure, not a malformed
+ * request: Google answers a bad key with HTTP 400 INVALID_ARGUMENT whose
+ * `details[]` ErrorInfo reason is `API_KEY_INVALID`, and some gateways send
+ * OpenAI-style `invalid_api_key` codes with a 400. The status stays as sent.
+ */
+const AUTH_REASONS = new Set(['api_key_invalid', 'api_key_expired', 'access_token_expired']);
+const AUTH_CODES = new Set(['invalid_api_key', 'authentication_error', 'unauthenticated', 'permission_error', 'permission_denied']);
+
+/**
+ * Refusals of the account or its credential, not the request, as a 400 or
+ * 422 or with no status: "Your credit balance is too low to access the
+ * Anthropic API", "You have reached your specified API usage limits. You
+ * will regain access on <date>", "This organization has been disabled.", and
+ * "This credential is only authorized for use with Claude Code and cannot be
+ * used for other API requests." (a Claude subscription's OAuth token sent to
+ * the API). Anthropic sends the first, second and fourth as
+ * `invalid_request_error` with no code of their own, so only the text tells
+ * them apart; the disabled organization's type isn't attested. The text is
+ * matched from any provider. Like a 402 they are `auth`: no retry and no
+ * change to the request succeeds until the account or the credential
+ * changes. They are read inside a router's wrapper too. There the account
+ * may be the router's own, which another route might serve, but membrane
+ * can't tell, and the type is what matters: as `invalid_request` the refusal
+ * reaches agent-framework's poison-history breaker, which sheds history over
+ * it, and `auth` never does. A router's quota is another matter:
+ * retryability is all that rides on it, so it stays retryable (see
+ * quotaFailureIsTerminal). Like the context-length forms, these are read only
+ * over the provider's own error message, never over a body that might echo
+ * the request, with or without a status.
+ */
+const ACCOUNT_REFUSAL_PATTERN =
+  /credit balance is too low|reached your specified API usage limits|organization has been disabled|only authorized for use with Claude Code/i;
+
+/**
+ * A retry hint stated only in prose: Azure OpenAI's "Please retry after 60
+ * seconds." The unit is required and a sentence boundary must follow, so
+ * minutes, hours, a timestamp or "retry after 3 attempts" never read as a
+ * wait in seconds.
+ */
+const RETRY_AFTER_PROSE = /\bretry after (\d+(?:\.\d+)?) ?(?:s|secs?|seconds?)(?=\s*(?:[.!;,)]|$))/i;
+
+/** Socket-level failure codes on an error or its `cause` (Node, undici, Bun). */
+const NETWORK_ERROR_CODES = new Set([
+  'econnreset', 'econnrefused', 'enotfound', 'eai_again', 'epipe', 'ehostunreach', 'enetunreach', 'econnaborted',
+  'und_err_socket', 'connectionrefused', 'connectionclosed', 'connectionreset',
+]);
+const TIMEOUT_ERROR_CODES = new Set(['etimedout', 'und_err_connect_timeout', 'und_err_headers_timeout', 'und_err_body_timeout']);
+/**
+ * Undici's own deadlines on a request it already sent: no response headers
+ * within headersTimeout, or no body data within bodyTimeout (300 s each by
+ * default). Each is a call's budget spent, so errorFromThrown marks it
+ * deadlineExpired. Its connect timeout and the system's ETIMEDOUT aren't
+ * here: they're sent again like any connection failure.
+ */
+const SENT_REQUEST_DEADLINE_CODES = new Set(['und_err_headers_timeout', 'und_err_body_timeout']);
+
+/**
+ * Whether a failure is a runtime's own deadline on a request it sent: one of
+ * undici's above, or Bun's fetch timeout, a DOMException named TimeoutError
+ * (Bun 1.4.3 threw it after 360 s at a server that never answered). It
+ * doesn't say which stage ran out, so a stalled connect is marked too. Its
+ * code, 23, is a number, which the code check doesn't read, so the name decides,
+ * anywhere down the cause chain: the Anthropic SDK's MessageStream wraps a
+ * failed read once more. A caller's AbortSignal.timeout() rejects the same
+ * way, but membrane reads the caller's signal before the error, so that one
+ * stays a cancellation.
+ */
+function isSentRequestDeadline(error: unknown): boolean {
+  if (socketCodes(error).some((code) => SENT_REQUEST_DEADLINE_CODES.has(code))) return true;
+  return causeChain(error).some((link) => (link as { name?: unknown }).name === 'TimeoutError');
+}
+
+function firstString(...candidates: unknown[]): string | undefined {
+  for (const candidate of candidates) {
+    if (typeof candidate === 'string' && candidate.trim() !== '') return candidate;
+  }
+  return undefined;
+}
+
+/** `retry-after` is either delta-seconds or an HTTP-date (RFC 9110). */
+function parseRetryAfterHeader(value: string | null | undefined): number | undefined {
+  if (!value) return undefined;
+  const trimmed = value.trim();
+  if (/^\d+(\.\d+)?$/.test(trimmed)) return Math.round(parseFloat(trimmed) * 1000);
+  const parsedDate = Date.parse(trimmed);
+  if (!Number.isNaN(parsedDate)) return Math.max(0, parsedDate - Date.now());
+  return undefined;
+}
+
+/** Body-carried retry hints: google's `retryDelay: '21s'`, or bare seconds. */
+function parseRetryDelayValue(value: unknown): number | undefined {
+  if (typeof value === 'number' && Number.isFinite(value)) return Math.round(value * 1000);
+  if (typeof value !== 'string') return undefined;
+  const seconds = value.trim().match(/^(\d+(?:\.\d+)?)s?$/);
+  return seconds?.[1] ? Math.round(parseFloat(seconds[1]) * 1000) : undefined;
+}
+
+function retryAfterFromBody(root: Record<string, unknown>, errorNode: Record<string, unknown>): number | undefined {
+  const details = errorNode.details ?? root.details;
+  if (Array.isArray(details)) {
+    for (const detail of details) {
+      if (detail && typeof detail === 'object') {
+        const delay = parseRetryDelayValue((detail as Record<string, unknown>).retryDelay);
+        if (delay !== undefined) return delay;
+      }
+    }
+  }
+  const millis = errorNode.retry_after_ms ?? root.retry_after_ms;
+  if (typeof millis === 'number' && Number.isFinite(millis)) return Math.round(millis);
+  // A digit string, as the SSE frame reader also accepts for this field.
+  if (typeof millis === 'string' && /^\d+$/.test(millis.trim())) return Number(millis.trim());
+  return parseRetryDelayValue(errorNode.retry_after ?? root.retry_after ?? errorNode.retryAfter ?? root.retryAfter);
+}
+
+/**
+ * Pull the fields providers actually put on an error body. Accepts either a
+ * parsed body or the raw text as received — a non-JSON body still yields its
+ * text as the message rather than being discarded.
+ */
+export function extractProviderErrorFields(body: unknown): ProviderErrorFields {
+  if (body === undefined || body === null) return {};
+
+  if (typeof body === 'string') {
+    const text = body.trim();
+    if (text === '') return {};
+    if (!text.startsWith('{') && !text.startsWith('[')) return { message: body };
+    try {
+      return extractProviderErrorFields(JSON.parse(text));
+    } catch {
+      return { message: body };
+    }
+  }
+
+  if (typeof body !== 'object') return { message: String(body) };
+
+  // A body wrapped in an array, as `[{"error": {...}}]`: its first entry is
+  // the error.
+  if (Array.isArray(body)) {
+    const first = body.find((entry) => entry !== null && typeof entry === 'object');
+    return first === undefined ? {} : extractProviderErrorFields(first);
+  }
+
+  const root = body as Record<string, unknown>;
+  const nested = root.error;
+  const errorNode =
+    nested !== null && typeof nested === 'object' ? (nested as Record<string, unknown>) : root;
+  // The provider's own message in the other shapes it comes in: a string
+  // `error` (`{"error": "..."}`), or the first of a top-level `errors` list.
+  // (Google's older format also lists `errors` inside its error object, but
+  // always beside that object's own `message`, which is read first.)
+  const firstListed = Array.isArray(root.errors)
+    ? root.errors.find((entry) => entry !== null && typeof entry === 'object') as Record<string, unknown> | undefined
+    : undefined;
+
+  const metadata = errorNode.metadata;
+  const upstreamRaw =
+    metadata !== null && typeof metadata === 'object' ? (metadata as Record<string, unknown>).raw : undefined;
+  const upstream = upstreamRaw !== undefined && upstreamRaw !== null && upstreamRaw !== body
+    ? extractProviderErrorFields(upstreamRaw)
+    : undefined;
+
+  return {
+    message: firstString(errorNode.message, errorNode.Message, root.message, root.Message, errorNode.detail,
+      typeof nested === 'string' ? nested : undefined, firstListed?.message),
+    // A numeric code can be an HTTP-shaped status or a provider-local number.
+    // Prefer a symbolic classification token; the original scalar stays in rawError.
+    // A router's wrapper gives its own code, not the upstream provider's: the
+    // upstream's stays in rawError, inside the raw body it came in.
+    code: firstString(...[errorNode.code, errorNode.status, errorNode.type, root.__type, root.code]
+      .filter(value => typeof value === 'string' && !/^\d+$/.test(value.trim())))
+      ?? firstString(errorNode.code, errorNode.status, errorNode.type, root.__type, root.code),
+    param: firstString(errorNode.param),
+    retryAfterMs: retryAfterFromBody(root, errorNode),
+    reason: errorInfoReason(errorNode.details ?? root.details),
+    // The body's own details only, never a router's upstream body: through
+    // OpenRouter a Google quota may be the router's shared one, which another
+    // route can still serve.
+    terminalQuota: quotaFailureIsTerminal(errorNode.details ?? root.details),
+    upstreamMessage: upstream?.message,
+  };
+}
+
+/**
+ * Whether a google.rpc.QuotaFailure in `details[]` names a quota that no
+ * retry within the call, and no caller's backoff, can outlast: one with no
+ * allocation at all (`quotaValue` 0; proto3 JSON renders the int64 as the
+ * string "0", and a parser takes the number too), or a daily window (a
+ * `quotaId` naming PerDay or Daily, which is how gemini-cli's own classifier
+ * reads it), which resets only once the day is out. Such a 429 isn't
+ * retryable; the body's RetryInfo delay is still reported, for a caller that
+ * schedules work that late. Any one such violation decides. A per-minute
+ * quota with an allocation stays retryable. Only details entries that are a
+ * QuotaFailure by their `@type`, or carry none, are read.
+ */
+function quotaFailureIsTerminal(details: unknown): boolean {
+  if (!Array.isArray(details)) return false;
+  return details.some((detail) => {
+    if (!detail || typeof detail !== 'object') return false;
+    const { '@type': type, violations } = detail as Record<string, unknown>;
+    if (typeof type === 'string' && !type.endsWith('google.rpc.QuotaFailure')) return false;
+    return Array.isArray(violations) && violations.some((violation) => {
+      if (!violation || typeof violation !== 'object') return false;
+      const { quotaValue, quotaId } = violation as Record<string, unknown>;
+      return quotaValue === '0' || quotaValue === 0 || (typeof quotaId === 'string' && /PerDay|Daily/.test(quotaId));
+    });
+  });
+}
+
+/** The `reason` of a google.rpc.ErrorInfo entry in `details[]`, if any. */
+function errorInfoReason(details: unknown): string | undefined {
+  if (!Array.isArray(details)) return undefined;
+  for (const detail of details) {
+    if (detail && typeof detail === 'object') {
+      const reason = (detail as Record<string, unknown>).reason;
+      if (typeof reason === 'string' && reason.trim() !== '') return reason;
+    }
+  }
+  return undefined;
+}
+
+function classifyByStatus(
+  status: number,
+  code: string | undefined,
+  message: string,
+  reason?: string,
+  terminalQuota = false,
+): { type: MembraneErrorType; retryable: boolean } {
+  const normalizedCode = code?.toLowerCase() ?? '';
+
+  if ((status === 400 || status === 422)
+    && (AUTH_REASONS.has(reason?.toLowerCase() ?? '') || AUTH_CODES.has(normalizedCode)
+      || ACCOUNT_REFUSAL_PATTERN.test(message))) {
+    return { type: 'auth', retryable: false };
+  }
+  if (status === 429) {
+    return { type: 'rate_limit', retryable: !NON_RETRYABLE_RATE_LIMIT_CODES.has(normalizedCode) && !terminalQuota };
+  }
+  if (status === 408) return { type: 'timeout', retryable: true };
+  if (status === 401 || status === 402 || status === 403) return { type: 'auth', retryable: false };
+  if (status === 413) return { type: 'context_length', retryable: false };
+  if (status === 404) return { type: 'invalid_request', retryable: false };
+  // Context-length is a request-shape problem and only ever arrives as a 4xx.
+  // Checking the message BEFORE the status would let a transient 5xx whose
+  // body happens to say "context" or "too long" become a non-retryable
+  // context_length, silently suppressing retries.
+  if (status === 400 || status === 422) {
+    const looksLikeContextOverflow =
+      normalizedCode === 'context_length_exceeded' || CONTEXT_LENGTH_PATTERN.test(message);
+    return {
+      type: looksLikeContextOverflow ? 'context_length' : 'invalid_request',
+      retryable: false,
+    };
+  }
+  if (status >= 500) return { type: 'server', retryable: true };
+  if (status >= 400) return { type: 'invalid_request', retryable: false };
+  return { type: 'unknown', retryable: false };
+}
+
+/**
+ * The HTTP status a provider's own error code implies, when the shared table
+ * knows the code. Adapters with a provider-specific precedence rule use it to
+ * read the same status errorFromProviderStatus would classify by.
+ */
+export function statusForProviderCode(code: string | undefined): number | undefined {
+  const key = code?.toLowerCase();
+  // Own keys only: a provider code such as "constructor" is not a table entry.
+  return key !== undefined && Object.prototype.hasOwnProperty.call(PROVIDER_ERROR_CODE_STATUS, key)
+    ? PROVIDER_ERROR_CODE_STATUS[key]
+    : undefined;
+}
+
+/**
+ * Build a MembraneError from a provider failure whose status may have to be
+ * recovered from the error code (in-band error object, or an SDK error that
+ * carries no status).
+ */
+export function errorFromProviderStatus(params: {
+  provider: string;
+  status?: number | undefined;
+  /** Provider-specific structured-token inference, after explicit status or a known code. */
+  fallbackStatus?: number | undefined;
+  body?: unknown;
+  message?: string;
+  retryAfterMs?: number | undefined;
+  /** A provider code carried outside the body (Bedrock's `x-amzn-ErrorType` header), used when the body names none. */
+  code?: string | undefined;
+  rawError?: unknown;
+  rawRequest?: unknown;
+}): MembraneError {
+  const fields = extractProviderErrorFields(params.body);
+  const code = fields.code ?? params.code;
+  const status = params.status ?? statusForProviderCode(code) ?? params.fallbackStatus;
+  const detail = firstString(params.message, fields.message) ?? renderBody(params.body);
+  const message =
+    params.message ??
+    `${params.provider} API error ${status ?? code ?? 'failure'}: ${detail}${
+      fields.param ? ` (param: ${fields.param})` : ''
+    }`;
+  // With a status, the patterns read the provider's own error message, and a
+  // router's upstream message beside it (its generic "Provider returned
+  // error" classifies by the upstream provider's own text). The caller's
+  // message is read only when there is no body: with one, the caller's is a
+  // rendering of it (the Anthropic SDK's "400 {...}", the stream path's
+  // description). Never a rendered body: a body with no message field can
+  // echo the request, and a prompt that says "context window" or "credit
+  // balance is too low" must not type the error.
+  const ownText = fields.message ?? (params.body === undefined ? params.message : undefined);
+  const evidence = [ownText, fields.upstreamMessage].filter((text): text is string => !!text).join('\n');
+
+  // Without a status the transport patterns read the whole message, but the
+  // echo-sensitive ones (an account refusal, a context overflow) read the
+  // same evidence as with one, so the same body types the same way.
+  const classification =
+    status !== undefined
+      ? { ...classifyByStatus(status, code, evidence, fields.reason, fields.terminalQuota), httpStatus: status }
+      : classifyMessage(fields.upstreamMessage ? `${message}\n${fields.upstreamMessage}` : message, evidence);
+  // A wait read from prose is believed only for an error that asks to be
+  // retried: a stated wait is a hold for anyone who honours it, and a 400
+  // whose text happens to say "retry after", or a 429 no retry can outlast,
+  // asks for none. A body's own RetryInfo or header is reported either way.
+  const retryAfterMs = params.retryAfterMs ?? fields.retryAfterMs
+    ?? (classification.retryable && (classification.type === 'rate_limit' || classification.type === 'server')
+      ? retryAfterFromProse(detail) : undefined);
+
+  // Credit or quota exhaustion is the account's, not the request's: a
+  // retryable rate limit with a wait, never a terminal `auth` or a
+  // non-retryable 429 (isCreditExhaustion). With a status the provider's own
+  // text is read, as for the other echo-sensitive patterns; without one the
+  // whole message too, as classifyMessage reads it.
+  if (creditExhaustionAt(status, code, status !== undefined ? evidence : `${message}\n${evidence}`)) {
+    return new MembraneError({
+      type: 'rate_limit',
+      message,
+      retryable: true,
+      retryAfterMs: retryAfterMs ?? retryAfterFromProse(detail) ?? CREDIT_EXHAUSTION_RETRY_AFTER_MS,
+      httpStatus: creditExhaustionStatus(status, message),
+      providerErrorCode: code,
+      creditExhausted: true,
+      rawError: params.rawError ?? params.body,
+      rawRequest: params.rawRequest,
+    });
+  }
+
+  return new MembraneError({
+    type: classification.type,
+    message,
+    retryable: classification.retryable,
+    retryAfterMs,
+    httpStatus: classification.httpStatus,
+    providerErrorCode: code,
+    rawError: params.rawError ?? params.body,
+    rawRequest: params.rawRequest,
+  });
+}
+
+/**
+ * The fetch boundary: the one place where status, headers and body are all
+ * still live. Everything downstream reads the classification off the error
+ * instead of re-deriving one by substring over a rendered string.
+ */
+export function errorFromHttpResponse(
+  provider: string,
+  response: HttpErrorResponseLike,
+  parsedBody: unknown,
+  rawRequest?: unknown
+): MembraneError {
+  return errorFromProviderStatus({
+    provider,
+    status: response.status,
+    body: parsedBody,
+    retryAfterMs: parseRetryAfterHeader(response.headers?.get('retry-after')),
+    code: amznErrorType(response.headers?.get('x-amzn-errortype')),
+    rawRequest,
+  });
+}
+
+/** Bedrock names its exception in a header: `ThrottlingException:http://internal.amazon.com/...`. */
+function amznErrorType(value: string | null | undefined): string | undefined {
+  const name = value?.split(':')[0]?.trim();
+  return name ? name : undefined;
+}
+
+/** A retry hint stated only in the message, when neither header nor body carries one. */
+function retryAfterFromProse(message: string): number | undefined {
+  const seconds = message.match(RETRY_AFTER_PROSE)?.[1];
+  return seconds ? Math.round(parseFloat(seconds) * 1000) : undefined;
+}
+
+/**
+ * Attach the raw request to an error that was already classified at the
+ * boundary, without re-deriving anything.
+ */
+export function withRawRequest(error: MembraneError, rawRequest: unknown): MembraneError {
+  if (rawRequest === undefined || error.rawRequest !== undefined) return error;
+  // Preserve object identity, subclass fields and private-field brands. Credential
+  // resolvers and deadline handling use the original classified error as evidence.
+  // An immutable caller-owned error remains authoritative even without this hint.
+  try {
+    Object.defineProperty(error, 'rawRequest', { value: rawRequest, enumerable: true, configurable: true });
+  } catch { /* A frozen error still propagates unchanged. */ }
+  return error;
+}
+
+// Symbol.for, like the adapters' deadline-abort mark, so a second loaded copy
+// of membrane reads the same mark.
+const DEADLINE_EXPIRY = Symbol.for('membrane.deadlineExpiry');
+
+/**
+ * Mark an error as a deadline running out on a call that was under way:
+ * AnthropicAdapter's idle and first-event watchdogs, every timeout its SDK
+ * client reports, and a runtime's own fetch deadlines (errorFromThrown). It
+ * stays the retryable timeout a caller sees, but membrane doesn't send the
+ * call again: the deadline was the call's budget, and another full one is the
+ * caller's to give. (An adapter's `timeoutMs` deadline is a TimeoutAbortError,
+ * which isn't retryable at all.) Keeps the error's identity.
+ */
+export function deadlineExpired<E extends MembraneError>(error: E): E {
+  try {
+    Object.defineProperty(error, DEADLINE_EXPIRY, { value: true });
+  } catch { /* A frozen error is retried like any other timeout. */ }
+  return error;
+}
+
+/** Whether an error was marked with deadlineExpired. */
+export function isDeadlineExpiry(error: unknown): boolean {
+  return typeof error === 'object' && error !== null
+    && (error as Record<symbol, unknown>)[DEADLINE_EXPIRY] === true;
+}
+
+/**
+ * What the caller's own code threw while membrane ran it beside a call: a
+ * hook, a request or stream callback, a receipt consumer, a header stamp,
+ * the configured logger or a model registry's pricing. Resending the provider
+ * request can't mend that code, and would pay for another call or run it
+ * again, so the error is never retryable: membrane's own retries stop on it,
+ * and so does a caller's policy that reads `retryable`. (What builds, sends
+ * or reads the call, such as an adapter, the transport, a credential
+ * resolver, a formatter or a parser, keeps its own classification.)
+ *
+ * A MembraneError that already says it isn't retryable leaves as itself.
+ * Anything else, a retryable MembraneError included, is wrapped, with the
+ * original as `cause`, so this never marks an error the caller still holds.
+ * (complete() and stream() may still attach their request to one that
+ * leaves as itself, as they do to any MembraneError that has none.) The
+ * wrapper keeps the type membrane reads from the error, but nothing a
+ * provider's response would state (an HTTP status, a provider code, a wait),
+ * since no response to this call stands behind it, and no request or raw
+ * error taken from a MembraneError the caller threw, which would be another
+ * call's.
+ */
+export function callerCodeError(error: unknown): MembraneError {
+  if (error instanceof MembraneError && !error.retryable) return error;
+  const info = classifyError(error);
+  const wrapped = new MembraneError({
+    ...info,
+    retryable: false,
+    httpStatus: undefined,
+    providerErrorCode: undefined,
+    retryAfterMs: undefined,
+    rawError: error instanceof MembraneError ? undefined : info.rawError,
+    rawRequest: undefined,
+  });
+  Object.defineProperty(wrapped, 'cause', { value: error, writable: true, configurable: true });
+  return wrapped;
+}
+
+/**
+ * Run the caller's code: what it throws leaves as a callerCodeError. Wrap
+ * each call membrane makes into the caller's code, since the rule covers
+ * those calls. A getter membrane reads outside them, such as on the caller's
+ * hooks or on a value its code returned, is a read, not a call, and its
+ * error is classified as before.
+ */
+export function runCallerCode<R>(run: () => R): R {
+  try {
+    return run();
+  } catch (error) {
+    throw callerCodeError(error);
+  }
+}
+
+/** Run caller code that membrane awaits, such as a hook or a tool executor. */
+export async function awaitCallerCode<R>(run: () => R | Promise<R>): Promise<R> {
+  try {
+    return await run();
+  } catch (error) {
+    throw callerCodeError(error);
+  }
+}
+
+/**
+ * A cancellation is a TYPE, never a phrase. Matching 'abort' anywhere in a
+ * message turned any error whose text merely contained it — a host tool
+ * throwing "zz-tool policy aborted the run" — into a well-formed
+ * "the user cancelled" response, destroying the real error.
+ */
+export function isTypedAbortError(error: unknown): boolean {
+  if (error instanceof MembraneError) return error.type === 'abort';
+  if (typeof DOMException !== 'undefined' && error instanceof DOMException) {
+    return error.name === 'AbortError';
+  }
+  // The Anthropic SDK's APIUserAbortError is named 'Error' (measured on
+  // @anthropic-ai/sdk 0.52), so no name arm can match it: the Anthropic
+  // adapter recognises it by class.
+  if (error instanceof Error) return error.name === 'AbortError';
+  return false;
+}
+
+function renderBody(body: unknown): string {
+  if (body === undefined || body === null) return '';
+  if (typeof body === 'string') return body;
+  try {
+    return JSON.stringify(body);
+  } catch {
+    return String(body);
+  }
+}
+
 // ============================================================================
 // Error Classification
 // ============================================================================
 
 /**
  * Provider capacity exhaustion — Anthropic 529 overloaded_error, whichever
- * path it arrived by (structured status from the provider handler, or the
- * message-matched fallbacks in classifyError). Used only to CHOOSE the retry
- * schedule among already-retryable errors, never to decide retryability.
- * Matches the same deliberately narrow tokens as classifyError's fallback
- * (status/`529`/exact `overloaded_error`) — a bare 'overloaded' in prose
- * (e.g. "worker pool overloaded") must not put an unrelated error onto the
- * ~10-minute schedule. The provider handlers' own bare-'overloaded' safety
- * nets attach httpStatus 529, so those still land here via the status check.
+ * path it arrived by. Used only to CHOOSE the retry schedule among
+ * already-retryable errors, never to decide retryability.
+ *
+ * A status in hand decides: only 529 is an overload. Every structured overload
+ * path already carries it — an HTTP 529, an `overloaded_error` code resolved
+ * through the shared code table, an SSE frame's overloaded tokens when the
+ * frame states no other error status, and the provider handlers'
+ * bare-'overloaded' safety nets. Reading prose past a known
+ * status let an explicit 429 take the overload schedule, and gave a 5xx whose
+ * body merely mentioned an upstream 529 the overload retry allowance even with
+ * `maxRetries: 0`.
+ *
+ * Only a status-less error falls back to the message, with the same narrow
+ * tokens as classifyError (`529` word-boundary anchored, exact
+ * `overloaded_error`): a bare 'overloaded' in prose ("worker pool overloaded")
+ * or digits inside another number ("timeout after 5290 ms", "req-98529abc")
+ * must not put an unrelated error onto the ~10-minute schedule.
  */
 export function isOverloadedError(info: ErrorInfo): boolean {
-  if (!info.retryable) return false;
-  if (info.httpStatus === 529) return true;
-  const m = info.message.toLowerCase();
-  return m.includes('529') || m.includes('overloaded_error');
+  return classifyFailure(info) === 'overloaded';
 }
 
-const CREDIT_EXHAUSTION_TOKENS = [
-  'insufficient_credits',
-  'insufficient credits',
-  'insufficient_quota',
-  'insufficient quota',
-  'payment_required',
-  'payment required',
-  'credit balance is too low',
-];
-
 /**
- * An HTTP status as error messages spell it: the adapters' `API error: 402`,
- * `OpenRouter error: 402`, the OpenAI SDK's leading `402 …`, `HTTP 402`,
- * `status: 402`, or a JSON body's `"code": 402`.
- */
-const statusPattern = (status: number): RegExp =>
-  new RegExp(`(?:^|error:\\s*|http\\s+|status\\s*:?\\s*|"code"\\s*:\\s*)${status}\\b`);
-
-/**
- * Account-level credit/quota exhaustion: HTTP 402 Payment Required, or a
- * provider's own insufficient-credits/quota code (VoidAI and OpenRouter answer
- * 402 `insufficient_credits`; OpenAI answers 429 `insufficient_quota`).
+ * Last-resort classification for throwables that never carried an HTTP
+ * response: SDK errors, socket failures, internal bugs. HTTP failures are
+ * classified at the boundary (`errorFromHttpResponse`) where the status is
+ * still in hand, so this table no longer has to guess at one.
  *
- * A fact about the ACCOUNT, not the request — the identical request succeeds
- * once credits refill or are topped up — so it must not surface as
- * `unknown, retryable: false`. Callers read retryable:false as "this request
- * fails identically forever" and spend bounded attempt budgets on it (a
- * context-manager merge burned all five attempts in one second and went to
- * quarantine on a credit dip that cleared minutes later). The status is
- * matched only where messages spell a status (see statusPattern), never as a
- * bare number in prose.
+ * The patterns are deliberately narrow. Bare `rate` promoted anything
+ * containing "generated"/"moderate"/"accurate" to a retryable 429, and bare
+ * `maximum` turned an internal TypeError ("...reading 'maximum'") into a
+ * provider context_length. Status digits are word-boundary anchored, and the
+ * server-status arm is tested BEFORE context-length so a transient 5xx whose
+ * body mentions "context" stays retryable.
+ *
+ * `ownText` is the provider's own message, for the patterns a request's echo
+ * could otherwise trip (an account refusal, a context overflow), as with a
+ * status; it is the message itself when the caller has nothing more precise.
  */
-export function isCreditExhaustion(message: string, httpStatus?: number): boolean {
-  if (httpStatus === 402) return true;
-  const m = message.toLowerCase();
-  if (CREDIT_EXHAUSTION_TOKENS.some((token) => m.includes(token))) return true;
-  return statusPattern(402).test(m);
-}
+function classifyMessage(rawMessage: string, ownText: string = rawMessage): {
+  type: MembraneErrorType;
+  retryable: boolean;
+  httpStatus?: number;
+} {
+  const message = rawMessage.toLowerCase();
 
-/** 429 when the provider sent one (OpenAI's insufficient_quota), else 402. */
-function creditExhaustionStatus(message: string): number {
-  return statusPattern(429).test(message.toLowerCase()) ? 429 : 402;
+  if (RATE_LIMIT_PATTERN.test(message)) {
+    return { type: 'rate_limit', retryable: true, httpStatus: 429 };
+  }
+
+  if (ACCOUNT_REFUSAL_PATTERN.test(ownText)) {
+    return { type: 'auth', retryable: false };
+  }
+
+  if (/\b401\b|\bapi key\b|unauthorized|authentication|authorization/.test(message)) {
+    return { type: 'auth', retryable: false, httpStatus: 401 };
+  }
+
+  if (/network|econnreset|econnrefused|socket|\bfetch failed\b|\bfailed to fetch\b/.test(message)) {
+    return { type: 'network', retryable: true };
+  }
+
+  if (/timeout|timed out/.test(message)) {
+    return { type: 'timeout', retryable: true };
+  }
+
+  if (SERVER_STATUS_PATTERN.test(message) || /overloaded_error/.test(message)) {
+    return { type: 'server', retryable: true };
+  }
+
+  if (CONTEXT_LENGTH_PATTERN.test(ownText)) {
+    return { type: 'context_length', retryable: false };
+  }
+
+  return { type: 'unknown', retryable: false };
 }
 
 /**
- * Credit exhaustion as a retryable `rate_limit` — the bucket OpenAI's own
- * insufficient_quota 429 already lands in — keeping the provider's status
- * (402 unless it said 429) so the cause stays legible in receipts.
+ * A transport failure named by its code, on the error or down its causes:
+ * Node's `fetch failed` hides `ECONNREFUSED` in `cause.code`, and Bun's "Unable to
+ * connect. Is the computer able to access the url?" carries
+ * `code: 'ConnectionRefused'` (the same text for a DNS failure). The message
+ * names neither.
  */
-export function creditExhaustionError(message: string, raw?: unknown, rawRequest?: unknown): MembraneError {
-  const m = message.toLowerCase();
-  const providerErrorCode = m.includes('insufficient_quota')
-    ? 'insufficient_quota'
-    : m.includes('insufficient_credits')
-      ? 'insufficient_credits'
-      : undefined;
-  return new MembraneError({
-    type: 'rate_limit',
-    message,
-    retryable: true,
-    httpStatus: creditExhaustionStatus(message),
-    ...(providerErrorCode ? { providerErrorCode } : {}),
-    rawError: raw,
-    rawRequest,
-  });
+function classifySocketCode(error: Error): { type: MembraneErrorType; retryable: boolean; httpStatus?: number } | undefined {
+  for (const key of socketCodes(error)) {
+    if (NETWORK_ERROR_CODES.has(key)) return { type: 'network', retryable: true };
+    if (TIMEOUT_ERROR_CODES.has(key)) return { type: 'timeout', retryable: true };
+  }
+  return undefined;
+}
+
+/**
+ * The lowercased string codes on an error and down its chain of causes,
+ * outermost first. Node's fetch hides undici's error in `cause`, and the
+ * Anthropic SDK's MessageStream wraps a failed read once more (an
+ * AnthropicError whose cause is the `terminated` TypeError), so the code can
+ * sit two causes down.
+ */
+function socketCodes(error: unknown): string[] {
+  return causeChain(error)
+    .map((link) => (link as { code?: unknown }).code)
+    .filter((code): code is string => typeof code === 'string')
+    .map((code) => code.toLowerCase());
+}
+
+/** An error and its causes, outermost first, at most four deep. */
+function causeChain(error: unknown): object[] {
+  const chain: object[] = [];
+  let current = error;
+  while (typeof current === 'object' && current !== null && !chain.includes(current) && chain.length < 4) {
+    chain.push(current);
+    current = (current as { cause?: unknown }).cause;
+  }
+  return chain;
+}
+
+/**
+ * The MembraneError for a failure an adapter caught that isn't one yet, such
+ * as what `fetch` throws: typed by classifyError, with the request attached.
+ * A runtime's deadline on a request it already sent (undici's headers and
+ * body timeouts, Bun's fetch timeout) is marked deadlineExpired, as an
+ * adapter's own watchdog is, so membrane leaves it to the caller.
+ */
+export function errorFromThrown(error: unknown, rawRequest?: unknown): MembraneError {
+  // Already typed: keep it, and its marks, as it is.
+  if (error instanceof MembraneError) return withRawRequest(error, rawRequest);
+  const info = classifyError(error);
+  info.rawRequest = rawRequest;
+  const typed = new MembraneError(info);
+  // A mark the error already carries, as a second loaded copy of membrane
+  // sets one on its own MembraneError, stays on the new one.
+  return isSentRequestDeadline(error) || isDeadlineExpiry(error) ? deadlineExpired(typed) : typed;
 }
 
 export function classifyError(error: unknown): ErrorInfo {
@@ -361,73 +1210,9 @@ export function classifyError(error: unknown): ErrorInfo {
   const serializedError = serializeError(error);
 
   if (error instanceof Error) {
-    const message = error.message.toLowerCase();
-
-    // Credit/quota exhaustion (402): transient at account scale.
-    if (isCreditExhaustion(error.message)) {
-      return {
-        type: 'rate_limit',
-        message: error.message,
-        retryable: true,
-        httpStatus: creditExhaustionStatus(error.message),
-        rawError: serializedError,
-      };
-    }
-
-    // Rate limit
-    if (message.includes('rate') || message.includes('429') || message.includes('too many')) {
-      return {
-        type: 'rate_limit',
-        message: error.message,
-        retryable: true,
-        httpStatus: 429,
-        rawError: serializedError,
-      };
-    }
-    
-    // Context length
-    if (message.includes('context') || message.includes('too long') || message.includes('maximum')) {
-      return {
-        type: 'context_length',
-        message: error.message,
-        retryable: false,
-        rawError: serializedError,
-      };
-    }
-    
-    // Auth
-    if (message.includes('auth') || message.includes('401') || message.includes('api key')) {
-      return {
-        type: 'auth',
-        message: error.message,
-        retryable: false,
-        httpStatus: 401,
-        rawError: serializedError,
-      };
-    }
-    
-    // Network
-    if (message.includes('network') || message.includes('econnreset') || message.includes('socket')) {
-      return {
-        type: 'network',
-        message: error.message,
-        retryable: true,
-        rawError: serializedError,
-      };
-    }
-    
-    // Timeout
-    if (message.includes('timeout') || message.includes('timed out')) {
-      return {
-        type: 'timeout',
-        message: error.message,
-        retryable: true,
-        rawError: serializedError,
-      };
-    }
-    
-    // Abort
-    if (message.includes('abort') || error.name === 'AbortError') {
+    // Abort is decided by type, never by prose: a tool or provider message
+    // that merely contains "abort" is not a user cancellation.
+    if (error.name === 'AbortError') {
       return {
         type: 'abort',
         message: error.message,
@@ -435,18 +1220,27 @@ export function classifyError(error: unknown): ErrorInfo {
         rawError: serializedError,
       };
     }
-    
-    // Server error (529/overloaded_error: Anthropic capacity errors —
-    // transient, always worth retrying). This is the provider-agnostic
-    // fallback path (handled Anthropic errors short-circuit above as
-    // MembraneError), so match the exact `overloaded_error` type token
-    // rather than a bare 'overloaded' that would also promote unrelated
-    // messages like "worker pool overloaded" to retryable.
-    if (message.includes('500') || message.includes('502') || message.includes('503') || message.includes('504') || message.includes('529') || message.includes('overloaded_error')) {
+    // A runtime's own timeout (Bun's fetch deadline) is named, whatever its
+    // message says. A caller's AbortSignal.timeout() rejects the same way, and
+    // membrane still ends that call as a cancellation, from the caller's signal.
+    if (causeChain(error).some((link) => (link as { name?: unknown }).name === 'TimeoutError')) {
+      return { type: 'timeout', message: error.message, retryable: true, rawError: serializedError };
+    }
+
+    // Credit or quota exhaustion named in a thrown error's message (an SDK
+    // error, a rethrown provider failure): the account's, so a retryable rate
+    // limit with a wait, as at the boundary (isCreditExhaustion).
+    if (!classifySocketCode(error) && isCreditExhaustion(error.message)) {
+      return { ...creditExhaustionError(error.message).toErrorInfo(), rawError: serializedError };
+    }
+
+    const classification = classifySocketCode(error) ?? classifyMessage(error.message);
+    if (classification.type !== 'unknown') {
       return {
-        type: 'server',
+        type: classification.type,
         message: error.message,
-        retryable: true,
+        retryable: classification.retryable,
+        httpStatus: classification.httpStatus,
         rawError: serializedError,
       };
     }

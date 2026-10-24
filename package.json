@@ -1,6 +1,6 @@
 {
   "name": "@animalabs/membrane",
-  "version": "0.5.86",
+  "version": "0.7.1",
   "description": "LLM middleware - a selective boundary that transforms what passes through",
   "repository": {
     "type": "git",
@@ -14,6 +14,11 @@
       "bun": "./src/index.ts",
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
+    },
+    "./retry": {
+      "bun": "./src/retry.ts",
+      "types": "./dist/retry.d.ts",
+      "import": "./dist/retry.js"
     }
   },
   "scripts": {
@@ -34,7 +39,7 @@
     "@types/node": "^22.0.0",
     "@vitest/coverage-v8": "^4.0.18",
     "tsx": "^4.21.0",
-    "typescript": "^5.7.0",
+    "typescript": "^7.0.2",
     "vitest": "^4.0.18"
   },
   "files": [
@@ -42,7 +47,7 @@
     "src"
   ],
   "engines": {
-    "node": ">=20.0.0"
+    "node": ">=22.12.0"
   },
   "license": "MIT"
 }

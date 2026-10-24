@@ -12,6 +12,9 @@
  * - Direct API integration with proper error handling
  */
 
+import { unreportedUsage } from '../utils/usage.js';
+import { assertMessagePrefillSupported } from './request-capabilities.js';
+
 import type {
   ProviderAdapter,
   ProviderRequest,
@@ -22,16 +25,15 @@ import type {
 } from '../types/index.js';
 import {
   MembraneError,
-  rateLimitError,
-  creditExhaustionError,
-  isCreditExhaustion,
-  contextLengthError,
-  authError,
-  serverError,
   abortError,
-  networkError,
+  errorFromHttpResponse,
+  isTypedAbortError,
+  withRawRequest,
 } from '../types/index.js';
-import { safeParseJson, textOnlyToolResultContent, createCombinedSignal, SSELineParser, isDeadlineAbort, deadlineTimeoutError, throwOnStreamErrorFrame, assertTerminalEventObserved } from './utils.js';
+import { errorFromThrown } from '../types/errors.js';
+import { isRawItemCarrier } from '../utils/fidelity.js';
+import { convertMcpMedia } from '../utils/mcp-media.js';
+import { toolUseInputFromText, textOnlyToolResultContent, splitToolResultImages, hoistedImagesLead, openAIImagePart, createCombinedSignal, SSELineParser, isDeadlineAbort, deadlineTimeoutError, throwOnStreamErrorFrame, assertTerminalEventObserved, streamedToolCalls, isEventObject } from './utils.js';
 
 // ============================================================================
 // Types
@@ -155,7 +157,7 @@ const COMPLETION_TOKENS_MODELS = [
 /**
  * Check if a model requires max_completion_tokens parameter
  */
-function requiresCompletionTokens(model: string): boolean {
+export function requiresCompletionTokens(model: string): boolean {
   return isReasoningGenerationGpt(model) || COMPLETION_TOKENS_MODELS.some(prefix => model.startsWith(prefix));
 }
 
@@ -175,7 +177,7 @@ const NO_TEMPERATURE_MODELS = [
 /**
  * Check if a model doesn't support custom temperature
  */
-function noTemperatureSupport(model: string): boolean {
+export function noTemperatureSupport(model: string): boolean {
   return isReasoningGenerationGpt(model) || NO_TEMPERATURE_MODELS.some(prefix => model.startsWith(prefix));
 }
 
@@ -198,48 +200,13 @@ const NO_STOP_MODELS = [
 /**
  * Check if a model doesn't support stop sequences
  */
-function noStopSupport(model: string): boolean {
+export function noStopSupport(model: string): boolean {
   return isReasoningGenerationGpt(model) || NO_STOP_MODELS.some(prefix => model.startsWith(prefix));
 }
 
 // ============================================================================
 // OpenAI Adapter
 // ============================================================================
-
-/**
- * Split a tool_result's content into the string body for the role:'tool'
- * message plus any image blocks hoisted as image_url parts. Chat Completions
- * tool messages are text-only — serializing an image block inline sends the
- * raw base64 as literal text — so images must ride in a user message that
- * follows the tool results. Mirrors openai-compatible.ts / openrouter.ts.
- */
-function splitToolResultContent(content: unknown): { text: string; imageParts: OpenAIContentPart[] } {
-  if (typeof content === 'string') return { text: content, imageParts: [] };
-  if (!Array.isArray(content)) return { text: textOnlyToolResultContent(content), imageParts: [] };
-
-  const imageParts: OpenAIContentPart[] = [];
-  const rest: any[] = [];
-  for (const block of content as any[]) {
-    if (block?.type === 'image' && block.source?.type === 'base64' && block.source.data) {
-      const mediaType = block.source.media_type ?? block.source.mediaType ?? 'image/png';
-      imageParts.push({
-        type: 'image_url',
-        image_url: { url: `data:${mediaType};base64,${block.source.data}` },
-      });
-    } else if (block?.type === 'image' && block.source?.type === 'url') {
-      imageParts.push({ type: 'image_url', image_url: { url: block.source.url } });
-    } else {
-      rest.push(block);
-    }
-  }
-  if (imageParts.length === 0) return { text: textOnlyToolResultContent(content), imageParts };
-
-  const note = `[${imageParts.length === 1 ? 'image' : `${imageParts.length} images`} from this tool result attached in the following user message]`;
-  const restText = rest.length === 0
-    ? ''
-    : rest.every(b => b?.type === 'text') ? rest.map(b => b.text).join('\n') : textOnlyToolResultContent(rest);
-  return { text: restText ? `${restText}\n${note}` : note, imageParts };
-}
 
 export class OpenAIAdapter implements ProviderAdapter {
   readonly name = 'openai';
@@ -282,6 +249,7 @@ export class OpenAIAdapter implements ProviderAdapter {
     options?: ProviderRequestOptions
   ): Promise<ProviderResponse> {
     const openAIRequest = this.buildRequest(request);
+    assertMessagePrefillSupported(openAIRequest.model, openAIRequest.messages, options, this.name, openAIRequest);
     options?.onRequest?.(openAIRequest);
 
     try {
@@ -301,6 +269,7 @@ export class OpenAIAdapter implements ProviderAdapter {
     openAIRequest.stream = true;
     // Request usage data in stream for cache metrics
     openAIRequest.stream_options = { include_usage: true };
+    assertMessagePrefillSupported(openAIRequest.model, openAIRequest.messages, options, this.name, openAIRequest);
     options?.onRequest?.(openAIRequest);
 
     const { signal: combinedSignal, cleanup } = createCombinedSignal(options?.signal, options?.timeoutMs);
@@ -313,8 +282,7 @@ export class OpenAIAdapter implements ProviderAdapter {
       });
 
       if (!response.ok) {
-        const errorText = await response.text();
-        throw new Error(`OpenAI API error: ${response.status} ${errorText}`);
+        throw errorFromHttpResponse(this.name, response, await response.text(), openAIRequest);
       }
 
       const reader = response.body?.getReader();
@@ -325,9 +293,9 @@ export class OpenAIAdapter implements ProviderAdapter {
       const decoder = new TextDecoder();
       const sseParser = new SSELineParser();
       let accumulated = '';
-      let finishReason = 'stop';
+      let finishReason: string | undefined;
       let sawTerminalEvent = false;
-      let toolCalls: OpenAIToolCall[] = [];
+      const toolCalls = streamedToolCalls();
       let streamUsage: OpenAIResponse['usage'] | undefined;
       // The model the provider actually served, echoed on every SSE
       // chunk. Reporting the requested id instead hides alias
@@ -342,78 +310,76 @@ export class OpenAIAdapter implements ProviderAdapter {
           return;
         }
 
-        // Parse first; only JSON noise is ignorable. Everything after the
-        // parse must NOT be swallowed by the catch below.
+        // Parse first: a line that isn't JSON is noise to ignore. Nothing
+        // after the parse is caught here, so an error there, a caller's
+        // callback included, fails the stream. What the handler can't read is
+        // dropped below by checks, not by a catch.
         let parsed: Record<string, any>;
         try {
           parsed = JSON.parse(data);
         } catch {
           return; // Ignore parse errors (partial/keep-alive lines)
         }
+        // JSON that isn't an object (`null`, a number, a string, an array)
+        // carries no event, so its frame is dropped.
+        if (!isEventObject(parsed)) return;
+        // A provider event is progress (comments never reach here).
+        options?.onProgress?.();
 
         throwOnStreamErrorFrame(parsed, 'OpenAI', openAIRequest);
 
-        try {
-          const delta = parsed.choices?.[0]?.delta;
+        const delta = parsed.choices?.[0]?.delta;
 
-          if (delta?.content) {
-            accumulated += delta.content;
-            callbacks.onChunk(delta.content);
-          }
+        if (delta?.content) {
+          accumulated += delta.content;
+          callbacks.onChunk(delta.content);
+        }
 
-          // Handle streaming tool calls
-          if (delta?.tool_calls) {
-            for (const tc of delta.tool_calls) {
-              const index = tc.index ?? 0;
-              if (!toolCalls[index]) {
-                toolCalls[index] = {
-                  id: tc.id ?? '',
-                  type: 'function',
-                  function: { name: '', arguments: '' },
-                };
-              }
-              if (tc.id) toolCalls[index].id = tc.id;
-              if (tc.function?.name) toolCalls[index].function.name = tc.function.name;
-              if (tc.function?.arguments) {
-                toolCalls[index].function.arguments += tc.function.arguments;
-              }
-            }
-          }
+        // Handle streaming tool calls
+        // streamedToolCalls places each entry: by its index, or, with none, by
+        // its id and name (antra-tess/membrane#159).
+        if (Array.isArray(delta?.tool_calls)) {
+          for (const tc of delta.tool_calls) toolCalls.add(tc);
+        }
 
-          if (parsed.choices?.[0]?.finish_reason) {
-            finishReason = parsed.choices[0].finish_reason;
-            sawTerminalEvent = true;
-          }
+        if (parsed.choices?.[0]?.finish_reason) {
+          finishReason = parsed.choices[0].finish_reason;
+          sawTerminalEvent = true;
+        }
 
-          // Capture usage data (comes in final chunk with stream_options.include_usage)
-          if (parsed.usage) {
-            streamUsage = parsed.usage;
-          }
+        // Capture usage data (comes in final chunk with stream_options.include_usage)
+        if (parsed.usage) {
+          streamUsage = parsed.usage;
+        }
 
-          if (parsed.model) {
-            servedModel = parsed.model;
-          }
-        } catch {
-          // Ignore parse errors in stream
+        if (parsed.model) {
+          servedModel = parsed.model;
         }
       };
 
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
 
-        const chunk = decoder.decode(value, { stream: true });
-        for (const data of sseParser.feed(chunk)) {
+          const chunk = decoder.decode(value, { stream: true });
+          for (const data of sseParser.feed(chunk)) {
+            processDataLine(data);
+          }
+        }
+
+        // A final `data:` line that arrived without its trailing newline is still
+        // buffered here. Servers and proxies do close right after writing the
+        // last event, so dropping it would report a finished turn as a dropped
+        // connection at the guard below.
+        for (const data of sseParser.flush()) {
           processDataLine(data);
         }
-      }
-
-      // A final `data:` line that arrived without its trailing newline is still
-      // buffered here. Servers and proxies do close right after writing the
-      // last event, so dropping it would report a finished turn as a dropped
-      // connection at the guard below.
-      for (const data of sseParser.flush()) {
-        processDataLine(data);
+      } finally {
+        // A read loop that ends early, on a callback's error or any other,
+        // leaves the body unread: cancel it, so the provider stops sending
+        // and the connection is let go. After a full read it does nothing.
+        void reader.cancel().catch(() => {});
       }
 
       assertTerminalEventObserved(sawTerminalEvent, 'OpenAI', openAIRequest);
@@ -424,8 +390,12 @@ export class OpenAIAdapter implements ProviderAdapter {
         content: accumulated || null,
       };
 
-      if (toolCalls.length > 0) {
-        message.tool_calls = toolCalls;
+      // The calls the stream placed: those with an index in index order (an
+      // index can skip a slot, and a hole would fail the response built from
+      // them), then those without one in the order they started.
+      const placedToolCalls = toolCalls.calls();
+      if (placedToolCalls.length > 0) {
+        message.tool_calls = placedToolCalls;
       }
 
       return this.parseStreamedResponse(message, finishReason, servedModel ?? request.model, streamUsage, openAIRequest);
@@ -451,7 +421,10 @@ export class OpenAIAdapter implements ProviderAdapter {
   }
 
   private buildRequest(request: ProviderRequest): any {
-    const messages = this.convertMessages(request.messages as any[]);
+    // Media in MCP's form becomes membrane's first, for a caller that builds
+    // a request directly (Membrane's own builds have converted it already,
+    // utils/mcp-media.ts).
+    const messages = this.convertMessages(convertMcpMedia(request.messages as any[]));
     const model = request.model;
     const maxTokens = request.maxTokens || this.defaultMaxTokens;
     
@@ -539,21 +512,16 @@ export class OpenAIAdapter implements ProviderAdapter {
 
         for (const block of msg.content) {
           if (block.type === 'text') {
+            // A zero-width carrier (a provider item with no normalized form,
+            // such as an Anthropic server-tool block) has no text and no form
+            // on this wire: an empty part would only add a blank line.
+            if (isRawItemCarrier(block)) continue;
             contentParts.push({ type: 'text', text: block.text });
           } else if (block.type === 'image') {
-            // Convert Anthropic-style image to OpenAI image_url with data URI
-            if (block.source?.type === 'base64') {
-              const mediaType = block.source.media_type ?? block.source.mediaType ?? 'image/png';
-              contentParts.push({
-                type: 'image_url',
-                image_url: { url: `data:${mediaType};base64,${block.source.data}` },
-              });
-            } else if (block.source?.type === 'url') {
-              contentParts.push({
-                type: 'image_url',
-                image_url: { url: block.source.url },
-              });
-            }
+            // Convert Anthropic-style image to OpenAI image_url with data URI,
+            // or to the placeholder for data these APIs don't accept
+            const part = openAIImagePart(block.source);
+            if (part) contentParts.push(part);
           } else if (block.type === 'tool_use') {
             toolCalls.push({
               id: block.id,
@@ -567,7 +535,7 @@ export class OpenAIAdapter implements ProviderAdapter {
             // Collect ALL tool results - each becomes a separate message.
             // Images inside a result are hoisted into the following user
             // message (role:'tool' content is text-only in this API).
-            const { text, imageParts } = splitToolResultContent(block.content);
+            const { text, imageParts } = splitToolResultImages(block.content);
             toolResults.push({
               role: 'tool' as const,
               tool_call_id: block.tool_use_id || block.toolUseId,
@@ -592,12 +560,7 @@ export class OpenAIAdapter implements ProviderAdapter {
           // the model then answers "no image" or re-calls the tool. Always
           // lead with a text part when images are present.
           if (followHasImages && !followParts.some(p => p.type === 'text')) {
-            followParts.unshift({
-              type: 'text',
-              text: hoistedImages.length === 1
-                ? '[image from the preceding tool result:]'
-                : `[${hoistedImages.length} images from the preceding tool results:]`,
-            });
+            followParts.unshift(hoistedImagesLead(hoistedImages.length));
           }
           const followText = followHasImages
             ? '' // unused: array form carries the parts
@@ -668,11 +631,13 @@ export class OpenAIAdapter implements ProviderAdapter {
       });
 
       if (!response.ok) {
-        const errorText = await response.text();
-        throw new Error(`OpenAI API error: ${response.status} ${errorText}`);
+        throw errorFromHttpResponse(this.name, response, await response.text(), request);
       }
 
-      return await response.json() as OpenAIResponse;
+      const body: unknown = await response.json();
+      // A 200 can carry the provider's error, as a stream frame can.
+      throwOnStreamErrorFrame(body, 'OpenAI', request, 'response error');
+      return body as OpenAIResponse;
     } finally {
       cleanup?.();
     }
@@ -683,19 +648,22 @@ export class OpenAIAdapter implements ProviderAdapter {
     const message = choice?.message;
 
     // Extract prompt caching details (OpenAI automatic caching for prompts ≥1024 tokens)
-    const cachedTokens = response.usage?.prompt_tokens_details?.cached_tokens ?? 0;
+    // A reported 0 is a fact (no cache read); only an unreported count is absent.
+    const cachedTokens = response.usage?.prompt_tokens_details?.cached_tokens;
 
     return {
       content: this.messageToContent(message),
       stopReason: this.mapFinishReason(choice?.finish_reason),
+      providerStopReason: choice?.finish_reason ?? undefined,
       stopSequence: undefined,
       usage: {
         inputTokens: response.usage?.prompt_tokens ?? 0,
         outputTokens: response.usage?.completion_tokens ?? 0,
         // OpenAI's automatic prompt caching - cached tokens are read from cache
         // Note: OpenAI doesn't have separate "creation" tokens - it's automatic
-        cacheReadTokens: cachedTokens > 0 ? cachedTokens : undefined,
+        ...(typeof cachedTokens === 'number' ? { cacheReadTokens: cachedTokens } : {}),
       },
+      ...unreportedUsage(response.usage?.prompt_tokens, response.usage?.completion_tokens),
       model: response.model ?? requestedModel,
       rawRequest,
       raw: response,
@@ -704,26 +672,28 @@ export class OpenAIAdapter implements ProviderAdapter {
 
   private parseStreamedResponse(
     message: OpenAIMessage,
-    finishReason: string,
+    finishReason: string | undefined,
     requestedModel: string,
     streamUsage?: OpenAIResponse['usage'],
     rawRequest?: unknown
   ): ProviderResponse {
     // Extract cached tokens from stream usage if available
-    const cachedTokens = streamUsage?.prompt_tokens_details?.cached_tokens ?? 0;
+    const cachedTokens = streamUsage?.prompt_tokens_details?.cached_tokens;
 
     return {
       content: this.messageToContent(message),
       stopReason: this.mapFinishReason(finishReason),
+      providerStopReason: finishReason,
       stopSequence: undefined,
       usage: {
         inputTokens: streamUsage?.prompt_tokens ?? 0,
         outputTokens: streamUsage?.completion_tokens ?? 0,
-        cacheReadTokens: cachedTokens > 0 ? cachedTokens : undefined,
+        ...(typeof cachedTokens === 'number' ? { cacheReadTokens: cachedTokens } : {}),
       },
+      ...unreportedUsage(streamUsage?.prompt_tokens, streamUsage?.completion_tokens),
       model: requestedModel,
       rawRequest,
-      raw: { message, finish_reason: finishReason, usage: streamUsage },
+      raw: { message, finish_reason: finishReason ?? 'stop', usage: streamUsage },
     };
   }
 
@@ -744,7 +714,7 @@ export class OpenAIAdapter implements ProviderAdapter {
           type: 'tool_use',
           id: tc.id,
           name: tc.function.name,
-          input: safeParseJson(tc.function.arguments),
+          ...toolUseInputFromText(tc.function.arguments),
         });
       }
     }
@@ -753,6 +723,8 @@ export class OpenAIAdapter implements ProviderAdapter {
   }
 
   private mapFinishReason(reason: string | undefined): string {
+    // No reason (or a server's null) is a plain end of turn.
+    if (reason == null) return 'end_turn';
     switch (reason) {
       case 'stop':
         return 'end_turn';
@@ -763,64 +735,26 @@ export class OpenAIAdapter implements ProviderAdapter {
       case 'content_filter':
         return 'refusal';
       default:
-        return 'end_turn';
+        // Unrecognized reasons (a compatible server's own token) travel as
+        // the provider's own token: membrane's mapper reads them as end_turn,
+        // but discloses the token in details.stop.providerReason and logs it
+        // once, so the stop isn't taken for a clean one. 'error' never gets
+        // here: throwOnStreamErrorFrame throws on it first.
+        return reason;
     }
   }
 
+  /**
+   * HTTP failures are classified at the fetch boundary, where status,
+   * headers and body are still live; this handles what is left — typed
+   * aborts and non-HTTP throwables — through the shared last-resort table.
+   */
   private handleError(error: unknown, rawRequest?: unknown): MembraneError {
-    // A deadline abort is a timeout and stays one. Collapsing it into a bare
-    // abortError() here is what erased the identity before Membrane's
-    // caller-signal > timeout > error ladder could read it.
     if (isDeadlineAbort(error)) return deadlineTimeoutError(error, rawRequest);
-    // Already-classified failures (e.g. the stream-integrity guards) keep
-    // their type and retryability instead of being re-derived from a string.
-    if (error instanceof MembraneError) return error;
+    if (error instanceof MembraneError) return withRawRequest(error, rawRequest);
+    if (isTypedAbortError(error)) return abortError(undefined, rawRequest);
 
-    if (error instanceof Error) {
-      const message = error.message;
-
-      // 402 / insufficient credits: transient at account scale, never a
-      // property of the request (see isCreditExhaustion).
-      if (isCreditExhaustion(message)) {
-        return creditExhaustionError(message, error, rawRequest);
-      }
-
-      // OpenAI specific error patterns
-      if (message.includes('429') || message.includes('rate_limit')) {
-        // Try to extract retry-after
-        const retryMatch = message.match(/retry after (\d+)/i);
-        const retryAfter = retryMatch?.[1] ? parseInt(retryMatch[1], 10) * 1000 : undefined;
-        return rateLimitError(message, retryAfter, error, rawRequest);
-      }
-
-      if (message.includes('401') || message.includes('invalid_api_key') || message.includes('Incorrect API key')) {
-        return authError(message, error, rawRequest);
-      }
-
-      if (message.includes('context_length') || message.includes('maximum context') || message.includes('too long')) {
-        return contextLengthError(message, error, rawRequest);
-      }
-
-      if (message.includes('500') || message.includes('502') || message.includes('503') || message.includes('server_error')) {
-        return serverError(message, undefined, error, rawRequest);
-      }
-
-      if (error.name === 'AbortError') {
-        return abortError(undefined, rawRequest);
-      }
-
-      if (message.includes('network') || message.includes('fetch') || message.includes('ECONNREFUSED')) {
-        return networkError(message, error, rawRequest);
-      }
-    }
-
-    return new MembraneError({
-      type: 'unknown',
-      message: error instanceof Error ? error.message : String(error),
-      retryable: false,
-      rawError: error,
-      rawRequest,
-    });
+    return errorFromThrown(error, rawRequest);
   }
 }
 
@@ -832,8 +766,11 @@ export class OpenAIAdapter implements ProviderAdapter {
  * Convert normalized content blocks to OpenAI message format
  */
 export function toOpenAIContent(blocks: ContentBlock[]): string | null {
-  const textBlocks = blocks.filter(b => b.type === 'text') as Array<{ type: 'text'; text: string }>;
-  if (textBlocks.length === 0) return null;
+  // A zero-width carrier holds a block this wire has no form for, so it adds
+  // no line; a turn whose only text blocks are carriers is '' as before, and
+  // only a turn with no text block at all is null.
+  const textBlocks = blocks.filter(b => b.type === 'text' && !isRawItemCarrier(b)) as Array<{ type: 'text'; text: string }>;
+  if (textBlocks.length === 0) return blocks.some(b => b.type === 'text') ? '' : null;
   return textBlocks.map(b => b.text).join('\n');
 }
 
@@ -854,7 +791,7 @@ export function fromOpenAIContent(message: OpenAIMessage): ContentBlock[] {
         type: 'tool_use',
         id: tc.id,
         name: tc.function.name,
-        input: safeParseJson(tc.function.arguments),
+        ...toolUseInputFromText(tc.function.arguments),
       });
     }
   }

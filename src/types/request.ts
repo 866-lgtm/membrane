@@ -44,8 +44,88 @@ export interface GenerationConfig {
      * Controls how thinking content is returned: 'summarized' (readable summary)
      * or 'omitted' (empty thinking field, signature only). Models like Fable 5 /
      * Opus 4.7+ default to 'omitted' — set 'summarized' to receive thinking text.
+     *
+     * 'updates' (Anthropic's `thinking-display-updates-2026-08-18` beta, which
+     * the Anthropic and Bedrock adapters add when the body they send carries
+     * it) hides reasoning as 'omitted' does, but returns the progress notes
+     * the model writes between tool calls ("found X, checking Y next") as
+     * text. On Fable 5 and 5.1 and Mythos 5.1 those notes come back as
+     * `thinking` blocks, and on Opus 5.5 and Sonnet 5.5 those longer than a
+     * sentence or two do, each signed and placed just before the `tool_use`
+     * it introduces, where earlier models returned them as `text`. Under
+     * 'omitted' their text is empty, so a long tool
+     * loop looks silent. Under 'updates' every thinking block with non-empty
+     * text is such a note; there may be none in a response. The text is a
+     * summary of the note: `output_tokens` bills the full note, and the
+     * model reads the full note when the block is sent back unchanged.
+     * 'summarized' returns these notes too, mixed with the reasoning
+     * summaries. A response cut off soon after a tool call can end in one
+     * whose text is exactly
+     * `This part of the response was interrupted before it finished.`
+     *
+     * Fable and Mythos models get no thinking config for 'summarized' or
+     * 'omitted' alone (see `blockBinding`), but they get
+     * `{ type: 'adaptive', display: 'updates' }` for 'updates'. Anthropic
+     * documents the value for the models above, on every platform; what
+     * other models do with it is untested.
      */
-    display?: 'summarized' | 'omitted';
+    display?: 'summarized' | 'omitted' | 'updates';
+    /**
+     * What the API does with a signed thinking block this request sends back
+     * when the conversation before it differs from the one it was minted in
+     * (Anthropic's block binding). 'error' fails the request with a 400;
+     * 'drop_block' removes the failing blocks and the request proceeds,
+     * without the reasoning they held. A response then reports the blocks
+     * that failed a binding check: on yielding streams as
+     * `RoundReport.thinking`, and elsewhere as the provider's own
+     * `input_transformations` on the raw response.
+     *
+     * Setting it sends `thinking.block_binding`, with the
+     * `thinking-binding-controls-2026-08-01` beta (the Anthropic and Bedrock
+     * adapters), inside the thinking config membrane builds: thinking enabled
+     * with a budget that fits under `maxTokens`, adaptive thinking, or a model
+     * whose thinking is always on. Such a model's thinking config is otherwise
+     * left out; with this set it gets `{ type: 'adaptive', block_binding }`,
+     * plus `display` when that is set. Fable 5 and Fable 5.1 accepted the
+     * binding config on 2026-10-10, and with `display: 'summarized'` beside it
+     * on 2026-10-12, returning signed thinking with its text. Mythos hasn't
+     * been tried, and the family has refused thinking configs with a 400
+     * before, so for a Mythos model setting it may fail every request.
+     * Bedrock's acceptance of the beta hasn't been tried either. The Bedrock
+     * adapter sends the interleaved-thinking beta only to models that take
+     * it, since legacy 3.x models there refuse unknown beta flags, but it
+     * sends this one whenever the body carries the binding, so an older
+     * thinking-capable model on Bedrock may refuse the request with a 400.
+     *
+     * A request that carries no thinking config carries no binding, and the
+     * account's default applies there: thinking disabled, an enabled budget
+     * that can't fit under `maxTokens` (membrane then leaves thinking out),
+     * and a request the XML or completions formatter builds to end in an
+     * assistant prefill, including an XML continuation, which never sends
+     * thinking. Fable and Mythos are the exception to the first two: they
+     * think whatever the config says, so they carry the binding whenever it's
+     * asked for. Sending no thinking config doesn't mean a reply holds no
+     * thinking that binds: on 2026-10-19 Opus 5.5 and 5, Sonnet 5.5 and 5,
+     * and Haiku 5.5 each returned a signed thinking block to a request with
+     * no thinking config, and Opus 5.5, Sonnet 5.5 and Haiku 5.5 bind it. To
+     * carry the binding to such a model in a request that doesn't end in an
+     * assistant prefill, set this and ask for adaptive thinking
+     * (`enabled: true`, `type: 'adaptive'`, and `display: 'omitted'`, so the
+     * block comes back signature only, as it did with no config). Those three
+     * accepted that config with the binding in place of no config, and read
+     * the same cached prefix, in one run each at the 5-minute TTL. As with any
+     * thinking config other than `disabled`, the Anthropic adapter then sends
+     * none of the caller's `temperature` or `topK`, and no `topP` below 0.95;
+     * to these three it sends no `topP` at all, since it strips sampling
+     * parameters for them whatever the config (NO_TEMPERATURE_MODELS).
+     * The Bedrock adapter sends `temperature` 1 and the caller's `topK` beside
+     * it; whether Bedrock takes that hasn't been tried. A `thinking` object
+     * passed through `providerParams` replaces the one membrane builds,
+     * binding included, so give `block_binding` inside it; the beta follows
+     * the body that is sent. Left unset, nothing is sent, and the account's
+     * default applies, which isn't the same on every account.
+     */
+    blockBinding?: { prefixMismatchBehavior: 'error' | 'drop_block' };
   };
   
   /** Image generation config (Gemini) */
@@ -131,7 +211,11 @@ export interface NormalizedRequest {
   /** Conversation messages */
   messages: NormalizedMessage[];
   
-  /** System prompt */
+  /**
+   * System prompt, as text. Under `cacheMarkers: 'cm-owned'`, a caller that
+   * wants it marked for Anthropic's prompt cache marks the provider request's
+   * `system` in a `beforeRequest` hook, as docs/formatters.md describes.
+   */
   system?: string;
   
   /** Generation configuration */
@@ -161,7 +245,9 @@ export interface NormalizedRequest {
   promptCaching?: boolean;
 
   /** Marker ownership policy. `cm-owned` disables every formatter-generated
-   * system/context-prefix marker; only normalized message breakpoints survive. */
+   * system/context-prefix marker, so a request carries only the markers its
+   * caller placed, such as its message breakpoints and a marker a
+   * `beforeRequest` hook adds. */
   cacheMarkers?: 'membrane-system' | 'cm-owned';
 
   /**
@@ -195,7 +281,9 @@ export interface NormalizedRequest {
   /**
    * Custom content for the synthetic user message injected when the first
    * provider message is an assistant turn (required by Claude Messages API).
-   * Defaults to '[Start]' if not specified.
+   * Defaults to '[Start]' in prefill construction (or a CLI-simulation command
+   * when no system prompt is set) and to '[continuing]' in native construction,
+   * which also uses '[continuing]' in place of text that is only whitespace.
    */
   prefillUserMessage?: string;
 

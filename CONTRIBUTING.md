@@ -65,6 +65,8 @@ are the house default; plain descriptive titles are accepted.
 - The reviewer will typically **run your branch** (typecheck, test suite,
   sometimes a live provider call) and paste transcripts. Claims are checked,
   not trusted.
+- **Greptile** doesn't review new PRs. It reviews only PRs labelled
+  `greptile` (`.greptile/config.json`), so don't add that label to a new PR.
 - Respond by pushing fix commits and replying per finding — "Addressed in
   `<sha>`" — rather than force-pushing a rewritten branch. A re-review then
   flips the verdict.

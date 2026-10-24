@@ -19,6 +19,7 @@ export type {
   ToolResultContent,
   ThinkingContent,
   RedactedThinkingContent,
+  SystemChangeContent,
 } from './content.js';
 
 export {
@@ -32,6 +33,7 @@ export {
   isToolResultContent,
   isThinkingContent,
   isRedactedThinkingContent,
+  isSystemChangeContent,
   isMediaContent,
 } from './content.js';
 
@@ -83,6 +85,8 @@ export type {
   TimingInfo,
   CacheInfo,
   ResponseDetails,
+  ResponseAnomaly,
+  ToolUseWithEndTurnAnomaly,
   RawAccess,
   NormalizedResponse,
   AbortedResponse,
@@ -102,7 +106,9 @@ export type {
   ProviderAdapter,
   ProviderRequest,
   ProviderRequestOptions,
+  ProviderRequestContext,
   ProviderResponse,
+  ProviderInputTransformation,
   StreamCallbacks,
   UsageCacheConvention,
 } from './provider.js';
@@ -130,6 +136,9 @@ export type {
   StreamBlockEvent,
   ToolCallsEvent,
   UsageEvent,
+  RoundReport,
+  RoundUsage,
+  ThinkingBindingEntry,
   CompleteEvent,
   ErrorEvent,
   AbortedEvent,
@@ -153,10 +162,12 @@ export {
 export type {
   MembraneErrorType,
   ErrorInfo,
+  HttpErrorResponseLike,
 } from './errors.js';
 
 export {
   MembraneError,
+  MembraneNotReadyError,
   serializeError,
   rateLimitError,
   contextLengthError,
@@ -174,6 +185,12 @@ export {
   isOverloadedError,
   isCreditExhaustion,
   creditExhaustionError,
+  CREDIT_EXHAUSTION_RETRY_AFTER_MS,
+  isTypedAbortError,
+  errorFromHttpResponse,
+  errorFromProviderStatus,
+  extractProviderErrorFields,
+  withRawRequest,
 } from './errors.js';
 
 // Config

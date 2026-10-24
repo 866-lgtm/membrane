@@ -4,10 +4,12 @@
  * Two wire-boundary repairs in the Anthropic adapter, both of which
  * previously produced a non-retryable 400 that killed the whole turn:
  *
- * 1. Temperature stripping for models that reject sampling parameters
- *    (Opus 4.7+/Sonnet 5/Fable 5/Mythos 5 have the parameters removed from
- *    the API surface). Haiku 4.5 ACCEPTS temperature and must be forwarded.
- *    Mirrors the OpenAI provider's `noTemperatureSupport` gate.
+ * 1. Temperature stripping for the models listed as rejecting sampling
+ *    parameters, each by its own id (Opus 4.7, 4.8, 5 and 5.5, Sonnet 5 and
+ *    5.5, Haiku 5.5, Fable 5 and 5.1, Mythos 5, 5.1 and preview, some of which take
+ *    only a top_p near 1). Haiku 4.5 ACCEPTS temperature and must be
+ *    forwarded, and so is an unlisted later version. Through Membrane, a
+ *    request's config already loses them for every Fable and Mythos id.
  *
  * 2. Root-level oneOf/anyOf/allOf in a tool's input schema (legal MCP,
  *    illegal for Anthropic tools) is flattened into a single object schema
@@ -16,6 +18,8 @@
 
 import { describe, it, expect } from 'vitest';
 import { AnthropicAdapter } from '../../src/providers/anthropic.js';
+import { Membrane } from '../../src/membrane.js';
+import { NativeFormatter } from '../../src/formatters/native.js';
 import { flattenRootSchemaUnion } from '../../src/providers/anthropic-tool-schema.js';
 
 // ---------------------------------------------------------------------------
@@ -129,7 +133,7 @@ describe('AnthropicAdapter: sampling-parameter model gate', () => {
     expect(captured[0].temperature).toBe(0.7);
   });
 
-  it('does not confuse claude-sonnet-4-5 with the claude-sonnet-5 prefix', async () => {
+  it('does not confuse claude-sonnet-4-5 with the claude-sonnet-5 entry', async () => {
     const { adapter, captured } = captureAdapter();
 
     await adapter.complete({
@@ -147,6 +151,118 @@ describe('AnthropicAdapter: sampling-parameter model gate', () => {
     expect(captured[1].temperature).toBe(0.7);             // sonnet-4-5: kept
   });
 
+  it('strips temperature, top_p and top_k for claude-haiku-5-5, each on its own', async () => {
+    // With no thinking config, the API refused temperature 0.2, top_k 40 and
+    // top_p 0.9 for Haiku 5.5 with a 400 ("`temperature` is deprecated for
+    // this model", and likewise for the other two), and took a top_p of 0.99.
+    // A listed model loses every top_p, 0.99 included, at the top level and
+    // through `extra`. Each is sent on its own, since a top_p beside a
+    // temperature is dropped anyway.
+    const { adapter, captured } = captureAdapter();
+
+    await adapter.complete({ ...baseRequest, model: 'claude-haiku-5-5', temperature: 0.2 } as any);
+    await adapter.complete({ ...baseRequest, model: 'claude-haiku-5-5', topP: 0.9 } as any);
+    await adapter.complete({ ...baseRequest, model: 'claude-haiku-5-5', topK: 40 } as any);
+    await adapter.complete({ ...baseRequest, model: 'claude-haiku-5-5', topP: 0.99 } as any);
+    await adapter.complete({ ...baseRequest, model: 'claude-haiku-5-5', extra: { top_p: 0.99 } } as any);
+
+    expect(captured[0]).not.toHaveProperty('temperature');
+    expect(captured[1]).not.toHaveProperty('top_p');
+    expect(captured[2]).not.toHaveProperty('top_k');
+    expect(captured[3]).not.toHaveProperty('top_p');
+    expect(captured[4]).not.toHaveProperty('top_p');
+  });
+
+  it('strips temperature, top_p and top_k for claude-opus-5 and claude-opus-5-5, each on its own', async () => {
+    // With no thinking config, the API refused temperature 0.2, top_k 40 and
+    // top_p 0.9 for both with a 400 ("`temperature` is deprecated for this
+    // model", and likewise for the other two), and took a top_p of 0.99, as
+    // for Haiku 5.5. Each is listed by its own id, which covers its dated
+    // snapshots. As for every listed model, every top_p goes, 0.99 included, at the top
+    // level and through `extra`, with a thinking config or without one.
+    const { adapter, captured } = captureAdapter();
+    const thinking = { type: 'adaptive', display: 'omitted' };
+
+    for (const model of ['claude-opus-5', 'claude-opus-5-5', 'claude-opus-5-5-20260301']) {
+      await adapter.complete({ ...baseRequest, model, temperature: 0.2 } as any);
+      await adapter.complete({ ...baseRequest, model, topP: 0.9 } as any);
+      await adapter.complete({ ...baseRequest, model, topK: 40 } as any);
+      await adapter.complete({ ...baseRequest, model, topP: 0.99 } as any);
+      await adapter.complete({ ...baseRequest, model, extra: { top_p: 0.99 } } as any);
+      await adapter.complete({ ...baseRequest, model, topP: 0.97, thinking } as any);
+    }
+
+    expect(captured).toHaveLength(18);
+    for (let i = 0; i < 18; i += 6) {
+      expect(captured[i]).not.toHaveProperty('temperature');
+      expect(captured[i + 1]).not.toHaveProperty('top_p');
+      expect(captured[i + 2]).not.toHaveProperty('top_k');
+      expect(captured[i + 3]).not.toHaveProperty('top_p');
+      expect(captured[i + 4]).not.toHaveProperty('top_p');
+      expect(captured[i + 5]).not.toHaveProperty('top_p');
+      expect(captured[i + 5].thinking).toEqual(thinking);
+    }
+  });
+
+  it('strips sampling for each listed id and its dated snapshots, and sends it as given to an unlisted later version', async () => {
+    // The list names models, not families: each entry was documented or
+    // measured to refuse, or (Mythos 5.1) is of the always-thinking family,
+    // and a later version is a model of its own, sent what the caller asked
+    // until it's listed.
+    const listed = [
+      'claude-opus-4-7', 'claude-opus-4-8', 'claude-opus-5', 'claude-opus-5-5', 'claude-sonnet-5',
+      'claude-sonnet-5-5', 'claude-haiku-5-5', 'claude-fable-5', 'claude-fable-5-1', 'claude-mythos-5',
+      'claude-mythos-5-1', 'claude-mythos-preview',
+    ];
+    const unlisted = ['claude-opus-5-6', 'claude-opus-5-50', 'claude-sonnet-5-6', 'claude-fable-5-2', 'claude-fable-5-10', 'claude-mythos-5-2', 'claude-haiku-5-6'];
+    const { adapter, captured } = captureAdapter();
+
+    for (const model of [...listed, ...listed.map((id) => `${id}-20260301`), ...unlisted]) {
+      await adapter.complete({ ...baseRequest, model, temperature: 0.2 } as any);
+    }
+
+    const sent = captured.map((request: any) => [request.model, request.temperature]);
+    expect(sent).toEqual([
+      ...listed.map((id) => [id, undefined]),
+      ...listed.map((id) => [`${id}-20260301`, undefined]),
+      ...unlisted.map((id) => [id, 0.2]),
+    ]);
+  });
+
+  it('through Membrane: Fable and Mythos ids lose config sampling by family, the list decides providerParams', async () => {
+    // Membrane drops a request config's sampling for every Fable and Mythos id
+    // by name (isAlwaysThinkingModel) before the adapter sees it. So for a
+    // later Mythos the list doesn't name, only sampling sent in providerParams
+    // reaches the wire, while Mythos 5.1, listed, loses it there too; a later
+    // Opus version gets either.
+    const { adapter, captured } = captureAdapter();
+    const membrane = new Membrane(adapter, { formatter: new NativeFormatter() });
+    const send = (model: string, sampling: { temperature?: number; providerParams?: Record<string, unknown> }) =>
+      membrane.complete({
+        messages: [{ participant: 'User', content: [{ type: 'text', text: 'hi' }] }],
+        config: { model, maxTokens: 64, ...(sampling.temperature !== undefined ? { temperature: sampling.temperature } : {}) },
+        ...(sampling.providerParams ? { providerParams: sampling.providerParams } : {}),
+      } as any);
+
+    await send('claude-mythos-5-2', { temperature: 0.2 });
+    await send('claude-mythos-5-2', { providerParams: { temperature: 0.2 } });
+    await send('claude-mythos-5-1', { temperature: 0.2 });
+    await send('claude-mythos-5-1', { providerParams: { temperature: 0.2 } });
+    await send('claude-fable-5-1', { providerParams: { temperature: 0.2 } });
+    await send('claude-opus-5-6', { temperature: 0.2 });
+    await send('claude-opus-5-5', { temperature: 0.2 });
+
+    expect(captured.map((request: any) => [request.model, request.temperature])).toEqual([
+      ['claude-mythos-5-2', undefined],
+      ['claude-mythos-5-2', 0.2],
+      ['claude-mythos-5-1', undefined],
+      ['claude-mythos-5-1', undefined],
+      ['claude-fable-5-1', undefined],
+      ['claude-opus-5-6', 0.2],
+      ['claude-opus-5-5', undefined],
+    ]);
+  });
+
   it('strips temperature/top_k when extended thinking is enabled (any model)', async () => {
     const { adapter, captured } = captureAdapter();
 
@@ -161,6 +277,25 @@ describe('AnthropicAdapter: sampling-parameter model gate', () => {
     expect(captured[0]).not.toHaveProperty('temperature');
     expect(captured[0]).not.toHaveProperty('top_k');
     expect(captured[0].thinking).toEqual({ type: 'enabled', budget_tokens: 2048 });
+  });
+
+  it('strips temperature, top_k and a top_p below 0.95 for an adaptive config too', async () => {
+    const { adapter, captured } = captureAdapter();
+    const thinking = { type: 'adaptive', display: 'omitted', block_binding: { prefix_mismatch_behavior: 'drop_block' } };
+
+    await adapter.complete({
+      ...baseRequest,
+      model: 'claude-sonnet-4-5',
+      temperature: 0.7,
+      topK: 40,
+      topP: 0.9,
+      thinking,
+    } as any);
+
+    expect(captured[0]).not.toHaveProperty('temperature');
+    expect(captured[0]).not.toHaveProperty('top_k');
+    expect(captured[0]).not.toHaveProperty('top_p');
+    expect(captured[0].thinking).toEqual(thinking);
   });
 
   it('keeps temperature when thinking is explicitly disabled', async () => {

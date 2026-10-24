@@ -8,9 +8,9 @@ const warnedUndeclaredAdapters = new Set<string>();
 /**
  * Restate a provider's usage in membrane's single convention: `inputTokens`,
  * `cacheReadTokens` and `cacheCreationTokens` DISJOINT, each priced at its own
- * rate. Adapters reporting `cache-inclusive` counts have the cached span
- * subtracted out of `inputTokens`; the total prompt size stays recoverable as
- * `inputTokens + cacheReadTokens`.
+ * rate. Adapters reporting `cache-inclusive` counts have the cached span, read
+ * and written, subtracted out of `inputTokens`; the total prompt size stays
+ * recoverable as `inputTokens + cacheCreationTokens + cacheReadTokens`.
  *
  * Without this, one field name carried two incomparable meanings — the cache
  * hit ratio was unbounded on cache-excluded adapters and cost double-charged
@@ -25,11 +25,17 @@ export function normalizeUsageToCacheExcluded(
   // which is why the interface field is optional and lands here.
   const convention = usage.cacheConvention ?? adapterConvention ?? 'unknown';
   const cacheReadTokens = usage.cacheReadTokens ?? 0;
+  const cacheCreationTokens = usage.cacheCreationTokens ?? 0;
 
-  if (convention === 'unknown' && cacheReadTokens > 0 && !warnedUndeclaredAdapters.has(adapterName)) {
+  if (
+    convention === 'unknown'
+    && (cacheReadTokens > 0 || cacheCreationTokens > 0)
+    && !warnedUndeclaredAdapters.has(adapterName)
+  ) {
     warnedUndeclaredAdapters.add(adapterName);
     console.warn(
-      `[membrane:usage] adapter "${adapterName}" reported ${cacheReadTokens} cache-read tokens but`
+      `[membrane:usage] adapter "${adapterName}" reported ${cacheReadTokens} cache-read and`
+      + ` ${cacheCreationTokens} cache-write tokens but`
       + ' declares usageCacheConvention "unknown", so membrane cannot tell whether inputTokens'
       + ` (${usage.inputTokens}) already includes them. Counts are passed through unchanged;`
       + ' cost and cache hit ratio may be off by the cached span until the adapter declares'
@@ -37,21 +43,26 @@ export function normalizeUsageToCacheExcluded(
     );
   }
 
-  if (convention !== 'cache-inclusive' || cacheReadTokens === 0) return usage;
+  if (convention !== 'cache-inclusive' || (cacheReadTokens === 0 && cacheCreationTokens === 0)) return usage;
 
-  return { ...usage, inputTokens: Math.max(0, usage.inputTokens - cacheReadTokens) };
+  // The clamp keeps a count that can't be right from going negative: an
+  // adapter declaring itself inclusive while reporting cached tokens outside
+  // its input count, reads or writes alike.
+  return { ...usage, inputTokens: Math.max(0, usage.inputTokens - cacheReadTokens - cacheCreationTokens) };
 }
 
 /**
- * Share of the prompt that was served from cache. Both terms are in the
- * cache-excluded convention, so this is a true ratio in [0, 1] regardless of
- * which provider produced the counts.
+ * Share of the prompt that was served from cache: cache reads over the whole
+ * prompt, fresh input, cache writes and cache reads together. For an adapter
+ * that declares its convention, the three terms are disjoint once restated, so
+ * this is a true ratio in [0, 1]. An `unknown` adapter's counts pass through as
+ * the provider gave them, so its ratio may be off by the cached span.
  */
 export function calculateCacheHitRatio(
-  usage: { inputTokens: number; cacheReadTokens?: number },
+  usage: { inputTokens: number; cacheCreationTokens?: number; cacheReadTokens?: number },
 ): number {
   const cacheReadTokens = usage.cacheReadTokens ?? 0;
-  const promptTokens = (usage.inputTokens ?? 0) + cacheReadTokens;
+  const promptTokens = (usage.inputTokens ?? 0) + (usage.cacheCreationTokens ?? 0) + cacheReadTokens;
   if (promptTokens === 0) return 0;
   return cacheReadTokens / promptTokens;
 }
@@ -82,6 +93,18 @@ export function warnUnconvertibleProviderItem(itemType: string): void {
 /** Test seam: the once-per-type warn latch is process-wide otherwise. */
 export function resetUnconvertibleProviderItemWarnings(): void {
   warnedUnconvertibleProviderItems.clear();
+}
+
+/**
+ * `ProviderResponse.unreportedUsage` for a provider's raw input and output
+ * counts: each that is not a number is unreported (its usage value is a 0
+ * default). Spread into a ProviderResponse.
+ */
+export function unreportedUsage(input: unknown, output: unknown): { unreportedUsage?: Array<'inputTokens' | 'outputTokens'> } {
+  const missing: Array<'inputTokens' | 'outputTokens'> = [];
+  if (typeof input !== 'number') missing.push('inputTokens');
+  if (typeof output !== 'number') missing.push('outputTokens');
+  return missing.length > 0 ? { unreportedUsage: missing } : {};
 }
 
 /**
@@ -121,15 +144,17 @@ export class TurnUsageAccumulator {
 
     this.tokens.inputTokens += usage.inputTokens;
     this.tokens.outputTokens += usage.outputTokens;
-    if (usage.cacheCreationTokens) {
+    // An optional count is in the total once any round reported it, a 0
+    // included, and absent while none has, as in each round's own entry.
+    if (usage.cacheCreationTokens != null) {
       this.tokens.cacheCreationTokens = (this.tokens.cacheCreationTokens ?? 0) + usage.cacheCreationTokens;
     }
-    if (usage.cacheReadTokens) {
+    if (usage.cacheReadTokens != null) {
       this.tokens.cacheReadTokens = (this.tokens.cacheReadTokens ?? 0) + usage.cacheReadTokens;
     }
     // Already inside outputTokens (billed at the output rate) — summed for
     // attribution, never added to the output total.
-    if (usage.thinkingTokens) {
+    if (usage.thinkingTokens != null) {
       this.tokens.thinkingTokens = (this.tokens.thinkingTokens ?? 0) + usage.thinkingTokens;
     }
 
@@ -175,6 +200,12 @@ export class TurnUsageAccumulator {
   /** The model that served the LAST round, or undefined if no round named one. */
   get lastServedModel(): string | undefined {
     return this.lastServed;
+  }
+
+  /** The latest round's own usage (a copy), or undefined before any round. */
+  get lastRound(): TurnRoundUsage | undefined {
+    const round = this.rounds[this.rounds.length - 1];
+    return round ? { model: round.model, usage: { ...round.usage } } : undefined;
   }
 
   /** One entry per provider round, in order — the audit trail behind the summed total. */
